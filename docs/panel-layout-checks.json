@@ -1,0 +1,626 @@
+[
+  {
+    "jogScroll": false,
+    "jointScroll": false,
+    "logsHeight": 128,
+    "page": [
+      960,
+      640
+    ],
+    "panels": [
+      {
+        "bottom": 497,
+        "client": 437,
+        "name": "连接",
+        "right": 256,
+        "scroll": 437
+      },
+      {
+        "bottom": 345,
+        "client": 285,
+        "name": "右臂",
+        "right": 702,
+        "scroll": 285
+      },
+      {
+        "bottom": 497,
+        "client": 142,
+        "name": "末端坐标（Link7）",
+        "right": 702,
+        "scroll": 142
+      },
+      {
+        "bottom": 497,
+        "client": 437,
+        "name": "点动",
+        "right": 950,
+        "scroll": 437
+      },
+      {
+        "bottom": 633,
+        "client": 126,
+        "name": "日志",
+        "right": 950,
+        "scroll": 126
+      }
+    ],
+    "viewport": [
+      960,
+      640
+    ],
+    "space": "cartesian",
+    "mode": "continuous"
+  },
+  {
+    "jogScroll": true,
+    "jointScroll": false,
+    "logsHeight": 128,
+    "page": [
+      960,
+      640
+    ],
+    "panels": [
+      {
+        "bottom": 497,
+        "client": 437,
+        "name": "连接",
+        "right": 256,
+        "scroll": 437
+      },
+      {
+        "bottom": 345,
+        "client": 285,
+        "name": "右臂",
+        "right": 702,
+        "scroll": 285
+      },
+      {
+        "bottom": 497,
+        "client": 142,
+        "name": "末端坐标（Link7）",
+        "right": 702,
+        "scroll": 142
+      },
+      {
+        "bottom": 497,
+        "client": 437,
+        "name": "点动",
+        "right": 950,
+        "scroll": 437
+      },
+      {
+        "bottom": 633,
+        "client": 126,
+        "name": "日志",
+        "right": 950,
+        "scroll": 126
+      }
+    ],
+    "viewport": [
+      960,
+      640
+    ],
+    "space": "cartesian",
+    "mode": "step"
+  },
+  {
+    "jogScroll": true,
+    "jointScroll": false,
+    "logsHeight": 128,
+    "page": [
+      960,
+      640
+    ],
+    "panels": [
+      {
+        "bottom": 497,
+        "client": 437,
+        "name": "连接",
+        "right": 256,
+        "scroll": 437
+      },
+      {
+        "bottom": 345,
+        "client": 285,
+        "name": "右臂",
+        "right": 702,
+        "scroll": 285
+      },
+      {
+        "bottom": 497,
+        "client": 142,
+        "name": "末端坐标（Link7）",
+        "right": 702,
+        "scroll": 142
+      },
+      {
+        "bottom": 497,
+        "client": 437,
+        "name": "点动",
+        "right": 950,
+        "scroll": 437
+      },
+      {
+        "bottom": 633,
+        "client": 126,
+        "name": "日志",
+        "right": 950,
+        "scroll": 126
+      }
+    ],
+    "viewport": [
+      960,
+      640
+    ],
+    "space": "joint",
+    "mode": "continuous"
+  },
+  {
+    "jogScroll": true,
+    "jointScroll": false,
+    "logsHeight": 128,
+    "page": [
+      960,
+      640
+    ],
+    "panels": [
+      {
+        "bottom": 497,
+        "client": 437,
+        "name": "连接",
+        "right": 256,
+        "scroll": 437
+      },
+      {
+        "bottom": 345,
+        "client": 285,
+        "name": "右臂",
+        "right": 702,
+        "scroll": 285
+      },
+      {
+        "bottom": 497,
+        "client": 142,
+        "name": "末端坐标（Link7）",
+        "right": 702,
+        "scroll": 142
+      },
+      {
+        "bottom": 497,
+        "client": 437,
+        "name": "点动",
+        "right": 950,
+        "scroll": 437
+      },
+      {
+        "bottom": 633,
+        "client": 126,
+        "name": "日志",
+        "right": 950,
+        "scroll": 126
+      }
+    ],
+    "viewport": [
+      960,
+      640
+    ],
+    "space": "joint",
+    "mode": "step"
+  },
+  {
+    "jogScroll": false,
+    "jointScroll": false,
+    "logsHeight": 192,
+    "page": [
+      1024,
+      768
+    ],
+    "panels": [
+      {
+        "bottom": 559,
+        "client": 495,
+        "name": "连接",
+        "right": 256,
+        "scroll": 495
+      },
+      {
+        "bottom": 407,
+        "client": 343,
+        "name": "右臂",
+        "right": 766,
+        "scroll": 343
+      },
+      {
+        "bottom": 559,
+        "client": 142,
+        "name": "末端坐标（Link7）",
+        "right": 766,
+        "scroll": 142
+      },
+      {
+        "bottom": 559,
+        "client": 495,
+        "name": "点动",
+        "right": 1014,
+        "scroll": 495
+      },
+      {
+        "bottom": 759,
+        "client": 190,
+        "name": "日志",
+        "right": 1014,
+        "scroll": 190
+      }
+    ],
+    "viewport": [
+      1024,
+      768
+    ],
+    "space": "cartesian",
+    "mode": "continuous"
+  },
+  {
+    "jogScroll": true,
+    "jointScroll": false,
+    "logsHeight": 192,
+    "page": [
+      1024,
+      768
+    ],
+    "panels": [
+      {
+        "bottom": 559,
+        "client": 495,
+        "name": "连接",
+        "right": 256,
+        "scroll": 495
+      },
+      {
+        "bottom": 407,
+        "client": 343,
+        "name": "右臂",
+        "right": 766,
+        "scroll": 343
+      },
+      {
+        "bottom": 559,
+        "client": 142,
+        "name": "末端坐标（Link7）",
+        "right": 766,
+        "scroll": 142
+      },
+      {
+        "bottom": 559,
+        "client": 495,
+        "name": "点动",
+        "right": 1014,
+        "scroll": 495
+      },
+      {
+        "bottom": 759,
+        "client": 190,
+        "name": "日志",
+        "right": 1014,
+        "scroll": 190
+      }
+    ],
+    "viewport": [
+      1024,
+      768
+    ],
+    "space": "cartesian",
+    "mode": "step"
+  },
+  {
+    "jogScroll": true,
+    "jointScroll": false,
+    "logsHeight": 192,
+    "page": [
+      1024,
+      768
+    ],
+    "panels": [
+      {
+        "bottom": 559,
+        "client": 495,
+        "name": "连接",
+        "right": 256,
+        "scroll": 495
+      },
+      {
+        "bottom": 407,
+        "client": 343,
+        "name": "右臂",
+        "right": 766,
+        "scroll": 343
+      },
+      {
+        "bottom": 559,
+        "client": 142,
+        "name": "末端坐标（Link7）",
+        "right": 766,
+        "scroll": 142
+      },
+      {
+        "bottom": 559,
+        "client": 495,
+        "name": "点动",
+        "right": 1014,
+        "scroll": 495
+      },
+      {
+        "bottom": 759,
+        "client": 190,
+        "name": "日志",
+        "right": 1014,
+        "scroll": 190
+      }
+    ],
+    "viewport": [
+      1024,
+      768
+    ],
+    "space": "joint",
+    "mode": "continuous"
+  },
+  {
+    "jogScroll": true,
+    "jointScroll": false,
+    "logsHeight": 192,
+    "page": [
+      1024,
+      768
+    ],
+    "panels": [
+      {
+        "bottom": 559,
+        "client": 495,
+        "name": "连接",
+        "right": 256,
+        "scroll": 495
+      },
+      {
+        "bottom": 407,
+        "client": 343,
+        "name": "右臂",
+        "right": 766,
+        "scroll": 343
+      },
+      {
+        "bottom": 559,
+        "client": 142,
+        "name": "末端坐标（Link7）",
+        "right": 766,
+        "scroll": 142
+      },
+      {
+        "bottom": 559,
+        "client": 495,
+        "name": "点动",
+        "right": 1014,
+        "scroll": 495
+      },
+      {
+        "bottom": 759,
+        "client": 190,
+        "name": "日志",
+        "right": 1014,
+        "scroll": 190
+      }
+    ],
+    "viewport": [
+      1024,
+      768
+    ],
+    "space": "joint",
+    "mode": "step"
+  },
+  {
+    "jogScroll": false,
+    "jointScroll": false,
+    "logsHeight": 150,
+    "page": [
+      1280,
+      720
+    ],
+    "panels": [
+      {
+        "bottom": 555,
+        "client": 495,
+        "name": "连接",
+        "right": 286,
+        "scroll": 495
+      },
+      {
+        "bottom": 403,
+        "client": 343,
+        "name": "右臂",
+        "right": 998,
+        "scroll": 343
+      },
+      {
+        "bottom": 555,
+        "client": 142,
+        "name": "末端坐标（Link7）",
+        "right": 998,
+        "scroll": 142
+      },
+      {
+        "bottom": 555,
+        "client": 495,
+        "name": "点动",
+        "right": 1270,
+        "scroll": 495
+      },
+      {
+        "bottom": 713,
+        "client": 148,
+        "name": "日志",
+        "right": 1270,
+        "scroll": 148
+      }
+    ],
+    "viewport": [
+      1280,
+      720
+    ],
+    "space": "cartesian",
+    "mode": "continuous"
+  },
+  {
+    "jogScroll": true,
+    "jointScroll": false,
+    "logsHeight": 150,
+    "page": [
+      1280,
+      720
+    ],
+    "panels": [
+      {
+        "bottom": 555,
+        "client": 495,
+        "name": "连接",
+        "right": 286,
+        "scroll": 495
+      },
+      {
+        "bottom": 403,
+        "client": 343,
+        "name": "右臂",
+        "right": 998,
+        "scroll": 343
+      },
+      {
+        "bottom": 555,
+        "client": 142,
+        "name": "末端坐标（Link7）",
+        "right": 998,
+        "scroll": 142
+      },
+      {
+        "bottom": 555,
+        "client": 495,
+        "name": "点动",
+        "right": 1270,
+        "scroll": 495
+      },
+      {
+        "bottom": 713,
+        "client": 148,
+        "name": "日志",
+        "right": 1270,
+        "scroll": 148
+      }
+    ],
+    "viewport": [
+      1280,
+      720
+    ],
+    "space": "cartesian",
+    "mode": "step"
+  },
+  {
+    "jogScroll": false,
+    "jointScroll": false,
+    "logsHeight": 150,
+    "page": [
+      1280,
+      720
+    ],
+    "panels": [
+      {
+        "bottom": 555,
+        "client": 495,
+        "name": "连接",
+        "right": 286,
+        "scroll": 495
+      },
+      {
+        "bottom": 403,
+        "client": 343,
+        "name": "右臂",
+        "right": 998,
+        "scroll": 343
+      },
+      {
+        "bottom": 555,
+        "client": 142,
+        "name": "末端坐标（Link7）",
+        "right": 998,
+        "scroll": 142
+      },
+      {
+        "bottom": 555,
+        "client": 495,
+        "name": "点动",
+        "right": 1270,
+        "scroll": 495
+      },
+      {
+        "bottom": 713,
+        "client": 148,
+        "name": "日志",
+        "right": 1270,
+        "scroll": 148
+      }
+    ],
+    "viewport": [
+      1280,
+      720
+    ],
+    "space": "joint",
+    "mode": "continuous"
+  },
+  {
+    "jogScroll": false,
+    "jointScroll": false,
+    "logsHeight": 150,
+    "page": [
+      1280,
+      720
+    ],
+    "panels": [
+      {
+        "bottom": 555,
+        "client": 495,
+        "name": "连接",
+        "right": 286,
+        "scroll": 495
+      },
+      {
+        "bottom": 403,
+        "client": 343,
+        "name": "右臂",
+        "right": 998,
+        "scroll": 343
+      },
+      {
+        "bottom": 555,
+        "client": 142,
+        "name": "末端坐标（Link7）",
+        "right": 998,
+        "scroll": 142
+      },
+      {
+        "bottom": 555,
+        "client": 495,
+        "name": "点动",
+        "right": 1270,
+        "scroll": 495
+      },
+      {
+        "bottom": 713,
+        "client": 148,
+        "name": "日志",
+        "right": 1270,
+        "scroll": 148
+      }
+    ],
+    "viewport": [
+      1280,
+      720
+    ],
+    "space": "joint",
+    "mode": "step"
+  }
+]

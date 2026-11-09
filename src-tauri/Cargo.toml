@@ -1,0 +1,40 @@
+[package]
+name = "unitree-r17a-controller"
+version = "0.1.0"
+description = "R1-7a desktop controller"
+license = "BSD-3-Clause"
+repository = "https://github.com/ExplodingUFO/UnitreeR17aController"
+edition = "2024"
+
+[lib]
+name = "unitree_controller_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+axum = { version = "0.8", features = ["ws", "json", "query"] }
+tower-http = { version = "0.6", features = ["cors"] }
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+crossbeam-channel = "0.5"
+serialport = "=4.10.1"
+nalgebra = "=0.35.0"
+urdf-rs = "=0.10.0"
+rusqlite = { version = "=0.41.1", features = ["bundled"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+tokio-tungstenite = "0.29"
+
+[profile.release]
+lto = "thin"
+codegen-units = 8
+strip = true

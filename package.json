@@ -1,0 +1,36 @@
+{
+  "name": "unitree-r17a-controller",
+  "private": true,
+  "version": "0.1.0",
+  "license": "BSD-3-Clause",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ExplodingUFO/UnitreeR17aController.git"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 4173 --strictPort",
+    "tauri": "tauri",
+    "format": "prettier --write src vite.config.ts tsconfig.json package.json src-tauri/tauri.conf.json",
+    "format:check": "prettier --check src vite.config.ts tsconfig.json package.json src-tauri/tauri.conf.json"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.12.4",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "three": "0.187.0",
+    "urdf-loader": "0.13.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.4",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@types/three": "0.187.0",
+    "@vitejs/plugin-react": "6.3.0",
+    "prettier": "3.6.2",
+    "typescript": "7.0.2",
+    "vite": "8.3.6"
+  }
+}

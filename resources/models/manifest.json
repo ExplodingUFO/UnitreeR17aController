@@ -1,0 +1,105 @@
+{
+  "source": {
+    "repository": "https://github.com/unitreerobotics/r1-7a_sdk",
+    "version": "0.1.0",
+    "commit": "0803d033b530fcfa0e6fa9236de68c2773fc9402",
+    "archive": "urdf/URDF_R1-7A.tar.gz",
+    "sha256": "dca2cea68150891b5312108dd7c448103d0f0d67690fde0918cea23b41b65e25",
+    "url": "https://github.com/unitreerobotics/r1-7a_sdk/blob/0803d033b530fcfa0e6fa9236de68c2773fc9402/urdf/URDF_R1-7A.tar.gz",
+    "license_file": "UNITREE-LICENSE",
+    "license_origin": "SDK repository root LICENSE; archive contains no separate license text",
+    "license": "BSD-3-Clause (SDK root LICENSE); package.xml declares BSD"
+  },
+  "sides": {
+    "right": {
+      "joint_names": [
+        "J1",
+        "J2",
+        "J3",
+        "J4",
+        "J5",
+        "J6",
+        "J7"
+      ],
+      "lower": [
+        -2.723,
+        0.0,
+        -0.349,
+        0.0,
+        -2.269,
+        -0.785,
+        -1.571
+      ],
+      "upper": [
+        2.723,
+        3.1416,
+        3.491,
+        3.1415,
+        2.269,
+        0.785,
+        1.571
+      ],
+      "urdf": "/models/right/robot.urdf",
+      "model_version": "V1.2-1023",
+      "original_urdf": "R1_Robotic_Arm_R_V1.2-1023/R1_Robotic_Arm_V1.2/R1_Robotic_Arm/urdf/R1_Robotic_Arm.urdf",
+      "original_urdf_sha256": "4e6655f511a88447e70a9437355241918b4ec094e4d8c09f1cae754d7724c0f5",
+      "urdf_sha256": "723cd4b18ce3ece51883647e24c02563c62a169062b2545f7ef7b8b76c22a1ed",
+      "mesh_sha256": {
+        "Link1.STL": "e766084eb972536eed974f4361028cb51e4b35d0036f152e9bf215c5d62775c0",
+        "Link2.STL": "d6d9d9aed7c73e837bec198827440533ed5db0fce80e9a7531e9c8b2993720ac",
+        "Link3.STL": "04870db8eba1cd4ef8f601050586caf63d07e79a053e626438703c453c496778",
+        "Link4.STL": "c90c7435eadb9cb54a8316666dfbd6eafdbb5fb3e2f32f3f5df3b6757ec06d4c",
+        "Link5.STL": "4a13ea7e4626827727c0b3a207a8ebd2a6576cde7d52cb14a00317e1b7e2fd00",
+        "Link6.STL": "10dbf195931d1c2e80672cb5e0572e1fc60925a99b563660833f45a5d04e2c77",
+        "Link7.STL": "f0b2a96dcb3e7c28f02d404af39c7caceeb6404e8df21c272561c3e08210598d",
+        "base_link.STL": "75124b266168a63131a737e4d50a497476384d0481a451c4be25bab2568e76ed"
+      },
+      "package_license": "BSD"
+    },
+    "left": {
+      "joint_names": [
+        "J1",
+        "J2",
+        "J3",
+        "J4",
+        "J5",
+        "J6",
+        "J7"
+      ],
+      "lower": [
+        -2.723,
+        0.0,
+        -0.349,
+        0.0,
+        -2.269,
+        -0.524,
+        -1.571
+      ],
+      "upper": [
+        2.723,
+        3.1416,
+        3.491,
+        3.1416,
+        2.269,
+        0.524,
+        1.571
+      ],
+      "urdf": "/models/left/robot.urdf",
+      "model_version": "V1.0-1027",
+      "original_urdf": "R1_Robotic_Arm_L_V1.0-1027/R1_Robotic_Arm_L_V1.0-1027/urdf/R1_Robotic_Arm_L_V1.0-1027.urdf",
+      "original_urdf_sha256": "e89fde206857e5740dad7980954679ead95e7e10516f466eb27277af5f8662f5",
+      "urdf_sha256": "4f002c90e116c2b0eb416b592b9d82e2280f4d7ca2b13bed64ec52d051272857",
+      "mesh_sha256": {
+        "Link1.STL": "767bc36e631cc063f0cb16cef4b6aee09c261edf86adcc1681ea626d29298967",
+        "Link2.STL": "86a489b0ebbeb961f1dbffa7a78fcc18c2094d76f8f35f2b76b21c3ab1994012",
+        "Link3.STL": "10bc90041ce12d47be6bcefc92fd0813c51c258e7c80da6aff562a689e0149d9",
+        "Link4.STL": "d51d64e67486a349342b073a29d3c740c3aea410a440a27722b8f49d25fd7dee",
+        "Link5.STL": "571b3d9e4e54697bc7efa3363bae470ddd92151cba7f7c1def4800abda44d313",
+        "Link6.STL": "e0e564a9676372c860283f34e949304b3b95879ac7b980134e1c5e0cf9a73887",
+        "Link7.STL": "b8b2f08eda588064471d357e3b20fe6a90894e4403c26923aa3bc24e449e1965",
+        "base_link.STL": "4c1d1ba86a6763c05ec44cbc5779a497e002daf33c5cc66b247a3563d6fb1517"
+      },
+      "package_license": "BSD"
+    }
+  }
+}

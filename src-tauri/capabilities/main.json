@@ -1,0 +1,6 @@
+{
+  "identifier": "main",
+  "description": "Main desktop window",
+  "windows": ["main"],
+  "permissions": ["core:default", "allow-session-info", "allow-host-stop"]
+}

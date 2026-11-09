@@ -1,0 +1,3 @@
+# Preserve upstream model bytes, including the original URDF line endings.
+resources/models/*/robot.urdf -text -whitespace
+resources/models/*/meshes/*.STL binary
