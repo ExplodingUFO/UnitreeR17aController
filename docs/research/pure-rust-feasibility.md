@@ -2,7 +2,7 @@
 
 日期：2026-11-09，Asia/Shanghai。范围：资料、源码核验与工程估算。本轮未编写控制器、协议实现或验证程序，未创建 Cargo 项目，未连接机械臂。
 
-后续约束与结论更新（2026-11-09）：用户要求重评 k 的维护性，调查活跃替代库和直接 nalgebra，按一天纯 Agent 推进规划。最新建议是 serialport + nalgebra + urdf-rs，集中实现当前七轴的有限局部点动；Caliper 小组合为现成库备选，k 不再是默认候选。当前设备不可访问，先在 macOS/arm64 进行软件侧验收；真机目标仍未验收。本文原有“人日”是人工工程估算，不能作为 Agent 日历工期；最新安排与比较见[一天 Agent 计划](day-one-agent-plan.md)。
+选型更新（2026-11-09）：采用 serialport + nalgebra + urdf-rs 实现当前七轴的局部点动，Caliper 作为现成库备选。本文保留早期的库比较和人工工时估算；一天内的开发安排见[开发计划](day-one-plan.md)。当前在 macOS arm64 进行软件测试，真机测试单独记录。
 
 本评估中的“纯 Rust”指机械臂后端、通信实现和运动学不依赖官方 C++ SDK、C++ FFI 或 ROS。Tauri 的系统 WebView、操作系统串口调用，以及前端 TypeScript/Three.js 不属于被替换的机器人 SDK。
 

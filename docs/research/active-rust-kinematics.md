@@ -2,7 +2,7 @@
 
 调查截至：**2026-11-09，Asia/Shanghai**。公开元数据时间均保留 UTC；提交查询上界为 `2026-11-09T15:59:59Z`。本轮只做文档研究，未写实现、Cargo 项目或探针，未编译、运行示例、解析本项目依赖或连接硬件。未 clone、索引或结构探索新仓库；只读取官方 README、公开 API、相关函数源码、发布依赖和 GitHub 元数据。
 
-目标是**单平台真机端到端 MVP**，当前只能在 **Darwin arm64 / Mac 做软件验收**，机械臂和转接器不可访问。因此下文“可评估接入”只针对软件 MVP；真机协议、反馈/停止、硬件端到端均未验收。其它平台的运行验证另算，维护性与可移植代码边界仍是要求。一天是 **Agent 执行预算**，不是人日换算；本报告不另做实现排期或替代并行的 nalgebra 设计评估。
+目标是**单平台真机端到端 MVP**，当前只能在 **Darwin arm64 / Mac 做软件验收**，机械臂和转接器不可访问。因此下文“可评估接入”只针对软件 MVP；真机协议、反馈/停止、硬件端到端均未验收。其它平台的运行验证另算，维护性与可移植代码边界仍是要求。开发时间按一天估算，具体安排和 nalgebra 方案另文记录。
 
 ## 结论
 
@@ -74,9 +74,9 @@ core 的**非 optional 普通依赖**是 `nalgebra ^0.35`（std）、`urdf-rs ^0
 
 **最小直接依赖**是 `ferromotion-core 0.73.0`，需要显式构造 Iso/数学对象时加兼容 `nalgebra 0.35`；不需要引入 umbrella、控制、可视化、GPU 或 Python。问题在于 core 自身不可按 kinematics/IK 功能裁分；其官方 0.73.0 文档称约 150 modules，许多领域与本 MVP 无关。这不是笼统认定功能多就难用，而是单个依赖的审阅、版本变化和排错范围确实更宽。[core API 文档][ferro-api]
 
-**CI 证据：** workflow 包括 Ubuntu workspace test、wasm build、all-features clippy、文档构建；最近 core 所在 workspace 的 CI run **36913181213**，创建 **2026-10-01T19:17:26Z**，head **5daca8a…**，结论 **failure**。job/log 请求被 GitHub 限流，未取得具体原因，不能断言是 IK 测试失败、编译错误或环境问题；也没有当前 Darwin arm64 成功门禁的独立核验。[workflow][ferro-ci]、[具体运行][ferro-ci-run]
+**CI 证据：** workflow 包括 Ubuntu workspace test、wasm build、all-features clippy、文档构建；最近 core 所在 workspace 的 CI run **36913181213**，创建 **2026-10-01T19:17:26Z**，head **5daca8a…**，结论 **failure**。job/log 请求被 GitHub 限流，未取得具体原因，不能断言是 IK 测试失败、编译错误或环境问题；也没有当前 Darwin arm64 检查通过的记录。[workflow][ferro-ci]、[具体运行][ferro-ci-run]
 
-对一天 Agent 软件 MVP，Ferromotion 的优势是现成 API，风险是扩大审阅面、默认 IK 的额外验收责任、失败的最近 CI 与较短维护历史。本次不据此推荐覆盖现有选择。
+对一天内的软件开发，Ferromotion 的优势是现成 API，风险是扩大审阅面、默认 IK 的额外验收责任、失败的最近 CI 与较短维护历史。本次不据此推荐覆盖现有选择。
 
 ## Optima：完整但不解决“更活跃、更轻”的问题
 
@@ -84,7 +84,7 @@ core 的**非 optional 普通依赖**是 `nalgebra ^0.35`（std）、`urdf-rs ^0
 
 发布普通依赖包括 **nalgebra ^0.30.1、urdf-rs ^0.6.2**，没有缓解用户担心的版本年龄。`pyo3 ^0.16.2` 且 feature 为 `extension-module` 是 **非 optional** 普通依赖，意味着 CPython ABI/build 环境边界不能靠 default-features=false 去掉；这与“核心算法本身用 Rust”是两个问题。Bevy 可选且默认打开，NLopt 为 optional；不用 NLopt 可以避开那条 native 优化器路径，但仍不能称已获得轻量无 native 依赖的纯 Rust 运行闭包。[已发布依赖][opt-deps]
 
-最近核心提交在 2023 年，核心 GitHub Actions API 本次返回无运行记录，未核实到可依赖的当前测试门禁。故既不因其较长年龄就认定更成熟，也不认为它符合本次“更活跃替代 k”的目标；无需为它进行更多集成调查。[核心提交][opt-commit]、[Actions][opt-actions]
+最近核心提交在 2023 年，核心 GitHub Actions API 本次返回无运行记录，未核实到可依赖的当前测试结果。故既不因其较长年龄就认定更成熟，也不认为它符合本次“更活跃替代 k”的目标；无需为它进行更多集成调查。[核心提交][opt-commit]、[Actions][opt-actions]
 
 ## 其余三项为什么未进入完整候选
 
@@ -108,7 +108,7 @@ core 的**非 optional 普通依赖**是 `nalgebra ^0.35`（std）、`urdf-rs ^0
 | Ferromotion core | URDF base→tip 选链、FK/Jacobian、LM 与 seed；能省下数值算法代码。 | 默认 IK 没有硬限位，converged 不能代替目标容差验收；仍需补策略/包装，并排查最近 CI 与发布包是否相关。不可裁开的 core 和额外依赖扩大审阅范围。 | **本次不作为首选**。比 Caliper 更多的功能不等于本 MVP 节省更多接入工作；净收益尚未证实。 |
 | Optima | 现成 FK/Jacobian/IK 及通用机器人模型。 | 资产预处理、robot set/scene/optimizer 体系、旧版本和 PyO3 环境；同时没缓解近期维护与旧依赖问题。 | **本次不推荐**；没有证据显示这些额外接入工作比复用局部数学内核更合算。 |
 
-本次没有构建或集成，因此**不把上述节省折算成小时，也不承诺哪条路线能在一天 Agent 预算内验收**。它们不会省去本项目的软件/真机验收责任；nalgebra 自写路线的具体设计与一天计划由并行评估承担。
+本次没有构建或集成，因此**不把上述节省折算成小时，也不承诺哪条路线能在一天的开发时间内验收**。它们不会省去本项目的软件/真机验收责任；nalgebra 自写路线的具体设计与一天计划由并行评估承担。
 
 两项新候选都改善 nalgebra 版本，但都仍使用 urdf-rs 0.9；它们没有自动消除“维护者少、0.x API、URDF 与本机定义接合、构型连续/奇异策略/控制节拍”的责任。现成 IK 或库中 resolved-rate 相关函数都不等于本项目完整 servo，更不等于真机 MVP 已完成。
 

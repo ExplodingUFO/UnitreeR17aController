@@ -4,7 +4,7 @@
 
 - 固定 commit：[`0803d033b530fcfa0e6fa9236de68c2773fc9402`](https://github.com/unitreerobotics/r1-7a_sdk/commit/0803d033b530fcfa0e6fa9236de68c2773fc9402)，提交时间 2026-11-03 08:12:50 UTC，提交说明 `fix (urdf): update urdf`。
 - `VERSION` 仍为 `0.1.0`，其日期 2026-09-17 不能替代 commit 身份。[VERSION L1–9](https://github.com/unitreerobotics/r1-7a_sdk/blob/0803d033b530fcfa0e6fa9236de68c2773fc9402/VERSION#L1-L9)
-- 本报告在项目实现前完成，使用隔离的临时目录核查源码与模型。临时目录不是本项目的运行或构建依赖；后续实现结果见[实施状态](../implementation-status.md)。
+- 本报告在项目实现前完成，使用隔离的临时目录核查源码与模型。临时目录不是本项目的运行或构建依赖；后续实现结果见[测试记录](../implementation-status.md)。
 
 ## 结论与范围
 

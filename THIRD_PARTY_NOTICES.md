@@ -1,6 +1,6 @@
 # 第三方版权与许可
 
-本项目新增代码采用根目录的 [BSD-3-Clause 许可证](LICENSE)。以下上游材料保留各自的版权与许可；项目许可证不改变第三方材料的授权。
+本项目代码采用 [BSD-3-Clause](LICENSE)。第三方资源和依赖的版权与许可列于下方。
 
 ## Unitree R1-7a SDK
 
@@ -19,8 +19,6 @@
 | `resources/calibration/joint_calib_{left,right}.txt` | SDK `config/` 中的官方示例标定文件，保留原始内容；不是对用户本体的标定结果。 |
 | `src-tauri/src/protocol.rs` | Rust 协议实现参考官方电机报文、CRC、缩放与标定约定。 |
 | `resources/calibration/protocol-golden.json` 与生成器 | 使用上述 SDK 固定版本的原始 `MotorProtocol.cpp` 离线生成协议对照；SDK 原始实现不作为本项目运行时依赖。复现方式见 [说明](resources/calibration/README.md)。 |
-
-宇树及其贡献者没有为本项目背书。本项目不是宇树官方软件。
 
 ## 软件依赖
 

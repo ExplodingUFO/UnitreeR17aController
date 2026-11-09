@@ -1,18 +1,13 @@
 # R1-7a 控制器
 
-这是一个通过 **vibe coding、由 AI Agent 辅助开发的个人自用实验项目**，用于在电脑上连接、调试宇树 R1-7a 机械臂。它不是宇树官方软件，也未获得宇树官方背书。
+宇树 R1-7a 七轴机械臂的桌面调试工具，基于 Rust 和 Tauri 2 开发。
 
-**真机尚未验收。** 目前完成的是 macOS arm64 上的软件 MVP、离线测试及界面检查。真实串口与 USB 转接器、用户本体标定、运动跟随、停止和失联行为均未完成真机验证；Windows/Linux 的构建和设备验证也未完成。模型显示、数值测试和软件测试通过不代表实机已经验证。
+- 串口连接与左右臂选择，查看关节位置、速度、扭矩和通信状态。
+- 关节与末端点动，支持连续操作、固定步长，以及基座和工具坐标系。
+- 加载官方 URDF 模型，根据关节反馈更新 3D 姿态。
+- 提供本机 HTTP/WebSocket 接口，使用 SQLite 记录操作和运行日志。
 
-软件侧已实现 Tauri 2 桌面应用、Rust 控制后端、本机 HTTP/WebSocket、七轴关节与末端点动、官方模型 3D 和 SQLite 结构化事件日志。测试、构建及验收记录见[实施状态](docs/implementation-status.md)。
-
-![无设备时的工作台，3D 显示参考姿态](docs/screenshots/resizable-panels-expanded.jpg)
-
-## 许可与来源
-
-本项目新增代码采用 **[BSD-3-Clause](LICENSE)**，允许商用，需遵守许可证条款。“个人自用”描述本项目的开发目的，不构成非商业使用限制。
-
-官方模型、示例标定及协议参考来自 [Unitree R1-7a SDK](https://github.com/unitreerobotics/r1-7a_sdk)，保留宇树原始版权声明和 BSD-3-Clause 许可。具体来源、固定版本和第三方许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+![R1-7a 控制器工作台](docs/screenshots/resizable-panels-expanded.jpg)
 
 ## 运行与构建
 
@@ -29,15 +24,37 @@ npm run tauri dev
 npm run tauri -- build --bundles app
 ```
 
-未指定额外 Cargo target 或输出目录时，预期应用位置为：
+默认构建输出：
 
 ```text
 src-tauri/target/release/bundle/macos/R1-7a Controller.app
 ```
 
-可用 `open "src-tauri/target/release/bundle/macos/R1-7a Controller.app"` 启动。实际产物与检查结果以[实施状态](docs/implementation-status.md)为准。
+可用 `open "src-tauri/target/release/bundle/macos/R1-7a Controller.app"` 启动。
 
-软件检查：
+## 使用
+
+选择左右臂和串口，取得控制后连接并使能。关节与末端点动共用一个操作区，一次执行一个动作；末端点动前需设置 TCP。默认串口波特率为 6 Mbps。
+
+拖动面板之间的分隔线，可调整左右栏宽度、3D/末端坐标区高度和日志高度。双击分隔线恢复默认尺寸，调整结果自动保存。分隔线聚焦后可用方向键微调，Shift 加方向键加大步幅，Enter 还原。关节表和点动列表在各自区域内滚动。
+
+未连接时，关节数据和计算 TCP 显示为空，3D 显示参考姿态。连接后，模型随关节反馈更新。
+
+## 本机接口与日志
+
+接口默认监听 `127.0.0.1:8177`。在工作台底部的“接口”中查看地址和会话令牌，调用方式见[接口说明](docs/implementation-contract.md)。桌面操作和外部程序共用一份设备状态，同一时间由一个客户端持有控制权；释放后可由其他客户端取得。
+
+工作台的停止按钮可取消任一客户端的当前动作，控制权和使能状态保持不变。
+
+日志由后台线程写入 SQLite，控制线程通过有界队列提交事件，不等待磁盘。队列满和写入失败分别计数。
+
+## 开发与测试
+
+个人自用项目，采用 vibe coding 方式开发。
+
+已在 macOS arm64 完成构建、48 项离线测试和界面检查。真机尚未验收，待测试项目包括串口与转接器、本体标定、运动跟随、停止和失联行为。Windows 和 Linux 尚未测试。详细结果见[测试记录](docs/implementation-status.md)。
+
+检查命令：
 
 ```bash
 npm run format:check
@@ -46,17 +63,10 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib --locked
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
 ```
 
-## 使用与边界
+相关文档：[功能规格](docs/spec.md)、[架构设计](docs/adr/0001-controller-architecture.md)、[原型记录](docs/prototype.md)。
 
-工作台集中显示连接、七轴、3D、点动和日志，目标布局为 1280×720 与 1024×768 无页面级滚动。先选择左右臂和串口，显式取得控制、连接并使能；关节与末端动作互斥，末端点动还要求有效 TCP 配置。宿主停止可取消任一客户端的当前动作，保留控制权且不自动失能。
+## 许可与来源
 
-面板之间的分隔线可以拖动：调整左右栏宽度、3D/末端坐标区的高度和日志高度。双击分隔线恢复该项默认尺寸，调整结果自动记忆。分隔线聚焦后可用方向键微调，Shift 加方向键加大步幅，Enter 还原。空间不足时关节表和点动列表在各自区域内滚动。
+采用 [BSD-3-Clause](LICENSE) 许可证，允许商用。
 
-无设备时关节实测数据和计算 TCP 为 `null`，3D 显示参考姿态；生产界面仅显示当前状态、数据来源、操作和必要错误原因。本机接口默认监听 `127.0.0.1:8177`，使用会话认证与控制租约；凭据不进入日志。SQLite 日志由专用后台线程写入，有界队列满或数据库故障不会让控制线程等待磁盘。
-
-当前交付环境为 macOS arm64。机械臂和转接器不可访问，真机尚未验收；协议默认波特率 6 Mbps，仍需验证实际转接器和本体的通信、标定、运动、停止及失联表现。Windows/Linux 的构建、运行与真机验证均未验收。
-
-- [首版规格](docs/spec.md)：功能、线程、接口、退出与验收边界。
-- [实施接口](docs/implementation-contract.md)：模块与数据契约。
-- [架构决策](docs/adr/0001-controller-architecture.md)：集中 Rust 后端、局部数值计算与异步 SQLite 日志。
-- [历史原型说明](docs/prototype.md)：保留原交互评审记录，与当前产品及验收证据分开。
+模型、示例标定和协议参考来自 [Unitree R1-7a SDK](https://github.com/unitreerobotics/r1-7a_sdk)，已保留宇树原始版权声明与许可证。来源、版本及第三方许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
