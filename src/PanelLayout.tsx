@@ -13,13 +13,13 @@ type Panel = "left" | "right" | "tcp" | "logs";
 type Sizes = Record<Panel, number>;
 type Geometry = { width: number; height: number };
 const GUTTER = 8;
-const MIN_LEFT = 220;
-const MIN_RIGHT = 220;
-const MIN_CENTER = 300;
-const MIN_WORKSPACE = 400;
-const MIN_LOGS = 112;
-const MIN_SCENE = 180;
-const MIN_TCP = 140;
+const MIN_LEFT = 196;
+const MIN_RIGHT = 216;
+const MIN_CENTER = 260;
+const MIN_WORKSPACE = 390;
+const MIN_LOGS = 36;
+const MIN_SCENE = 160;
+const MIN_TCP = 128;
 const STORAGE_KEY = "r17a.panel-layout.v1";
 const panels = {
   left: {
@@ -53,10 +53,10 @@ const clamp = (value: number, min: number, max: number) =>
 
 function defaults(): Sizes {
   return {
-    left: window.innerWidth <= 1100 ? 246 : 276,
-    right: window.innerWidth <= 1100 ? 240 : 264,
+    left: window.innerWidth <= 1100 ? 216 : 260,
+    right: window.innerWidth <= 1100 ? 232 : 264,
     tcp: 144,
-    logs: Math.max(128, Math.min(192, window.innerHeight - 570)),
+    logs: MIN_LOGS,
   };
 }
 
@@ -171,7 +171,7 @@ export function usePanelLayout() {
   const workspaceRef = useRef<HTMLElement>(null);
   const [preferred, setPreferred] = useState(load);
   const [geometry, setGeometry] = useState<Geometry>({
-    width: Math.max(760, Math.min(1520, window.innerWidth) - 20),
+    width: Math.max(688, Math.min(1520, window.innerWidth) - 20),
     height: Math.max(MIN_WORKSPACE + MIN_LOGS, window.innerHeight - 80),
   });
   const [active, setActive] = useState<Panel | null>(null);
@@ -185,7 +185,7 @@ export function usePanelLayout() {
     const workspace = workspaceRef.current;
     if (!root || !workspace) return;
     const measure = () => {
-      if (window.innerWidth <= 900) return;
+      if (root.dataset.page !== "control") return;
       const rootRect = root.getBoundingClientRect();
       const workspaceRect = workspace.getBoundingClientRect();
       const error = root.querySelector<HTMLElement>(".error-line");
@@ -326,6 +326,17 @@ export function usePanelLayout() {
     rootRef,
     workspaceRef,
     divider,
+    logsCollapsed: sizes.logs <= 48,
+    toggleLogs: () => {
+      const state = current.current;
+      commit(
+        fit(
+          { ...state.preferred, logs: state.sizes.logs <= 48 ? 160 : MIN_LOGS },
+          state.geometry,
+        ),
+        true,
+      );
+    },
     resizing: active
       ? panels[active].vertical
         ? "vertical"

@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 export const FEEDBACK_MAX_AGE_MS = 200;
 export type Side = "right" | "left";
 export type Space = "joint" | "cartesian";
+export type Frame = "base" | "tool";
 export type Phase =
   | "disconnected"
   | "connecting"
@@ -27,9 +28,15 @@ export interface Pose {
   translation: [number, number, number];
   rotation: [number, number, number, number];
 }
+export type ResultStatus =
+  | "accepted"
+  | "rejected"
+  | "completed"
+  | "cancelled"
+  | "failed";
 export interface Result {
   request_id: string;
-  status: string;
+  status: ResultStatus;
   code: string;
   message: string;
 }
@@ -77,14 +84,53 @@ export interface Log {
   source: string;
   code: string;
   message: string;
+  request_id: string | null;
 }
-interface Session {
+export interface Session {
   base_url: string;
   token: string;
   client_id: string;
   version: string;
   journal_path: string;
 }
+export interface ControlReply {
+  lease_id: string | null;
+  expires_in_ms: number;
+  generation: number;
+}
+export interface CommandAck {
+  request_id: string;
+  status: "queued";
+}
+export interface MotionArguments {
+  space: Space;
+  axis: number;
+  direction: -1 | 1;
+  speed: number;
+  frame?: Frame;
+}
+export type Operation =
+  | { kind: "connect"; port: string; side: Side }
+  | { kind: "disconnect" | "enable" | "disable" | "clear_fault" | "stop" }
+  | { kind: "configure_tcp"; tcp: Pose }
+  | ({
+      kind: "jog_start";
+      input_seq: number;
+      ttl_ms?: number;
+    } & MotionArguments)
+  | {
+      kind: "jog_update";
+      action_id: string;
+      input_seq: number;
+      ttl_ms?: number;
+    }
+  | ({ kind: "step"; amount: number } & MotionArguments);
+export type CommandRequest = Operation & {
+  request_id: string;
+  client_id: string;
+  lease_id: string;
+  generation: number;
+};
 export const emptySnapshot: Snapshot = {
   seq: 0,
   generation: 0,
@@ -155,7 +201,7 @@ class DesktopApi {
     this.listeners.forEach((fn) => fn(this.view));
   }
   fail(e: unknown) {
-    this.publish({ error: e instanceof Error ? e.message : String(e) });
+    this.publish({ error: this.errorMessage(e) });
   }
   clearError() {
     this.publish({ error: "" });
@@ -175,29 +221,71 @@ class DesktopApi {
       return false;
     }
   }
+  private errorMessage(error: unknown): string {
+    let message = error instanceof Error ? error.message : String(error);
+    for (const secret of [this.session?.token, this.lease]) {
+      if (secret) message = message.split(secret).join("[已隐藏]");
+    }
+    return (
+      message
+        .replace(/\bBearer\s+[^\s"'<>]+/gi, "Bearer [已隐藏]")
+        .replace(
+          /(["']?(?:token|lease_id)["']?\s*[:=]\s*["']?)[^"',}\s]+/gi,
+          "$1[已隐藏]",
+        )
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 400) || "请求失败"
+    );
+  }
   private async request<T>(path: string, body?: unknown): Promise<T> {
     if (!this.session) throw new Error("未连接");
-    const response = await fetch(
-      `${this.session.base_url.replace(/\/$/, "")}${path}`,
-      {
-        method: body ? "POST" : "GET",
-        headers: {
-          Authorization: `Bearer ${this.session.token}`,
-          ...(body ? { "Content-Type": "application/json" } : {}),
+    try {
+      const response = await fetch(
+        `${this.session.base_url.replace(/\/$/, "")}${path}`,
+        {
+          method: body ? "POST" : "GET",
+          headers: {
+            Authorization: `Bearer ${this.session.token}`,
+            ...(body ? { "Content-Type": "application/json" } : {}),
+          },
+          body: body ? JSON.stringify(body) : undefined,
+          signal: AbortSignal.timeout(4000),
         },
-        body: body ? JSON.stringify(body) : undefined,
-        signal: AbortSignal.timeout(4000),
-      },
-    );
-    const data = await response.json().catch(() => null);
-    if (!response.ok)
-      throw new Error(
-        data?.message ??
-          data?.error?.message ??
-          data?.error ??
-          `HTTP ${response.status}`,
       );
-    return data as T;
+      const text = await response.text();
+      let data: unknown;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        if (response.ok) throw new Error("响应数据格式无效");
+      }
+      if (!response.ok) {
+        const fields =
+          data && typeof data === "object"
+            ? (data as { message?: unknown; error?: unknown })
+            : null;
+        const nested =
+          fields?.error && typeof fields.error === "object"
+            ? (fields.error as { message?: unknown }).message
+            : null;
+        const message = [fields?.message, nested, fields?.error].find(
+          (value): value is string => typeof value === "string" && !!value,
+        );
+        throw new Error(
+          message ??
+            (text.trim() && !text.trimStart().startsWith("<")
+              ? text
+              : `HTTP ${response.status}`),
+        );
+      }
+      return data as T;
+    } catch (error) {
+      throw new Error(this.errorMessage(error));
+    }
+  }
+  async readState(): Promise<Snapshot> {
+    return this.request<Snapshot>("/v1/state");
   }
   async start() {
     this.stopped = false;
@@ -304,11 +392,7 @@ class DesktopApi {
       await this.cancelJog();
     }
     const epoch = this.leaseEpoch;
-    const data = await this.request<{
-      lease_id?: string;
-      expires_in_ms: number;
-      generation: number;
-    }>("/v1/control", {
+    const data = await this.request<ControlReply>("/v1/control", {
       action,
       client_id: "desktop",
       ...(this.lease ? { lease_id: this.lease } : {}),
@@ -354,17 +438,14 @@ class DesktopApi {
   ) {
     if (!this.view.online) throw new Error("未连接");
     if (!this.lease || !this.view.hasControl) throw new Error("未持有控制权");
-    return this.request<{ request_id: string; status: string }>(
-      "/v1/commands",
-      {
-        ...params,
-        kind,
-        request_id: requestId,
-        client_id: "desktop",
-        lease_id: this.lease,
-        generation,
-      },
-    );
+    return this.request<CommandAck>("/v1/commands", {
+      ...params,
+      kind,
+      request_id: requestId,
+      client_id: "desktop",
+      lease_id: this.lease,
+      generation,
+    });
   }
   async startJog(params: Record<string, unknown>) {
     if (this.jog || this.view.snapshot.action) throw new Error("运动中");

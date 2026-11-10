@@ -4,15 +4,29 @@
 
 功能见[规格](spec.md)，数据格式和模块接口见[接口说明](implementation-contract.md)。
 
+## 2026-11-10 界面与接口更新
+
+顶部增加“控制”“接口”“日志”三个页面。控制页默认收起日志，保留四条可拖动分隔线；接口页提供接入信息、输入输出示例、OpenAPI 下载、状态查询与请求结果；日志页支持文本筛选。点动支持鼠标和 Enter/空格，输入速度上限与后端一致。
+
+- 检查 800×600、800×570、1024×640、1280×800、1920×1080，各含末端/关节与连续/步长四种组合，共 20 种。默认布局中，七轴反馈与点动按钮均完整可见，无页面横向溢出。
+- 45 项浏览器检查通过，覆盖布局、拖动持久化、键盘导航、十种命令示例、复制与选中回退、状态查询、纯文本错误、日志筛选和停止。设备操作部分使用隔离的 IPC/HTTP 数据，未打开实际串口。
+- Hallmark 对四个页面执行静态与渲染检查：0 FAIL、0 REFLEX、0 WARN。原有 5 个字段保留；3 处输入处理调整为后端速度范围，其余 32 个事件处理器保留。
+- `cargo test --lib --locked` 的 48 项测试通过；TypeScript、Vite 与 macOS arm64 应用打包通过。
+- 从生产 `.app` 打开接口页，确认 WebSocket 已连接；“读取状态”返回后端当前 JSON，状态为 `disconnected`，未持有控制权，关节反馈为 null。原生 OpenAPI 下载完成，导出文件与源定义逐字节一致。
+
+宽度达到 1024 px 时，接入信息与状态返回并排显示；状态 JSON 单独滚动。800×600 使用单列布局。接口标题、页签和下载按钮合并为一行工具栏。检查使用完整 JSON 返回值，覆盖五种尺寸；800×600 另确认滚动后可查看 JSON 并使用复制按钮。
+
+截图：[800×600 控制页](screenshots/workspace-800x600.jpg)、[800×600 接口参考](screenshots/api-800x600.jpg)。[宽屏接入页](screenshots/api-wide.jpg)使用隔离测试数据，访问令牌已遮蔽。以下记录保留此前版本的测量数据。
+
 ## 软件检查
 
-| 项目 | 结果 |
-|---|---|
-| Rust 测试 | `cargo test --lib`：48 通过、0 失败；运行约 0.10 秒 |
-| 静态检查 | `cargo clippy --all-targets -- -D warnings` 通过；`cargo fmt --check` 通过 |
-| 前端检查 | `npm run build`：TypeScript 与 Vite 生产构建通过；`npm run format:check` 通过 |
-| macOS 打包 | `npm run tauri -- build --bundles app`；产物见下方 |
-| 运行 | 从生产 `.app` 启动，原生 WebView 为 `tauri://localhost`；HTTP/WS 与 SQLite 均联通 |
+| 项目         | 结果                                                                                                                      |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| Rust 测试    | `cargo test --lib`：48 通过、0 失败；运行约 0.10 秒                                                                       |
+| 静态检查     | `cargo clippy --all-targets -- -D warnings` 通过；`cargo fmt --check` 通过                                                |
+| 前端检查     | `npm run build`：TypeScript 与 Vite 生产构建通过；`npm run format:check` 通过                                             |
+| macOS 打包   | `npm run tauri -- build --bundles app`；产物见下方                                                                        |
+| 运行         | 从生产 `.app` 启动，原生 WebView 为 `tauri://localhost`；HTTP/WS 与 SQLite 均联通                                         |
 | 关闭与持久化 | 关闭主窗口后应用退出、8177 无监听；数据库保存 started/acquired/configure_tcp/host_stop/released/shutdown；完整性检查为 ok |
 
 48 项检查包括：
@@ -35,17 +49,17 @@
 4. Esc 触发桌面停止命令，写入 host_stop 事件，所有者保持不变。
 5. 关闭窗口后控制线程结束、服务关闭、SQLite 刷新。重新启动后可以查询上一会话记录。
 
-日志位置：`~/Library/Logs/com.superdragon.unitreer17a/events.sqlite3`。本机接口默认 `http://127.0.0.1:8177`；工作台底部“接口”可查看/复制当前会话 URL 与令牌。HTTP 用 Bearer 认证，WS 首帧用 `{ "token": "…" }`；控制操作还须申请租约。
+日志位置：`~/Library/Logs/com.superdragon.unitreer17a/events.sqlite3`。本机接口默认 `http://127.0.0.1:8177`；顶部“接口”页可查看/复制当前会话 URL 与令牌。HTTP 用 Bearer 认证，WS 首帧用 `{ "token": "…" }`；控制操作还须申请租约。
 
 ## 紧凑布局
 
 在浏览器中运行前端，测量结果如下：
 
-| 视口 | 页面 scrollWidth × scrollHeight | 检查 |
-|---|---|---|
-| 1280×720 | 1280×720 | 默认日志高 150 px，底部 713 px；所有模块可见 |
-| 1024×768 | 1024×768 | 默认日志高 192 px，底部 759 px；所有模块可见 |
-| 960×640 | 960×640 | 默认日志高 128 px，底部 633 px；关节数据完整，点动区按需内部滚动 |
+| 视口     | 页面 scrollWidth × scrollHeight | 检查                                                             |
+| -------- | ------------------------------- | ---------------------------------------------------------------- |
+| 1280×720 | 1280×720                        | 默认日志高 150 px，底部 713 px；所有模块可见                     |
+| 1024×768 | 1024×768                        | 默认日志高 192 px，底部 759 px；所有模块可见                     |
+| 960×640  | 960×640                         | 默认日志高 128 px，底部 633 px；关节数据完整，点动区按需内部滚动 |
 
 页面没有滚动；日志、关节表和点动列表在各自区域内按需滚动。
 

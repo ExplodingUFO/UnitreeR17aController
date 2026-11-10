@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type PointerEvent } from "react";
 import RobotScene from "./RobotScene";
+import ApiPanel from "./ApiPanel";
 import { PanelDivider, usePanelLayout } from "./PanelLayout";
 import {
   api,
@@ -10,6 +11,16 @@ import {
   type View,
 } from "./api";
 const DEG = 180 / Math.PI;
+type Page = "control" | "api" | "logs";
+const pages: { id: Page; label: string }[] = [
+  { id: "control", label: "控制" },
+  { id: "api", label: "接口" },
+  { id: "logs", label: "日志" },
+];
+const currentPage = (): Page => {
+  const page = location.hash.slice(1).split("/")[0];
+  return page === "api" || page === "logs" ? page : "control";
+};
 const phaseLabels: Record<Phase, string> = {
   disconnected: "未连接",
   connecting: "连接中",
@@ -50,6 +61,8 @@ function quaternion(values: number[]): [number, number, number, number] {
 }
 export default function App() {
   const layout = usePanelLayout();
+  const [page, setPage] = useState<Page>(currentPage);
+  const [logFilter, setLogFilter] = useState("");
   const [view, setView] = useState<View>(api.view);
   const [now, setNow] = useState(performance.now());
   const [side, setSide] = useState<Side>("right");
@@ -274,21 +287,24 @@ export default function App() {
     cancel();
     fn();
   };
-  const startMotion = (
-    event: PointerEvent<HTMLButtonElement>,
-    axis: number,
-    direction: number,
-  ) => {
-    if (
-      event.button !== 0 ||
-      !motionAllowed ||
-      stepGate.current ||
-      pointer.current !== null
-    )
-      return;
-    event.preventDefault();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    pointer.current = event.pointerId;
+  const navigate = (next: Page) => {
+    cancel();
+    setTcpOpen(false);
+    setInterfaceOpen(false);
+    setPage(next);
+    location.hash = next;
+  };
+  useEffect(() => {
+    const changed = () => {
+      cancel();
+      setTcpOpen(false);
+      setInterfaceOpen(false);
+      setPage(currentPage());
+    };
+    window.addEventListener("hashchange", changed);
+    return () => window.removeEventListener("hashchange", changed);
+  }, []);
+  const beginMotion = (axis: number, direction: number) => {
     setPressed(`${axis}:${direction}`);
     api.clearError();
     const angular = space === "joint" || axis >= 3;
@@ -320,6 +336,23 @@ export default function App() {
           api.fail(e);
         });
     }
+  };
+  const startMotion = (
+    event: PointerEvent<HTMLButtonElement>,
+    axis: number,
+    direction: number,
+  ) => {
+    if (
+      event.button !== 0 ||
+      !motionAllowed ||
+      stepGate.current ||
+      pointer.current !== null
+    )
+      return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    pointer.current = event.pointerId;
+    beginMotion(axis, direction);
   };
   const openTcp = () => {
     const transform = s.tcp_transform;
@@ -356,6 +389,14 @@ export default function App() {
       ? result?.message
       : "");
   const error = view.error || fault;
+  const shownLogs =
+    page === "logs"
+      ? view.logs.filter((log) =>
+          `${log.source} ${log.code} ${log.message} ${log.request_id ?? ""}`
+            .toLowerCase()
+            .includes(logFilter.toLowerCase()),
+        )
+      : view.logs;
   return (
     <div
       className="workbench"
@@ -363,11 +404,51 @@ export default function App() {
       style={layout.style}
       data-resizing={layout.resizing}
       data-short-workspace={layout.shortWorkspace}
+      data-page={page}
     >
       <header className="topbar">
         <div className="brand">
           <h1>R1-7a 控制器</h1>
         </div>
+        <nav
+          className="page-tabs"
+          aria-label="工作区"
+          role="tablist"
+          onKeyDown={(event) => {
+            const index = pages.findIndex((item) => item.id === page);
+            const next =
+              event.key === "ArrowRight"
+                ? (index + 1) % pages.length
+                : event.key === "ArrowLeft"
+                  ? (index + pages.length - 1) % pages.length
+                  : event.key === "Home"
+                    ? 0
+                    : event.key === "End"
+                      ? pages.length - 1
+                      : null;
+            if (next === null) return;
+            event.preventDefault();
+            navigate(pages[next].id);
+            document.getElementById(`page-${pages[next].id}`)?.focus();
+          }}
+        >
+          {pages.map((item) => (
+            <button
+              type="button"
+              key={item.id}
+              id={`page-${item.id}`}
+              role="tab"
+              aria-selected={page === item.id}
+              aria-controls={
+                item.id === "logs" ? "logs-panel" : `${item.id}-view`
+              }
+              tabIndex={page === item.id ? 0 : -1}
+              onClick={() => navigate(item.id)}
+            >
+              {item.label}
+            </button>
+          ))}
+        </nav>
         <div
           className={`status-pill ${s.phase === "fault" ? "danger" : connected ? "good" : ""}`}
         >
@@ -402,7 +483,14 @@ export default function App() {
           停止 <kbd>Esc</kbd>
         </button>
       </header>
-      <main className="workspace" ref={layout.workspaceRef}>
+      <main
+        className="workspace"
+        ref={layout.workspaceRef}
+        id="control-view"
+        role="tabpanel"
+        aria-labelledby="page-control"
+        hidden={page !== "control"}
+      >
         <section className="panel left-panel" id="device-panel">
           <div className="panel-heading">
             <h2>连接</h2>
@@ -585,6 +673,16 @@ export default function App() {
         <section className="panel jog-panel" id="jog-panel">
           <div className="panel-heading">
             <h2>点动</h2>
+            <select
+              className="jog-frame"
+              aria-label="坐标系"
+              value={frame}
+              disabled={space === "joint" || !!s.action}
+              onChange={(e) => changeControls(() => setFrame(e.target.value))}
+            >
+              <option value="base">基座坐标</option>
+              <option value="tool">工具坐标</option>
+            </select>
           </div>
           <div className="jog-settings">
             <div className="segmented" aria-label="点动空间">
@@ -593,7 +691,14 @@ export default function App() {
                   key={value}
                   className={space === value ? "selected" : ""}
                   aria-pressed={space === value}
-                  onClick={() => changeControls(() => setSpace(value))}
+                  onClick={() =>
+                    changeControls(() => {
+                      setSpace(value);
+                      setAngularSpeed((speed) =>
+                        Math.min(speed, (value === "joint" ? 0.2 : 0.15) * DEG),
+                      );
+                    })
+                  }
                 >
                   {value === "cartesian" ? "末端" : "关节"}
                 </button>
@@ -610,18 +715,6 @@ export default function App() {
                   {value === "continuous" ? "按住连续" : "固定步长"}
                 </button>
               ))}
-            </div>
-            <div className="frame-row">
-              <span>坐标系</span>
-              <select
-                aria-label="坐标系"
-                value={frame}
-                disabled={space === "joint" || !!s.action}
-                onChange={(e) => changeControls(() => setFrame(e.target.value))}
-              >
-                <option value="base">基座</option>
-                <option value="tool">工具</option>
-              </select>
             </div>
           </div>
           <div className="jog-axis-list">
@@ -653,6 +746,25 @@ export default function App() {
                     onPointerUp={cancel}
                     onPointerCancel={cancel}
                     onLostPointerCapture={cancel}
+                    onKeyDown={(event) => {
+                      if (event.key !== " " && event.key !== "Enter") return;
+                      event.preventDefault();
+                      if (
+                        event.repeat ||
+                        !motionAllowed ||
+                        stepGate.current ||
+                        pointer.current !== null
+                      )
+                        return;
+                      pointer.current = -1;
+                      beginMotion(axis, direction);
+                    }}
+                    onKeyUp={(event) => {
+                      if (event.key !== " " && event.key !== "Enter") return;
+                      event.preventDefault();
+                      cancel();
+                    }}
+                    onBlur={cancel}
                     onContextMenu={(e) => e.preventDefault()}
                   >
                     {direction < 0 ? "−" : "+"}
@@ -671,14 +783,14 @@ export default function App() {
                   aria-label="线速度 mm/s"
                   type="number"
                   min="0.1"
-                  max="50"
+                  max="15"
                   step="1"
                   value={linearSpeed}
                   onChange={(e) =>
                     setLinearSpeed(
                       Math.max(
                         0.1,
-                        Math.min(50, Number(e.target.value) || 0.1),
+                        Math.min(15, Number(e.target.value) || 0.1),
                       ),
                     )
                   }
@@ -693,12 +805,18 @@ export default function App() {
                 aria-label="角速度 度每秒"
                 type="number"
                 min="0.1"
-                max="30"
+                max={space === "joint" ? 0.2 * DEG : 0.15 * DEG}
                 step="1"
                 value={angularSpeed}
                 onChange={(e) =>
                   setAngularSpeed(
-                    Math.max(0.1, Math.min(30, Number(e.target.value) || 0.1)),
+                    Math.max(
+                      0.1,
+                      Math.min(
+                        space === "joint" ? 0.2 * DEG : 0.15 * DEG,
+                        Number(e.target.value) || 0.1,
+                      ),
+                    ),
                   )
                 }
               />
@@ -758,6 +876,15 @@ export default function App() {
           </div>
         </section>
       </main>
+      <section
+        className="secondary-screen"
+        id="api-view"
+        role="tabpanel"
+        aria-labelledby="page-api"
+        hidden={page !== "api"}
+      >
+        <ApiPanel view={view} />
+      </section>
       {error && (
         <div className="error-line" role="alert">
           <span>{error}</span>
@@ -768,8 +895,15 @@ export default function App() {
           )}
         </div>
       )}
-      <PanelDivider {...layout.divider("logs")} />
-      <section className="panel logs-panel" id="logs-panel">
+      <PanelDivider {...layout.divider("logs")} hidden={page !== "control"} />
+      <section
+        className="panel logs-panel"
+        id="logs-panel"
+        aria-label="运行日志"
+        hidden={page === "api"}
+        data-fullscreen={page === "logs"}
+        data-collapsed={page === "control" && layout.logsCollapsed}
+      >
         <div className="logs-heading">
           <h2>日志</h2>
           <div className="journal-counts">
@@ -784,6 +918,18 @@ export default function App() {
               丢弃 <b>{s.journal.dropped}</b>
             </span>
           </div>
+          {page === "logs" && (
+            <label className="log-filter">
+              <span>筛选</span>
+              <input
+                type="search"
+                aria-label="筛选日志"
+                placeholder="来源、编号或内容"
+                value={logFilter}
+                onChange={(event) => setLogFilter(event.target.value)}
+              />
+            </label>
+          )}
           <span className="endpoint" title={view.baseUrl}>
             {view.baseUrl || "服务未连接"}
           </span>
@@ -796,14 +942,35 @@ export default function App() {
               setInterfaceOpen(true);
             }}
           >
-            接口
+            连接信息
           </button>
+          {page === "control" && (
+            <button
+              type="button"
+              onClick={layout.toggleLogs}
+              aria-expanded={!layout.logsCollapsed}
+              aria-controls="logs-scroll"
+            >
+              {layout.logsCollapsed ? "展开" : "收起"}
+            </button>
+          )}
         </div>
-        <div className="logs-scroll">
-          {view.logs.length ? (
+        <div className="logs-scroll" id="logs-scroll">
+          {shownLogs.length ? (
             <table>
+              {page === "logs" && (
+                <thead>
+                  <tr>
+                    <th>时间</th>
+                    <th>级别</th>
+                    <th>来源</th>
+                    <th>编号</th>
+                    <th>内容</th>
+                  </tr>
+                </thead>
+              )}
               <tbody>
-                {view.logs.map((log) => (
+                {shownLogs.map((log) => (
                   <tr key={log.id}>
                     <td>
                       {new Date(log.ts_ms).toLocaleTimeString("zh-CN", {
@@ -821,7 +988,9 @@ export default function App() {
               </tbody>
             </table>
           ) : (
-            <div className="logs-empty">暂无日志</div>
+            <div className="logs-empty">
+              {logFilter && page === "logs" ? "没有匹配的日志" : "暂无日志"}
+            </div>
           )}
         </div>
       </section>

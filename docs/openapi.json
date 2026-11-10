@@ -1,0 +1,2566 @@
+{
+  "openapi": "3.1.0",
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "info": {
+    "title": "R1-7a Controller 本机 API",
+    "version": "0.1.0",
+    "description": "对应当前桌面软件。应用从 127.0.0.1:8177 提供 HTTP 与 WebSocket，随桌面启停。token 从桌面“接口”面板取得，每次启动变化。POST /v1/commands 的 202 仅代表入队，执行结果从 Snapshot.results 按 request_id 读取。字段范围表示有效业务输入；业务校验可在入队后返回 rejected。所有量采用 m、rad、s，显式 _ms 字段采用 ms。UTF-8 字节上限使用 x-utf8-max-bytes 表示。示例数值为协议示例。",
+    "license": {
+      "name": "BSD-3-Clause",
+      "url": "https://opensource.org/license/bsd-3-clause"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8177",
+      "description": "本机桌面应用"
+    }
+  ],
+  "security": [
+    {
+      "ApplicationToken": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "状态"
+    },
+    {
+      "name": "控制权"
+    },
+    {
+      "name": "命令"
+    },
+    {
+      "name": "日志"
+    }
+  ],
+  "paths": {
+    "/v1/ports": {
+      "get": {
+        "operationId": "listPorts",
+        "tags": ["状态"],
+        "summary": "枚举串口",
+        "description": "按 name 排序并去重。系统枚举错误当前返回空数组；后台枚举任务本身失败时返回 ports_failed。",
+        "responses": {
+          "200": {
+            "description": "本机串口列表。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PortInfo"
+                  }
+                },
+                "example": [
+                  {
+                    "name": "/dev/cu.usbserial-001",
+                    "label": "USB Serial",
+                    "kind": "usb"
+                  }
+                ]
+              }
+            }
+          },
+          "400": {
+            "description": "枚举任务失败。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "code": "ports_failed",
+                  "message": "串口枚举失败"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenOrigin"
+          }
+        }
+      }
+    },
+    "/v1/state": {
+      "get": {
+        "operationId": "getState",
+        "tags": ["状态"],
+        "summary": "读取最近状态快照",
+        "description": "返回 Snapshot 本体。快照通常约 30 Hz 更新，状态变化可提前发布；此接口读取缓存，非设备同步查询。",
+        "responses": {
+          "200": {
+            "description": "当前完整状态。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Snapshot"
+                },
+                "example": {
+                  "seq": 1,
+                  "generation": 1,
+                  "phase": "disconnected",
+                  "side": "right",
+                  "port": null,
+                  "enabled": false,
+                  "owner": null,
+                  "joints": [
+                    {
+                      "id": 0,
+                      "name": "J1",
+                      "q": null,
+                      "dq": null,
+                      "tau": null,
+                      "age_ms": null,
+                      "temperature": null,
+                      "voltage": null,
+                      "error": null
+                    },
+                    {
+                      "id": 1,
+                      "name": "J2",
+                      "q": null,
+                      "dq": null,
+                      "tau": null,
+                      "age_ms": null,
+                      "temperature": null,
+                      "voltage": null,
+                      "error": null
+                    },
+                    {
+                      "id": 2,
+                      "name": "J3",
+                      "q": null,
+                      "dq": null,
+                      "tau": null,
+                      "age_ms": null,
+                      "temperature": null,
+                      "voltage": null,
+                      "error": null
+                    },
+                    {
+                      "id": 3,
+                      "name": "J4",
+                      "q": null,
+                      "dq": null,
+                      "tau": null,
+                      "age_ms": null,
+                      "temperature": null,
+                      "voltage": null,
+                      "error": null
+                    },
+                    {
+                      "id": 4,
+                      "name": "J5",
+                      "q": null,
+                      "dq": null,
+                      "tau": null,
+                      "age_ms": null,
+                      "temperature": null,
+                      "voltage": null,
+                      "error": null
+                    },
+                    {
+                      "id": 5,
+                      "name": "J6",
+                      "q": null,
+                      "dq": null,
+                      "tau": null,
+                      "age_ms": null,
+                      "temperature": null,
+                      "voltage": null,
+                      "error": null
+                    },
+                    {
+                      "id": 6,
+                      "name": "J7",
+                      "q": null,
+                      "dq": null,
+                      "tau": null,
+                      "age_ms": null,
+                      "temperature": null,
+                      "voltage": null,
+                      "error": null
+                    }
+                  ],
+                  "tcp": null,
+                  "tcp_transform": null,
+                  "tcp_configured": false,
+                  "feedback_age_ms": null,
+                  "action": null,
+                  "last_result": null,
+                  "results": [],
+                  "error": null,
+                  "journal": {
+                    "pending": 0,
+                    "written": 1,
+                    "dropped": 0,
+                    "errors": 0,
+                    "healthy": true
+                  },
+                  "communication": {
+                    "received": 0,
+                    "crc_errors": 0,
+                    "timeouts": 0
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenOrigin"
+          }
+        }
+      }
+    },
+    "/v1/control": {
+      "post": {
+        "operationId": "updateControl",
+        "tags": ["控制权"],
+        "summary": "取得、续期或释放控制权",
+        "description": "同一时间一名控制者，已有控制者时 acquire 返回 409，即使 client_id 相同。有效期 2500 ms，建议每 800 ms 续期。release/过期取消动作，不自动失能。接口等待控制线程处理后返回；排队截止 300 ms，等待上限 350 ms。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ControlRequest"
+              },
+              "examples": {
+                "acquire": {
+                  "value": {
+                    "action": "acquire",
+                    "client_id": "example-service"
+                  }
+                },
+                "renew": {
+                  "value": {
+                    "action": "renew",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111"
+                  }
+                },
+                "release": {
+                  "value": {
+                    "action": "release",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "控制权操作已生效。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ControlReply"
+                },
+                "examples": {
+                  "control_acquired": {
+                    "value": {
+                      "lease_id": "11111111-1111-4111-8111-111111111111",
+                      "expires_in_ms": 2500,
+                      "generation": 2
+                    }
+                  },
+                  "control_renewed": {
+                    "value": {
+                      "lease_id": "11111111-1111-4111-8111-111111111111",
+                      "expires_in_ms": 2500,
+                      "generation": 5
+                    }
+                  },
+                  "control_released": {
+                    "value": {
+                      "lease_id": null,
+                      "expires_in_ms": 0,
+                      "generation": 6
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "输入无效时 JSON ApiError；JSON 语法错误时纯文本。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "code": "invalid_client",
+                  "message": "客户端标识无效"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Failed to parse the request body as JSON"
+              }
+            }
+          },
+          "409": {
+            "$ref": "#/components/responses/ControlConflict"
+          },
+          "504": {
+            "$ref": "#/components/responses/ControlTimeout"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenOrigin"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/InvalidJsonFields"
+          },
+          "429": {
+            "$ref": "#/components/responses/QueueFull"
+          },
+          "503": {
+            "$ref": "#/components/responses/Closing"
+          }
+        }
+      }
+    },
+    "/v1/commands": {
+      "post": {
+        "operationId": "submitCommand",
+        "tags": ["命令"],
+        "summary": "提交设备操作或点动请求",
+        "description": "HTTP 202 仅确认入队。控制权、generation、运行阶段、运动范围在控制线程中校验，失败通过 Snapshot.results 返回 rejected。results 新到旧，按 request_id 取第一条，最多 32 条记录。相同 generation/request_id 有最多 256 项的内存去重历史；网络超时后先查结果，不自动重发运动。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CommandRequest"
+              },
+              "examples": {
+                "connect": {
+                  "value": {
+                    "request_id": "req-connect-001",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 2,
+                    "kind": "connect",
+                    "port": "/dev/cu.usbserial-001",
+                    "side": "right"
+                  }
+                },
+                "disconnect": {
+                  "value": {
+                    "request_id": "req-disconnect-001",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 6,
+                    "kind": "disconnect"
+                  }
+                },
+                "enable": {
+                  "value": {
+                    "request_id": "req-enable-001",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 4,
+                    "kind": "enable"
+                  }
+                },
+                "disable": {
+                  "value": {
+                    "request_id": "req-disable-001",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 6,
+                    "kind": "disable"
+                  }
+                },
+                "clear_fault": {
+                  "value": {
+                    "request_id": "req-clear-fault-001",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 6,
+                    "kind": "clear_fault"
+                  }
+                },
+                "configure_tcp": {
+                  "value": {
+                    "request_id": "req-configure-tcp-001",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 3,
+                    "kind": "configure_tcp",
+                    "tcp": {
+                      "translation": [0.0, 0.0, 0.0],
+                      "rotation": [0.0, 0.0, 0.0, 1.0]
+                    }
+                  }
+                },
+                "jog_start": {
+                  "value": {
+                    "request_id": "req-jog-001",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 5,
+                    "kind": "jog_start",
+                    "space": "joint",
+                    "axis": 0,
+                    "direction": 1,
+                    "speed": 0.1,
+                    "frame": "base",
+                    "ttl_ms": 350,
+                    "input_seq": 0
+                  }
+                },
+                "jog_update": {
+                  "value": {
+                    "request_id": "req-jog-update-001",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 5,
+                    "kind": "jog_update",
+                    "action_id": "req-jog-001",
+                    "input_seq": 1,
+                    "ttl_ms": 350
+                  }
+                },
+                "step": {
+                  "value": {
+                    "request_id": "req-step-001",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 5,
+                    "kind": "step",
+                    "space": "cartesian",
+                    "axis": 0,
+                    "direction": 1,
+                    "amount": 0.005,
+                    "speed": 0.01,
+                    "frame": "base"
+                  }
+                },
+                "stop": {
+                  "value": {
+                    "request_id": "req-stop-001",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 5,
+                    "kind": "stop"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "已入队；执行状态通过状态快照读取。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandAck"
+                },
+                "example": {
+                  "request_id": "req-step-001",
+                  "status": "queued"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "request_id 无效时 JSON；JSON 语法错误时纯文本。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "code": "invalid_request",
+                  "message": "请求标识无效"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Failed to parse the request body as JSON"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenOrigin"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "422": {
+            "$ref": "#/components/responses/InvalidJsonFields"
+          },
+          "429": {
+            "$ref": "#/components/responses/QueueFull"
+          },
+          "503": {
+            "$ref": "#/components/responses/Closing"
+          }
+        }
+      }
+    },
+    "/v1/logs": {
+      "get": {
+        "operationId": "getLogs",
+        "tags": ["日志"],
+        "summary": "查询最近日志",
+        "description": "SQLite 按 id 降序返回。日志异步写入，新事件可能尚未提交。保留最近 100000 条；查询在独立阻塞任务中执行。",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "u32，默认 50；实际查询条数限制到 1..500，0 按 1，超过 500 按 500。",
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 50
+            },
+            "example": 50
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "最近日志。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/LogRecord"
+                  }
+                },
+                "example": [
+                  {
+                    "id": 101,
+                    "ts_ms": 1794268800000,
+                    "level": "info",
+                    "source": "control",
+                    "code": "acquired",
+                    "message": "控制权已取得",
+                    "request_id": null
+                  }
+                ]
+              }
+            }
+          },
+          "400": {
+            "description": "limit 格式错误、负数或超出 u32；框架返回纯文本。",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Failed to deserialize query string"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenOrigin"
+          },
+          "503": {
+            "$ref": "#/components/responses/JournalUnavailable"
+          }
+        }
+      }
+    },
+    "/v1/events": {
+      "get": {
+        "operationId": "subscribeState",
+        "tags": ["状态"],
+        "summary": "升级为 WebSocket 并订阅状态",
+        "security": [],
+        "description": "连接 ws://127.0.0.1:8177/v1/events；升级后 2 秒内首个文本帧发送 {\"token\":\"...\"}。不通过 URL 认证，HTTP Bearer 不能替代首帧。首条输出直接是状态，没有认证确认消息。随后只接收协议层 Ping/Pong，额外应用文本或二进制输入会关闭连接。最多 16 个连接，客户端输入帧/消息最多 8 KiB，服务端发送超时 500 ms。",
+        "responses": {
+          "101": {
+            "description": "已升级；认证后立即发送状态，随后推送最新完整快照；允许跳序号，没有历史重放。"
+          },
+          "400": {
+            "description": "非有效 WebSocket 升级请求；框架返回纯文本。",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Connection header did not include upgrade"
+              }
+            }
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenOrigin"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyConnections"
+          }
+        },
+        "x-websocket": {
+          "url": "ws://127.0.0.1:8177/v1/events",
+          "authentication": {
+            "timeout_ms": 2000,
+            "schema": {
+              "$ref": "#/components/schemas/WebSocketAuth"
+            },
+            "example": {
+              "token": "example-application-token"
+            }
+          },
+          "outbound": {
+            "schema": {
+              "$ref": "#/components/schemas/StateEvent"
+            },
+            "example": {
+              "type": "state",
+              "data": {
+                "seq": 1,
+                "generation": 1,
+                "phase": "disconnected",
+                "side": "right",
+                "port": null,
+                "enabled": false,
+                "owner": null,
+                "joints": [
+                  {
+                    "id": 0,
+                    "name": "J1",
+                    "q": null,
+                    "dq": null,
+                    "tau": null,
+                    "age_ms": null,
+                    "temperature": null,
+                    "voltage": null,
+                    "error": null
+                  },
+                  {
+                    "id": 1,
+                    "name": "J2",
+                    "q": null,
+                    "dq": null,
+                    "tau": null,
+                    "age_ms": null,
+                    "temperature": null,
+                    "voltage": null,
+                    "error": null
+                  },
+                  {
+                    "id": 2,
+                    "name": "J3",
+                    "q": null,
+                    "dq": null,
+                    "tau": null,
+                    "age_ms": null,
+                    "temperature": null,
+                    "voltage": null,
+                    "error": null
+                  },
+                  {
+                    "id": 3,
+                    "name": "J4",
+                    "q": null,
+                    "dq": null,
+                    "tau": null,
+                    "age_ms": null,
+                    "temperature": null,
+                    "voltage": null,
+                    "error": null
+                  },
+                  {
+                    "id": 4,
+                    "name": "J5",
+                    "q": null,
+                    "dq": null,
+                    "tau": null,
+                    "age_ms": null,
+                    "temperature": null,
+                    "voltage": null,
+                    "error": null
+                  },
+                  {
+                    "id": 5,
+                    "name": "J6",
+                    "q": null,
+                    "dq": null,
+                    "tau": null,
+                    "age_ms": null,
+                    "temperature": null,
+                    "voltage": null,
+                    "error": null
+                  },
+                  {
+                    "id": 6,
+                    "name": "J7",
+                    "q": null,
+                    "dq": null,
+                    "tau": null,
+                    "age_ms": null,
+                    "temperature": null,
+                    "voltage": null,
+                    "error": null
+                  }
+                ],
+                "tcp": null,
+                "tcp_transform": null,
+                "tcp_configured": false,
+                "feedback_age_ms": null,
+                "action": null,
+                "last_result": null,
+                "results": [],
+                "error": null,
+                "journal": {
+                  "pending": 0,
+                  "written": 1,
+                  "dropped": 0,
+                  "errors": 0,
+                  "healthy": true
+                },
+                "communication": {
+                  "received": 0,
+                  "crc_errors": 0,
+                  "timeouts": 0
+                }
+              }
+            }
+          },
+          "inbound_after_auth": "WebSocket protocol Ping/Pong only",
+          "max_connections": 16,
+          "max_incoming_message_bytes": 8192,
+          "send_timeout_ms": 500,
+          "description": "订阅断开不直接释放控制权；连续点动 TTL 与控制权租期仍分别计时。退出时推送 closing 后关闭。"
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "ApplicationToken": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "本次应用启动的令牌；前缀使用 Bearer 加空格。"
+      }
+    },
+    "schemas": {
+      "ApiError": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "供程序判断的错误码。"
+          },
+          "message": {
+            "type": "string",
+            "description": "供显示的说明文字。"
+          }
+        },
+        "required": ["code", "message"]
+      },
+      "PortInfo": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "connect.port 使用此值。"
+          },
+          "label": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": ["usb", "bluetooth", "pci", "unknown"]
+          }
+        },
+        "required": ["name", "label", "kind"],
+        "examples": [
+          {
+            "name": "/dev/cu.usbserial-001",
+            "label": "USB Serial",
+            "kind": "usb"
+          }
+        ]
+      },
+      "Pose": {
+        "type": "object",
+        "properties": {
+          "translation": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3,
+            "description": "平移 [x,y,z]，单位 m。"
+          },
+          "rotation": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 4,
+            "maxItems": 4,
+            "description": "四元数 [x,y,z,w]，不是欧拉角。"
+          }
+        },
+        "required": ["translation", "rotation"],
+        "examples": [
+          {
+            "translation": [0.0, 0.0, 0.0],
+            "rotation": [0.0, 0.0, 0.0, 1.0]
+          }
+        ]
+      },
+      "TcpPose": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Pose"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "translation": {
+                "type": "array",
+                "items": {
+                  "type": "number",
+                  "minimum": -2,
+                  "maximum": 2
+                },
+                "minItems": 3,
+                "maxItems": 3
+              }
+            },
+            "required": []
+          }
+        ],
+        "description": "Link7 → TCP 工具变换。四元数范数至少 1e-9，后端归一化；此条件在控制线程中校验。",
+        "examples": [
+          {
+            "translation": [0.0, 0.0, 0.0],
+            "rotation": [0.0, 0.0, 0.0, 1.0]
+          }
+        ]
+      },
+      "ControlRequest": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": ["acquire", "renew", "release"]
+          },
+          "client_id": {
+            "type": "string",
+            "minLength": 1,
+            "x-utf8-max-bytes": 64,
+            "description": "客户端标识；非空，UTF-8 编码后最多 64 字节。"
+          },
+          "lease_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "description": "取得控制权时返回的私有凭据。"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": ["action", "client_id"],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "action": {
+                  "enum": ["renew", "release"]
+                }
+              },
+              "required": ["action"]
+            },
+            "then": {
+              "properties": {
+                "lease_id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "取得控制权时返回的私有凭据。"
+                }
+              },
+              "required": ["lease_id"]
+            }
+          }
+        ],
+        "examples": [
+          {
+            "action": "acquire",
+            "client_id": "example-service"
+          },
+          {
+            "action": "renew",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111"
+          },
+          {
+            "action": "release",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111"
+          }
+        ]
+      },
+      "ControlReply": {
+        "type": "object",
+        "properties": {
+          "lease_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "description": "取得控制权时返回的私有凭据。"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expires_in_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "取得或续期时为 2500；释放时为 0。"
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "当前控制上下文编号；提交命令时使用最新值。"
+          }
+        },
+        "required": ["lease_id", "expires_in_ms", "generation"],
+        "examples": [
+          {
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "expires_in_ms": 2500,
+            "generation": 2
+          },
+          {
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "expires_in_ms": 2500,
+            "generation": 5
+          },
+          {
+            "lease_id": null,
+            "expires_in_ms": 0,
+            "generation": 6
+          }
+        ]
+      },
+      "CommandEnvelope": {
+        "type": "object",
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "minLength": 1,
+            "x-utf8-max-bytes": 100,
+            "description": "每个新请求使用新标识；非空，UTF-8 编码后最多 100 字节。"
+          },
+          "client_id": {
+            "type": "string",
+            "minLength": 1,
+            "x-utf8-max-bytes": 64,
+            "description": "客户端标识；非空，UTF-8 编码后最多 64 字节。"
+          },
+          "lease_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "取得控制权时返回的私有凭据。"
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "来自最新 Snapshot 或 ControlReply，不自行递增。"
+          }
+        },
+        "required": ["request_id", "client_id", "lease_id", "generation"]
+      },
+      "MotionArguments": {
+        "type": "object",
+        "properties": {
+          "space": {
+            "type": "string",
+            "enum": ["joint", "cartesian"]
+          },
+          "axis": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 6,
+            "description": "joint: 0..6 = J1..J7；cartesian: 0..5 = X,Y,Z,Rx,Ry,Rz。"
+          },
+          "direction": {
+            "type": "integer",
+            "enum": [-1, 1]
+          },
+          "speed": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "必须为正数；关节/旋转用 rad/s，平移用 m/s。"
+          },
+          "frame": {
+            "type": "string",
+            "enum": ["base", "tool"],
+            "default": "base",
+            "description": "base 沿固定基座轴，tool 沿当前 TCP 轴；关节点动忽略该字段。"
+          }
+        },
+        "required": ["space", "axis", "direction", "speed"],
+        "oneOf": [
+          {
+            "properties": {
+              "space": {
+                "const": "joint"
+              },
+              "axis": {
+                "minimum": 0,
+                "maximum": 6
+              },
+              "speed": {
+                "maximum": 0.2
+              }
+            }
+          },
+          {
+            "properties": {
+              "space": {
+                "const": "cartesian"
+              },
+              "axis": {
+                "minimum": 0,
+                "maximum": 2
+              },
+              "speed": {
+                "maximum": 0.015
+              }
+            }
+          },
+          {
+            "properties": {
+              "space": {
+                "const": "cartesian"
+              },
+              "axis": {
+                "minimum": 3,
+                "maximum": 5
+              },
+              "speed": {
+                "maximum": 0.15
+              }
+            }
+          }
+        ]
+      },
+      "ConnectCommand": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CommandEnvelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "connect"
+              },
+              "port": {
+                "type": "string",
+                "minLength": 1,
+                "x-utf8-max-bytes": 300,
+                "description": "使用 /v1/ports 返回的 name；UTF-8 最多 300 字节。"
+              },
+              "side": {
+                "type": "string",
+                "enum": ["left", "right"]
+              }
+            },
+            "required": ["kind", "port", "side"]
+          }
+        ],
+        "description": "打开串口，当前波特率 6000000。已有连接时需先断开；切换左右臂会清除 TCP。accepted 后等待 disabled 与七轴有效反馈。",
+        "examples": [
+          {
+            "request_id": "req-connect-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 2,
+            "kind": "connect",
+            "port": "/dev/cu.usbserial-001",
+            "side": "right"
+          }
+        ]
+      },
+      "DisconnectCommand": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CommandEnvelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "disconnect"
+              }
+            },
+            "required": ["kind"]
+          }
+        ],
+        "description": "取消动作、失能、关闭串口；确认 phase=disconnected 且 port=null。",
+        "examples": [
+          {
+            "request_id": "req-disconnect-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 6,
+            "kind": "disconnect"
+          }
+        ]
+      },
+      "EnableCommand": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CommandEnvelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "enable"
+              }
+            },
+            "required": ["kind"]
+          }
+        ],
+        "description": "进入 enabling；一秒内收齐请求后的七轴新鲜反馈并确认设备状态后，报告 completed/enabled。",
+        "examples": [
+          {
+            "request_id": "req-enable-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 4,
+            "kind": "enable"
+          }
+        ]
+      },
+      "DisableCommand": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CommandEnvelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "disable"
+              }
+            },
+            "required": ["kind"]
+          }
+        ],
+        "description": "取消动作并失能；确认 accepted 且 enabled=false。已有故障时 phase 可保持 fault。",
+        "examples": [
+          {
+            "request_id": "req-disable-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 6,
+            "kind": "disable"
+          }
+        ]
+      },
+      "ClearFaultCommand": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CommandEnvelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "clear_fault"
+              }
+            },
+            "required": ["kind"]
+          }
+        ],
+        "description": "取消动作，保持未使能；以新鲜反馈确认清错，报告 completed/cleared 或 failed/clear_failed。",
+        "examples": [
+          {
+            "request_id": "req-clear-fault-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 6,
+            "kind": "clear_fault"
+          }
+        ]
+      },
+      "ConfigureTcpCommand": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CommandEnvelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "configure_tcp"
+              },
+              "tcp": {
+                "$ref": "#/components/schemas/TcpPose"
+              }
+            },
+            "required": ["kind", "tcp"]
+          }
+        ],
+        "description": "设置 Link7 → TCP 变换，可在取得控制权后离线设置。运动、停止减速或待确认使能时拒绝。本次运行内存配置。",
+        "examples": [
+          {
+            "request_id": "req-configure-tcp-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 3,
+            "kind": "configure_tcp",
+            "tcp": {
+              "translation": [0.0, 0.0, 0.0],
+              "rotation": [0.0, 0.0, 0.0, 1.0]
+            }
+          }
+        ]
+      },
+      "JogStartCommand": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CommandEnvelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "jog_start"
+              },
+              "ttl_ms": {
+                "type": "integer",
+                "minimum": 50,
+                "maximum": 500,
+                "default": 150,
+                "description": "输入有效期，单位 ms；从后端首次接收开始计算。"
+              },
+              "input_seq": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 18446744073709551615,
+                "description": "本动作的输入序号，可从 0 开始。"
+              }
+            },
+            "required": ["kind", "input_seq"]
+          },
+          {
+            "$ref": "#/components/schemas/MotionArguments"
+          }
+        ],
+        "description": "开始单轴连续点动。本请求 request_id 同时作为 action_id；推荐 ttl_ms=350，每 100 ms 更新一次。",
+        "examples": [
+          {
+            "request_id": "req-jog-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 5,
+            "kind": "jog_start",
+            "space": "joint",
+            "axis": 0,
+            "direction": 1,
+            "speed": 0.1,
+            "frame": "base",
+            "ttl_ms": 350,
+            "input_seq": 0
+          }
+        ]
+      },
+      "JogUpdateCommand": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CommandEnvelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "jog_update"
+              },
+              "action_id": {
+                "type": "string",
+                "description": "当前 jog_start 的 request_id。"
+              },
+              "input_seq": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 18446744073709551615,
+                "description": "必须严格大于同一动作上次接受的序号。"
+              },
+              "ttl_ms": {
+                "type": "integer",
+                "minimum": 50,
+                "maximum": 500,
+                "default": 150,
+                "description": "输入有效期，单位 ms；从后端首次接收开始计算。"
+              }
+            },
+            "required": ["kind", "action_id", "input_seq"]
+          }
+        ],
+        "description": "只延长当前连续动作，不创建动作或更改运动参数。只保留最新待处理更新；成功时不产生 accepted 结果。",
+        "examples": [
+          {
+            "request_id": "req-jog-update-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 5,
+            "kind": "jog_update",
+            "action_id": "req-jog-001",
+            "input_seq": 1,
+            "ttl_ms": 350
+          }
+        ]
+      },
+      "StepCommand": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CommandEnvelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "step"
+              },
+              "amount": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": "正步长；关节/旋转用 rad，平移用 m；方向由 direction 指定。"
+              }
+            },
+            "required": ["kind", "amount"]
+          },
+          {
+            "$ref": "#/components/schemas/MotionArguments"
+          },
+          {
+            "if": {
+              "properties": {
+                "space": {
+                  "const": "cartesian"
+                },
+                "axis": {
+                  "maximum": 2
+                }
+              },
+              "required": ["space", "axis"]
+            },
+            "then": {
+              "properties": {
+                "amount": {
+                  "maximum": 0.05
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "amount": {
+                  "maximum": 0.35
+                }
+              }
+            }
+          }
+        ],
+        "description": "执行一次固定步长动作，不排运动队列。以 completed/completed 为完成标志，progress=1 不是完成确认。",
+        "examples": [
+          {
+            "request_id": "req-step-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 5,
+            "kind": "step",
+            "space": "cartesian",
+            "axis": 0,
+            "direction": 1,
+            "amount": 0.005,
+            "speed": 0.01,
+            "frame": "base"
+          }
+        ]
+      },
+      "StopCommand": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CommandEnvelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "stop"
+              }
+            },
+            "required": ["kind"]
+          }
+        ],
+        "description": "需要当前控制权和 generation；取消原动作，递增 generation，保留控制者与使能状态。仍可能需要等待 stopping 结束。",
+        "examples": [
+          {
+            "request_id": "req-stop-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 5,
+            "kind": "stop"
+          }
+        ]
+      },
+      "CommandRequest": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ConnectCommand"
+          },
+          {
+            "$ref": "#/components/schemas/DisconnectCommand"
+          },
+          {
+            "$ref": "#/components/schemas/EnableCommand"
+          },
+          {
+            "$ref": "#/components/schemas/DisableCommand"
+          },
+          {
+            "$ref": "#/components/schemas/ClearFaultCommand"
+          },
+          {
+            "$ref": "#/components/schemas/ConfigureTcpCommand"
+          },
+          {
+            "$ref": "#/components/schemas/JogStartCommand"
+          },
+          {
+            "$ref": "#/components/schemas/JogUpdateCommand"
+          },
+          {
+            "$ref": "#/components/schemas/StepCommand"
+          },
+          {
+            "$ref": "#/components/schemas/StopCommand"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "kind",
+          "mapping": {
+            "connect": "#/components/schemas/ConnectCommand",
+            "disconnect": "#/components/schemas/DisconnectCommand",
+            "enable": "#/components/schemas/EnableCommand",
+            "disable": "#/components/schemas/DisableCommand",
+            "clear_fault": "#/components/schemas/ClearFaultCommand",
+            "configure_tcp": "#/components/schemas/ConfigureTcpCommand",
+            "jog_start": "#/components/schemas/JogStartCommand",
+            "jog_update": "#/components/schemas/JogUpdateCommand",
+            "step": "#/components/schemas/StepCommand",
+            "stop": "#/components/schemas/StopCommand"
+          }
+        },
+        "description": "全部操作参数与公共字段位于同一层。范围表示有效业务输入；HTTP 202 后仍可能异步 rejected。未知 JSON 字段当前会被忽略。",
+        "examples": [
+          {
+            "request_id": "req-connect-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 2,
+            "kind": "connect",
+            "port": "/dev/cu.usbserial-001",
+            "side": "right"
+          },
+          {
+            "request_id": "req-disconnect-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 6,
+            "kind": "disconnect"
+          },
+          {
+            "request_id": "req-enable-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 4,
+            "kind": "enable"
+          },
+          {
+            "request_id": "req-disable-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 6,
+            "kind": "disable"
+          },
+          {
+            "request_id": "req-clear-fault-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 6,
+            "kind": "clear_fault"
+          },
+          {
+            "request_id": "req-configure-tcp-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 3,
+            "kind": "configure_tcp",
+            "tcp": {
+              "translation": [0.0, 0.0, 0.0],
+              "rotation": [0.0, 0.0, 0.0, 1.0]
+            }
+          },
+          {
+            "request_id": "req-jog-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 5,
+            "kind": "jog_start",
+            "space": "joint",
+            "axis": 0,
+            "direction": 1,
+            "speed": 0.1,
+            "frame": "base",
+            "ttl_ms": 350,
+            "input_seq": 0
+          },
+          {
+            "request_id": "req-jog-update-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 5,
+            "kind": "jog_update",
+            "action_id": "req-jog-001",
+            "input_seq": 1,
+            "ttl_ms": 350
+          },
+          {
+            "request_id": "req-step-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 5,
+            "kind": "step",
+            "space": "cartesian",
+            "axis": 0,
+            "direction": 1,
+            "amount": 0.005,
+            "speed": 0.01,
+            "frame": "base"
+          },
+          {
+            "request_id": "req-stop-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 5,
+            "kind": "stop"
+          }
+        ]
+      },
+      "CommandAck": {
+        "type": "object",
+        "properties": {
+          "request_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "const": "queued"
+          }
+        },
+        "required": ["request_id", "status"],
+        "description": "仅确认入队，不表示执行成功。",
+        "examples": [
+          {
+            "request_id": "req-step-001",
+            "status": "queued"
+          }
+        ]
+      },
+      "CommandResult": {
+        "type": "object",
+        "properties": {
+          "request_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["accepted", "rejected", "completed", "cancelled", "failed"]
+          },
+          "code": {
+            "type": "string",
+            "description": "依据此值处理结果；字符串不限定为固定枚举。"
+          },
+          "message": {
+            "type": "string",
+            "description": "显示文字。"
+          }
+        },
+        "required": ["request_id", "status", "code", "message"],
+        "examples": [
+          {
+            "request_id": "req-step-001",
+            "status": "completed",
+            "code": "completed",
+            "message": "动作已完成"
+          },
+          {
+            "request_id": "req-step-001",
+            "status": "rejected",
+            "code": "stale_context",
+            "message": "操作上下文已改变"
+          }
+        ]
+      },
+      "OwnerSnapshot": {
+        "type": "object",
+        "properties": {
+          "client_id": {
+            "type": "string"
+          },
+          "expires_in_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          }
+        },
+        "required": ["client_id", "expires_in_ms"]
+      },
+      "JointSnapshot": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 6
+          },
+          "name": {
+            "type": "string",
+            "enum": ["J1", "J2", "J3", "J4", "J5", "J6", "J7"]
+          },
+          "q": {
+            "anyOf": [
+              {
+                "type": "number",
+                "description": "关节位置，rad。"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "dq": {
+            "anyOf": [
+              {
+                "type": "number",
+                "description": "关节速度，rad/s。"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "tau": {
+            "anyOf": [
+              {
+                "type": "number",
+                "description": "估算扭矩，Nm。"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "age_ms": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 18446744073709551615,
+                "description": "本反馈距快照生成的接收年龄，ms。"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "temperature": {
+            "anyOf": [
+              {
+                "type": "number",
+                "description": "温度，°C。"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "voltage": {
+            "anyOf": [
+              {
+                "type": "number",
+                "description": "电压，V。"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 4294967295
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "q",
+          "dq",
+          "tau",
+          "age_ms",
+          "temperature",
+          "voltage",
+          "error"
+        ],
+        "description": "未收到的反馈为 null；过期反馈仍保留最后数值，使用 age_ms 判断新鲜度。"
+      },
+      "ActionSnapshot": {
+        "type": "object",
+        "properties": {
+          "request_id": {
+            "type": "string"
+          },
+          "space": {
+            "type": "string",
+            "enum": ["joint", "cartesian"]
+          },
+          "mode": {
+            "type": "string",
+            "enum": ["continuous", "step"]
+          },
+          "axis": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 6
+          },
+          "progress": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "时间进度估计；达到 1 不代表完成。"
+          }
+        },
+        "required": ["request_id", "space", "mode", "axis", "progress"]
+      },
+      "JournalStats": {
+        "type": "object",
+        "properties": {
+          "pending": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "已接收但尚未写入。"
+          },
+          "written": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "本次运行成功提交的日志数量。"
+          },
+          "dropped": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "队列满、关闭后提交或退出未写完的数量。"
+          },
+          "errors": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "本次运行数据库操作失败计数。"
+          },
+          "healthy": {
+            "type": "boolean"
+          }
+        },
+        "required": ["pending", "written", "dropped", "errors", "healthy"]
+      },
+      "Communication": {
+        "type": "object",
+        "properties": {
+          "received": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          },
+          "crc_errors": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          },
+          "timeouts": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          }
+        },
+        "required": ["received", "crc_errors", "timeouts"]
+      },
+      "Snapshot": {
+        "type": "object",
+        "properties": {
+          "seq": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "本次应用运行的快照序号；重启后重新计数。"
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "当前控制上下文编号。"
+          },
+          "phase": {
+            "type": "string",
+            "enum": [
+              "disconnected",
+              "connecting",
+              "disabled",
+              "enabling",
+              "ready",
+              "moving",
+              "stopping",
+              "fault",
+              "closing"
+            ]
+          },
+          "side": {
+            "type": "string",
+            "enum": ["left", "right"]
+          },
+          "port": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "owner": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OwnerSnapshot"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "joints": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JointSnapshot"
+            },
+            "minItems": 7,
+            "maxItems": 7
+          },
+          "tcp": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Pose"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "tcp_transform": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Pose"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "tcp_configured": {
+            "type": "boolean"
+          },
+          "feedback_age_ms": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 18446744073709551615,
+                "description": "已有反馈中最大年龄；不证明七轴齐全。"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "action": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ActionSnapshot"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "last_result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CommandResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "results": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CommandResult"
+            },
+            "maxItems": 32,
+            "description": "新到旧排列；同 request_id 取第一条。最多 32 条结果记录。"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ApiError"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "journal": {
+            "$ref": "#/components/schemas/JournalStats"
+          },
+          "communication": {
+            "$ref": "#/components/schemas/Communication"
+          }
+        },
+        "required": [
+          "seq",
+          "generation",
+          "phase",
+          "side",
+          "port",
+          "enabled",
+          "owner",
+          "joints",
+          "tcp",
+          "tcp_transform",
+          "tcp_configured",
+          "feedback_age_ms",
+          "action",
+          "last_result",
+          "results",
+          "error",
+          "journal",
+          "communication"
+        ],
+        "description": "完整状态；所有键均存在，可选值用 null。tcp 是实测关节计算的基座 → TCP；未设置 TCP 或反馈无效时为 null。",
+        "examples": [
+          {
+            "seq": 1,
+            "generation": 1,
+            "phase": "disconnected",
+            "side": "right",
+            "port": null,
+            "enabled": false,
+            "owner": null,
+            "joints": [
+              {
+                "id": 0,
+                "name": "J1",
+                "q": null,
+                "dq": null,
+                "tau": null,
+                "age_ms": null,
+                "temperature": null,
+                "voltage": null,
+                "error": null
+              },
+              {
+                "id": 1,
+                "name": "J2",
+                "q": null,
+                "dq": null,
+                "tau": null,
+                "age_ms": null,
+                "temperature": null,
+                "voltage": null,
+                "error": null
+              },
+              {
+                "id": 2,
+                "name": "J3",
+                "q": null,
+                "dq": null,
+                "tau": null,
+                "age_ms": null,
+                "temperature": null,
+                "voltage": null,
+                "error": null
+              },
+              {
+                "id": 3,
+                "name": "J4",
+                "q": null,
+                "dq": null,
+                "tau": null,
+                "age_ms": null,
+                "temperature": null,
+                "voltage": null,
+                "error": null
+              },
+              {
+                "id": 4,
+                "name": "J5",
+                "q": null,
+                "dq": null,
+                "tau": null,
+                "age_ms": null,
+                "temperature": null,
+                "voltage": null,
+                "error": null
+              },
+              {
+                "id": 5,
+                "name": "J6",
+                "q": null,
+                "dq": null,
+                "tau": null,
+                "age_ms": null,
+                "temperature": null,
+                "voltage": null,
+                "error": null
+              },
+              {
+                "id": 6,
+                "name": "J7",
+                "q": null,
+                "dq": null,
+                "tau": null,
+                "age_ms": null,
+                "temperature": null,
+                "voltage": null,
+                "error": null
+              }
+            ],
+            "tcp": null,
+            "tcp_transform": null,
+            "tcp_configured": false,
+            "feedback_age_ms": null,
+            "action": null,
+            "last_result": null,
+            "results": [],
+            "error": null,
+            "journal": {
+              "pending": 0,
+              "written": 1,
+              "dropped": 0,
+              "errors": 0,
+              "healthy": true
+            },
+            "communication": {
+              "received": 0,
+              "crc_errors": 0,
+              "timeouts": 0
+            }
+          }
+        ]
+      },
+      "StateEvent": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "state"
+          },
+          "data": {
+            "$ref": "#/components/schemas/Snapshot"
+          }
+        },
+        "required": ["type", "data"],
+        "examples": [
+          {
+            "type": "state",
+            "data": {
+              "seq": 1,
+              "generation": 1,
+              "phase": "disconnected",
+              "side": "right",
+              "port": null,
+              "enabled": false,
+              "owner": null,
+              "joints": [
+                {
+                  "id": 0,
+                  "name": "J1",
+                  "q": null,
+                  "dq": null,
+                  "tau": null,
+                  "age_ms": null,
+                  "temperature": null,
+                  "voltage": null,
+                  "error": null
+                },
+                {
+                  "id": 1,
+                  "name": "J2",
+                  "q": null,
+                  "dq": null,
+                  "tau": null,
+                  "age_ms": null,
+                  "temperature": null,
+                  "voltage": null,
+                  "error": null
+                },
+                {
+                  "id": 2,
+                  "name": "J3",
+                  "q": null,
+                  "dq": null,
+                  "tau": null,
+                  "age_ms": null,
+                  "temperature": null,
+                  "voltage": null,
+                  "error": null
+                },
+                {
+                  "id": 3,
+                  "name": "J4",
+                  "q": null,
+                  "dq": null,
+                  "tau": null,
+                  "age_ms": null,
+                  "temperature": null,
+                  "voltage": null,
+                  "error": null
+                },
+                {
+                  "id": 4,
+                  "name": "J5",
+                  "q": null,
+                  "dq": null,
+                  "tau": null,
+                  "age_ms": null,
+                  "temperature": null,
+                  "voltage": null,
+                  "error": null
+                },
+                {
+                  "id": 5,
+                  "name": "J6",
+                  "q": null,
+                  "dq": null,
+                  "tau": null,
+                  "age_ms": null,
+                  "temperature": null,
+                  "voltage": null,
+                  "error": null
+                },
+                {
+                  "id": 6,
+                  "name": "J7",
+                  "q": null,
+                  "dq": null,
+                  "tau": null,
+                  "age_ms": null,
+                  "temperature": null,
+                  "voltage": null,
+                  "error": null
+                }
+              ],
+              "tcp": null,
+              "tcp_transform": null,
+              "tcp_configured": false,
+              "feedback_age_ms": null,
+              "action": null,
+              "last_result": null,
+              "results": [],
+              "error": null,
+              "journal": {
+                "pending": 0,
+                "written": 1,
+                "dropped": 0,
+                "errors": 0,
+                "healthy": true
+              },
+              "communication": {
+                "received": 0,
+                "crc_errors": 0,
+                "timeouts": 0
+              }
+            }
+          }
+        ]
+      },
+      "WebSocketAuth": {
+        "type": "object",
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "本次应用启动的令牌。"
+          }
+        },
+        "required": ["token"],
+        "examples": [
+          {
+            "token": "example-application-token"
+          }
+        ]
+      },
+      "LogRecord": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "SQLite 自增记录编号，跨应用运行保留。"
+          },
+          "ts_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix UTC 毫秒时间戳。"
+          },
+          "level": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "request_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "ts_ms",
+          "level",
+          "source",
+          "code",
+          "message",
+          "request_id"
+        ],
+        "examples": [
+          {
+            "id": 101,
+            "ts_ms": 1794268800000,
+            "level": "info",
+            "source": "control",
+            "code": "acquired",
+            "message": "控制权已取得",
+            "request_id": null
+          }
+        ]
+      },
+      "SessionInfo": {
+        "type": "object",
+        "properties": {
+          "base_url": {
+            "type": "string"
+          },
+          "token": {
+            "type": "string"
+          },
+          "client_id": {
+            "type": "string",
+            "const": "desktop"
+          },
+          "version": {
+            "type": "string"
+          },
+          "journal_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "base_url",
+          "token",
+          "client_id",
+          "version",
+          "journal_path"
+        ],
+        "examples": [
+          {
+            "base_url": "http://127.0.0.1:8177",
+            "token": "example-application-token",
+            "client_id": "desktop",
+            "version": "0.1.0",
+            "journal_path": "/path/to/events.sqlite3"
+          }
+        ]
+      }
+    },
+    "responses": {
+      "Unauthorized": {
+        "description": "认证失败。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "example": {
+              "code": "unauthorized",
+              "message": "认证失败"
+            }
+          }
+        }
+      },
+      "ForbiddenOrigin": {
+        "description": "浏览器 Origin 不受支持。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "example": {
+              "code": "forbidden_origin",
+              "message": "来源不受支持"
+            }
+          }
+        }
+      },
+      "QueueFull": {
+        "description": "请求队列已满。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "example": {
+              "code": "queue_full",
+              "message": "请求队列已满"
+            }
+          }
+        }
+      },
+      "Closing": {
+        "description": "应用正在关闭。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "example": {
+              "code": "closing",
+              "message": "应用正在关闭"
+            }
+          }
+        }
+      },
+      "ControlConflict": {
+        "description": "控制权冲突，code 为 owned 或 not_owner。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "example": {
+              "code": "owned",
+              "message": "控制权已被占用"
+            }
+          }
+        }
+      },
+      "ControlTimeout": {
+        "description": "控制权请求过期或等待超时。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "example": {
+              "code": "timeout",
+              "message": "控制请求超时"
+            }
+          }
+        }
+      },
+      "JournalUnavailable": {
+        "description": "日志当前不可读。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "example": {
+              "code": "journal_unavailable",
+              "message": "日志暂不可读"
+            }
+          }
+        }
+      },
+      "TooManyConnections": {
+        "description": "订阅连接已满。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "example": {
+              "code": "too_many_connections",
+              "message": "订阅连接已满"
+            }
+          }
+        }
+      },
+      "MalformedJson": {
+        "description": "JSON 语法错误，由框架返回纯文本。",
+        "content": {
+          "text/plain": {
+            "schema": {
+              "type": "string"
+            },
+            "example": "Failed to parse the request body as JSON"
+          }
+        }
+      },
+      "PayloadTooLarge": {
+        "description": "请求体超过 16 KiB；框架返回纯文本。",
+        "content": {
+          "text/plain": {
+            "schema": {
+              "type": "string"
+            },
+            "example": "Failed to buffer the request body: length limit exceeded"
+          }
+        }
+      },
+      "UnsupportedMediaType": {
+        "description": "POST 缺少或未使用 application/json Content-Type；框架返回纯文本。",
+        "content": {
+          "text/plain": {
+            "schema": {
+              "type": "string"
+            },
+            "example": "Expected request with `Content-Type: application/json`"
+          }
+        }
+      },
+      "InvalidJsonFields": {
+        "description": "JSON 缺少字段、字段类型或 serde 枚举不符；框架返回纯文本。业务范围校验则通常在 202 后异步拒绝。",
+        "content": {
+          "text/plain": {
+            "schema": {
+              "type": "string"
+            },
+            "example": "Failed to deserialize the JSON body into the target type"
+          }
+        }
+      }
+    }
+  },
+  "externalDocs": {
+    "description": "源代码与接入说明",
+    "url": "https://github.com/ExplodingUFO/UnitreeR17aController"
+  },
+  "x-tauri-commands": {
+    "session_info": {
+      "arguments": {},
+      "result": {
+        "$ref": "#/components/schemas/SessionInfo"
+      },
+      "example": {
+        "base_url": "http://127.0.0.1:8177",
+        "token": "example-application-token",
+        "client_id": "desktop",
+        "version": "0.1.0",
+        "journal_path": "/path/to/events.sqlite3"
+      },
+      "description": "仅主窗口调用，不通过 HTTP 获取 token。"
+    },
+    "host_stop": {
+      "arguments": {},
+      "result": {
+        "type": "null"
+      },
+      "example": null,
+      "description": "仅主窗口调用。立即发出取消请求，可停止任意客户端动作，不取得控制权、不自动失能。"
+    }
+  }
+}
