@@ -19,14 +19,18 @@ const LEASE_MS: u64 = 2500;
 const FEEDBACK_MS: u64 = 200;
 const FEEDBACK_SPAN_MS: u64 = 100;
 const ENABLE_TIMEOUT: Duration = Duration::from_secs(1);
-const MAX_REFERENCE_ERROR: f64 = 0.15;
+const CONTROL_PERIOD: Duration = Duration::from_millis(20);
+// The official motion demo tolerates 0.6 rad tracking error while moving.
+// Position error is what creates holding torque; do not clamp it so tightly
+// that a load drags the commanded reference down with the measured joint.
+const MAX_TRACKING_ERROR: f64 = 0.60;
 const JOINT_SPEED: f64 = 0.20;
 const JOINT_ACCELERATION: f64 = 0.60;
 const LINEAR_SPEED: f64 = 0.015;
 const ANGULAR_SPEED: f64 = 0.15;
-// Defaults from the official test_arm_lowlevel Options, at the recorded SDK commit.
+// The official motion demo uses these gains for loaded joint movement.
 const SERVO_KP: f64 = 60.0;
-const SERVO_KD: f64 = 0.5;
+const SERVO_KD: f64 = 1.0;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ApiError {
@@ -385,7 +389,6 @@ struct Core {
     seen: VecDeque<(u64, String)>,
     error: Option<ApiError>,
     communication: Communication,
-    next_joint: usize,
     connected_at: Option<Instant>,
     clear_pending: [bool; 7],
     clear_request: Option<(String, Instant)>,
@@ -421,7 +424,6 @@ impl Core {
             seen: VecDeque::new(),
             error,
             communication: Communication::default(),
-            next_joint: 0,
             connected_at: None,
             clear_pending: [false; 7],
             clear_request: None,
@@ -668,10 +670,17 @@ impl Core {
                     return Err(ApiError::new("invalid_device", "设备配置无效"));
                 }
                 let model = Kinematics::load(&side).map_err(|e| ApiError::new("model_error", e))?;
-                let bus = Bus::open(&port, &side, 6_000_000, Duration::from_millis(2))
+                // The first FTDI reply after opening can arrive after the
+                // adapter's latency timer; 20 ms also bounds a failed probe.
+                let bus = Bus::open(&port, &side, 6_000_000, Duration::from_millis(20))
                     .map_err(|e| ApiError::new("connect_failed", e))?;
-                if self.side != side {
-                    self.tcp = None;
+                if self.side != side || self.tcp.is_none() {
+                    // Link7 itself is a usable jog reference on a bare flange.
+                    // A user-supplied tool transform replaces it explicitly.
+                    self.tcp = Some(Pose {
+                        translation: [0.0; 3],
+                        rotation: [0.0, 0.0, 0.0, 1.0],
+                    });
                 }
                 self.model = Some(model);
                 self.side = side;
@@ -871,9 +880,17 @@ impl Core {
         }
         let measured = self.measured(now)?;
         self.check_positions(&measured)?;
-        self.reference = measured;
+        let preserve_reference = self.enabled
+            && self.reference.iter().all(|value| value.is_finite())
+            && (0..7).all(|i| (self.reference[i] - measured[i]).abs() <= MAX_TRACKING_ERROR);
+        let anchor = if preserve_reference {
+            self.reference
+        } else {
+            measured
+        };
+        self.reference = anchor;
         self.velocity = [0.0; 7];
-        let mut target = measured;
+        let mut target = anchor;
         let mut initial_pose = None;
         let mut target_pose = None;
         if space == Space::Joint {
@@ -890,7 +907,7 @@ impl Core {
                 .model
                 .as_ref()
                 .unwrap()
-                .fk(&measured, tcp)
+                .fk(&anchor, tcp)
                 .map_err(|e| ApiError::new("kinematics", e))?;
             if step {
                 let mut delta = [0.0; 6];
@@ -923,7 +940,7 @@ impl Core {
             amount,
             started: now,
             duration,
-            initial: measured,
+            initial: anchor,
             target,
             initial_pose,
             target_pose,
@@ -934,43 +951,21 @@ impl Core {
         Ok(())
     }
     fn check_positions(&self, q: &[f64; 7]) -> Result<(), ApiError> {
-        let (lower, upper) = self
-            .model
-            .as_ref()
-            .ok_or_else(|| ApiError::new("model_error", "模型不可用"))?
-            .position_limits();
-        if (0..7).any(|i| !q[i].is_finite() || q[i] < lower[i] - 1e-8 || q[i] > upper[i] + 1e-8) {
-            return Err(ApiError::new("joint_limit", "关节位置超限"));
+        // Absolute travel is bounded by the arm's physical stops. URDF limits
+        // describe the nominal model and need not match the installed zero.
+        if q.iter().any(|value| !value.is_finite()) {
+            return Err(ApiError::new("invalid_feedback", "关节位置无效"));
         }
         Ok(())
     }
     // Constrain the velocity that will actually be transmitted, then integrate once.
     // Absolute-time waypoints alone do not bound derivatives under scheduler jitter.
-    fn commit_joint_velocity(
-        &mut self,
-        desired: [f64; 7],
-        measured: &[f64; 7],
-        dt: f64,
-    ) -> Result<(), ApiError> {
-        let (lower, upper) = self.model.as_ref().unwrap().position_limits();
+    fn commit_joint_velocity(&mut self, desired: [f64; 7], dt: f64) -> Result<(), ApiError> {
         let mut velocity = [0.0; 7];
         let mut reference = self.reference;
         for i in 0..7 {
-            let low_position = lower[i].max(measured[i] - MAX_REFERENCE_ERROR);
-            let high_position = upper[i].min(measured[i] + MAX_REFERENCE_ERROR);
-            let brake_speed = |distance: f64| {
-                let at = JOINT_ACCELERATION * dt;
-                let twice_ad = 2.0 * JOINT_ACCELERATION * distance.max(0.0);
-                twice_ad / ((at * at + twice_ad).sqrt() + at)
-            };
-            let low = (-JOINT_SPEED)
-                .max(self.velocity[i] - JOINT_ACCELERATION * dt)
-                .max((low_position - self.reference[i]) / dt)
-                .max(-brake_speed(self.reference[i] - low_position));
-            let high = JOINT_SPEED
-                .min(self.velocity[i] + JOINT_ACCELERATION * dt)
-                .min((high_position - self.reference[i]) / dt)
-                .min(brake_speed(high_position - self.reference[i]));
+            let low = (-JOINT_SPEED).max(self.velocity[i] - JOINT_ACCELERATION * dt);
+            let high = JOINT_SPEED.min(self.velocity[i] + JOINT_ACCELERATION * dt);
             if !desired[i].is_finite() || low > high {
                 return Err(ApiError::new("joint_dynamics", "关节动态约束无法满足"));
             }
@@ -998,7 +993,12 @@ impl Core {
             self.fault("control_timeout", "控制周期超时");
             return;
         }
-        if (0..7).any(|i| (self.reference[i] - measured[i]).abs() > MAX_REFERENCE_ERROR) {
+        if self
+            .motion
+            .as_ref()
+            .is_some_and(|motion| motion.space == Space::Cartesian)
+            && (0..7).any(|i| (self.reference[i] - measured[i]).abs() > MAX_TRACKING_ERROR)
+        {
             self.fault("following_error", "关节跟随偏差超限");
             return;
         }
@@ -1010,7 +1010,7 @@ impl Core {
             self.end_motion("cancelled", "input_expired", "连续输入已过期");
         }
         if self.stopping {
-            if let Err(e) = self.commit_joint_velocity([0.0; 7], &measured, dt) {
+            if let Err(e) = self.commit_joint_velocity([0.0; 7], dt) {
                 self.fault(&e.code, e.message);
                 return;
             }
@@ -1051,7 +1051,7 @@ impl Core {
         let at_target =
             motion.step && t >= 1.0 && within_target(&measured) && within_target(&self.reference);
         if at_target {
-            if let Err(e) = self.commit_joint_velocity([0.0; 7], &measured, dt) {
+            if let Err(e) = self.commit_joint_velocity([0.0; 7], dt) {
                 self.fault(&e.code, e.message);
                 return;
             }
@@ -1073,21 +1073,11 @@ impl Core {
                 })
             } else {
                 let i = motion.axis;
-                let (lower, upper) = self.model.as_ref().unwrap().position_limits();
-                let remaining = if motion.direction > 0.0 {
-                    upper[i] - self.reference[i]
-                } else {
-                    self.reference[i] - lower[i]
-                };
-                if remaining <= 1e-5 {
-                    self.end_motion("failed", "joint_limit", "已到达关节限位");
-                    return;
-                }
                 let mut desired = [0.0; 7];
                 desired[i] = motion.direction * motion.speed;
                 desired
             };
-            if let Err(e) = self.commit_joint_velocity(desired_velocity, &measured, dt) {
+            if let Err(e) = self.commit_joint_velocity(desired_velocity, dt) {
                 self.fault(&e.code, e.message);
                 return;
             }
@@ -1118,7 +1108,7 @@ impl Core {
             let limits = MotionLimits {
                 joint_velocity: [JOINT_SPEED; 7],
                 joint_acceleration: [JOINT_ACCELERATION; 7],
-                max_reference_error: MAX_REFERENCE_ERROR,
+                max_reference_error: MAX_TRACKING_ERROR,
                 max_joint_step: 0.01,
                 linear_speed: LINEAR_SPEED,
                 angular_speed: ANGULAR_SPEED,
@@ -1151,12 +1141,9 @@ impl Core {
         }
     }
     fn poll(&mut self, now: Instant) {
-        let i = self.next_joint;
-        self.next_joint = (i + 1) % 7;
-        let clear = self.clear_pending[i];
         let servo = self.enabled || self.enable_request.is_some();
-        let setpoint = Setpoint {
-            mode: if clear {
+        let setpoints: [Setpoint; 7] = std::array::from_fn(|i| Setpoint {
+            mode: if self.clear_pending[i] {
                 DriveMode::ClearFault
             } else if servo {
                 DriveMode::Servo
@@ -1168,23 +1155,24 @@ impl Core {
             tau: 0.0,
             kp: if servo { SERVO_KP } else { 0.0 },
             kd: if servo { SERVO_KD } else { 0.0 },
-        };
+        });
         let Some(bus) = self.bus.as_mut() else {
             return;
         };
-        let result = bus.exchange(i as u8, setpoint);
+        let result = bus.exchange_all(&setpoints);
         let stats = bus.stats();
         self.communication = Communication {
             received: stats.received,
             crc_errors: stats.crc_errors,
             timeouts: stats.timeouts,
         };
-        self.clear_pending[i] = false;
         match result {
-            Ok(Some(value)) if value.id < 7 => {
-                self.accept_feedback(value, Instant::now());
+            Ok(values) => {
+                self.clear_pending = [false; 7];
+                for value in values.into_iter().flatten() {
+                    self.accept_feedback(value, Instant::now());
+                }
             }
-            Ok(_) => {}
             Err(e) => self.fault("communication_error", e),
         }
         if self.phase == Phase::Connecting && self.measured(Instant::now()).is_ok() {
@@ -1262,19 +1250,15 @@ impl Core {
     }
     fn send_disable(&mut self) {
         if let Some(bus) = self.bus.as_mut() {
-            for i in 0..7 {
-                let _ = bus.exchange(
-                    i,
-                    Setpoint {
-                        mode: DriveMode::Disabled,
-                        q: 0.0,
-                        dq: 0.0,
-                        tau: 0.0,
-                        kp: 0.0,
-                        kd: 0.0,
-                    },
-                );
-            }
+            let setpoints: [Setpoint; 7] = std::array::from_fn(|_| Setpoint {
+                mode: DriveMode::Disabled,
+                q: 0.0,
+                dq: 0.0,
+                tau: 0.0,
+                kp: 0.0,
+                kd: 0.0,
+            });
+            let _ = bus.exchange_all(&setpoints);
         }
     }
     fn snapshot(&self, now: Instant) -> Snapshot {
@@ -1375,6 +1359,7 @@ fn run(
     let mut seen_epoch = 0;
     let mut last_control = Instant::now();
     let mut published = last_control;
+    let mut next_control = last_control;
     loop {
         let now = Instant::now();
         let epoch = host_epoch.load(Ordering::Acquire);
@@ -1434,7 +1419,13 @@ fn run(
             core.dirty = false;
             published = Instant::now();
         }
-        std::thread::sleep(Duration::from_millis(2));
+        next_control += CONTROL_PERIOD;
+        let wait = next_control.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
+            next_control = Instant::now();
+        } else {
+            std::thread::sleep(wait);
+        }
     }
 }
 
@@ -1668,6 +1659,150 @@ mod tests {
         assert!(core.enabled);
         assert!(core.enable_request.is_none());
         assert_eq!(core.results.front().unwrap().code, "enabled");
+    }
+    #[test]
+    fn finite_pose_below_urdf_lower_passes_enable_check_and_joint_step() {
+        let now = Instant::now();
+        let (mut core, _directory) = observed_core(now);
+        let (lower, _) = core.model.as_ref().unwrap().position_limits();
+        let mut q = core.reference;
+        // Real installation zero: J2 ~ -0.035, J4 ~ -0.022, both below the
+        // official model's lower bound of zero.
+        q[1] = lower[1] - 0.035;
+        q[3] = lower[3] - 0.022;
+        for (i, target) in q.iter().enumerate() {
+            let mut sample = core.feedback[i].as_ref().unwrap().value.clone();
+            sample.q = *target;
+            core.accept_feedback(sample, now + Duration::from_millis(1));
+        }
+        let at = now + Duration::from_millis(1);
+        assert!(core.check_positions(&q).is_ok());
+        core.enabled = true;
+        core.begin(
+            "outside-urdf",
+            Space::Joint,
+            1,
+            1,
+            0.05,
+            Frame::Base,
+            true,
+            0.01,
+            None,
+            0,
+            at,
+        )
+        .unwrap();
+        assert!(core.error.is_none());
+        assert!(core.motion.is_some());
+        core.advance(at + Duration::from_millis(2), 0.002);
+        assert!(core.error.is_none(), "{:?}", core.error);
+        assert!(core.motion.is_some());
+        for (reference, target) in core.reference.iter().zip(q) {
+            assert!((reference - target).abs() <= 0.01 + 1e-12);
+        }
+    }
+    #[test]
+    fn joint_reference_keeps_pushing_up_when_feedback_sags_under_load() {
+        let mut now = Instant::now();
+        let (mut core, _directory) = observed_core(now);
+        core.enabled = true;
+        let start = core.reference;
+        core.begin(
+            "loaded-joint",
+            Space::Joint,
+            0,
+            1,
+            0.05,
+            Frame::Base,
+            false,
+            0.0,
+            Some(now + Duration::from_secs(5)),
+            1,
+            now,
+        )
+        .unwrap();
+        for _ in 0..40 {
+            now += Duration::from_millis(20);
+            for (i, target) in start.iter().enumerate() {
+                let mut sample = core.feedback[i].as_ref().unwrap().value.clone();
+                sample.q = *target;
+                sample.dq = 0.0;
+                core.accept_feedback(sample, now);
+            }
+            core.advance(now, 0.02);
+        }
+        assert!(core.reference[0] > start[0] + 0.02);
+        let before_sag = core.reference[0];
+        now += Duration::from_millis(20);
+        for (i, target) in start.iter().enumerate() {
+            let mut sample = core.feedback[i].as_ref().unwrap().value.clone();
+            sample.q = if i == 0 { *target - 0.20 } else { *target };
+            sample.dq = 0.0;
+            core.accept_feedback(sample, now);
+        }
+        core.advance(now, 0.02);
+        assert!(core.error.is_none(), "{:?}", core.error);
+        assert!(core.motion.is_some());
+        assert!(core.reference[0] > before_sag);
+    }
+    #[test]
+    fn restarting_joint_jog_preserves_existing_holding_reference() {
+        let now = Instant::now();
+        let (mut core, _directory) = observed_core(now);
+        core.enabled = true;
+        core.reference[0] += 0.10;
+        let held = core.reference;
+        let measured = core.measured(now).unwrap();
+        assert!((held[0] - measured[0]).abs() < MAX_TRACKING_ERROR);
+        core.begin(
+            "restarted-joint",
+            Space::Joint,
+            0,
+            -1,
+            0.05,
+            Frame::Base,
+            false,
+            0.0,
+            Some(now + Duration::from_millis(500)),
+            1,
+            now,
+        )
+        .unwrap();
+        assert_eq!(core.reference, held);
+        assert_eq!(core.motion.as_ref().unwrap().initial, held);
+    }
+    #[test]
+    fn continuous_joint_jog_below_urdf_lower_does_not_stop_on_model_limit() {
+        let now = Instant::now();
+        let (mut core, _directory) = observed_core(now);
+        let (lower, _) = core.model.as_ref().unwrap().position_limits();
+        let mut q = core.reference;
+        q[1] = lower[1] - 0.035;
+        for (i, target) in q.iter().enumerate() {
+            let mut sample = core.feedback[i].as_ref().unwrap().value.clone();
+            sample.q = *target;
+            core.accept_feedback(sample, now + Duration::from_millis(1));
+        }
+        let at = now + Duration::from_millis(1);
+        core.enabled = true;
+        core.begin(
+            "below-lower",
+            Space::Joint,
+            1,
+            -1,
+            0.05,
+            Frame::Base,
+            false,
+            0.01,
+            Some(at + Duration::from_millis(150)),
+            1,
+            at,
+        )
+        .unwrap();
+        core.advance(at + Duration::from_millis(2), 0.002);
+        assert!(core.error.is_none(), "{:?}", core.error);
+        assert!(core.motion.is_some());
+        assert!(core.reference[1] < q[1]);
     }
     #[test]
     fn cancelled_or_timed_out_enable_cannot_complete_later() {

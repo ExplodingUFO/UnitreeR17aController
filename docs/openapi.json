@@ -41,7 +41,7 @@
         "operationId": "listPorts",
         "tags": ["状态"],
         "summary": "枚举串口",
-        "description": "按 name 排序并去重。系统枚举错误当前返回空数组；后台枚举任务本身失败时返回 ports_failed。",
+        "description": "按设备身份去重；macOS 合并同一设备的 /dev/cu.* 与 /dev/tty.* 并优先 cu。结果按 name 排序。系统枚举错误当前返回空数组；后台枚举任务本身失败时返回 ports_failed。",
         "responses": {
           "200": {
             "description": "本机串口列表。",
@@ -1948,7 +1948,8 @@
             ]
           },
           "tcp_configured": {
-            "type": "boolean"
+            "type": "boolean",
+            "description": "连接后默认使用 Link7 法兰，因此为 true；configure_tcp 可替换为工具偏移。"
           },
           "feedback_age_ms": {
             "anyOf": [

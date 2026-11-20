@@ -245,6 +245,14 @@ export default function App() {
     valid && s.tcp && s.tcp_configured
       ? [...s.tcp.translation.map((v) => v * 1000), ...rpy(s.tcp.rotation)]
       : null;
+  const tcpAtLink7 =
+    !!s.tcp_transform &&
+    s.tcp_transform.translation.every((value) => Math.abs(value) < 1e-9) &&
+    s.tcp_transform.rotation[0] * s.tcp_transform.rotation[0] +
+      s.tcp_transform.rotation[1] * s.tcp_transform.rotation[1] +
+      s.tcp_transform.rotation[2] * s.tcp_transform.rotation[2] <
+      1e-18 &&
+    Math.abs(Math.abs(s.tcp_transform.rotation[3]) - 1) < 1e-9;
   const run = async (fn: () => Promise<unknown>) => {
     if (busy) return;
     setBusy(true);
@@ -635,7 +643,13 @@ export default function App() {
           <PanelDivider {...layout.divider("tcp")} />
           <div className="panel tcp-panel" id="tcp-panel">
             <div className="panel-heading">
-              <h2>{s.tcp_configured ? "TCP 坐标" : "末端坐标（Link7）"}</h2>
+              <h2>
+                {s.tcp_configured
+                  ? tcpAtLink7
+                    ? "TCP 坐标（Link7 法兰）"
+                    : "TCP 坐标"
+                  : "末端坐标（Link7）"}
+              </h2>
               <button
                 disabled={!deviceWritable || !!s.action}
                 onClick={openTcp}
@@ -664,7 +678,9 @@ export default function App() {
                     : !s.tcp_configured
                       ? "未设置 TCP"
                       : valid
-                        ? "基座坐标系"
+                        ? tcpAtLink7
+                          ? "默认 Link7 法兰"
+                          : "基座坐标系"
                         : "等待反馈"}
             </div>
           </div>
@@ -872,6 +888,15 @@ export default function App() {
           </div>
           <div className="motion-state">
             <span>{motionReason || "就绪"}</span>
+            {space === "cartesian" && connected && !s.tcp_configured && (
+              <button
+                className="motion-tcp"
+                disabled={!deviceWritable || !!s.action}
+                onClick={openTcp}
+              >
+                设置 TCP
+              </button>
+            )}
             {s.action && <b>{Math.round(s.action.progress * 100)}%</b>}
           </div>
         </section>
@@ -1018,6 +1043,10 @@ export default function App() {
                 ×
               </button>
             </div>
+            <p className="dialog-hint">
+              末端点动默认使用 Link7 法兰，可直接操作。安装工具后在这里填写相对
+              Link7 的 TCP 偏移。
+            </p>
             <div className="tcp-fields">
               {["X / mm", "Y / mm", "Z / mm", "Rx / °", "Ry / °", "Rz / °"].map(
                 (name, i) => (

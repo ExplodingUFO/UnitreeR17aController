@@ -78,7 +78,9 @@ struct Joint {
     name: String,
     origin: Isometry3<f64>,
     axis: Unit<Vector3<f64>>,
+    #[cfg_attr(not(test), allow(dead_code))]
     lower: f64,
+    #[cfg_attr(not(test), allow(dead_code))]
     upper: f64,
     velocity: f64,
 }
@@ -197,6 +199,7 @@ impl Kinematics {
         std::array::from_fn(|i| self.joints[i].name.clone())
     }
 
+    #[cfg(test)]
     pub fn position_limits(&self) -> ([f64; 7], [f64; 7]) {
         (
             std::array::from_fn(|i| self.joints[i].lower),
@@ -205,13 +208,10 @@ impl Kinematics {
     }
 
     fn validate_q(&self, q: &[f64; 7]) -> Result<(), String> {
-        for (value, joint) in q.iter().zip(&self.joints) {
-            if !value.is_finite() || *value < joint.lower || *value > joint.upper {
-                return Err(format!(
-                    "{} position is non-finite or outside URDF limits",
-                    joint.name
-                ));
-            }
+        // URDF limits are model metadata; the installed arm's physical stops
+        // bound travel, so only reject values that cannot be computed.
+        if q.iter().any(|value| !value.is_finite()) {
+            return Err("joint position is non-finite".into());
         }
         Ok(())
     }
@@ -395,10 +395,9 @@ impl Kinematics {
             }
         }
         for i in 0..7 {
-            let joint = &self.joints[i];
             let acceleration = limits.joint_acceleration[i];
-            let lower = joint.lower.max(measured[i] - limits.max_reference_error);
-            let upper = joint.upper.min(measured[i] + limits.max_reference_error);
+            let lower = measured[i] - limits.max_reference_error;
+            let upper = measured[i] + limits.max_reference_error;
             let mut low = (-speeds[i])
                 .max(-max_step / dt)
                 .max((lower - reference[i]) / dt)
@@ -601,7 +600,6 @@ mod tests {
     }
 
     fn check_bounds(k: &Kinematics, i: &StepInput, c: &StepCandidate) {
-        let (lower, upper) = k.position_limits();
         assert!(c.speed_scale.is_finite() && (0.0..=1.0).contains(&c.speed_scale));
         let old = k.fk(&i.reference, &i.tcp).unwrap();
         let new = k.fk(&c.q, &i.tcp).unwrap();
@@ -610,7 +608,6 @@ mod tests {
         assert!(effective.fixed_rows::<3>(3).norm() <= i.limits.angular_speed + 1e-10);
         for j in 0..7 {
             assert!(c.q[j].is_finite() && c.dq[j].is_finite());
-            assert!(c.q[j] >= lower[j] && c.q[j] <= upper[j]);
             assert!((c.q[j] - i.reference[j] - c.dq[j] * i.dt).abs() < 1e-14);
             assert!((c.q[j] - i.reference[j]).abs() <= i.limits.max_joint_step + 1e-12);
             assert!(c.dq[j].abs() <= i.limits.joint_velocity[j] + 1e-12);
@@ -944,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn joint_position_velocity_acceleration_reference_and_increment_constraints() {
+    fn joint_velocity_acceleration_reference_and_increment_constraints() {
         let coaxial = planar_urdf().replace("xyz=\"1 0 0\"", "xyz=\"0 0 0\"");
         let k = Kinematics::from_urdf(&coaxial).unwrap();
         let mut i = input(
@@ -958,14 +955,8 @@ mod tests {
         let c = k.step(i.clone()).unwrap();
         check_bounds(&k, &i, &c);
         assert!(c.speed_scale < 1.0);
-        let mut at_limit = input(
-            [4.0; 7],
-            velocity([0.0, 0.0, 0.0, 0.0, 0.0, 0.1], Frame::Base),
-        );
-        at_limit.limits.joint_acceleration = [100.0; 7];
-        assert!(k.step(at_limit).is_err());
-        // Every official lower/upper joint boundary must reject or stay within
-        // all constraints; no failed branch may return an invalid candidate.
+        // Official lower/upper values are model metadata; candidates at those
+        // values must still satisfy every dynamic constraint.
         for side in ["right", "left"] {
             let official = Kinematics::load(side).unwrap();
             let (lower, upper) = official.position_limits();
@@ -982,6 +973,114 @@ mod tests {
                             check_bounds(&official, &i, &c);
                         }
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn finite_poses_outside_urdf_limits_still_support_fk_and_local_steps() {
+        for side in ["right", "left"] {
+            let k = Kinematics::load(side).unwrap();
+            let (lower, _) = k.position_limits();
+            let mut q = interior();
+            // Observed installation offsets: J2 and J4 sit slightly below the
+            // official model's zero/lower bound.
+            q[1] = lower[1] - 0.035;
+            q[3] = lower[3] - 0.022;
+            let pose = k.fk(&q, &Pose::identity()).unwrap();
+            assert!(pose.translation.iter().all(|value| value.is_finite()));
+            let jacobian = k.jacobian(&q, &Pose::identity()).unwrap();
+            assert!(jacobian.iter().all(|value| value.is_finite()));
+            let joint_velocity = [0.005, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+            let twist: [f64; 6] = std::array::from_fn(|row| {
+                (0..7)
+                    .map(|column| jacobian[(row, column)] * joint_velocity[column])
+                    .sum()
+            });
+            let i = input(q, velocity(twist, Frame::Base));
+            let candidate = k.step(i.clone()).unwrap();
+            check_bounds(&k, &i, &candidate);
+            assert!(candidate.q[0] > q[0]);
+        }
+    }
+
+    #[test]
+    fn observed_installation_pose_supports_every_cartesian_jog_axis() {
+        let q = [1.5576, -0.0350, 0.0102, -0.0217, 1.6217, 0.0088, 0.1133];
+        for side in ["right", "left"] {
+            let k = Kinematics::load(side).unwrap();
+            for frame in [Frame::Base, Frame::Tool] {
+                for axis in 0..6 {
+                    let mut twist = [0.0; 6];
+                    twist[axis] = if axis < 3 { 0.01 } else { 0.05 };
+                    let sample = input(q, velocity(twist, frame));
+                    let candidate = k
+                        .step(sample.clone())
+                        .unwrap_or_else(|error| panic!("{side} {frame:?} axis {axis}: {error}"));
+                    check_bounds(&k, &sample, &candidate);
+                    assert!(
+                        candidate.speed_scale > 0.05,
+                        "{side} {frame:?} axis {axis}: scale {}",
+                        candidate.speed_scale
+                    );
+                    assert!(
+                        candidate
+                            .q
+                            .iter()
+                            .zip(q)
+                            .any(|(after, before)| (after - before).abs() > 1e-8)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn observed_installation_pose_sustains_continuous_cartesian_jog() {
+        let q = [1.5576, -0.0350, 0.0102, -0.0217, 1.6217, 0.0088, 0.1133];
+        let mut limits = limits();
+        limits.joint_velocity = [0.2; 7];
+        limits.joint_acceleration = [0.6; 7];
+        limits.max_reference_error = 0.6;
+        limits.linear_speed = 0.015;
+        limits.angular_speed = 0.15;
+        for side in ["right", "left"] {
+            let k = Kinematics::load(side).unwrap();
+            let tcp = Pose::identity();
+            for frame in [Frame::Base, Frame::Tool] {
+                for axis in 0..6 {
+                    let mut reference = q;
+                    let mut measured = q;
+                    let mut previous_velocity = [0.0; 7];
+                    let initial = k.fk(&q, &tcp).unwrap();
+                    let mut twist = [0.0; 6];
+                    twist[axis] = if axis < 3 { 0.01 } else { 0.1 };
+                    for _ in 0..100 {
+                        let candidate = k
+                            .step(StepInput {
+                                reference,
+                                measured,
+                                previous_velocity,
+                                target: velocity(twist, frame),
+                                dt: 0.02,
+                                tcp,
+                                limits,
+                            })
+                            .unwrap_or_else(|error| {
+                                panic!("{side} {frame:?} axis {axis}: {error}")
+                            });
+                        measured = reference;
+                        reference = candidate.q;
+                        previous_velocity = candidate.dq;
+                    }
+                    let final_pose = k.fk(&reference, &tcp).unwrap();
+                    let error = pose_error(&initial, &final_pose);
+                    assert!(
+                        error[..3].iter().map(|v| v * v).sum::<f64>().sqrt() > 1e-3
+                            || error[3..].iter().map(|v| v * v).sum::<f64>().sqrt() > 1e-3,
+                        "{side} {frame:?} axis {axis} did not move"
+                    );
                 }
             }
         }
@@ -1079,7 +1178,7 @@ mod tests {
         for dt in [0.0, -0.01, 0.100001, f64::INFINITY, f64::NAN] {
             assert!(k.step(StepInput { dt, ..i.clone() }).is_err());
         }
-        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX] {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let mut q = interior();
             q[2] = bad;
             assert!(k.fk(&q, &Pose::identity()).is_err());
@@ -1130,6 +1229,20 @@ mod tests {
                 .is_err()
             );
         }
+        assert!(
+            k.step(StepInput {
+                previous_velocity: [f64::MAX; 7],
+                ..i.clone()
+            })
+            .is_err()
+        );
+        assert!(
+            k.step(StepInput {
+                target: velocity([f64::MAX; 6], Frame::Tool),
+                ..i.clone()
+            })
+            .is_err()
+        );
         let mut stale = i.clone();
         stale.measured[0] += 0.081;
         assert!(k.step(stale).is_err());

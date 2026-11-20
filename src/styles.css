@@ -686,6 +686,10 @@ pre {
   margin-left: auto;
   font-variant-numeric: tabular-nums;
 }
+.motion-state .motion-tcp {
+  padding: 0 6px;
+  font-size: 11px;
+}
 .error-line {
   grid-row: 3;
   min-height: 0;
@@ -1245,6 +1249,13 @@ summary:focus-visible {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
+}
+.dialog-hint {
+  margin: 0;
+  padding: 0 16px;
+  color: var(--color-muted);
+  font-size: 11px;
+  line-height: 1.4;
 }
 .tcp-fields label {
   display: grid;

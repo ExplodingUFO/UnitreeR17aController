@@ -1,11 +1,12 @@
 //! IM6014 wire protocol, verified against Unitree SDK commit
 //! 0803d033b530fcfa0e6fa9236de68c2773fc9402, MotorProtocol.cpp / arm_motor_bus.cpp.
-//! One owner, one joint per exchange. No enable, action retries, or cached feedback.
+//! One owner, seven-joint command batches. No action retries or cached feedback.
 
 use serde::{Deserialize, Serialize};
 use serialport::{
     ClearBuffer, DataBits, FlowControl, Parity, SerialPort, SerialPortType, StopBits,
 };
+use std::collections::BTreeMap;
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -15,7 +16,7 @@ const MAX_TRANSACTION: Duration = Duration::from_millis(20);
 const IO_SLICE: Duration = Duration::from_millis(2);
 const PI: f64 = std::f64::consts::PI;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PortInfo {
     pub name: String,
     pub label: String,
@@ -23,7 +24,7 @@ pub struct PortInfo {
 }
 
 pub fn enumerate_ports() -> Vec<PortInfo> {
-    let mut ports: Vec<_> = serialport::available_ports()
+    let ports = serialport::available_ports()
         .unwrap_or_default()
         .into_iter()
         .map(|p| {
@@ -55,8 +56,58 @@ pub fn enumerate_ports() -> Vec<PortInfo> {
             }
         })
         .collect();
+    dedupe_ports(ports)
+}
+
+fn port_key(name: &str) -> &str {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(suffix) = name.strip_prefix("/dev/cu.") {
+            return suffix;
+        }
+        if let Some(suffix) = name.strip_prefix("/dev/tty.") {
+            return suffix;
+        }
+    }
+    name
+}
+
+fn prefer_candidate(candidate: &PortInfo, existing: &PortInfo) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let candidate_cu = candidate.name.starts_with("/dev/cu.");
+        let existing_cu = existing.name.starts_with("/dev/cu.");
+        if candidate_cu != existing_cu {
+            return candidate_cu;
+        }
+    }
+    (existing.kind == "unknown" && candidate.kind != "unknown")
+        || (existing.label == existing.name && candidate.label != candidate.name)
+}
+
+fn dedupe_ports(ports: Vec<PortInfo>) -> Vec<PortInfo> {
+    let mut unique: BTreeMap<String, PortInfo> = BTreeMap::new();
+    for candidate in ports {
+        let key = port_key(&candidate.name).to_string();
+        match unique.get_mut(&key) {
+            Some(existing) if prefer_candidate(&candidate, existing) => {
+                let mut merged = candidate;
+                if merged.kind == "unknown" && existing.kind != "unknown" {
+                    merged.kind = existing.kind.clone();
+                    if let Some(detail) = existing.label.strip_prefix(&existing.name) {
+                        merged.label = format!("{}{}", merged.name, detail);
+                    }
+                }
+                *existing = merged;
+            }
+            Some(_) => {}
+            None => {
+                unique.insert(key, candidate);
+            }
+        }
+    }
+    let mut ports: Vec<_> = unique.into_values().collect();
     ports.sort_by(|a, b| a.name.cmp(&b.name));
-    ports.dedup_by(|a, b| a.name == b.name);
     ports
 }
 
@@ -100,7 +151,7 @@ pub struct BusStats {
     /// All CRC-valid frames received during exchanges, including other IDs.
     pub received: u64,
     pub crc_errors: u64,
-    /// Transactions whose total budget expired, counted once per exchange.
+    /// Seven-joint cycles whose shared feedback budget expired.
     pub timeouts: u64,
 }
 
@@ -353,7 +404,7 @@ pub struct Bus {
 
 impl Bus {
     /// Opens an exclusive native serial port; sends nothing. The supplied
-    /// timeout is the TOTAL transaction budget, capped at 20ms (minimum 1ms).
+    /// timeout is the TOTAL seven-joint cycle budget, capped at 20ms (minimum 1ms).
     pub fn open(port: &str, side: &str, baud: u32, timeout: Duration) -> Result<Self, String> {
         let calibration = calibrations(side)?;
         if baud == 0 {
@@ -387,6 +438,7 @@ impl Bus {
     /// sequence number: a delayed same-ID reply arriving after TX cannot be
     /// distinguished from this request's reply. No hardware ACK is fabricated.
     /// Ok(None) means response deadline; Err may mean the command was sent.
+    #[cfg(test)]
     pub fn exchange(&mut self, id: u8, setpoint: Setpoint) -> Result<Option<Feedback>, String> {
         if self.incomplete_write {
             return Err("previous command was partially written; reconnect serial port".into());
@@ -401,6 +453,89 @@ impl Bus {
         self.port
             .clear(ClearBuffer::Input)
             .map_err(|e| format!("clear stale input: {e}"))?;
+        self.write_packet(&packet, deadline)?;
+        // Never call flush/tcdrain here: it has no portable bounded deadline.
+        let mut bytes = [0u8; 256];
+        loop {
+            if !self.set_io_deadline(deadline)? {
+                return Ok(None);
+            }
+            match self.port.read(&mut bytes) {
+                Ok(0) => return Err("serial read returned zero (device closed)".into()),
+                Ok(n) => {
+                    let frames = self.receiver.feed(&bytes[..n], &mut self.stats);
+                    // A driver may return after its requested timeout. Do not
+                    // publish that feedback as a successful bounded exchange.
+                    if Instant::now() >= deadline {
+                        continue;
+                    }
+                    if let Some(frame) = frames.into_iter().find(|frame| frame.id == id) {
+                        return Ok(Some(cal.feedback(frame)));
+                    }
+                }
+                Err(e) if transient(&e) => std::thread::yield_now(),
+                Err(e) => return Err(format!("serial read after command sent: {e}")),
+            }
+        }
+    }
+
+    /// Sends all seven joint setpoints in one cycle, then collects any feedback
+    /// that arrives before the shared deadline. Missing frames are left as
+    /// `None`; freshness checks decide whether motion may continue.
+    pub fn exchange_all(
+        &mut self,
+        setpoints: &[Setpoint; 7],
+    ) -> Result<[Option<Feedback>; 7], String> {
+        if self.incomplete_write {
+            return Err("previous command was partially written; reconnect serial port".into());
+        }
+        let deadline = Instant::now() + self.budget;
+        let mut packets = [[0u8; COMMAND_LEN]; 7];
+        for (i, packet) in packets.iter_mut().enumerate() {
+            *packet = encode(i as u8, self.calibration[i].command(setpoints[i]))?;
+        }
+        self.receiver.bytes.clear();
+        self.port
+            .clear(ClearBuffer::Input)
+            .map_err(|e| format!("clear stale input: {e}"))?;
+        for packet in &packets {
+            self.write_packet(packet, deadline)?;
+            // The official SDK keeps this gap after every packet, including
+            // the last one, before the adapter turns around to receive.
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        let mut feedback: [Option<Feedback>; 7] = std::array::from_fn(|_| None);
+        let mut bytes = [0u8; 256];
+        loop {
+            if feedback.iter().all(Option::is_some) {
+                return Ok(feedback);
+            }
+            if !self.set_io_deadline(deadline)? {
+                return Ok(feedback);
+            }
+            match self.port.read(&mut bytes) {
+                Ok(0) => return Err("serial read returned zero (device closed)".into()),
+                Ok(n) => {
+                    let frames = self.receiver.feed(&bytes[..n], &mut self.stats);
+                    // A driver may return after its requested timeout. Do not
+                    // publish that feedback as a successful bounded exchange.
+                    if Instant::now() >= deadline {
+                        continue;
+                    }
+                    for frame in frames {
+                        let id = frame.id as usize;
+                        if id < 7 {
+                            feedback[id] = Some(self.calibration[id].feedback(frame));
+                        }
+                    }
+                }
+                Err(e) if transient(&e) => std::thread::yield_now(),
+                Err(e) => return Err(format!("serial read after command sent: {e}")),
+            }
+        }
+    }
+
+    fn write_packet(&mut self, packet: &[u8], deadline: Instant) -> Result<(), String> {
         let mut offset = 0;
         while offset < packet.len() {
             let ready = self.set_io_deadline(deadline).and_then(|ready| {
@@ -433,29 +568,7 @@ impl Bus {
                 }
             }
         }
-        // Never call flush/tcdrain here: it has no portable bounded deadline.
-        let mut bytes = [0u8; 256];
-        loop {
-            if !self.set_io_deadline(deadline)? {
-                return Ok(None);
-            }
-            match self.port.read(&mut bytes) {
-                Ok(0) => return Err("serial read returned zero (device closed)".into()),
-                Ok(n) => {
-                    let frames = self.receiver.feed(&bytes[..n], &mut self.stats);
-                    // A driver may return after its requested timeout. Do not
-                    // publish that feedback as a successful bounded exchange.
-                    if Instant::now() >= deadline {
-                        continue;
-                    }
-                    if let Some(frame) = frames.into_iter().find(|frame| frame.id == id) {
-                        return Ok(Some(cal.feedback(frame)));
-                    }
-                }
-                Err(e) if transient(&e) => std::thread::yield_now(),
-                Err(e) => return Err(format!("serial read after command sent: {e}")),
-            }
-        }
+        Ok(())
     }
 
     fn set_io_deadline(&mut self, deadline: Instant) -> Result<bool, String> {
@@ -502,6 +615,14 @@ mod tests {
             .collect()
     }
 
+    fn feedback_for_id(base: &[u8], id: u8) -> Vec<u8> {
+        let mut frame = base.to_vec();
+        frame[2] = (frame[2] & 0xf0) | id;
+        let crc = crc32(&frame[2..22]);
+        frame[22..26].copy_from_slice(&crc.to_le_bytes());
+        frame
+    }
+
     fn stop() -> Setpoint {
         Setpoint {
             mode: DriveMode::Disabled,
@@ -511,6 +632,47 @@ mod tests {
             kp: 0.,
             kd: 0.,
         }
+    }
+
+    #[test]
+    fn exact_duplicate_ports_collapse() {
+        let port = PortInfo {
+            name: "/dev/cu.usbserial-A".into(),
+            label: "/dev/cu.usbserial-A".into(),
+            kind: "usb".into(),
+        };
+        assert_eq!(dedupe_ports(vec![port.clone(), port]).len(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_cu_and_tty_are_one_device_and_cu_wins() {
+        let ports = vec![
+            PortInfo {
+                name: "/dev/tty.usbserial-A".into(),
+                label: "/dev/tty.usbserial-A — FTDI [0403:6001]".into(),
+                kind: "usb".into(),
+            },
+            PortInfo {
+                name: "/dev/cu.usbserial-A".into(),
+                label: "/dev/cu.usbserial-A".into(),
+                kind: "unknown".into(),
+            },
+            PortInfo {
+                name: "/dev/cu.Bluetooth-Incoming-Port".into(),
+                label: "/dev/cu.Bluetooth-Incoming-Port".into(),
+                kind: "bluetooth".into(),
+            },
+        ];
+        let deduped = dedupe_ports(ports);
+        assert_eq!(deduped.len(), 2);
+        let usb = deduped
+            .iter()
+            .find(|port| port.name.contains("usbserial-A"))
+            .unwrap();
+        assert_eq!(usb.name, "/dev/cu.usbserial-A");
+        assert_eq!(usb.kind, "usb");
+        assert!(usb.label.contains("FTDI"));
     }
 
     #[test]
@@ -901,6 +1063,43 @@ mod tests {
         assert_eq!(bus.stats().timeouts, 1);
         assert_eq!(bus.stats().received, 2);
         assert_eq!(wire.lock().unwrap().written.len(), 2 * COMMAND_LEN);
+    }
+
+    #[test]
+    fn batch_exchange_sends_seven_joints_before_collecting_feedback() {
+        let g = golden();
+        let base = unhex(g["feedback"][0]["packet"].as_str().unwrap());
+        let frames: VecDeque<Vec<u8>> = (0..7).map(|id| feedback_for_id(&base, id)).collect();
+        let (mut bus, wire) = fake_bus(Wire {
+            write_chunk: COMMAND_LEN,
+            after_tx: frames,
+            ..Wire::default()
+        });
+        let setpoints = [Setpoint {
+            mode: DriveMode::Servo,
+            q: 0.1,
+            dq: 0.0,
+            tau: 0.0,
+            kp: 60.0,
+            kd: 0.5,
+        }; 7];
+        let feedback = bus.exchange_all(&setpoints).unwrap();
+        for (id, value) in feedback.iter().enumerate() {
+            assert_eq!(value.as_ref().unwrap().id as usize, id);
+        }
+        let cal = calibrations("right").unwrap();
+        let written = wire.lock().unwrap().written.clone();
+        assert_eq!(written.len(), 7 * COMMAND_LEN);
+        for (id, setpoint) in setpoints.iter().enumerate() {
+            let expected = encode(id as u8, cal[id].command(*setpoint)).unwrap();
+            assert_eq!(
+                &written[id * COMMAND_LEN..(id + 1) * COMMAND_LEN],
+                expected.as_slice()
+            );
+        }
+        assert_eq!(bus.stats().received, 7);
+        assert_eq!(bus.stats().timeouts, 0);
+        assert_eq!(wire.lock().unwrap().clears, 1);
     }
 
     #[test]

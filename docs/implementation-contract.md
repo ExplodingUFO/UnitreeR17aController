@@ -276,8 +276,8 @@ J1 正向连续点动，速度 0.1 rad/s：
 | `owner`                   | object 或 null                 | `{client_id,expires_in_ms}`；不包含控制权凭据      |
 | `joints`                  | 7 个 `JointSnapshot`           | J1..J7 的实测反馈                                  |
 | `tcp`                     | `Pose` 或 null                 | 根据实测关节计算的基座 → 当前 TCP 位姿             |
-| `tcp_transform`           | `Pose` 或 null                 | 已设置的 Link7 → TCP 变换                          |
-| `tcp_configured`          | boolean                        | 是否设置了工具变换                                 |
+| `tcp_transform`           | `Pose` 或 null                 | 当前 Link7 → TCP 变换；连接后默认为单位变换        |
+| `tcp_configured`          | boolean                        | 是否有可用的 TCP；连接后默认 Link7 法兰为 true     |
 | `feedback_age_ms`         | u64 或 null                    | 已有反馈中最大的接收年龄                           |
 | `action`                  | object 或 null                 | 当前动作：`request_id,space,mode,axis,progress`    |
 | `last_result` / `results` | `CommandResult` 或 null / 数组 | 最新一条结果 / 最近结果                            |
@@ -331,7 +331,7 @@ TCP 未设置或控制反馈无效时，`tcp:null`。`action.mode` 为 `continuo
 
 ## 9. 串口与日志输出
 
-`GET /v1/ports` 返回数组，按 `name` 排序并去重：
+`GET /v1/ports` 返回数组。macOS 上同一设备的 `/dev/cu.*` 与 `/dev/tty.*` 会合并为一项并优先返回 `cu`；结果按 `name` 排序：
 
 ```json
 [{ "name": "/dev/cu.usbserial-001", "label": "USB Serial", "kind": "usb" }]
@@ -391,7 +391,7 @@ JSON 解析与类型错误由 HTTP 框架直接返回纯文本：格式错误 40
 | `feedback_missing`、`feedback_stale`、`invalid_feedback`、`feedback_span`                                                        | 反馈不满足控制条件                         |
 | `tcp_missing`                                                                                                                    | 设置 TCP 后再使用末端点动                  |
 | `no_action`、`stale_input`、`input_expired`                                                                                      | 连续点动已经结束，或更新序号/有效期不符    |
-| `joint_limit`、`joint_dynamics`、`kinematics`、`following_error`、`target_timeout`                                               | 本次运动不能继续，结合状态和日志检查原因   |
+| `joint_dynamics`、`kinematics`、`following_error`、`target_timeout`                                                              | 本次运动不能继续，结合状态和日志检查原因   |
 | `communication_error`、`feedback_timeout`、`device_error`、`device_timeout`、`device_disabled`、`enable_timeout`、`clear_failed` | 通信、设备或确认失败                       |
 | `stopped`、`host_stop`、`released`、`lease_expired`、`disabled`、`disconnected`、`clearing`、`closing`                           | 动作取消原因                               |
 
@@ -430,7 +430,7 @@ Tauri 仅向主窗口提供两个命令：
 
 导出 `DriveMode::{Disabled,Servo,ClearFault}`、`Setpoint {mode,q,dq,tau,kp,kd}`，数值均为标定后的 URDF 关节量。`Feedback {id,q,dq,tau,temperature,voltage,error,warning,mode,timeout}`。
 
-`Bus::open(port:&str,side:&str,baud:u32,timeout:Duration)->Result<Bus,String>`；`exchange(&mut self,id:u8,setpoint:Setpoint)->Result<Option<Feedback>,String>` 为单关节有界事务；`stats()->BusStats {received,crc_errors,timeouts}`。控制线程在每个事务之间检查取消信号，控制状态和动作取消由 arm.rs 管理。标定从 resources/calibration 的官方文件编译内嵌。
+`Bus::open(port:&str,side:&str,baud:u32,timeout:Duration)->Result<Bus,String>`；`exchange_all(&mut self,setpoints:&[Setpoint;7])->Result<[Option<Feedback>;7],String>` 在一个控制周期内按 200 μs 间隔下发七轴，并在共享截止时间前收集反馈；`stats()->BusStats {received,crc_errors,timeouts}`。控制线程在每个周期之间检查取消信号，控制状态和动作取消由 arm.rs 管理。标定从 resources/calibration 的官方文件编译内嵌。
 
 ### kinematics.rs
 
@@ -440,7 +440,7 @@ Tauri 仅向主窗口提供两个命令：
 
 `MotionLimits {joint_velocity:[f64;7],joint_acceleration:[f64;7],max_reference_error:f64,max_joint_step:f64,linear_speed:f64,angular_speed:f64}`。
 
-`LocalTarget::Velocity {twist:[f64;6],frame:Frame}` 或 `LocalTarget::Pose(Pose)`；`StepInput {reference:[f64;7],measured:[f64;7],previous_velocity:[f64;7],target:LocalTarget,dt:f64,tcp:TcpTransform,limits:MotionLimits}`；`step(input)->Result<StepCandidate,String>`，候选包含 `q:[f64;7],dq:[f64;7],speed_scale:f64`。统一局部加权 DLS，限制关节位置/速度/加速度/参考偏差，拒绝 NaN、无效 dt 和不能推进的候选，不随机跳构型。
+`LocalTarget::Velocity {twist:[f64;6],frame:Frame}` 或 `LocalTarget::Pose(Pose)`；`StepInput {reference:[f64;7],measured:[f64;7],previous_velocity:[f64;7],target:LocalTarget,dt:f64,tcp:TcpTransform,limits:MotionLimits}`；`step(input)->Result<StepCandidate,String>`，候选包含 `q:[f64;7],dq:[f64;7],speed_scale:f64`。统一局部加权 DLS，限制关节速度/加速度、单步增量和相对实测的参考偏差；绝对行程由物理限位约束。拒绝 NaN、无效 dt 和不能推进的候选，不随机跳构型。
 
 提供 `offset_pose(pose:&Pose,delta:[f64;6],frame:Frame)->Result<Pose,String>` 和 `pose_error(current:&Pose,target:&Pose)->[f64;6]`。动作和目标由 arm.rs 管理，运动学模块只计算每一步的候选输出。
 

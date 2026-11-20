@@ -34,7 +34,7 @@ src-tauri/target/release/bundle/macos/R1-7a Controller.app
 
 ## 使用
 
-选择左右臂和串口，取得控制后连接并使能。关节与末端点动共用一个操作区，一次执行一个动作；末端点动前需设置 TCP。默认串口波特率为 6 Mbps。
+选择左右臂和串口，取得控制后连接并使能。关节与末端点动共用一个操作区，一次执行一个动作。末端点动默认使用 Link7 法兰作为参考；安装工具后可再设置 TCP 偏移。默认串口波特率为 6 Mbps。
 
 窗口支持 800×600。顶部可切换“控制”“接口”和“日志”；停止按钮在各页均可使用。点动按钮支持鼠标按住，也可聚焦后按住 Enter 或空格，松开结束连续点动。
 
@@ -54,7 +54,7 @@ src-tauri/target/release/bundle/macos/R1-7a Controller.app
 
 个人自用项目，采用 vibe coding 方式开发。
 
-已在 macOS arm64 完成构建、48 项离线测试和界面检查。真机尚未验收，待测试项目包括串口与转接器、本体标定、运动跟随、停止和失联行为。Windows 和 Linux 尚未测试。详细结果见[测试记录](docs/implementation-status.md)。
+已在 macOS arm64 完成构建、58 项离线测试和界面检查。真机串口连接与七轴反馈已在本机验证；本体标定、方向、TCP、使能、连续运动平滑性、姿态保持、停止和失联行为仍未验收。Windows 和 Linux 尚未测试。详细结果见[测试记录](docs/implementation-status.md)。
 
 检查命令：
 
