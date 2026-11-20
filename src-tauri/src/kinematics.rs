@@ -4,7 +4,7 @@ use nalgebra::{
     Isometry3, Quaternion, SMatrix, SVector, Translation3, Unit, UnitQuaternion, Vector3,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 type Jacobian = SMatrix<f64, 6, 7>;
 type Twist = SVector<f64, 6>;
@@ -78,6 +78,8 @@ struct Joint {
     name: String,
     origin: Isometry3<f64>,
     axis: Unit<Vector3<f64>>,
+    link_mass: f64,
+    link_com: Vector3<f64>,
     #[cfg_attr(not(test), allow(dead_code))]
     lower: f64,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -135,6 +137,11 @@ impl Kinematics {
         if children.contains(&"base_link".to_string()) {
             return Err("base_link must be the chain root".into());
         }
+        let link_bodies: HashMap<_, _> = robot
+            .links
+            .iter()
+            .map(|link| (link.name.as_str(), link))
+            .collect();
         let mut link = "base_link";
         let mut visited = HashSet::new();
         let mut pending = Isometry3::identity();
@@ -172,10 +179,20 @@ impl Kinematics {
                     {
                         return Err(format!("invalid axis or limits for {}", joint.name));
                     }
+                    let body = link_bodies
+                        .get(joint.child.link.as_str())
+                        .ok_or_else(|| format!("missing child link for {}", joint.name))?;
+                    let mass = body.inertial.mass.value;
+                    let com = body.inertial.origin.xyz;
+                    if !mass.is_finite() || mass < 0.0 || !com.iter().all(|v| v.is_finite()) {
+                        return Err(format!("invalid inertial for {}", joint.name));
+                    }
                     joints.push(Joint {
                         name: joint.name.clone(),
                         origin: pending,
                         axis: Unit::new_normalize(axis),
+                        link_mass: mass,
+                        link_com: Vector3::new(com[0], com[1], com[2]),
                         lower: l.lower,
                         upper: l.upper,
                         velocity: l.velocity,
@@ -252,6 +269,40 @@ impl Kinematics {
 
     pub fn fk(&self, q: &[f64; 7], tcp: &TcpTransform) -> Result<Pose, String> {
         self.evaluate(q, tcp).map(|(pose, _)| pose)
+    }
+
+    /// Static gravity torque in URDF joint coordinates, using the same link
+    /// inertials as the official R1-7A model. Positive values are the torque
+    /// the actuator must apply to hold the commanded configuration.
+    pub fn gravity(&self, q: &[f64; 7]) -> Result<[f64; 7], String> {
+        self.validate_q(q)?;
+        let mut transform = Isometry3::identity();
+        let mut origins = [Vector3::zeros(); 7];
+        let mut axes = [Vector3::zeros(); 7];
+        let mut coms = [Vector3::zeros(); 7];
+        for (i, joint) in self.joints.iter().enumerate() {
+            transform *= joint.origin;
+            origins[i] = transform.translation.vector;
+            axes[i] = transform.rotation * joint.axis.as_ref();
+            transform *= Isometry3::from_parts(
+                Translation3::identity(),
+                UnitQuaternion::from_axis_angle(&joint.axis, q[i]),
+            );
+            coms[i] = transform.translation.vector + transform.rotation * joint.link_com;
+        }
+        let mut torque = [0.0; 7];
+        for i in 0..7 {
+            let mut gravity_moment = 0.0;
+            for (j, com) in coms.iter().enumerate().skip(i) {
+                let force = Vector3::new(0.0, 0.0, -9.81 * self.joints[j].link_mass);
+                gravity_moment += axes[i].dot(&(*com - origins[i]).cross(&force));
+            }
+            torque[i] = -gravity_moment;
+        }
+        if !torque.iter().all(|value| value.is_finite()) {
+            return Err("non-finite gravity torque".into());
+        }
+        Ok(torque)
     }
 
     #[cfg(test)]
@@ -1033,6 +1084,25 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn gravity_feedforward_has_expected_holding_sign_for_the_shoulder_joints() {
+        let q = [1.5576, -0.0350, 0.0102, -0.0217, 1.6217, 0.0088, 0.1133];
+        for side in ["right", "left"] {
+            let k = Kinematics::load(side).unwrap();
+            let torque = k.gravity(&q).unwrap();
+            assert!(
+                torque.iter().all(|value| value.is_finite()),
+                "{side}: {torque:?}"
+            );
+            assert!(torque[1] > 0.1, "{side}: {torque:?}");
+            assert!(torque[3] > 0.1, "{side}: {torque:?}");
+            assert!(
+                torque.iter().all(|value| value.abs() < 30.0),
+                "{side}: {torque:?}"
+            );
         }
     }
 

@@ -54,7 +54,7 @@ src-tauri/target/release/bundle/macos/R1-7a Controller.app
 
 个人自用项目，采用 vibe coding 方式开发。
 
-已在 macOS arm64 完成构建、59 项离线测试和界面检查。真机串口连接与七轴反馈已在本机验证；本体标定、方向、TCP、使能、连续运动平滑性、姿态保持、停止和失联行为仍未验收。Windows 和 Linux 尚未测试。详细结果见[测试记录](docs/implementation-status.md)。
+已在 macOS arm64 完成构建、60 项离线测试和界面检查。真机串口连接与七轴反馈已在本机验证；本体标定、方向、TCP、使能、连续运动平滑性、姿态保持、停止和失联行为仍未验收。Windows 和 Linux 尚未测试。详细结果见[测试记录](docs/implementation-status.md)。
 
 检查命令：
 

@@ -428,7 +428,7 @@ Tauri 仅向主窗口提供两个命令：
 
 导出 `PortInfo {name,label,kind}`、`enumerate_ports() -> Vec<PortInfo>`。
 
-导出 `DriveMode::{Disabled,Servo,ClearFault}`、`Setpoint {mode,q,dq,tau,kp,kd}`，数值均为标定后的 URDF 关节量。`Feedback {id,q,dq,tau,temperature,voltage,error,warning,mode,timeout}`。
+导出 `DriveMode::{Disabled,Servo,ClearFault}`、`Setpoint {mode,q,dq,tau,kp,kd}`，数值均为标定后的 URDF 关节量。`Feedback {id,q,dq,tau,temperature,voltage,error,warning,mode,timeout}`。伺服模式默认 `kp=60`、`kd=10`；`tau` 由 URDF 质量/质心在指令姿态计算的重力前馈填充，逐轴限幅 ±8 Nm。
 
 `BusHandle::open(port:&str,side:&str,baud:u32,timeout:Duration)->Result<BusHandle,String>`；`send(setpoints:[Setpoint;7])->Result<(),String>` 发布最新七轴目标，`drain()->(Vec<(Feedback,Instant)>,Option<String>)` 读取已到达的带时间戳反馈；`disable()` 和 `write_blocking()` 用于停止/清错等需要确认的写操作；`stats()->BusStats {received,crc_errors,timeouts}`。内部串口 I/O 线程按 10 ms 目标间隔写七轴、每包保留 200 μs 间隔，并在无新目标时重复最后目标作为保持心跳，因此控制线程不等待七帧。测试保留单周期 `exchange_all` 作为协议对照。标定从 resources/calibration 的官方文件编译内嵌。
 

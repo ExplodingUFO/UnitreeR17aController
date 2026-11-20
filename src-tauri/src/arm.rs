@@ -30,7 +30,9 @@ const LINEAR_SPEED: f64 = 0.015;
 const ANGULAR_SPEED: f64 = 0.15;
 // The official motion demo uses these gains for loaded joint movement.
 const SERVO_KP: f64 = 60.0;
-const SERVO_KD: f64 = 1.0;
+// The official R1-7A teleoperation stack uses kd=10 with gravity feedforward.
+const SERVO_KD: f64 = 10.0;
+const TAU_FF_LIMIT: f64 = 8.0;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ApiError {
@@ -1162,6 +1164,14 @@ impl Core {
     }
     fn poll(&mut self, now: Instant) {
         let servo = self.enabled || self.enable_request.is_some();
+        let gravity = if servo {
+            self.model
+                .as_ref()
+                .and_then(|model| model.gravity(&self.reference).ok())
+                .unwrap_or([0.0; 7])
+        } else {
+            [0.0; 7]
+        };
         let setpoints: [Setpoint; 7] = std::array::from_fn(|i| Setpoint {
             mode: if self.clear_pending[i] {
                 DriveMode::ClearFault
@@ -1172,7 +1182,11 @@ impl Core {
             },
             q: self.reference[i],
             dq: self.velocity[i],
-            tau: 0.0,
+            tau: if servo && !self.clear_pending[i] {
+                gravity[i].clamp(-TAU_FF_LIMIT, TAU_FF_LIMIT)
+            } else {
+                0.0
+            },
             kp: if servo { SERVO_KP } else { 0.0 },
             kd: if servo { SERVO_KD } else { 0.0 },
         });
