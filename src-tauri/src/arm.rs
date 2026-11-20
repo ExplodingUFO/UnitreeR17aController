@@ -1,14 +1,14 @@
 use crate::{
     journal::{Journal, JournalStats},
     kinematics::{self, Frame, Kinematics, LocalTarget, MotionLimits, Pose, StepInput},
-    protocol::{Bus, DriveMode, Feedback, Setpoint},
+    protocol::{BusHandle, DriveMode, Feedback, Setpoint},
 };
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -19,7 +19,7 @@ const LEASE_MS: u64 = 2500;
 const FEEDBACK_MS: u64 = 200;
 const FEEDBACK_SPAN_MS: u64 = 100;
 const ENABLE_TIMEOUT: Duration = Duration::from_secs(1);
-const CONTROL_PERIOD: Duration = Duration::from_millis(20);
+const CONTROL_PERIOD: Duration = Duration::from_millis(10);
 // The official motion demo tolerates 0.6 rad tracking error while moving.
 // Position error is what creates holding torque; do not clamp it so tightly
 // that a load drags the commanded reference down with the measured joint.
@@ -229,6 +229,7 @@ pub struct ArmHandle {
     latest: Sender<Work>,
     latest_rx: Receiver<Work>,
     host_epoch: Arc<AtomicU64>,
+    stop_reason: Arc<Mutex<Option<String>>>,
     shutdown: Arc<AtomicBool>,
     finished: Receiver<()>,
     state: watch::Receiver<Snapshot>,
@@ -243,8 +244,10 @@ impl ArmHandle {
         let (latest, latest_rx) = bounded(1);
         let (done_tx, finished) = bounded(1);
         let host_epoch = Arc::new(AtomicU64::new(0));
+        let stop_reason = Arc::new(Mutex::new(None));
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_epoch = host_epoch.clone();
+        let worker_reason = stop_reason.clone();
         let worker_shutdown = shutdown.clone();
         let worker_latest = latest_rx.clone();
         std::thread::Builder::new()
@@ -256,6 +259,7 @@ impl ArmHandle {
                     priority_rx,
                     worker_latest,
                     worker_epoch,
+                    worker_reason,
                     worker_shutdown,
                     state_tx,
                 );
@@ -268,6 +272,7 @@ impl ArmHandle {
             latest,
             latest_rx,
             host_epoch,
+            stop_reason,
             shutdown,
             finished,
             state,
@@ -282,12 +287,15 @@ impl ArmHandle {
     pub fn is_closing(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
     }
-    pub fn host_stop(&self) {
+    pub fn host_stop(&self, reason: impl Into<String>) {
+        if let Ok(mut current) = self.stop_reason.lock() {
+            *current = Some(reason.into());
+        }
         self.host_epoch.fetch_add(1, Ordering::AcqRel);
     }
     pub fn request_shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
-        self.host_stop();
+        self.host_stop("shutdown");
     }
     pub fn shutdown(&self, timeout: Duration) -> bool {
         self.request_shutdown();
@@ -373,7 +381,7 @@ struct Core {
     model: Option<Kinematics>,
     side: String,
     port: Option<String>,
-    bus: Option<Bus>,
+    bus: Option<BusHandle>,
     feedback: [Option<Observation>; 7],
     reference: [f64; 7],
     velocity: [f64; 7],
@@ -393,6 +401,12 @@ struct Core {
     clear_pending: [bool; 7],
     clear_request: Option<(String, Instant)>,
     enable_request: Option<(String, Instant)>,
+    diag_at: Instant,
+    diag_cycles: u64,
+    diag_dt_sum: f64,
+    diag_dt_max: f64,
+    diag_work_sum: f64,
+    diag_work_max: f64,
     dirty: bool,
 }
 
@@ -428,6 +442,12 @@ impl Core {
             clear_pending: [false; 7],
             clear_request: None,
             enable_request: None,
+            diag_at: Instant::now(),
+            diag_cycles: 0,
+            diag_dt_sum: 0.0,
+            diag_dt_max: 0.0,
+            diag_work_sum: 0.0,
+            diag_work_max: 0.0,
             dirty: true,
         }
     }
@@ -672,7 +692,7 @@ impl Core {
                 let model = Kinematics::load(&side).map_err(|e| ApiError::new("model_error", e))?;
                 // The first FTDI reply after opening can arrive after the
                 // adapter's latency timer; 20 ms also bounds a failed probe.
-                let bus = Bus::open(&port, &side, 6_000_000, Duration::from_millis(20))
+                let bus = BusHandle::open(&port, &side, 6_000_000, Duration::from_millis(20))
                     .map_err(|e| ApiError::new("connect_failed", e))?;
                 if self.side != side || self.tcp.is_none() {
                     // Link7 itself is a usable jog reference on a bare flange.
@@ -1156,24 +1176,42 @@ impl Core {
             kp: if servo { SERVO_KP } else { 0.0 },
             kd: if servo { SERVO_KD } else { 0.0 },
         });
-        let Some(bus) = self.bus.as_mut() else {
+        let clearing = self.clear_pending.iter().any(|pending| *pending);
+        let Some(bus) = self.bus.as_ref() else {
             return;
         };
-        let result = bus.exchange_all(&setpoints);
+        let clear_result = if clearing {
+            bus.write_blocking(setpoints)
+        } else {
+            Ok(())
+        };
+        let send_result = bus.send(setpoints);
+        let (values, read_error) = bus.drain();
         let stats = bus.stats();
+        if let Err(e) = clear_result {
+            self.fault("communication_error", e);
+            return;
+        }
+        if clearing {
+            self.clear_pending = [false; 7];
+        }
+        if let Err(e) = send_result {
+            self.fault("communication_error", e);
+            return;
+        }
         self.communication = Communication {
             received: stats.received,
             crc_errors: stats.crc_errors,
             timeouts: stats.timeouts,
         };
-        match result {
-            Ok(values) => {
-                self.clear_pending = [false; 7];
-                for value in values.into_iter().flatten() {
-                    self.accept_feedback(value, Instant::now());
-                }
+        for (value, at) in values {
+            if self.error.is_some() {
+                break;
             }
-            Err(e) => self.fault("communication_error", e),
+            self.accept_feedback(value, at);
+        }
+        if let Some(e) = read_error {
+            self.fault("communication_error", e);
         }
         if self.phase == Phase::Connecting && self.measured(Instant::now()).is_ok() {
             self.phase = Phase::Disabled;
@@ -1187,6 +1225,92 @@ impl Core {
             self.fault("feedback_timeout", "设备反馈超时");
         }
         self.settle_transitions(Instant::now());
+    }
+    fn diagnose(&mut self, now: Instant, dt_ms: f64, work_ms: f64) {
+        if !self.enabled && self.motion.is_none() {
+            self.diag_at = now;
+            self.diag_cycles = 0;
+            self.diag_dt_sum = 0.0;
+            self.diag_dt_max = 0.0;
+            self.diag_work_sum = 0.0;
+            self.diag_work_max = 0.0;
+            return;
+        }
+        self.diag_cycles += 1;
+        self.diag_dt_sum += dt_ms;
+        self.diag_dt_max = self.diag_dt_max.max(dt_ms);
+        self.diag_work_sum += work_ms;
+        self.diag_work_max = self.diag_work_max.max(work_ms);
+        if now.saturating_duration_since(self.diag_at) < Duration::from_secs(1) {
+            return;
+        }
+        let cycles = self.diag_cycles.max(1) as f64;
+        let age_ms = self
+            .feedback
+            .iter()
+            .filter_map(|sample| {
+                sample
+                    .as_ref()
+                    .map(|sample| now.saturating_duration_since(sample.at).as_millis())
+            })
+            .max()
+            .unwrap_or(0);
+        let (joint, error) = self
+            .feedback
+            .iter()
+            .enumerate()
+            .filter_map(|(i, sample)| {
+                sample
+                    .as_ref()
+                    .map(|sample| (i, (self.reference[i] - sample.value.q).abs()))
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap_or((0, 0.0));
+        let (q, dq, tau) = self
+            .feedback
+            .get(joint)
+            .and_then(Option::as_ref)
+            .map(|sample| (sample.value.q, sample.value.dq, sample.value.tau))
+            .unwrap_or((0.0, 0.0, 0.0));
+        let motion = self
+            .motion
+            .as_ref()
+            .map(|motion| {
+                format!(
+                    "{}{}J{}",
+                    if motion.step { "step " } else { "continuous " },
+                    if motion.space == Space::Joint {
+                        "joint "
+                    } else {
+                        "cartesian "
+                    },
+                    motion.axis + 1
+                )
+            })
+            .unwrap_or_else(|| "-".into());
+        let message = format!(
+            "周期 {:.2}/{:.2} ms，控制线程 {:.2}/{:.2} ms，action={motion}，反馈年龄 {age_ms} ms，J{} 参考误差 {:.3} rad，qref={:.3} q={:.3} dq={:.3} tau={:.2}，comm={}/{}/{}",
+            self.diag_dt_sum / cycles,
+            self.diag_dt_max,
+            self.diag_work_sum / cycles,
+            self.diag_work_max,
+            joint + 1,
+            error,
+            self.reference[joint],
+            q,
+            dq,
+            tau,
+            self.communication.received,
+            self.communication.crc_errors,
+            self.communication.timeouts,
+        );
+        self.journal.log("info", "control", "cycle", &message, None);
+        self.diag_at = now;
+        self.diag_cycles = 0;
+        self.diag_dt_sum = 0.0;
+        self.diag_dt_max = 0.0;
+        self.diag_work_sum = 0.0;
+        self.diag_work_max = 0.0;
     }
     fn accept_feedback(&mut self, value: Feedback, at: Instant) {
         let id = value.id as usize;
@@ -1237,6 +1361,7 @@ impl Core {
             {
                 let id = id.clone();
                 self.clear_request = None;
+                self.clear_pending = [false; 7];
                 self.error = None;
                 self.phase();
                 self.record(&id, "completed", "cleared", "故障已清除");
@@ -1249,16 +1374,8 @@ impl Core {
         }
     }
     fn send_disable(&mut self) {
-        if let Some(bus) = self.bus.as_mut() {
-            let setpoints: [Setpoint; 7] = std::array::from_fn(|_| Setpoint {
-                mode: DriveMode::Disabled,
-                q: 0.0,
-                dq: 0.0,
-                tau: 0.0,
-                kp: 0.0,
-                kd: 0.0,
-            });
-            let _ = bus.exchange_all(&setpoints);
+        if let Some(bus) = self.bus.as_ref() {
+            let _ = bus.disable();
         }
     }
     fn snapshot(&self, now: Instant) -> Snapshot {
@@ -1347,12 +1464,14 @@ fn input_deadline(received: Instant, ttl_ms: u64, now: Instant) -> Result<Instan
     }
     Ok(deadline)
 }
+#[allow(clippy::too_many_arguments)]
 fn run(
     mut core: Core,
     ordinary: Receiver<Work>,
     priority: Receiver<Work>,
     latest: Receiver<Work>,
     host_epoch: Arc<AtomicU64>,
+    stop_reason: Arc<Mutex<Option<String>>>,
     shutdown: Arc<AtomicBool>,
     state: watch::Sender<Snapshot>,
 ) {
@@ -1364,8 +1483,18 @@ fn run(
         let now = Instant::now();
         let epoch = host_epoch.load(Ordering::Acquire);
         if epoch != seen_epoch {
-            core.journal
-                .log("info", "control", "host_stop", "停止请求", None);
+            let reason = stop_reason
+                .lock()
+                .ok()
+                .and_then(|mut reason| reason.take())
+                .unwrap_or_else(|| "unspecified".into());
+            core.journal.log(
+                "info",
+                "control",
+                "host_stop",
+                &format!("停止请求：{reason}"),
+                None,
+            );
             core.end_motion("cancelled", "host_stop", "宿主已取消当前动作");
             seen_epoch = epoch;
         }
@@ -1405,6 +1534,7 @@ fn run(
             .saturating_duration_since(last_control)
             .as_secs_f64()
             .max(0.0001);
+        let work_at = Instant::now();
         last_control = at;
         core.expire_lease(at);
         core.advance(at, dt);
@@ -1413,6 +1543,8 @@ fn run(
         }
         core.expire_lease(Instant::now());
         core.poll(Instant::now());
+        let work_ms = work_at.elapsed().as_secs_f64() * 1000.0;
+        core.diagnose(at, dt * 1000.0, work_ms);
         if core.dirty || published.elapsed() >= Duration::from_millis(33) {
             core.seq += 1;
             state.send_replace(core.snapshot(Instant::now()));

@@ -401,10 +401,10 @@ JSON 解析与类型错误由 HTTP 框架直接返回纯文本：格式错误 40
 
 Tauri 仅向主窗口提供两个命令：
 
-| 命令           | 输入 | 输出          | 用途                                   |
-| -------------- | ---- | ------------- | -------------------------------------- |
-| `session_info` | 无   | `SessionInfo` | 取得本次会话地址、令牌、版本与日志位置 |
-| `host_stop`    | 无   | `null`        | 请求取消任意客户端的当前动作，立即返回 |
+| 命令           | 输入            | 输出          | 用途                                   |
+| -------------- | --------------- | ------------- | -------------------------------------- |
+| `session_info` | 无              | `SessionInfo` | 取得本次会话地址、令牌、版本与日志位置 |
+| `host_stop`    | `reason:string` | `null`        | 请求取消任意客户端的当前动作，原因写入日志 |
 
 `SessionInfo` 示例：
 
@@ -430,7 +430,7 @@ Tauri 仅向主窗口提供两个命令：
 
 导出 `DriveMode::{Disabled,Servo,ClearFault}`、`Setpoint {mode,q,dq,tau,kp,kd}`，数值均为标定后的 URDF 关节量。`Feedback {id,q,dq,tau,temperature,voltage,error,warning,mode,timeout}`。
 
-`Bus::open(port:&str,side:&str,baud:u32,timeout:Duration)->Result<Bus,String>`；`exchange_all(&mut self,setpoints:&[Setpoint;7])->Result<[Option<Feedback>;7],String>` 在一个控制周期内按 200 μs 间隔下发七轴，并在共享截止时间前收集反馈；`stats()->BusStats {received,crc_errors,timeouts}`。控制线程在每个周期之间检查取消信号，控制状态和动作取消由 arm.rs 管理。标定从 resources/calibration 的官方文件编译内嵌。
+`BusHandle::open(port:&str,side:&str,baud:u32,timeout:Duration)->Result<BusHandle,String>`；`send(setpoints:[Setpoint;7])->Result<(),String>` 发布最新七轴目标，`drain()->(Vec<(Feedback,Instant)>,Option<String>)` 读取已到达的带时间戳反馈；`disable()` 和 `write_blocking()` 用于停止/清错等需要确认的写操作；`stats()->BusStats {received,crc_errors,timeouts}`。内部串口 I/O 线程按 10 ms 目标间隔写七轴、每包保留 200 μs 间隔，并在无新目标时重复最后目标作为保持心跳，因此控制线程不等待七帧。测试保留单周期 `exchange_all` 作为协议对照。标定从 resources/calibration 的官方文件编译内嵌。
 
 ### kinematics.rs
 

@@ -2,18 +2,26 @@
 //! 0803d033b530fcfa0e6fa9236de68c2773fc9402, MotorProtocol.cpp / arm_motor_bus.cpp.
 //! One owner, seven-joint command batches. No action retries or cached feedback.
 
+use crossbeam_channel::{Receiver as EventReceiver, Sender, bounded, unbounded};
 use serde::{Deserialize, Serialize};
 use serialport::{
     ClearBuffer, DataBits, FlowControl, Parity, SerialPort, SerialPortType, StopBits,
 };
 use std::collections::BTreeMap;
 use std::io;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
 
 const COMMAND_LEN: usize = 20;
 const FEEDBACK_LEN: usize = 26;
 const MAX_TRANSACTION: Duration = Duration::from_millis(20);
-const IO_SLICE: Duration = Duration::from_millis(2);
+const IO_SLICE: Duration = Duration::from_millis(1);
+const WRITE_PERIOD: Duration = Duration::from_millis(10);
 const PI: f64 = std::f64::consts::PI;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -419,6 +427,8 @@ impl Bus {
             .timeout(budget.min(IO_SLICE))
             .open()
             .map_err(|e| format!("open serial port: {e}"))?;
+        port.clear(ClearBuffer::Input)
+            .map_err(|e| format!("clear stale input after open: {e}"))?;
         Ok(Self {
             port,
             calibration,
@@ -482,28 +492,17 @@ impl Bus {
     /// Sends all seven joint setpoints in one cycle, then collects any feedback
     /// that arrives before the shared deadline. Missing frames are left as
     /// `None`; freshness checks decide whether motion may continue.
+    #[cfg(test)]
     pub fn exchange_all(
         &mut self,
         setpoints: &[Setpoint; 7],
     ) -> Result<[Option<Feedback>; 7], String> {
-        if self.incomplete_write {
-            return Err("previous command was partially written; reconnect serial port".into());
-        }
-        let deadline = Instant::now() + self.budget;
-        let mut packets = [[0u8; COMMAND_LEN]; 7];
-        for (i, packet) in packets.iter_mut().enumerate() {
-            *packet = encode(i as u8, self.calibration[i].command(setpoints[i]))?;
-        }
         self.receiver.bytes.clear();
         self.port
             .clear(ClearBuffer::Input)
             .map_err(|e| format!("clear stale input: {e}"))?;
-        for packet in &packets {
-            self.write_packet(packet, deadline)?;
-            // The official SDK keeps this gap after every packet, including
-            // the last one, before the adapter turns around to receive.
-            std::thread::sleep(Duration::from_micros(200));
-        }
+        self.write_all(setpoints)?;
+        let deadline = Instant::now() + self.budget;
         let mut feedback: [Option<Feedback>; 7] = std::array::from_fn(|_| None);
         let mut bytes = [0u8; 256];
         loop {
@@ -532,6 +531,47 @@ impl Bus {
                 Err(e) if transient(&e) => std::thread::yield_now(),
                 Err(e) => return Err(format!("serial read after command sent: {e}")),
             }
+        }
+    }
+
+    /// Writes one seven-joint command batch. It never reads feedback and can
+    /// be called from a dedicated I/O thread while another path drains frames.
+    pub fn write_all(&mut self, setpoints: &[Setpoint; 7]) -> Result<(), String> {
+        if self.incomplete_write {
+            return Err("previous command was partially written; reconnect serial port".into());
+        }
+        let deadline = Instant::now() + self.budget;
+        let mut packets = [[0u8; COMMAND_LEN]; 7];
+        for (i, packet) in packets.iter_mut().enumerate() {
+            *packet = encode(i as u8, self.calibration[i].command(setpoints[i]))?;
+        }
+        for packet in &packets {
+            self.write_packet(packet, deadline)?;
+            // The official SDK keeps this gap after every packet, including
+            // the last one, before the adapter turns around to receive.
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        Ok(())
+    }
+
+    /// Reads at most one driver chunk. A read timeout or a partial frame is
+    /// not an error; the persistent receiver keeps partial bytes for later.
+    pub fn read_available(&mut self) -> Result<Vec<Feedback>, String> {
+        let mut bytes = [0u8; 512];
+        match self.port.read(&mut bytes) {
+            Ok(0) => Err("serial read returned zero (device closed)".into()),
+            Ok(n) => {
+                let frames = self.receiver.feed(&bytes[..n], &mut self.stats);
+                Ok(frames
+                    .into_iter()
+                    .filter_map(|frame| {
+                        let id = frame.id as usize;
+                        (id < 7).then(|| self.calibration[id].feedback(frame))
+                    })
+                    .collect())
+            }
+            Err(e) if transient(&e) => Ok(Vec::new()),
+            Err(e) => Err(format!("serial read: {e}")),
         }
     }
 
@@ -581,6 +621,216 @@ impl Bus {
             .set_timeout(remaining.min(IO_SLICE))
             .map(|()| true)
             .map_err(|e| format!("set serial I/O timeout: {e}"))
+    }
+}
+
+enum BusEvent {
+    Feedback(Feedback, Instant),
+    Error(String),
+}
+
+enum BusCommand {
+    Disable(Sender<Result<(), String>>),
+    Write(Box<[Setpoint; 7]>, Sender<Result<(), String>>),
+}
+
+fn stopped_setpoints() -> [Setpoint; 7] {
+    std::array::from_fn(|_| Setpoint {
+        mode: DriveMode::Disabled,
+        q: 0.0,
+        dq: 0.0,
+        tau: 0.0,
+        kp: 0.0,
+        kd: 0.0,
+    })
+}
+
+/// Owns the serial bus on a dedicated thread. The control loop only publishes
+/// the latest setpoints and drains timestamped feedback, so a slow feedback
+/// frame cannot lengthen the command cycle.
+pub struct BusHandle {
+    setpoints: watch::Sender<[Setpoint; 7]>,
+    command: Sender<BusCommand>,
+    events: EventReceiver<BusEvent>,
+    stats: Arc<Mutex<BusStats>>,
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+    reader: Option<JoinHandle<()>>,
+}
+
+impl BusHandle {
+    pub fn open(port: &str, side: &str, baud: u32, timeout: Duration) -> Result<Self, String> {
+        Self::start(Bus::open(port, side, baud, timeout)?)
+    }
+
+    fn start(mut bus: Bus) -> Result<Self, String> {
+        let reader_port = bus
+            .port
+            .try_clone()
+            .map_err(|error| format!("clone serial reader: {error}"))?;
+        let mut reader = Bus {
+            port: reader_port,
+            calibration: bus.calibration,
+            receiver: Receiver::default(),
+            budget: bus.budget,
+            stats: BusStats::default(),
+            incomplete_write: false,
+        };
+        let (setpoint_tx, mut setpoint_rx) = watch::channel(stopped_setpoints());
+        let (command_tx, command_rx) = bounded::<BusCommand>(1);
+        let (event_tx, event_rx) = unbounded();
+        let writer_events = event_tx.clone();
+        let stats = Arc::new(Mutex::new(BusStats::default()));
+        let handle_stats = stats.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let reader_stats = stats.clone();
+        let writer_stats = stats;
+        let join = thread::Builder::new()
+            .name("arm-serial-tx".into())
+            .spawn(move || {
+                let mut last = *setpoint_rx.borrow_and_update();
+                let mut last_write = Instant::now() - WRITE_PERIOD;
+                let mut disabled = false;
+                loop {
+                    if worker_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if let Ok(command) = command_rx.try_recv() {
+                        match command {
+                            BusCommand::Disable(reply) => {
+                                let result = bus.write_all(&stopped_setpoints());
+                                let _ = reply.send(result);
+                                disabled = true;
+                            }
+                            BusCommand::Write(setpoints, reply) => {
+                                let result = bus.write_all(&setpoints);
+                                if result.is_ok() {
+                                    last = *setpoints;
+                                    last_write = Instant::now();
+                                }
+                                let _ = reply.send(result);
+                            }
+                        }
+                    }
+                    if !disabled {
+                        if setpoint_rx.has_changed().unwrap_or(false) {
+                            last = *setpoint_rx.borrow_and_update();
+                            last_write = Instant::now() - WRITE_PERIOD;
+                        }
+                        if last_write.elapsed() >= WRITE_PERIOD {
+                            if let Err(error) = bus.write_all(&last) {
+                                let _ = writer_events.send(BusEvent::Error(error));
+                                break;
+                            }
+                            last_write = Instant::now();
+                        }
+                    }
+                    if let Ok(mut shared) = writer_stats.lock() {
+                        shared.timeouts = bus.stats().timeouts;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            })
+            .map_err(|error| format!("spawn serial I/O thread: {error}"))?;
+        let reader_stop = stop.clone();
+        let reader = match thread::Builder::new()
+            .name("arm-serial-rx".into())
+            .spawn(move || {
+                loop {
+                    if reader_stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    match reader.read_available() {
+                        Ok(frames) => {
+                            for frame in frames {
+                                let _ = event_tx.send(BusEvent::Feedback(frame, Instant::now()));
+                            }
+                        }
+                        Err(error) => {
+                            let _ = event_tx.send(BusEvent::Error(error));
+                            break;
+                        }
+                    }
+                    if let Ok(mut shared) = reader_stats.lock() {
+                        shared.received = reader.stats.received;
+                        shared.crc_errors = reader.stats.crc_errors;
+                    }
+                }
+            }) {
+            Ok(reader) => reader,
+            Err(error) => {
+                stop.store(true, Ordering::Release);
+                let _ = join.join();
+                return Err(format!("spawn serial I/O thread: {error}"));
+            }
+        };
+        Ok(Self {
+            setpoints: setpoint_tx,
+            command: command_tx,
+            events: event_rx,
+            stats: handle_stats,
+            stop,
+            join: Some(join),
+            reader: Some(reader),
+        })
+    }
+
+    pub fn send(&self, setpoints: [Setpoint; 7]) -> Result<(), String> {
+        self.setpoints
+            .send(setpoints)
+            .map_err(|_| "serial I/O thread is closed".into())
+    }
+
+    pub fn drain(&self) -> (Vec<(Feedback, Instant)>, Option<String>) {
+        let mut feedback = Vec::new();
+        let mut error = None;
+        for event in self.events.try_iter() {
+            match event {
+                BusEvent::Feedback(value, at) => feedback.push((value, at)),
+                BusEvent::Error(message) => error = Some(message),
+            }
+        }
+        (feedback, error)
+    }
+
+    pub fn disable(&self) -> Result<(), String> {
+        let (reply, result) = bounded(1);
+        self.command
+            .send_timeout(BusCommand::Disable(reply), Duration::from_millis(100))
+            .map_err(|error| format!("serial I/O command queue: {error}"))?;
+        result
+            .recv_timeout(Duration::from_millis(500))
+            .map_err(|error| format!("serial disable acknowledgement: {error}"))?
+    }
+
+    pub fn write_blocking(&self, setpoints: [Setpoint; 7]) -> Result<(), String> {
+        let (reply, result) = bounded(1);
+        self.command
+            .send_timeout(
+                BusCommand::Write(Box::new(setpoints), reply),
+                Duration::from_millis(100),
+            )
+            .map_err(|error| format!("serial I/O command queue: {error}"))?;
+        result
+            .recv_timeout(Duration::from_millis(500))
+            .map_err(|error| format!("serial write acknowledgement: {error}"))?
+    }
+
+    pub fn stats(&self) -> BusStats {
+        self.stats.lock().map(|value| *value).unwrap_or_default()
+    }
+}
+
+impl Drop for BusHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
     }
 }
 
@@ -938,7 +1188,7 @@ mod tests {
     }
 
     // Unused native-port operations deliberately panic, so an accidental modem
-    // signal change, clone, or unrelated I/O cannot be hidden by this test port.
+    // signal change or unrelated I/O cannot be hidden by this test port.
     impl SerialPort for FakePort {
         fn name(&self) -> Option<String> {
             None
@@ -1013,7 +1263,10 @@ mod tests {
             Ok(())
         }
         fn try_clone(&self) -> serialport::Result<Box<dyn SerialPort>> {
-            unimplemented!()
+            Ok(Box::new(FakePort {
+                wire: self.wire.clone(),
+                timeout: self.timeout,
+            }))
         }
         fn set_break(&self) -> serialport::Result<()> {
             unimplemented!()
@@ -1100,6 +1353,50 @@ mod tests {
         assert_eq!(bus.stats().received, 7);
         assert_eq!(bus.stats().timeouts, 0);
         assert_eq!(wire.lock().unwrap().clears, 1);
+    }
+
+    #[test]
+    fn async_bus_writes_and_drains_timestamped_feedback_without_control_thread_blocking() {
+        let g = golden();
+        let base = unhex(g["feedback"][0]["packet"].as_str().unwrap());
+        let frames: VecDeque<Vec<u8>> = (0..7).map(|id| feedback_for_id(&base, id)).collect();
+        let (bus, wire) = fake_bus(Wire {
+            write_chunk: COMMAND_LEN,
+            after_tx: frames,
+            ..Wire::default()
+        });
+        let handle = BusHandle::start(bus).unwrap();
+        handle
+            .send(
+                [Setpoint {
+                    mode: DriveMode::Servo,
+                    q: 0.1,
+                    dq: 0.0,
+                    tau: 0.0,
+                    kp: 60.0,
+                    kd: 1.0,
+                }; 7],
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut received = Vec::new();
+        while received.len() < 7 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+            let (events, error) = handle.drain();
+            assert!(error.is_none());
+            received.extend(events);
+        }
+        assert!(received.len() >= 7);
+        for (id, (value, at)) in received.iter().enumerate() {
+            if id == 7 {
+                break;
+            }
+            assert_eq!(value.id as usize, id);
+            assert!(at.elapsed() < Duration::from_secs(1));
+        }
+        assert!(wire.lock().unwrap().written.len() >= 7 * COMMAND_LEN);
+        handle.disable().unwrap();
+        assert!(wire.lock().unwrap().written.len() >= 14 * COMMAND_LEN);
     }
 
     #[test]

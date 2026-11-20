@@ -50,11 +50,15 @@ fn session_info(
 fn host_stop(
     window: tauri::WebviewWindow,
     state: tauri::State<'_, RuntimeState>,
+    reason: String,
 ) -> Result<(), String> {
     if window.label() != "main" {
         return Err("无权访问此入口".into());
     }
-    state.0.arm.host_stop();
+    if reason.is_empty() || reason.len() > 80 {
+        return Err("停止原因无效".into());
+    }
+    state.0.arm.host_stop(reason);
     Ok(())
 }
 

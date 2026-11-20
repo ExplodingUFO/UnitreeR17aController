@@ -99,15 +99,15 @@ export default function App() {
   useEffect(() => {
     if (!port && view.ports.length) setPort(view.ports[0].name);
   }, [port, view.ports]);
-  const cancel = () => {
+  const cancel = (reason = "unspecified") => {
     pointer.current = null;
     setPressed(null);
-    void api.cancelJog().catch((e) => api.fail(e));
+    void api.cancelJog(reason).catch((e) => api.fail(e));
   };
   useEffect(() => {
-    const release = () => cancel();
+    const release = (event: Event) => cancel(`window_${event.type}`);
     const visibility = () => {
-      if (document.hidden) release();
+      if (document.hidden) cancel("document_hidden");
     };
     window.addEventListener("pointerup", release);
     window.addEventListener("pointercancel", release);
@@ -196,7 +196,7 @@ export default function App() {
           : "等待反馈";
   useEffect(() => {
     if (!valid || !view.hasControl) {
-      cancel();
+      cancel(!valid ? "feedback_invalid" : "control_lost");
     }
   }, [valid, view.hasControl]);
   const hasOwner = !!s.owner && view.online;
@@ -230,7 +230,7 @@ export default function App() {
     if (connected) setSide(s.side);
   }, [connected, s.side]);
   useEffect(() => {
-    cancel();
+    cancel("generation_changed");
   }, [s.generation]);
   const modelSide = connected ? s.side : side;
   const source =
@@ -286,17 +286,18 @@ export default function App() {
       }
     });
   const stop = () => {
-    cancel();
+    pointer.current = null;
+    setPressed(null);
     setMotionPending(null);
     stepGate.current = false;
-    void api.hostStop().catch((e) => api.fail(e));
+    void api.hostStop("stop_button").catch((e) => api.fail(e));
   };
   const changeControls = (fn: () => void) => {
-    cancel();
+    cancel("controls_changed");
     fn();
   };
   const navigate = (next: Page) => {
-    cancel();
+    cancel("navigation");
     setTcpOpen(false);
     setInterfaceOpen(false);
     setPage(next);
@@ -304,7 +305,7 @@ export default function App() {
   };
   useEffect(() => {
     const changed = () => {
-      cancel();
+      cancel("hashchange");
       setTcpOpen(false);
       setInterfaceOpen(false);
       setPage(currentPage());
@@ -759,9 +760,9 @@ export default function App() {
                     onPointerDown={(event) =>
                       startMotion(event, axis, direction)
                     }
-                    onPointerUp={cancel}
-                    onPointerCancel={cancel}
-                    onLostPointerCapture={cancel}
+                    onPointerUp={() => cancel("pointerup")}
+                    onPointerCancel={() => cancel("pointercancel")}
+                    onLostPointerCapture={() => cancel("lost_pointer_capture")}
                     onKeyDown={(event) => {
                       if (event.key !== " " && event.key !== "Enter") return;
                       event.preventDefault();
@@ -778,9 +779,9 @@ export default function App() {
                     onKeyUp={(event) => {
                       if (event.key !== " " && event.key !== "Enter") return;
                       event.preventDefault();
-                      cancel();
+                      cancel("key_up");
                     }}
-                    onBlur={cancel}
+                    onBlur={() => cancel("button_blur")}
                     onContextMenu={(e) => e.preventDefault()}
                   >
                     {direction < 0 ? "−" : "+"}
@@ -962,7 +963,7 @@ export default function App() {
             className="interface-button"
             disabled={!view.baseUrl}
             onClick={() => {
-              cancel();
+              cancel("interface_dialog");
               setTcpOpen(false);
               setInterfaceOpen(true);
             }}

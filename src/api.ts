@@ -354,7 +354,8 @@ class DesktopApi {
       this.clearJog();
       this.dropLease();
       this.publish({ online: false });
-      if (active) void this.hostStop().catch((e) => this.fail(e));
+      if (active)
+        void this.hostStop("websocket_closed").catch((e) => this.fail(e));
       if (!this.stopped)
         this.reconnectTimer = setTimeout(() => this.openSocket(), 1500);
     };
@@ -389,7 +390,7 @@ class DesktopApi {
     if (action === "release") {
       this.leaseEpoch++;
       if (this.renewTimer) clearTimeout(this.renewTimer);
-      await this.cancelJog();
+      await this.cancelJog("release_control");
     }
     const epoch = this.leaseEpoch;
     const data = await this.request<ControlReply>("/v1/control", {
@@ -423,7 +424,7 @@ class DesktopApi {
     } catch (e) {
       if (epoch === this.leaseEpoch) {
         this.dropLease();
-        await this.cancelJog().catch(() => {});
+        await this.cancelJog("renew_failed").catch(() => {});
         this.fail(e);
       }
     } finally {
@@ -473,7 +474,7 @@ class DesktopApi {
             Math.max(0, performance.now() - this.view.receivedAt) >
             FEEDBACK_MAX_AGE_MS
         ) {
-          void this.cancelJog().catch((e) => this.fail(e));
+          void this.cancelJog("feedback_stale").catch((e) => this.fail(e));
           return;
         }
         jog.updating = true;
@@ -486,7 +487,7 @@ class DesktopApi {
           .catch((e) => {
             if (this.jog === jog) {
               this.fail(e);
-              void this.cancelJog().catch((e) => this.fail(e));
+              void this.cancelJog("update_failed").catch((e) => this.fail(e));
             }
           })
           .finally(() => {
@@ -496,7 +497,7 @@ class DesktopApi {
     } catch (e) {
       if (this.jog !== jog) return;
       this.clearJog();
-      void this.hostStop().catch((e) => this.fail(e));
+      void this.hostStop("start_failed").catch((e) => this.fail(e));
       throw e;
     }
   }
@@ -504,14 +505,14 @@ class DesktopApi {
     if (this.jog?.timer) clearInterval(this.jog.timer);
     this.jog = null;
   }
-  async cancelJog() {
+  async cancelJog(reason = "unspecified") {
     if (!this.jog) return;
     this.clearJog();
-    await this.hostStop();
+    await this.hostStop(reason);
   }
-  async hostStop() {
+  async hostStop(reason = "unspecified") {
     this.clearJog();
-    await invoke("host_stop");
+    await invoke("host_stop", { reason });
   }
 }
 export const api = new DesktopApi();
