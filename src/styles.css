@@ -206,7 +206,6 @@ pre {
   overflow: hidden;
 }
 .workbench[data-page="api"],
-.workbench[data-page="tuning"],
 .workbench[data-page="logs"] {
   grid-template-rows: 52px minmax(0, 1fr) auto;
 }
@@ -576,6 +575,15 @@ pre {
 .jog-panel {
   display: flex;
   flex-direction: column;
+}
+.jog-heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.jog-heading-actions > button {
+  flex-shrink: 0;
 }
 .jog-frame {
   width: 102px;
@@ -1025,13 +1033,35 @@ pre {
   min-height: 0;
   margin-top: 8px;
 }
+.servo-backdrop {
+  grid-template-columns: minmax(0, 1fr);
+  background: color-mix(in srgb, var(--color-overlay) 60%, transparent);
+}
 .servo-panel {
   display: flex;
   flex-direction: column;
-  height: 100%;
+  width: 840px;
+  max-width: 100%;
+  max-height: calc(100dvh - 32px);
 }
 .servo-toolbar {
-  gap: 12px;
+  flex-shrink: 0;
+  gap: 10px;
+  min-height: 48px;
+  padding: 8px 12px;
+}
+.servo-toolbar h2 {
+  white-space: nowrap;
+}
+.servo-toolbar .servo-close {
+  flex-shrink: 0;
+  width: 28px;
+  min-height: 28px;
+  padding: 0;
+  font-size: 20px;
+  color: var(--color-muted);
+  border-color: transparent;
+  background: transparent;
 }
 .servo-context,
 .servo-draft-state {
@@ -1079,7 +1109,7 @@ pre {
   flex: 1;
   min-height: 0;
   overflow: auto;
-  padding: 16px;
+  padding: 12px;
 }
 .servo-table-wrap,
 .servo-json {
@@ -1147,6 +1177,7 @@ pre {
 }
 .servo-actions {
   display: flex;
+  flex-shrink: 0;
   align-items: center;
   gap: 8px;
   padding: 8px 12px;
@@ -1810,7 +1841,6 @@ summary:focus-visible {
       );
   }
   .workbench[data-page="api"],
-  .workbench[data-page="tuning"],
   .workbench[data-page="logs"] {
     grid-template-rows: 48px minmax(0, 1fr) auto;
   }
@@ -1848,7 +1878,6 @@ summary:focus-visible {
 @media (max-width: 760px) {
   .workbench,
   .workbench[data-page="api"],
-  .workbench[data-page="tuning"],
   .workbench[data-page="logs"] {
     padding-inline: 4px;
     grid-template-rows: auto minmax(0, 1fr) auto;
@@ -2013,7 +2042,6 @@ summary:focus-visible {
       );
   }
   .workbench[data-page="api"],
-  .workbench[data-page="tuning"],
   .workbench[data-page="logs"] {
     grid-template-rows: 44px minmax(0, 1fr) auto;
   }

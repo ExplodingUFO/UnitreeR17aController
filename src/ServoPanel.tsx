@@ -106,9 +106,15 @@ function readDraft(draft: Draft): ServoTuning | null {
 export default function ServoPanel({
   view,
   blocked,
+  open,
+  onClose,
+  onStop,
 }: {
   view: View;
   blocked: boolean;
+  open: boolean;
+  onClose: () => void;
+  onStop: () => void;
 }) {
   const s = view.snapshot;
   const applied = s.servo_tuning ?? createServoTuning();
@@ -125,6 +131,8 @@ export default function ServoPanel({
   const [copyFeedback, setCopyFeedback] = useState("");
   const [copyText, setCopyText] = useState("");
   const copyInput = useRef<HTMLTextAreaElement>(null);
+  const dialog = useRef<HTMLElement>(null);
+  const lastField = useRef<HTMLInputElement>(null);
   const applying = useRef<AbortController | null>(null);
   const alive = useRef(true);
   const config = readDraft(draft);
@@ -154,10 +162,22 @@ export default function ServoPanel({
     };
   }, []);
   useEffect(() => {
-    if (!copyText) return;
+    if (!open) return;
+    const previous = document.activeElement;
+    const field = lastField.current?.isConnected
+      ? lastField.current
+      : dialog.current?.querySelector<HTMLInputElement>('input[type="number"]');
+    (field ?? dialog.current)?.focus();
+    return () => {
+      if (previous instanceof HTMLElement && previous.isConnected)
+        previous.focus();
+    };
+  }, [open]);
+  useEffect(() => {
+    if (!open || !copyText) return;
     copyInput.current?.focus();
     copyInput.current?.select();
-  }, [copyText]);
+  }, [open, copyText]);
 
   const invalid = draft.joints.flatMap((joint, index) =>
     fields.flatMap((field) => {
@@ -251,156 +271,213 @@ export default function ServoPanel({
   }
 
   return (
-    <div className="panel servo-panel">
-      <div className="secondary-toolbar servo-toolbar">
-        <h2>伺服参数</h2>
-        <span className="servo-context">
-          本次连接 · r{s.servo_tuning_revision ?? 0}
-        </span>
-        <span
-          className="servo-draft-state"
-          data-dirty={dirty}
-          role="status"
-          aria-live="polite"
-        >
-          {status}
-        </span>
-        <label className="servo-friction">
-          <input
-            type="checkbox"
-            role="switch"
-            checked={draft.friction_enabled}
-            onChange={(event) => {
-              edited();
-              setDraft((current) => ({
-                ...current,
-                friction_enabled: event.target.checked,
-              }));
-            }}
-          />
-          摩擦补偿
-        </label>
-      </div>
-      <div className="servo-body">
-        <div className="servo-table-wrap">
-          <table className="servo-table" aria-label="七轴伺服参数草稿">
-            <thead>
-              <tr>
-                <th scope="col">轴</th>
-                {fields.map(({ key, label, unit, title }) => (
-                  <th key={key} scope="col" title={title}>
-                    {label}
-                    <small>{unit}</small>
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {draft.joints.map((joint, index) => (
-                <tr key={index}>
-                  <th scope="row">J{index + 1}</th>
-                  {fields.map(({ key, label, unit, step }) => {
-                    const [min, max] = SERVO_TUNING_RANGES[key];
-                    const number = Number(joint[key]);
-                    const invalid =
-                      !joint[key].trim() ||
-                      !Number.isFinite(number) ||
-                      number < min ||
-                      number > max;
-                    return (
-                      <td key={key}>
-                        <input
-                          type="number"
-                          aria-label={`J${index + 1} ${label}`}
-                          aria-invalid={invalid}
-                          aria-describedby={
-                            invalid ? "servo-feedback" : undefined
-                          }
-                          title={`${min}–${max} ${unit}；已应用 ${applied.joints[index][key]}`}
-                          min={min}
-                          max={max}
-                          step={step}
-                          value={joint[key]}
-                          data-changed={
-                            invalid || number !== applied.joints[index][key]
-                          }
-                          onChange={(event) => {
-                            const value = event.target.value;
-                            edited();
-                            setDraft((current) => ({
-                              ...current,
-                              joints: current.joints.map((joint, i) =>
-                                i === index
-                                  ? { ...joint, [key]: value }
-                                  : joint,
-                              ),
-                            }));
-                          }}
-                        />
-                      </td>
-                    );
-                  })}
-                </tr>
-              ))}
-            </tbody>
-          </table>
+    <div
+      className="modal-backdrop servo-backdrop"
+      hidden={!open}
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          onStop();
+          onClose();
+        } else if (event.key === "Tab") {
+          const controls = Array.from(
+            dialog.current?.querySelectorAll<HTMLElement>(
+              "button:not(:disabled), input:not(:disabled), textarea:not(:disabled)",
+            ) ?? [],
+          );
+          const first = controls[0];
+          const last = controls[controls.length - 1];
+          if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last?.focus();
+          } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first?.focus();
+          }
+        }
+      }}
+    >
+      <section
+        ref={dialog}
+        id="servo-dialog"
+        className="panel servo-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="servo-title"
+        tabIndex={-1}
+        onFocusCapture={(event) => {
+          if (
+            event.target instanceof HTMLInputElement &&
+            event.target.type === "number"
+          )
+            lastField.current = event.target;
+        }}
+      >
+        <div className="secondary-toolbar servo-toolbar">
+          <h2 id="servo-title">伺服参数</h2>
+          <span className="servo-context">
+            本次连接 · r{s.servo_tuning_revision ?? 0}
+          </span>
+          <span
+            className="servo-draft-state"
+            data-dirty={dirty}
+            role="status"
+            aria-live="polite"
+          >
+            {status}
+          </span>
+          <label className="servo-friction">
+            <input
+              type="checkbox"
+              role="switch"
+              checked={draft.friction_enabled}
+              onChange={(event) => {
+                edited();
+                setDraft((current) => ({
+                  ...current,
+                  friction_enabled: event.target.checked,
+                }));
+              }}
+            />
+            摩擦补偿
+          </label>
+          <button className="stop-button" onClick={onStop}>
+            停止 <kbd>Esc</kbd>
+          </button>
+          <button
+            className="servo-close"
+            aria-label="关闭伺服参数"
+            title="关闭"
+            onClick={onClose}
+          >
+            ×
+          </button>
         </div>
-        {copyText && (
-          <textarea
-            className="servo-json"
-            ref={copyInput}
-            aria-label="参数草稿 JSON，请手动复制"
-            value={copyText}
-            readOnly
-            spellCheck={false}
-            onFocus={(event) => event.currentTarget.select()}
-          />
-        )}
-      </div>
-      <div className="servo-actions">
-        <p
-          id="servo-feedback"
-          className={error || validation ? "danger" : ""}
-          role={error ? "alert" : "status"}
-          title={feedback}
-        >
-          {feedback}
-        </p>
-        <button
-          disabled={!config}
-          title="复制当前草稿参数"
-          onClick={() => void copy()}
-        >
-          复制 JSON
-        </button>
-        <button
-          title="将默认参数填入草稿"
-          onClick={() => {
-            edited();
-            setDraft(toDraft(createServoTuning()));
-          }}
-        >
-          基线
-        </button>
-        <button
-          disabled={!dirty}
-          onClick={() => {
-            edited();
-            setDraft(toDraft(applied));
-          }}
-        >
-          重置草稿
-        </button>
-        <button
-          className="primary"
-          disabled={pending || !config || !dirty || !!applyReason}
-          aria-busy={pending}
-          title={validation || applyReason || "应用于本次连接"}
-          onClick={() => void apply()}
-        >
-          {pending ? "等待确认…" : "应用"}
-        </button>
-      </div>
+        <div className="servo-body">
+          <div className="servo-table-wrap">
+            <table className="servo-table" aria-label="七轴伺服参数草稿">
+              <thead>
+                <tr>
+                  <th scope="col">轴</th>
+                  {fields.map(({ key, label, unit, title }) => (
+                    <th key={key} scope="col" title={title}>
+                      {label}
+                      <small>{unit}</small>
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {draft.joints.map((joint, index) => (
+                  <tr key={index}>
+                    <th scope="row">J{index + 1}</th>
+                    {fields.map(({ key, label, unit, step }) => {
+                      const [min, max] = SERVO_TUNING_RANGES[key];
+                      const number = Number(joint[key]);
+                      const invalid =
+                        !joint[key].trim() ||
+                        !Number.isFinite(number) ||
+                        number < min ||
+                        number > max;
+                      return (
+                        <td key={key}>
+                          <input
+                            type="number"
+                            aria-label={`J${index + 1} ${label}`}
+                            aria-invalid={invalid}
+                            aria-describedby={
+                              invalid ? "servo-feedback" : undefined
+                            }
+                            title={`${min}–${max} ${unit}；已应用 ${applied.joints[index][key]}`}
+                            min={min}
+                            max={max}
+                            step={step}
+                            value={joint[key]}
+                            data-changed={
+                              invalid || number !== applied.joints[index][key]
+                            }
+                            onChange={(event) => {
+                              const value = event.target.value;
+                              edited();
+                              setDraft((current) => ({
+                                ...current,
+                                joints: current.joints.map((joint, i) =>
+                                  i === index
+                                    ? { ...joint, [key]: value }
+                                    : joint,
+                                ),
+                              }));
+                            }}
+                          />
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {copyText && (
+            <textarea
+              className="servo-json"
+              ref={copyInput}
+              aria-label="参数草稿 JSON，请手动复制"
+              value={copyText}
+              readOnly
+              spellCheck={false}
+              onFocus={(event) => event.currentTarget.select()}
+            />
+          )}
+        </div>
+        <div className="servo-actions">
+          <p
+            id="servo-feedback"
+            className={error || validation ? "danger" : ""}
+            role={error ? "alert" : "status"}
+            title={feedback}
+          >
+            {feedback}
+          </p>
+          <button
+            disabled={!config}
+            title="复制当前草稿参数"
+            onClick={() => void copy()}
+          >
+            复制 JSON
+          </button>
+          <button
+            title="将默认参数填入草稿"
+            onClick={() => {
+              edited();
+              setDraft(toDraft(createServoTuning()));
+            }}
+          >
+            基线
+          </button>
+          <button
+            disabled={!dirty}
+            onClick={() => {
+              edited();
+              setDraft(toDraft(applied));
+            }}
+          >
+            重置草稿
+          </button>
+          <button
+            className="primary"
+            disabled={pending || !config || !dirty || !!applyReason}
+            aria-busy={pending}
+            title={validation || applyReason || "应用于本次连接"}
+            onClick={() => void apply()}
+          >
+            {pending ? "等待确认…" : "应用"}
+          </button>
+          <button onClick={onClose}>关闭</button>
+        </div>
+      </section>
     </div>
   );
 }

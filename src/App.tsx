@@ -17,19 +17,16 @@ import {
   type View,
 } from "./api";
 const DEG = 180 / Math.PI;
-type Page = "control" | "tuning" | "api" | "logs";
+type Page = "control" | "api" | "logs";
 type SafetyIntent = "parking" | "disconnect" | "disable" | "exit";
 const pages: { id: Page; label: string }[] = [
   { id: "control", label: "控制" },
-  { id: "tuning", label: "调试" },
   { id: "api", label: "接口" },
   { id: "logs", label: "日志" },
 ];
 const currentPage = (): Page => {
   const page = location.hash.slice(1).split("/")[0];
-  return page === "tuning" || page === "api" || page === "logs"
-    ? page
-    : "control";
+  return page === "api" || page === "logs" ? page : "control";
 };
 const phaseLabels: Record<Phase, string> = {
   disconnected: "未连接",
@@ -89,6 +86,7 @@ export default function App() {
   const [motionPending, setMotionPending] = useState<string | null>(null);
   const pendingGeneration = useRef(0);
   const [tcpOpen, setTcpOpen] = useState(false);
+  const [servoOpen, setServoOpen] = useState(false);
   const [tcpFields, setTcpFields] = useState(["0", "0", "0", "0", "0", "0"]);
   const [interfaceOpen, setInterfaceOpen] = useState(false);
   const [safetyIntent, setSafetyIntent] = useState<SafetyIntent | null>(null);
@@ -334,6 +332,7 @@ export default function App() {
     if (moving) stop();
     cancel("safety_dialog");
     setTcpOpen(false);
+    setServoOpen(false);
     setInterfaceOpen(false);
     setSafetyIntent(intent);
   };
@@ -348,10 +347,17 @@ export default function App() {
     cancel("controls_changed");
     fn();
   };
+  const openServo = () => {
+    cancel("servo_dialog");
+    setTcpOpen(false);
+    setInterfaceOpen(false);
+    setServoOpen(true);
+  };
   const navigate = (next: Page) => {
     cancel("navigation");
     dismissSafety();
     setTcpOpen(false);
+    setServoOpen(false);
     setInterfaceOpen(false);
     setPage(next);
     location.hash = next;
@@ -364,6 +370,7 @@ export default function App() {
         .catch((error) => api.fail(error));
       setSafetyIntent(null);
       setTcpOpen(false);
+      setServoOpen(false);
       setInterfaceOpen(false);
       setPage(currentPage());
     };
@@ -757,16 +764,29 @@ export default function App() {
         <section className="panel jog-panel" id="jog-panel">
           <div className="panel-heading">
             <h2>点动</h2>
-            <select
-              className="jog-frame"
-              aria-label="坐标系"
-              value={frame}
-              disabled={space === "joint" || !!s.action}
-              onChange={(e) => changeControls(() => setFrame(e.target.value))}
-            >
-              <option value="base">基座坐标</option>
-              <option value="tool">工具坐标</option>
-            </select>
+            <div className="jog-heading-actions">
+              <select
+                className="jog-frame"
+                aria-label="坐标系"
+                value={frame}
+                disabled={space === "joint" || !!s.action}
+                onChange={(e) => changeControls(() => setFrame(e.target.value))}
+              >
+                <option value="base">基座坐标</option>
+                <option value="tool">工具坐标</option>
+              </select>
+              <button
+                type="button"
+                aria-label="伺服参数"
+                aria-haspopup="dialog"
+                aria-controls="servo-dialog"
+                aria-expanded={servoOpen}
+                title="伺服参数"
+                onClick={openServo}
+              >
+                参数
+              </button>
+            </div>
           </div>
           <div className="jog-settings">
             <div className="segmented" aria-label="点动空间">
@@ -975,24 +995,6 @@ export default function App() {
       </main>
       <section
         className="secondary-screen"
-        id="tuning-view"
-        role="tabpanel"
-        aria-labelledby="page-tuning"
-        hidden={page !== "tuning"}
-      >
-        <ServoPanel
-          key={
-            view.connectionEpoch ??
-            `${s.side}:${s.port ?? ""}:${["disconnected", "connecting", "closing"].includes(s.phase)}`
-          }
-          view={view}
-          blocked={
-            busy || enableInProgress || !!motionPending || !!safetyIntent
-          }
-        />
-      </section>
-      <section
-        className="secondary-screen"
         id="api-view"
         role="tabpanel"
         aria-labelledby="page-api"
@@ -1161,6 +1163,17 @@ export default function App() {
           </div>
         )}
       </section>
+      <ServoPanel
+        key={
+          view.connectionEpoch ??
+          `${s.side}:${s.port ?? ""}:${["disconnected", "connecting", "closing"].includes(s.phase)}`
+        }
+        view={view}
+        open={servoOpen}
+        blocked={busy || enableInProgress || !!motionPending || !!safetyIntent}
+        onClose={() => setServoOpen(false)}
+        onStop={stop}
+      />
       {tcpOpen && (
         <div
           className="modal-backdrop"
