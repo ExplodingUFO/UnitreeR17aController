@@ -441,7 +441,10 @@ impl Kinematics {
             if !speed.is_finite() {
                 return Err("non-finite candidate TCP velocity".into());
             }
-            if speed > bound {
+            // The Jacobian bounds instantaneous speed; the finite FK step can
+            // be slightly faster due to curvature. Reserve the same headroom
+            // before reaching the cap, rather than only after exceeding it.
+            if speed > 0.0 {
                 alpha_max = alpha_max.min(0.999 * bound / speed);
             }
         }
@@ -648,6 +651,122 @@ mod tests {
 
     fn interior() -> [f64; 7] {
         [0.3, 0.7, 1.1, 0.9, -0.4, 0.2, -0.3]
+    }
+
+    // Offline probes: match arm::advance's 100 Hz configuration, not the
+    // older, more permissive test fixture above. No device/bus is constructed.
+    fn rotation_diagnostic_limits() -> MotionLimits {
+        MotionLimits {
+            joint_velocity: [0.20; 7],
+            joint_acceleration: [0.60; 7],
+            max_reference_error: 0.60,
+            max_joint_step: 0.01,
+            linear_speed: 0.015,
+            angular_speed: 0.15,
+        }
+    }
+
+    #[test]
+    fn rotation_jog_preserves_selected_tcp_and_axis() {
+        let q = [1.5576, -0.0350, 0.0102, -0.0217, 1.6217, 0.0088, 0.1133];
+        let k = Kinematics::load("right").unwrap();
+        for z_offset in [0.0, 0.1] {
+            let tcp = Pose {
+                translation: [0.0, 0.0, z_offset],
+                ..Pose::identity()
+            };
+            for frame in [Frame::Base, Frame::Tool] {
+                for axis in 0..3 {
+                    let mut twist = [0.0; 6];
+                    twist[axis + 3] = 5.0_f64.to_radians();
+                    let mut sample = StepInput {
+                        dt: 0.01,
+                        tcp,
+                        limits: rotation_diagnostic_limits(),
+                        ..input(q, velocity(twist, frame))
+                    };
+                    let start_tcp = k.fk(&q, &tcp).unwrap();
+                    let start_link = k.fk(&q, &Pose::identity()).unwrap();
+                    let desired_axis = if frame == Frame::Base {
+                        Vector3::ith(axis, 1.0)
+                    } else {
+                        to_isometry(&start_tcp).unwrap().rotation * Vector3::ith(axis, 1.0)
+                    };
+                    for tick in 0..200 {
+                        let c = k.step(sample.clone()).unwrap_or_else(|e| {
+                            panic!("offset={z_offset} {frame:?} axis={axis} tick={tick}: {e}")
+                        });
+                        check_bounds(&k, &sample, &c);
+                        sample.reference = c.q;
+                        sample.measured = c.q;
+                        sample.previous_velocity = c.dq;
+                    }
+                    let end_tcp = k.fk(&sample.reference, &tcp).unwrap();
+                    let end_link = k.fk(&sample.reference, &Pose::identity()).unwrap();
+                    let tcp_delta = Twist::from(pose_error(&start_tcp, &end_tcp));
+                    let link_delta = Twist::from(pose_error(&start_link, &end_link));
+                    let angular = tcp_delta.fixed_rows::<3>(3).into_owned();
+                    let axis_error = angular
+                        .normalize()
+                        .dot(&desired_axis)
+                        .clamp(-1.0, 1.0)
+                        .acos()
+                        .to_degrees();
+                    let tcp_drift = tcp_delta.fixed_rows::<3>(0).norm() * 1000.0;
+                    let link_motion = link_delta.fixed_rows::<3>(0).norm() * 1000.0;
+                    // Removing the tool displacement from each TCP pose must
+                    // account for Link7 motion about the fixed selected point.
+                    let start_r = to_isometry(&start_tcp).unwrap().rotation;
+                    let end_r = to_isometry(&end_tcp).unwrap().rotation;
+                    let tool_vector = Vector3::new(0.0, 0.0, z_offset);
+                    let expected_link_delta = start_r * tool_vector - end_r * tool_vector;
+                    assert!((link_delta.fixed_rows::<3>(0) - expected_link_delta).norm() < 0.00005);
+                    assert!(
+                        tcp_drift < 0.05,
+                        "{frame:?} axis={axis}: TCP moved {tcp_drift} mm"
+                    );
+                    assert!(
+                        axis_error < 0.1,
+                        "{frame:?} axis={axis}: wrong rotation axis {axis_error} deg"
+                    );
+                    if z_offset == 0.1 && frame == Frame::Tool && axis < 2 {
+                        assert!(
+                            link_motion > 10.0,
+                            "Link7 must translate to keep offset TCP fixed"
+                        );
+                        assert!(
+                            sample.previous_velocity[..6].iter().any(|v| v.abs() > 0.01),
+                            "compensation must involve more than J7"
+                        );
+                    }
+                    eprintln!(
+                        "rotation-tcp100 offset_m={z_offset} {frame:?} axis={axis} tcp_drift_mm={tcp_drift:.6} link7_motion_mm={link_motion:.6} axis_error_deg={axis_error:.6} angle_rad={:.6} final_dq={:?}",
+                        angular.norm(),
+                        sample.previous_velocity
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rotation_jog_at_maximum_speed_does_not_interrupt() {
+        let k = Kinematics::load("right").unwrap();
+        let q = [1.5576, -0.0350, 0.0102, -0.0217, 1.6217, 0.0088, 0.1133];
+        let mut sample = StepInput {
+            dt: 0.01,
+            limits: rotation_diagnostic_limits(),
+            ..input(q, velocity([0.0, 0.0, 0.0, 0.15, 0.0, 0.0], Frame::Base))
+        };
+        for tick in 0..200 {
+            let candidate = k
+                .step(sample.clone())
+                .unwrap_or_else(|e| panic!("tick={tick}: {e}"));
+            check_bounds(&k, &sample, &candidate);
+            sample.reference = candidate.q;
+            sample.measured = candidate.q;
+            sample.previous_velocity = candidate.dq;
+        }
     }
 
     fn check_bounds(k: &Kinematics, i: &StepInput, c: &StepCandidate) {

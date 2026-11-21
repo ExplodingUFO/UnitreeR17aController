@@ -1242,6 +1242,9 @@ impl Core {
     }
     fn diagnose(&mut self, now: Instant, dt_ms: f64, work_ms: f64) {
         if !self.enabled && self.motion.is_none() {
+            if let Some(bus) = &self.bus {
+                bus.take_transmit_stats();
+            }
             self.diag_at = now;
             self.diag_cycles = 0;
             self.diag_dt_sum = 0.0;
@@ -1280,12 +1283,29 @@ impl Core {
             })
             .max_by(|a, b| a.1.total_cmp(&b.1))
             .unwrap_or((0, 0.0));
-        let (q, dq, tau) = self
+        let (q, dq, tau, voltage) = self
             .feedback
             .get(joint)
             .and_then(Option::as_ref)
-            .map(|sample| (sample.value.q, sample.value.dq, sample.value.tau))
-            .unwrap_or((0.0, 0.0, 0.0));
+            .map(|sample| {
+                (
+                    sample.value.q,
+                    sample.value.dq,
+                    sample.value.tau,
+                    sample.value.voltage,
+                )
+            })
+            .unwrap_or((0.0, 0.0, 0.0, 0.0));
+        let transmit = self
+            .bus
+            .as_ref()
+            .map(|bus| bus.take_transmit_stats())
+            .unwrap_or_default();
+        let gravity = self
+            .model
+            .as_ref()
+            .and_then(|model| model.gravity(&self.reference).ok())
+            .unwrap_or([0.0; 7]);
         let motion = self
             .motion
             .as_ref()
@@ -1303,7 +1323,7 @@ impl Core {
             })
             .unwrap_or_else(|| "-".into());
         let message = format!(
-            "周期 {:.2}/{:.2} ms，控制线程 {:.2}/{:.2} ms，action={motion}，反馈年龄 {age_ms} ms，J{} 参考误差 {:.3} rad，qref={:.3} q={:.3} dq={:.3} tau={:.2}，comm={}/{}/{}",
+            "周期 {:.2}/{:.2} ms，控制线程 {:.2}/{:.2} ms，action={motion}，反馈年龄 {age_ms} ms，J{} 参考误差 {:.3} rad，qref={:.3} q={:.3} dq={:.3} tau={:.2}，comm={}/{}/{}，tx批次={} 间隔均/小/大={:.2}/{:.2}/{:.2} ms 写入最大={:.2} ms，dqcmd={:.4} tauff={:.3} voltage={:.2}",
             self.diag_dt_sum / cycles,
             self.diag_dt_max,
             self.diag_work_sum / cycles,
@@ -1317,6 +1337,14 @@ impl Core {
             self.communication.received,
             self.communication.crc_errors,
             self.communication.timeouts,
+            transmit.batches,
+            transmit.interval_sum_ms / transmit.intervals.max(1) as f64,
+            transmit.interval_min_ms,
+            transmit.interval_max_ms,
+            transmit.write_max_ms,
+            self.velocity[joint],
+            gravity[joint].clamp(-TAU_FF_LIMIT, TAU_FF_LIMIT),
+            voltage,
         );
         self.journal.log("info", "control", "cycle", &message, None);
         self.diag_at = now;

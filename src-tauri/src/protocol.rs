@@ -161,6 +161,38 @@ pub struct BusStats {
     pub crc_errors: u64,
     /// Seven-joint cycles whose shared feedback budget expired.
     pub timeouts: u64,
+    pub transmit: TransmitStats,
+}
+
+/// Host-side batch timing, not USB wire timing or an actuator acknowledgement.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
+pub struct TransmitStats {
+    pub batches: u64,
+    pub intervals: u64,
+    pub interval_sum_ms: f64,
+    pub interval_min_ms: f64,
+    pub interval_max_ms: f64,
+    pub write_max_ms: f64,
+}
+
+impl TransmitStats {
+    fn record(&mut self, previous: Option<Instant>, started: Instant, finished: Instant) {
+        self.batches += 1;
+        self.write_max_ms = self
+            .write_max_ms
+            .max(finished.saturating_duration_since(started).as_secs_f64() * 1000.0);
+        if let Some(previous) = previous {
+            let ms = started.saturating_duration_since(previous).as_secs_f64() * 1000.0;
+            self.interval_min_ms = if self.intervals == 0 {
+                ms
+            } else {
+                self.interval_min_ms.min(ms)
+            };
+            self.intervals += 1;
+            self.interval_sum_ms += ms;
+            self.interval_max_ms = self.interval_max_ms.max(ms);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -690,7 +722,8 @@ impl BusHandle {
             .name("arm-serial-tx".into())
             .spawn(move || {
                 let mut last = *setpoint_rx.borrow_and_update();
-                let mut last_write = Instant::now() - WRITE_PERIOD;
+                let mut next_write = Instant::now();
+                let mut previous_write = None;
                 let mut disabled = false;
                 loop {
                     if worker_stop.load(Ordering::Acquire) {
@@ -704,10 +737,19 @@ impl BusHandle {
                                 disabled = true;
                             }
                             BusCommand::Write(setpoints, reply) => {
+                                let started = Instant::now();
                                 let result = bus.write_all(&setpoints);
                                 if result.is_ok() {
                                     last = *setpoints;
-                                    last_write = Instant::now();
+                                    next_write = started + WRITE_PERIOD;
+                                    if let Ok(mut shared) = writer_stats.lock() {
+                                        shared.transmit.record(
+                                            previous_write,
+                                            started,
+                                            Instant::now(),
+                                        );
+                                    }
+                                    previous_write = Some(started);
                                 }
                                 let _ = reply.send(result);
                             }
@@ -716,14 +758,23 @@ impl BusHandle {
                     if !disabled {
                         if setpoint_rx.has_changed().unwrap_or(false) {
                             last = *setpoint_rx.borrow_and_update();
-                            last_write = Instant::now() - WRITE_PERIOD;
                         }
-                        if last_write.elapsed() >= WRITE_PERIOD {
+                        if Instant::now() >= next_write {
+                            let started = Instant::now();
                             if let Err(error) = bus.write_all(&last) {
                                 let _ = writer_events.send(BusEvent::Error(error));
                                 break;
                             }
-                            last_write = Instant::now();
+                            if let Ok(mut shared) = writer_stats.lock() {
+                                shared
+                                    .transmit
+                                    .record(previous_write, started, Instant::now());
+                            }
+                            previous_write = Some(started);
+                            // A target update changes the next payload, not the clock.
+                            // Count start-to-start, including the seven-packet write;
+                            // after an overrun send the latest target once, never catch up.
+                            next_write = started + WRITE_PERIOD;
                         }
                     }
                     if let Ok(mut shared) = writer_stats.lock() {
@@ -819,6 +870,14 @@ impl BusHandle {
 
     pub fn stats(&self) -> BusStats {
         self.stats.lock().map(|value| *value).unwrap_or_default()
+    }
+
+    /// Reset only the diagnostic window; receive/error counters remain cumulative.
+    pub fn take_transmit_stats(&self) -> TransmitStats {
+        self.stats
+            .lock()
+            .map(|mut stats| std::mem::take(&mut stats.transmit))
+            .unwrap_or_default()
     }
 }
 
@@ -1127,6 +1186,7 @@ mod tests {
     #[derive(Default)]
     struct Wire {
         written: Vec<u8>,
+        command_times: Vec<(u8, Instant)>,
         write_chunk: usize,
         fail_after: Option<usize>,
         fail_kind: Option<io::ErrorKind>,
@@ -1175,6 +1235,9 @@ mod tests {
                 ));
             }
             let n = buf.len().min(w.write_chunk);
+            if w.written.len().is_multiple_of(COMMAND_LEN) && buf.len() == COMMAND_LEN {
+                w.command_times.push((buf[2] & 0x0f, Instant::now()));
+            }
             w.written.extend_from_slice(&buf[..n]);
             if w.written.len().is_multiple_of(COMMAND_LEN) {
                 let staged = std::mem::take(&mut w.after_tx);
@@ -1397,6 +1460,85 @@ mod tests {
         assert!(wire.lock().unwrap().written.len() >= 7 * COMMAND_LEN);
         handle.disable().unwrap();
         assert!(wire.lock().unwrap().written.len() >= 14 * COMMAND_LEN);
+    }
+
+    #[test]
+    fn transmit_timing_records_batch_starts_and_can_reset_its_window() {
+        let at = Instant::now();
+        let mut stats = TransmitStats::default();
+        stats.record(None, at, at + Duration::from_millis(2));
+        stats.record(
+            Some(at),
+            at + Duration::from_millis(10),
+            at + Duration::from_millis(13),
+        );
+        stats.record(
+            Some(at + Duration::from_millis(10)),
+            at + Duration::from_millis(25),
+            at + Duration::from_millis(27),
+        );
+        assert_eq!(stats.batches, 3);
+        assert_eq!(stats.intervals, 2);
+        assert!((stats.interval_sum_ms - 25.0).abs() < 1e-9);
+        assert!((stats.interval_min_ms - 10.0).abs() < 1e-9);
+        assert!((stats.interval_max_ms - 15.0).abs() < 1e-9);
+        assert!((stats.write_max_ms - 3.0).abs() < 1e-9);
+        let finished = std::mem::take(&mut stats);
+        assert_eq!(finished.batches, 3);
+        assert_eq!(stats.batches, 0);
+        stats.record(
+            Some(at + Duration::from_millis(25)),
+            at + Duration::from_millis(35),
+            at + Duration::from_millis(36),
+        );
+        assert!((stats.interval_min_ms - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn serial_target_update_after_heartbeat_preserves_send_period() {
+        let (bus, wire) = fake_bus(Wire {
+            write_chunk: COMMAND_LEN,
+            ..Wire::default()
+        });
+        let handle = BusHandle::start(bus).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        // A producer update just after an entire heartbeat batch is legal.
+        // It must not force a second batch at a fraction of the stated 10ms period.
+        while wire.lock().unwrap().command_times.len() < 14 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        let baseline = wire.lock().unwrap().command_times.len();
+        assert!(baseline >= 14);
+        handle
+            .send(
+                [Setpoint {
+                    mode: DriveMode::Servo,
+                    q: 0.1,
+                    dq: 0.1,
+                    tau: 0.0,
+                    kp: 60.0,
+                    kd: 10.0,
+                }; 7],
+            )
+            .unwrap();
+        while wire.lock().unwrap().command_times.len() < baseline + 7 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        let times = wire.lock().unwrap().command_times.clone();
+        let batches: Vec<_> = times
+            .iter()
+            .filter(|(id, _)| *id == 0)
+            .map(|(_, at)| *at)
+            .collect();
+        let intervals: Vec<_> = batches
+            .windows(2)
+            .map(|pair| pair[1].duration_since(pair[0]).as_secs_f64() * 1000.0)
+            .collect();
+        println!("TX batch intervals (ms): {intervals:?}");
+        assert!(
+            intervals.iter().all(|ms| *ms >= 9.0),
+            "watch updates bypass the 10ms writer cadence: {intervals:?}"
+        );
     }
 
     #[test]
