@@ -2,7 +2,10 @@
 //! 0803d033b530fcfa0e6fa9236de68c2773fc9402, MotorProtocol.cpp / arm_motor_bus.cpp.
 //! One owner, seven-joint command batches. No action retries or cached feedback.
 
-use crate::journal::{Journal, TraceData};
+use crate::{
+    journal::{Journal, TraceData},
+    reference::{Previous, Reference, SampleStatus, Timing},
+};
 use crossbeam_channel::{Receiver as EventReceiver, Sender, bounded, unbounded};
 use serde::{Deserialize, Serialize};
 use serialport::{
@@ -12,7 +15,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -591,7 +594,7 @@ impl Bus {
     fn write_all_recorded(
         &mut self,
         setpoints: &[Setpoint; 7],
-        recording: Option<(&Journal, Instant, u64)>,
+        recording: Option<(&Journal, Instant, u64, Option<Timing>)>,
     ) -> Result<(), String> {
         if self.incomplete_write {
             return Err("previous command was partially written; reconnect serial port".into());
@@ -607,12 +610,13 @@ impl Bus {
             // the last one, before the adapter turns around to receive.
             std::thread::sleep(Duration::from_micros(200));
         }
-        if let Some((journal, started, seq)) = recording {
+        if let Some((journal, started, seq, timing)) = recording {
             sample_transmit(
                 journal,
                 started,
                 setpoints,
                 seq,
+                timing,
                 &packets,
                 &self.calibration,
             );
@@ -693,6 +697,23 @@ impl Bus {
 enum BusEvent {
     Feedback(Feedback, Instant),
     Error(String),
+    ReferenceRejected {
+        generation: u64,
+        epoch: u64,
+        held: [f64; 7],
+        reason: SampleStatus,
+    },
+}
+
+#[derive(Debug)]
+pub enum BusError {
+    Io(String),
+    Reference {
+        generation: u64,
+        epoch: u64,
+        held: [f64; 7],
+        reason: SampleStatus,
+    },
 }
 
 enum BusCommand {
@@ -711,10 +732,147 @@ fn stopped_setpoints() -> [Setpoint; 7] {
     })
 }
 
-#[derive(Clone, Copy)]
+#[cfg(test)]
+pub(crate) fn test_wire_targets(side: &str, q: [f64; 7], dq: [f64; 7]) -> ([f64; 7], [f64; 7]) {
+    let calibration = calibrations(side).unwrap();
+    let values: [[f64; 3]; 7] = std::array::from_fn(|i| {
+        let packet = encode(
+            i as u8,
+            calibration[i].command(Setpoint {
+                mode: DriveMode::Servo,
+                q: q[i],
+                dq: dq[i],
+                tau: 0.0,
+                kp: 60.0,
+                kd: 10.0,
+            }),
+        )
+        .unwrap();
+        calibration[i].feedback_motion(decode_motion(
+            i as u8,
+            i16::from_le_bytes(packet[4..6].try_into().unwrap()),
+            i16::from_le_bytes(packet[6..8].try_into().unwrap()),
+            i32::from_le_bytes(packet[8..12].try_into().unwrap()),
+        ))
+    });
+    (values.map(|v| v[0]), values.map(|v| v[1]))
+}
+
+#[derive(Clone)]
 struct PublishedSetpoints {
     values: [Setpoint; 7],
     seq: u64,
+    reference: Option<Reference>,
+}
+
+struct Prepared {
+    values: [Setpoint; 7],
+    timing: Option<Timing>,
+    rejection: Option<SampleStatus>,
+}
+
+#[derive(Clone, Copy)]
+struct Committed {
+    at: Instant,
+    values: [Setpoint; 7],
+}
+
+/// Latest successfully written servo batch, for idle action handoff only.
+#[derive(Clone, Copy, Debug)]
+pub struct SentReference {
+    pub at: Instant,
+    pub generation: u64,
+    pub epoch: u64,
+    pub q: [f64; 7],
+    pub dq: [f64; 7],
+}
+impl Committed {
+    fn servo(&self) -> Option<Previous> {
+        self.values
+            .iter()
+            .all(|s| s.mode == DriveMode::Servo)
+            .then(|| Previous {
+                at: self.at,
+                q: self.values.map(|s| s.q),
+                dq: self.values.map(|s| s.dq),
+            })
+    }
+}
+
+impl PublishedSetpoints {
+    fn is_current(&self, epoch: &AtomicU64, at: Instant) -> bool {
+        self.values.iter().all(|s| s.mode == DriveMode::Disabled)
+            || self.reference.as_ref().is_none_or(|r| {
+                r.epoch == epoch.load(Ordering::Acquire)
+                    && r.valid_until.is_none_or(|until| at < until)
+            })
+    }
+    fn prepare(
+        &self,
+        at: Instant,
+        committed: Option<Committed>,
+        latched: Option<SampleStatus>,
+    ) -> Result<Prepared, String> {
+        if self.values.iter().all(|s| s.mode != DriveMode::Servo) {
+            return Ok(Prepared {
+                values: self.values,
+                timing: None,
+                rejection: None,
+            });
+        }
+        let Some(reference) = &self.reference else {
+            return Ok(Prepared {
+                values: self.values,
+                timing: None,
+                rejection: None,
+            });
+        };
+        let previous = committed.and_then(|c| c.servo());
+        let sample = if let Some(reason) = latched {
+            Err(reason)
+        } else {
+            reference.sample(at, previous)
+        };
+        match sample {
+            Ok(sample) => {
+                let mut values = self.values;
+                for (i, value) in values.iter_mut().enumerate() {
+                    if value.mode == DriveMode::Servo {
+                        value.q = sample.q[i];
+                        value.dq = sample.dq[i];
+                    }
+                }
+                Ok(Prepared {
+                    values,
+                    timing: Some(sample.timing),
+                    rejection: None,
+                })
+            }
+            Err(reason) => {
+                let committed = committed.filter(|c| c.servo().is_some()).ok_or_else(|| {
+                    format!("send reference {reason:?} before a valid servo target")
+                })?;
+                let values = committed.values.map(|s| Setpoint { dq: 0.0, ..s });
+                Ok(Prepared {
+                    values,
+                    timing: Some(reference.timing(at, reason)),
+                    rejection: Some(reason),
+                })
+            }
+        }
+    }
+}
+
+// Stay on the original deadline grid. Skip missed slots rather than emitting
+// catch-up batches; leave at least half a period between ordinary starts.
+fn next_deadline(scheduled: Instant, started: Instant, finished: Instant) -> Instant {
+    let minimum = finished.max(started + WRITE_PERIOD / 2);
+    if scheduled > minimum {
+        return scheduled;
+    }
+    let slots =
+        minimum.saturating_duration_since(scheduled).as_nanos() / WRITE_PERIOD.as_nanos() + 1;
+    scheduled + WRITE_PERIOD.mul_f64(slots as f64)
 }
 
 fn sample_transmit(
@@ -722,6 +880,7 @@ fn sample_transmit(
     started: Instant,
     values: &[Setpoint; 7],
     seq: u64,
+    timing: Option<Timing>,
     packets: &[[u8; COMMAND_LEN]; 7],
     calibration: &[Calibration; 7],
 ) {
@@ -742,6 +901,7 @@ fn sample_transmit(
         started,
         TraceData::Transmit {
             seq,
+            timing,
             mode: std::array::from_fn(|i| (packets[i][2] >> 4) & 0x07),
             q_ref: std::array::from_fn(|i| values[i].q),
             dq_ref: std::array::from_fn(|i| values[i].dq),
@@ -761,6 +921,7 @@ fn sample_transmit(
 /// frame cannot lengthen the command cycle.
 pub struct BusHandle {
     setpoints: watch::Sender<PublishedSetpoints>,
+    sent: watch::Receiver<Option<SentReference>>,
     command: Sender<BusCommand>,
     events: EventReceiver<BusEvent>,
     stats: Arc<Mutex<BusStats>>,
@@ -776,15 +937,28 @@ impl BusHandle {
         baud: u32,
         timeout: Duration,
         journal: Journal,
+        reference_epoch: Arc<AtomicU64>,
     ) -> Result<Self, String> {
-        Self::start_recorded(Bus::open(port, side, baud, timeout)?, Some(journal))
+        Self::start_with_epoch(
+            Bus::open(port, side, baud, timeout)?,
+            Some(journal),
+            reference_epoch,
+        )
     }
 
     #[cfg(test)]
     fn start(bus: Bus) -> Result<Self, String> {
         Self::start_recorded(bus, None)
     }
-    fn start_recorded(mut bus: Bus, journal: Option<Journal>) -> Result<Self, String> {
+    #[cfg(test)]
+    fn start_recorded(bus: Bus, journal: Option<Journal>) -> Result<Self, String> {
+        Self::start_with_epoch(bus, journal, Arc::new(AtomicU64::new(0)))
+    }
+    fn start_with_epoch(
+        mut bus: Bus,
+        journal: Option<Journal>,
+        reference_epoch: Arc<AtomicU64>,
+    ) -> Result<Self, String> {
         let reader_port = bus
             .port
             .try_clone()
@@ -800,7 +974,9 @@ impl BusHandle {
         let (setpoint_tx, mut setpoint_rx) = watch::channel(PublishedSetpoints {
             values: stopped_setpoints(),
             seq: 0,
+            reference: None,
         });
+        let (sent_tx, sent) = watch::channel(None);
         let (command_tx, command_rx) = bounded::<BusCommand>(1);
         let (event_tx, event_rx) = unbounded();
         let writer_events = event_tx.clone();
@@ -814,9 +990,11 @@ impl BusHandle {
         let join = thread::Builder::new()
             .name("arm-serial-tx".into())
             .spawn(move || {
-                let mut last = *setpoint_rx.borrow_and_update();
+                let mut last = setpoint_rx.borrow_and_update().clone();
                 let mut next_write = Instant::now();
                 let mut previous_write = None;
+                let mut committed: Option<Committed> = None;
+                let mut rejected: Option<(u64, SampleStatus)> = None;
                 let mut disabled = false;
                 loop {
                     if worker_stop.load(Ordering::Acquire) {
@@ -826,25 +1004,44 @@ impl BusHandle {
                         match command {
                             BusCommand::Disable(reply) => {
                                 let started = Instant::now();
+                                let values = stopped_setpoints();
                                 let result = bus.write_all_recorded(
-                                    &stopped_setpoints(),
-                                    writer_journal.as_ref().map(|journal| (journal, started, 0)),
+                                    &values,
+                                    writer_journal
+                                        .as_ref()
+                                        .map(|journal| (journal, started, 0, None)),
                                 );
+                                if result.is_ok() {
+                                    committed = Some(Committed {
+                                        at: started,
+                                        values,
+                                    });
+                                }
+                                sent_tx.send_replace(None);
                                 let _ = reply.send(result);
+                                // Sticky until this bus is closed; cached motion cannot revive it.
                                 disabled = true;
                             }
                             BusCommand::Write(setpoints, reply) => {
                                 let started = Instant::now();
                                 let result = bus.write_all_recorded(
                                     &setpoints,
-                                    writer_journal.as_ref().map(|journal| (journal, started, 0)),
+                                    writer_journal
+                                        .as_ref()
+                                        .map(|journal| (journal, started, 0, None)),
                                 );
                                 if result.is_ok() {
                                     last = PublishedSetpoints {
                                         values: *setpoints,
                                         seq: 0,
+                                        reference: None,
                                     };
-                                    next_write = started + WRITE_PERIOD;
+                                    committed = Some(Committed {
+                                        at: started,
+                                        values: *setpoints,
+                                    });
+                                    rejected = None;
+                                    next_write = next_deadline(next_write, started, Instant::now());
                                     if let Ok(mut shared) = writer_stats.lock() {
                                         shared.transmit.record(
                                             previous_write,
@@ -854,35 +1051,86 @@ impl BusHandle {
                                     }
                                     previous_write = Some(started);
                                 }
+                                sent_tx.send_replace(None);
                                 let _ = reply.send(result);
                             }
                         }
                     }
-                    if !disabled {
+                    if !disabled && Instant::now() >= next_write {
+                        // Select immediately before sampling; updates do not move the deadline.
                         if setpoint_rx.has_changed().unwrap_or(false) {
-                            last = *setpoint_rx.borrow_and_update();
+                            last = setpoint_rx.borrow_and_update().clone();
                         }
-                        if Instant::now() >= next_write {
-                            let started = Instant::now();
-                            if let Err(error) = bus.write_all_recorded(
-                                &last.values,
-                                writer_journal
+                        let started = Instant::now();
+                        if !last.is_current(&reference_epoch, started) {
+                            next_write = next_deadline(next_write, started, started);
+                        } else {
+                            let latched = last.reference.as_ref().and_then(|r| {
+                                rejected
+                                    .filter(|(epoch, _)| *epoch == r.epoch)
+                                    .map(|(_, reason)| reason)
+                            });
+                            let prepared = match last.prepare(started, committed, latched) {
+                                Ok(prepared) => prepared,
+                                Err(error) => {
+                                    sent_tx.send_replace(None);
+                                    let _ = writer_events.send(BusEvent::Error(error));
+                                    break;
+                                }
+                            };
+                            // A stop or priority command can arrive while FK is evaluated.
+                            // Once writing begins, the existing bounded whole-batch rule applies.
+                            let valid = last.is_current(&reference_epoch, Instant::now());
+                            if valid && command_rx.is_empty() {
+                                if let Err(error) = bus.write_all_recorded(
+                                    &prepared.values,
+                                    writer_journal.as_ref().map(|journal| {
+                                        (journal, started, last.seq, prepared.timing)
+                                    }),
+                                ) {
+                                    sent_tx.send_replace(None);
+                                    let _ = writer_events.send(BusEvent::Error(error));
+                                    break;
+                                }
+                                committed = Some(Committed {
+                                    at: started,
+                                    values: prepared.values,
+                                });
+                                let sent_reference = last
+                                    .reference
                                     .as_ref()
-                                    .map(|journal| (journal, started, last.seq)),
-                            ) {
-                                let _ = writer_events.send(BusEvent::Error(error));
-                                break;
+                                    .filter(|_| {
+                                        prepared.values.iter().all(|s| s.mode == DriveMode::Servo)
+                                    })
+                                    .map(|r| SentReference {
+                                        at: started,
+                                        generation: r.generation,
+                                        epoch: r.epoch,
+                                        q: prepared.values.map(|s| s.q),
+                                        dq: prepared.values.map(|s| s.dq),
+                                    });
+                                sent_tx.send_replace(sent_reference);
+                                if let Some(reason) = prepared.rejection
+                                    && let Some(source) = &last.reference
+                                {
+                                    if rejected.is_none_or(|(epoch, _)| epoch != source.epoch) {
+                                        let _ = writer_events.send(BusEvent::ReferenceRejected {
+                                            generation: source.generation,
+                                            epoch: source.epoch,
+                                            held: prepared.values.map(|s| s.q),
+                                            reason,
+                                        });
+                                    }
+                                    rejected = Some((source.epoch, reason));
+                                }
+                                if let Ok(mut shared) = writer_stats.lock() {
+                                    shared
+                                        .transmit
+                                        .record(previous_write, started, Instant::now());
+                                }
+                                previous_write = Some(started);
+                                next_write = next_deadline(next_write, started, Instant::now());
                             }
-                            if let Ok(mut shared) = writer_stats.lock() {
-                                shared
-                                    .transmit
-                                    .record(previous_write, started, Instant::now());
-                            }
-                            previous_write = Some(started);
-                            // A target update changes the next payload, not the clock.
-                            // Count start-to-start, including the seven-packet write;
-                            // after an overrun send the latest target once, never catch up.
-                            next_write = started + WRITE_PERIOD;
                         }
                     }
                     if let Ok(mut shared) = writer_stats.lock() {
@@ -943,6 +1191,7 @@ impl BusHandle {
         };
         Ok(Self {
             setpoints: setpoint_tx,
+            sent,
             command: command_tx,
             events: event_rx,
             stats: handle_stats,
@@ -956,22 +1205,83 @@ impl BusHandle {
     pub fn send(&self, setpoints: [Setpoint; 7]) -> Result<(), String> {
         self.send_with_sequence(setpoints, 0)
     }
+    #[cfg(test)]
     pub fn send_with_sequence(&self, setpoints: [Setpoint; 7], seq: u64) -> Result<(), String> {
         self.setpoints
             .send(PublishedSetpoints {
                 values: setpoints,
                 seq,
+                reference: None,
             })
             .map_err(|_| "serial I/O thread is closed".into())
     }
 
-    pub fn drain(&self) -> (Vec<(Feedback, Instant)>, Option<String>) {
+    pub fn publish(
+        &self,
+        values: [Setpoint; 7],
+        seq: u64,
+        reference: Reference,
+    ) -> Result<(), String> {
+        self.setpoints
+            .send(PublishedSetpoints {
+                values,
+                seq,
+                reference: Some(reference),
+            })
+            .map_err(|_| "serial I/O thread is closed".into())
+    }
+
+    pub fn latest_reference(&self) -> Option<SentReference> {
+        *self.sent.borrow()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_idle_bus() -> (Self, watch::Sender<Option<SentReference>>) {
+        let (setpoints, _) = watch::channel(PublishedSetpoints {
+            values: stopped_setpoints(),
+            seq: 0,
+            reference: None,
+        });
+        let (command, _) = bounded(1);
+        let (_, events) = unbounded();
+        let (sent_tx, sent) = watch::channel(None);
+        (
+            Self {
+                setpoints,
+                sent,
+                command,
+                events,
+                stats: Arc::new(Mutex::new(BusStats::default())),
+                stop: Arc::new(AtomicBool::new(false)),
+                join: None,
+                reader: None,
+            },
+            sent_tx,
+        )
+    }
+
+    pub fn drain(&self) -> (Vec<(Feedback, Instant)>, Option<BusError>) {
         let mut feedback = Vec::new();
         let mut error = None;
         for event in self.events.try_iter() {
             match event {
                 BusEvent::Feedback(value, at) => feedback.push((value, at)),
-                BusEvent::Error(message) => error = Some(message),
+                BusEvent::Error(message) => error = Some(BusError::Io(message)),
+                BusEvent::ReferenceRejected {
+                    generation,
+                    epoch,
+                    held,
+                    reason,
+                } => {
+                    if !matches!(error, Some(BusError::Io(_))) {
+                        error = Some(BusError::Reference {
+                            generation,
+                            epoch,
+                            held,
+                            reason,
+                        });
+                    }
+                }
             }
         }
         (feedback, error)
@@ -1035,6 +1345,211 @@ fn transient(e: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deadline_grid_does_not_accumulate_wakeup_delay_or_catch_up() {
+        let origin = Instant::now();
+        let mut scheduled = origin;
+        for tick in 0..1000 {
+            let started = scheduled + Duration::from_micros(676);
+            scheduled = next_deadline(scheduled, started, started + Duration::from_micros(1856));
+            assert_eq!(scheduled, origin + WRITE_PERIOD * (tick + 1));
+        }
+        let started = scheduled + Duration::from_millis(37);
+        let finished = started + Duration::from_millis(19);
+        let next = next_deadline(scheduled, started, finished);
+        assert!(next > finished);
+        assert!(next >= started + WRITE_PERIOD / 2);
+        assert_eq!(next.duration_since(origin).as_millis() % 10, 0);
+        // An out-of-band clear can finish before an already scheduled slot.
+        // Keep that slot if the ordinary minimum spacing still fits.
+        assert_eq!(
+            next_deadline(
+                origin + WRITE_PERIOD,
+                origin,
+                origin + Duration::from_millis(1)
+            ),
+            origin + WRITE_PERIOD
+        );
+    }
+
+    #[test]
+    fn stopped_epoch_cannot_commit_a_prepared_old_motion() {
+        let now = Instant::now();
+        let epoch = AtomicU64::new(4);
+        let values = [Setpoint {
+            mode: DriveMode::Servo,
+            q: 0.5,
+            dq: 0.02,
+            tau: 0.1,
+            kp: 60.0,
+            kd: 10.0,
+        }; 7];
+        let published = PublishedSetpoints {
+            values,
+            seq: 12,
+            reference: Some(Reference::joint(now, [0.5; 7], [0.02; 7], [0.0; 7], 3, 4)),
+        };
+        assert!(published.is_current(&epoch, now));
+        let prepared = published
+            .prepare(now + Duration::from_millis(10), None, None)
+            .unwrap();
+        assert!(prepared.values[0].q > 0.5);
+        epoch.fetch_add(1, Ordering::AcqRel);
+        assert!(!published.is_current(&epoch, now));
+    }
+
+    #[test]
+    fn prepared_targets_and_timing_are_the_values_sent_for_the_current_time() {
+        let now = Instant::now();
+        let values = [Setpoint {
+            mode: DriveMode::Servo,
+            q: 0.5,
+            dq: 0.05,
+            tau: 0.3,
+            kp: 60.0,
+            kd: 10.0,
+        }; 7];
+        let published = PublishedSetpoints {
+            values,
+            seq: 7,
+            reference: Some(Reference::joint(now, [0.5; 7], [0.05; 7], [0.0; 7], 1, 0)),
+        };
+        let prepared = published
+            .prepare(now + Duration::from_millis(20), None, None)
+            .unwrap();
+        assert_eq!(prepared.values.map(|s| s.q), [0.501; 7]);
+        assert_eq!(prepared.values.map(|s| s.dq), [0.05; 7]);
+        assert_eq!(prepared.values.map(|s| s.tau), [0.3; 7]);
+        let timing = prepared.timing.unwrap();
+        assert_eq!(timing.age_us, Some(20_000));
+        assert_eq!(timing.status, SampleStatus::Aligned);
+        let disabled = PublishedSetpoints {
+            values: stopped_setpoints(),
+            seq: 8,
+            reference: published.reference,
+        };
+        let direct = disabled
+            .prepare(now + Duration::from_secs(1), None, None)
+            .unwrap();
+        assert!(direct.values.iter().all(|s| s.mode == DriveMode::Disabled));
+        assert!(direct.timing.is_none());
+    }
+
+    #[test]
+    fn stale_reference_holds_only_a_successfully_committed_servo_target() {
+        let now = Instant::now();
+        let values = [Setpoint {
+            mode: DriveMode::Servo,
+            q: 0.5,
+            dq: 0.1,
+            tau: 0.2,
+            kp: 60.0,
+            kd: 10.0,
+        }; 7];
+        let published = PublishedSetpoints {
+            values,
+            seq: 9,
+            reference: Some(Reference::joint(now, [0.5; 7], [0.1; 7], [0.0; 7], 1, 0)),
+        };
+        let at = now + Duration::from_millis(60);
+        assert!(published.prepare(at, None, None).is_err());
+        let committed = Committed {
+            at: now + Duration::from_millis(10),
+            values: values.map(|s| Setpoint { q: 0.501, ..s }),
+        };
+        let held = published.prepare(at, Some(committed), None).unwrap();
+        assert_eq!(held.values.map(|s| s.q), [0.501; 7]);
+        assert_eq!(held.values.map(|s| s.dq), [0.0; 7]);
+        assert_eq!(held.timing.unwrap().status, SampleStatus::Stale);
+        let later = published
+            .prepare(
+                at + Duration::from_secs(1),
+                Some(committed),
+                Some(SampleStatus::Stale),
+            )
+            .unwrap();
+        assert_eq!(later.values.map(|s| s.q), [0.501; 7]);
+        // An initial disabled target is not an observed servo position.
+        assert!(
+            published
+                .prepare(
+                    at,
+                    Some(Committed {
+                        at: now,
+                        values: stopped_setpoints()
+                    }),
+                    None
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn timed_bus_skips_canceled_motion_and_disable_cannot_be_revived() {
+        let (bus, wire) = fake_bus(Wire {
+            write_chunk: COMMAND_LEN,
+            ..Wire::default()
+        });
+        let epoch = Arc::new(AtomicU64::new(0));
+        let handle = BusHandle::start_with_epoch(bus, None, epoch.clone()).unwrap();
+        let values = [Setpoint {
+            mode: DriveMode::Servo,
+            q: 0.5,
+            dq: 0.02,
+            tau: 0.1,
+            kp: 60.0,
+            kd: 10.0,
+        }; 7];
+        handle
+            .publish(
+                values,
+                10,
+                Reference::joint(Instant::now(), [0.5; 7], [0.02; 7], [0.0; 7], 1, 0),
+            )
+            .unwrap();
+        let servo_count = || {
+            wire.lock()
+                .unwrap()
+                .written
+                .as_chunks::<COMMAND_LEN>()
+                .0
+                .iter()
+                .filter(|p| (p[2] >> 4) & 7 == 1)
+                .count()
+        };
+        wait_for_protocol(|| servo_count() >= 7);
+        epoch.fetch_add(1, Ordering::AcqRel);
+        // An already-started seven-packet batch may finish. No old snapshot
+        // may start another batch after the bounded in-flight write completes.
+        thread::sleep(MAX_TRANSACTION + WRITE_PERIOD);
+        let canceled_count = wire.lock().unwrap().written.len();
+        thread::sleep(WRITE_PERIOD * 2);
+        assert_eq!(wire.lock().unwrap().written.len(), canceled_count);
+        let before = servo_count();
+        let held = values.map(|s| Setpoint { dq: 0.0, ..s });
+        handle
+            .publish(
+                held,
+                11,
+                Reference::joint(Instant::now(), [0.5; 7], [0.0; 7], [0.0; 7], 2, 1),
+            )
+            .unwrap();
+        wait_for_protocol(|| servo_count() >= before + 7);
+        handle.disable().unwrap();
+        assert!(handle.latest_reference().is_none());
+        let disabled_count = wire.lock().unwrap().written.len();
+        handle
+            .publish(
+                values,
+                12,
+                Reference::joint(Instant::now(), [0.5; 7], [0.02; 7], [0.0; 7], 3, 1),
+            )
+            .unwrap();
+        thread::sleep(WRITE_PERIOD * 2);
+        assert_eq!(wire.lock().unwrap().written.len(), disabled_count);
+        assert!(handle.drain().1.is_none());
+    }
     use serde_json::Value;
     use std::collections::VecDeque;
     use std::io::{Read, Write};
@@ -1665,6 +2180,7 @@ mod tests {
                     kp,
                     kd,
                     write_us,
+                    timing: _,
                 } = sample.data
                 else {
                     unreachable!()
@@ -1816,7 +2332,7 @@ mod tests {
                 // queue-consumption, serialization or SQLite completion time.
                 thread::sleep(Duration::from_millis(20));
             }
-            bus.write_all_recorded(&values, Some((&journal, started, seq as u64)))
+            bus.write_all_recorded(&values, Some((&journal, started, seq as u64, None)))
                 .unwrap();
             sources.push(started);
             values_by_sequence.push(values);
@@ -1831,7 +2347,7 @@ mod tests {
                 kd: 1.0,
             });
             let started = Instant::now();
-            bus.write_all_recorded(&values, Some((&journal, started, (n + 6) as u64)))
+            bus.write_all_recorded(&values, Some((&journal, started, (n + 6) as u64, None)))
                 .unwrap();
             sources.push(started);
             values_by_sequence.push(values);
@@ -1845,7 +2361,7 @@ mod tests {
             kd: 1.0,
         });
         let started = Instant::now();
-        bus.write_all_recorded(&negative, Some((&journal, started, 8)))
+        bus.write_all_recorded(&negative, Some((&journal, started, 8, None)))
             .unwrap();
         sources.push(started);
         values_by_sequence.push(negative);
@@ -1950,19 +2466,25 @@ mod tests {
             ..stop()
         };
         assert!(
-            bus.write_all_recorded(&invalid, Some((&journal, Instant::now(), 81)))
+            bus.write_all_recorded(&invalid, Some((&journal, Instant::now(), 81, None)))
                 .is_err()
         );
         assert!(wire.lock().unwrap().written.is_empty());
         assert!(
-            bus.write_all_recorded(&stopped_setpoints(), Some((&journal, Instant::now(), 82)))
-                .is_err()
+            bus.write_all_recorded(
+                &stopped_setpoints(),
+                Some((&journal, Instant::now(), 82, None))
+            )
+            .is_err()
         );
         assert_eq!(wire.lock().unwrap().written.len(), 5);
         assert!(
-            bus.write_all_recorded(&stopped_setpoints(), Some((&journal, Instant::now(), 83)))
-                .unwrap_err()
-                .contains("reconnect")
+            bus.write_all_recorded(
+                &stopped_setpoints(),
+                Some((&journal, Instant::now(), 83, None))
+            )
+            .unwrap_err()
+            .contains("reconnect")
         );
         assert_eq!(wire.lock().unwrap().written.len(), 5);
         let recording = finish_trace(&journal, &trace.id);

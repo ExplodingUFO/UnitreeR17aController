@@ -2,6 +2,9 @@ mod arm;
 mod journal;
 mod kinematics;
 mod protocol;
+mod reference;
+#[cfg(test)]
+mod send_replay;
 mod server;
 mod trace;
 mod trajectory;

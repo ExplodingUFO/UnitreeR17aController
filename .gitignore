@@ -7,6 +7,7 @@ src-tauri/gen/
 *.sqlite3-wal
 .DS_Store
 .scratch/
+/temp/
 .hallmark/
 .codebase-memory/
 .env

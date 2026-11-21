@@ -1016,7 +1016,7 @@
         "operationId": "readTrace",
         "tags": ["采样"],
         "summary": "读取或下载采样 JSON",
-        "description": "返回 {trace,samples}，序列化与读取在独立阻塞任务中执行。download=true 或 attachment=true 时返回附件头，JSON 结构相同。来源时间不是入库时间；重复发送序号保留，跳号也可能由采样丢弃造成。",
+        "description": "返回 {trace,samples}，序列化与读取在独立阻塞任务中执行。download=true 或 attachment=true 时返回附件头，JSON 结构相同。来源时间不是入库时间；transmit.seq 索引源控制周期，重复序号可有不同对齐目标，跳号也可能由采样丢弃造成。transmit.timing 可为 null，旧文件可缺省。",
         "parameters": [
           {
             "name": "id",
@@ -1114,8 +1114,9 @@
                       "at_us": 1100,
                       "source": "transmit",
                       "seq": 101,
-                      "q_ref": [0.1, 0.2, -0.1, -0.2, 0.1, 0.0, 0.1],
-                      "dq_ref": [0.001, 0, 0, 0, 0, 0, 0],
+                      "timing": { "status": "aligned", "age_us": 100 },
+                      "q_ref": [0.10000010025, 0.2, -0.1, -0.2, 0.1, 0.0, 0.1],
+                      "dq_ref": [0.001005, 0, 0, 0, 0, 0, 0],
                       "tau_ff": [0.1, -0.2, 0.05, 0, 0, 0, 0],
                       "q_wire": [
                         0.0999999, 0.1999999, -0.0999999, -0.1999999, 0.0999999,
@@ -3058,7 +3059,7 @@
             "type": "integer",
             "minimum": 0,
             "maximum": 18446744073709551615,
-            "description": "控制周期序号，用于关联 transmit。"
+            "description": "源控制周期序号，用于关联 transmit；同一源可在多个发送时刻取样，序号不代表对齐后的目标值。"
           },
           "generation": {
             "type": "integer",
@@ -3090,7 +3091,7 @@
             },
             "minItems": 7,
             "maxItems": 7,
-            "description": "J1..J7 的最终积分参考，rad。"
+            "description": "J1..J7 在该控制周期按原有 Euler 积分得到的参考，rad；不是发送时刻对齐后的目标。"
           },
           "dq_ref": {
             "type": "array",
@@ -3099,7 +3100,7 @@
             },
             "minItems": 7,
             "maxItems": 7,
-            "description": "J1..J7 的参考速度，rad/s。"
+            "description": "J1..J7 在该控制周期的参考速度，rad/s；不是发送时刻对齐后的速度。"
           },
           "ddq_ref": {
             "type": "array",
@@ -3241,7 +3242,7 @@
             "type": "integer",
             "minimum": 0,
             "maximum": 18446744073709551615,
-            "description": "主机七轴批次写入开始时间相对采样开始的微秒数。"
+            "description": "主机七轴批次起点相对采样开始的微秒数，也是发送端取样时刻；不是实际 USB 线上 TX 时间。"
           },
           "source": {
             "type": "string",
@@ -3251,7 +3252,34 @@
             "type": "integer",
             "minimum": 0,
             "maximum": 18446744073709551615,
-            "description": "被实际选中发送的 control.seq；重复序号表示重复参考。0 用于初始或直接停止/清错写入。 非零序号也可对应 disabled 心跳，需按每轴 mode 判断是否为有效伺服目标。"
+            "description": "被选中源参考的 control.seq，仍为源索引；重复序号表示同一源再次取样，不表示相同 q_ref 或 q_wire。0 用于初始或直接停止/清错写入。非零序号也可对应 disabled 心跳，需按每轴 mode 判断是否为有效伺服目标。"
+          },
+          "timing": {
+            "type": ["object", "null"],
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": [
+                  "aligned",
+                  "bounded",
+                  "stale",
+                  "future",
+                  "invalid",
+                  "constraint",
+                  "expired"
+                ],
+                "description": "aligned 已按发送时刻取样速度并连续积分位置，含速度/首次零点封顶；bounded 受目标边界限制或保持；stale 源年龄超过 50 ms；future 取样时刻早于源或不晚于上一成功伺服批次；invalid 数值或参数无效；constraint 路径/TCP 速度/参考偏差/相邻成功目标位移或方向检查失败；expired 输入或租约有效期已到。"
+              },
+              "age_us": {
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "maximum": 18446744073709551615,
+                "description": "本批次主机起点相对源参考的年龄，μs；无法计算非负年龄时为 null。新鲜参考满足 0 ≤ age_us ≤ 50000。"
+              }
+            },
+            "required": ["status", "age_us"],
+            "default": null,
+            "description": "发送端取样状态与源年龄。未执行取样的直接写入、disabled/clear 批次为 null；旧文件可以缺少此字段，Rust 通过 #[serde(default)] 按 null 读取。匹配当前上下文的拒绝会结束动作或使能请求，结果为 failed/send_reference，保留原有使能状态；使能确认被拒绝后不能由同次反馈进入 Ready。写前已换代或到期而跳过的批次不生成 transmit 样本。"
           },
           "q_ref": {
             "type": "array",
@@ -3260,7 +3288,7 @@
             },
             "minItems": 7,
             "maxItems": 7,
-            "description": "编码前理想关节位置，rad，J1..J7。"
+            "description": "发送时对齐或回退保持的编码前理想关节位置，rad，J1..J7。有成功伺服历史时按相邻批次实际间隔和平均取样速度连续积分，不随源切换重新锚定；可与同 seq 的 control.q_ref 不同。timing 为 null 的旧文件或未取样批次保留原始理想字段。"
           },
           "dq_ref": {
             "type": "array",
@@ -3269,7 +3297,7 @@
             },
             "minItems": 7,
             "maxItems": 7,
-            "description": "编码前理想关节速度，rad/s，J1..J7。"
+            "description": "发送时对齐后的编码前理想关节速度，rad/s，J1..J7；回退保持时为零，可与同 seq 的 control.dq_ref 不同。timing 为 null 的旧文件或未取样批次保留原始理想字段。"
           },
           "tau_ff": {
             "type": "array",
@@ -3278,7 +3306,7 @@
             },
             "minItems": 7,
             "maxItems": 7,
-            "description": "编码前理想前馈扭矩，Nm，J1..J7。"
+            "description": "该批次编码前前馈扭矩，Nm，J1..J7；发送时间对齐只更新 q/dq，不重新计算源前馈。"
           },
           "q_wire": {
             "type": "array",
@@ -3287,7 +3315,7 @@
             },
             "minItems": 7,
             "maxItems": 7,
-            "description": "从实际报文位置字段解码并按标定转回关节坐标，rad，J1..J7。停机/清错时保留报文字段的反标定结果。"
+            "description": "从实际编码报文的位置字段解码并按标定转回关节坐标，rad，J1..J7；包含校准、f32 转换和量化后的结果，用于与对齐后的 q_ref 比较。停机/清错时保留报文字段的反标定结果。"
           },
           "dq_wire": {
             "type": "array",
@@ -3357,7 +3385,7 @@
           "kd",
           "write_us"
         ],
-        "description": "TraceSample 的一种展开结构；字段均位于样本顶层。"
+        "description": "成功写完整个七轴批次的样本，字段位于顶层。普通批次保持原始 10 ms 网格并跳过错过槽位，主机起点至少相隔 5 ms；新鲜源按 q+dq*age+0.5*ddq*age² 取样，含速度/首次零点封顶、不可变 TCP/路径、全局 TCP 速度、上一成功伺服目标和目标边界复核。写前复查 epoch 与输入/租约有效期；已开始的写入沿用原有 20 ms 整批预算。控制器 Euler 积分与 jerk 限制不变，不保证实际 TX 节拍或物理 jerk，尚未硬件验收。"
       },
       "TraceFeedbackSample": {
         "type": "object",
@@ -3475,8 +3503,9 @@
             "at_us": 1100,
             "source": "transmit",
             "seq": 101,
-            "q_ref": [0.1, 0.2, -0.1, -0.2, 0.1, 0.0, 0.1],
-            "dq_ref": [0.001, 0, 0, 0, 0, 0, 0],
+            "timing": { "status": "aligned", "age_us": 100 },
+            "q_ref": [0.10000010025, 0.2, -0.1, -0.2, 0.1, 0.0, 0.1],
+            "dq_ref": [0.001005, 0, 0, 0, 0, 0, 0],
             "tau_ff": [0.1, -0.2, 0.05, 0, 0, 0, 0],
             "q_wire": [
               0.0999999, 0.1999999, -0.0999999, -0.1999999, 0.0999999, 0.0,
@@ -3516,7 +3545,7 @@
               "$ref": "#/components/schemas/TraceSample"
             },
             "maxItems": 100000,
-            "description": "同一数据库快照内已提交的数据，按 at_us 排序，同一时间保留提交顺序。重复 transmit.seq 保留。"
+            "description": "同一数据库快照内已提交的数据，按 at_us 排序，同一时间保留提交顺序。重复 transmit.seq 保留，各条对齐目标可以不同；旧样本可以缺少 timing。"
           }
         },
         "required": ["trace", "samples"],

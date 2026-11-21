@@ -1,6 +1,7 @@
 //! Short, bounded observation captures. Producers try a preallocated queue's mutex
 //! once and drop on contention or overflow; they never wait for its lock or allocate.
 //! Serialization and disk work run on readers/writer after releasing the queue lock.
+use crate::reference::Timing;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -55,6 +56,9 @@ pub enum TraceData {
     },
     Transmit {
         seq: u64,
+        /// Missing in captures made before send-time sampling was introduced.
+        #[serde(default)]
+        timing: Option<Timing>,
         /// Encoded `(packet[2] >> 4) & 0x07`: 0 disabled, 1 servo, 6 clear.
         mode: [u8; 7],
         q_ref: [f64; 7],
@@ -1054,6 +1058,7 @@ mod tests {
     fn transmit(seq: u64) -> TraceData {
         TraceData::Transmit {
             seq,
+            timing: None,
             mode: [1; 7],
             q_ref: [0.1; 7],
             dq_ref: [0.2; 7],

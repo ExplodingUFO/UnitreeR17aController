@@ -4,7 +4,8 @@ use crate::{
         self, CartesianPath, Frame, Kinematics, LocalTarget, MotionLimits, Pose, SmoothingState,
         StepInput,
     },
-    protocol::{BusHandle, DriveMode, Feedback, Setpoint},
+    protocol::{BusError, BusHandle, DriveMode, Feedback, Setpoint},
+    reference::{CartesianGuard, MAX_REFERENCE_AGE, Reference},
     trajectory::{self, JOINT_ACCELERATION, JOINT_JERK, JOINT_SPEED},
 };
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
@@ -248,6 +249,7 @@ pub struct ArmHandle {
     latest: Sender<Work>,
     latest_rx: Receiver<Work>,
     host_epoch: Arc<AtomicU64>,
+    reference_epoch: Arc<AtomicU64>,
     stop_reason: Arc<Mutex<Option<String>>>,
     shutdown: Arc<AtomicBool>,
     finished: Receiver<()>,
@@ -257,6 +259,7 @@ pub struct ArmHandle {
 impl ArmHandle {
     pub fn spawn(journal: Journal) -> Result<Self, String> {
         let core = Core::new(journal);
+        let reference_epoch = core.reference_epoch.clone();
         let (state_tx, state) = watch::channel(core.snapshot(Instant::now()));
         let (ordinary, ordinary_rx) = bounded(128);
         let (priority, priority_rx) = bounded(32);
@@ -291,6 +294,7 @@ impl ArmHandle {
             latest,
             latest_rx,
             host_epoch,
+            reference_epoch,
             stop_reason,
             shutdown,
             finished,
@@ -307,6 +311,7 @@ impl ArmHandle {
         self.shutdown.load(Ordering::Acquire)
     }
     pub fn host_stop(&self, reason: impl Into<String>) {
+        self.reference_epoch.fetch_add(1, Ordering::AcqRel);
         if let Ok(mut current) = self.stop_reason.lock() {
             *current = Some(reason.into());
         }
@@ -434,7 +439,9 @@ struct Motion {
 }
 struct Core {
     journal: Journal,
-    model: Option<Kinematics>,
+    model: Option<Arc<Kinematics>>,
+    reference_epoch: Arc<AtomicU64>,
+    reference_version: u64,
     side: String,
     port: Option<String>,
     bus: Option<BusHandle>,
@@ -481,7 +488,9 @@ impl Core {
             .map(|e| ApiError::new("model_error", e.clone()));
         Self {
             journal,
-            model: loaded.ok(),
+            model: loaded.ok().map(Arc::new),
+            reference_epoch: Arc::new(AtomicU64::new(0)),
+            reference_version: 0,
             side: "right".into(),
             port: None,
             bus: None,
@@ -518,6 +527,16 @@ impl Core {
             diag_work_max: 0.0,
             dirty: true,
         }
+    }
+    fn invalidate_reference(&mut self) {
+        self.reference_version = self
+            .reference_epoch
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+    }
+    fn bump_generation(&mut self) {
+        self.generation += 1;
+        self.invalidate_reference();
     }
     fn record(&mut self, id: &str, status: &str, code: &str, message: impl Into<String>) {
         let result = CommandResult {
@@ -568,10 +587,13 @@ impl Core {
             self.stop_path = Self::motion_path(&motion);
             self.record(&motion.request_id, status, code, message);
         }
-        self.generation += 1;
+        self.bump_generation();
         self.stopping = self.enabled
             && (self.velocity.iter().any(|v| v.abs() > 1e-12)
                 || self.acceleration.iter().any(|a| a.abs() > 1e-12));
+        if !self.stopping {
+            self.stop_path = None;
+        }
         self.phase();
         self.dirty = true;
     }
@@ -584,7 +606,7 @@ impl Core {
         if self.motion.is_some() || self.enable_request.is_some() {
             self.end_motion("failed", code, &message);
         } else if changed {
-            self.generation += 1;
+            self.bump_generation();
         }
         self.enabled = false;
         self.reset_derivatives();
@@ -660,7 +682,7 @@ impl Core {
                     secret: secret.clone(),
                     expires: now + Duration::from_millis(LEASE_MS),
                 });
-                self.generation += 1;
+                self.bump_generation();
                 self.journal
                     .log("info", "control", "acquired", "控制权已取得", None);
                 Some(secret)
@@ -784,6 +806,7 @@ impl Core {
                     6_000_000,
                     Duration::from_millis(20),
                     self.journal.clone(),
+                    self.reference_epoch.clone(),
                 )
                 .map_err(|e| ApiError::new("connect_failed", e))?;
                 if self.side != side || self.tcp.is_none() {
@@ -794,7 +817,7 @@ impl Core {
                         rotation: [0.0, 0.0, 0.0, 1.0],
                     });
                 }
-                self.model = Some(model);
+                self.model = Some(Arc::new(model));
                 self.side = side;
                 self.port = Some(port);
                 self.bus = Some(bus);
@@ -806,7 +829,7 @@ impl Core {
                 self.reset_derivatives();
                 self.connected_at = Some(now);
                 self.phase = Phase::Connecting;
-                self.generation += 1;
+                self.bump_generation();
                 self.journal
                     .log("info", "device", "connected", "串口连接已建立", Some(id));
             }
@@ -836,7 +859,7 @@ impl Core {
                 self.enable_request = Some((id.into(), now));
                 self.stopping = false;
                 self.phase = Phase::Enabling;
-                self.generation += 1;
+                self.bump_generation();
             }
             Operation::Disable { allow_release } => {
                 self.require_release(allow_release)?;
@@ -875,7 +898,7 @@ impl Core {
                 }
                 tcp.rotation.iter_mut().for_each(|q| *q /= norm);
                 self.tcp = Some(tcp);
-                self.generation += 1;
+                self.bump_generation();
             }
             Operation::JogStart {
                 space,
@@ -994,6 +1017,27 @@ impl Core {
         }
         let measured = self.measured(now)?;
         self.check_positions(&measured)?;
+        if let Some(bus) = &self.bus {
+            // A completed controller segment and the last written pose can
+            // differ slightly. Start from the writer's stationary hold rather
+            // than accumulating that residual across subsequent actions.
+            let sent = bus
+                .latest_reference()
+                .filter(|sent| {
+                    sent.generation == self.generation
+                        && sent.epoch == self.reference_version
+                        && sent.epoch == self.reference_epoch.load(Ordering::Acquire)
+                        && now
+                            .checked_duration_since(sent.at)
+                            .is_some_and(|age| age <= MAX_REFERENCE_AGE)
+                        && sent.dq.iter().all(|v| v.abs() < 1e-12)
+                })
+                .ok_or_else(|| ApiError::new("motion_busy", "等待发送目标稳定"))?;
+            if (0..7).any(|i| (sent.q[i] - measured[i]).abs() > MAX_TRACKING_ERROR) {
+                return Err(ApiError::new("following_error", "关节跟随偏差超限"));
+            }
+            return Ok(sent.q);
+        }
         let preserve_reference = self.reference.iter().all(|value| value.is_finite())
             && (0..7).all(|i| (self.reference[i] - measured[i]).abs() <= MAX_TRACKING_ERROR);
         Ok(if preserve_reference {
@@ -1164,6 +1208,7 @@ impl Core {
         Ok(())
     }
     fn reset_derivatives(&mut self) {
+        self.invalidate_reference();
         self.velocity = [0.0; 7];
         self.acceleration = [0.0; 7];
         self.jerk = [0.0; 7];
@@ -1287,7 +1332,7 @@ impl Core {
                 return;
             }
         };
-        if dt > 0.05 || !dt.is_finite() {
+        if dt > MAX_REFERENCE_AGE.as_secs_f64() || !dt.is_finite() {
             self.fault("control_timeout", "控制周期超时");
             return;
         }
@@ -1405,7 +1450,7 @@ impl Core {
                         self.disconnect();
                         self.record(&id, "completed", "parked", "收纳到位，连接已断开");
                     } else {
-                        self.generation += 1;
+                        self.bump_generation();
                         self.stop_path = None;
                         self.record(&id, "completed", "returned", "已返回收纳位");
                         self.phase();
@@ -1414,7 +1459,7 @@ impl Core {
                 }
                 let id = self.motion.take().unwrap().request_id;
                 self.stop_path = None;
-                self.generation += 1;
+                self.bump_generation();
                 self.record(&id, "completed", "completed", "动作已完成");
                 self.phase();
             }
@@ -1486,6 +1531,80 @@ impl Core {
         {
             self.end_motion("failed", "target_timeout", "目标到达超时");
         }
+    }
+    fn outgoing_reference(&self) -> Reference {
+        let mut reference = Reference::joint(
+            self.control_at,
+            self.reference,
+            self.velocity,
+            self.acceleration,
+            self.generation,
+            self.reference_version,
+        );
+        reference.stopping = self.stopping || self.stop_path.is_some();
+        let motion = self.motion.as_ref();
+        if let Some(motion) = motion {
+            reference.valid_until = motion.deadline;
+            if let Some(lease) = &self.lease {
+                reference.valid_until = Some(
+                    reference
+                        .valid_until
+                        .map_or(lease.expires, |until| until.min(lease.expires)),
+                );
+            }
+        }
+        reference.joint_goal = motion
+            .filter(|m| m.space == Space::Joint && m.mode.timed())
+            .map(|m| m.target);
+        if let (Some(model), Some(tcp), Some(path)) = (
+            &self.model,
+            self.tcp,
+            motion.and_then(Self::motion_path).or(self.stop_path),
+        ) {
+            reference.cartesian = Some(CartesianGuard {
+                model: model.clone(),
+                tcp,
+                path,
+                goal: motion.and_then(|m| m.target_pose),
+                linear_speed: LINEAR_SPEED,
+                angular_speed: ANGULAR_SPEED,
+                measured: std::array::from_fn(|i| {
+                    self.feedback[i]
+                        .as_ref()
+                        .map_or(self.reference[i], |s| s.value.q)
+                }),
+                max_reference_error: MAX_TRACKING_ERROR,
+            });
+        }
+        reference
+    }
+    fn reject_send_reference(
+        &mut self,
+        generation: u64,
+        epoch: u64,
+        held: [f64; 7],
+        reason: crate::reference::SampleStatus,
+    ) {
+        // A rejection from an earlier action cannot alter a newer stop/return.
+        if (!self.enabled && self.enable_request.is_none())
+            || self.generation != generation
+            || self.reference_version != epoch
+            || self.reference_epoch.load(Ordering::Acquire) != epoch
+        {
+            return;
+        }
+        self.end_motion("failed", "send_reference", "发送参考无法对齐，动作已停止");
+        self.reference = held;
+        self.reset_derivatives();
+        self.stopping = false;
+        self.phase();
+        self.journal.log(
+            "warn",
+            "control",
+            "send_reference",
+            &format!("发送参考已保持：{reason:?}"),
+            None,
+        );
     }
     fn poll(&mut self, now: Instant) {
         let servo = self.enabled || self.enable_request.is_some();
@@ -1563,7 +1682,7 @@ impl Core {
         } else {
             Ok(())
         };
-        let send_result = bus.send_with_sequence(setpoints, self.control_seq);
+        let send_result = bus.publish(setpoints, self.control_seq, self.outgoing_reference());
         let (values, read_error) = bus.drain();
         let stats = bus.stats();
         if let Err(e) = clear_result {
@@ -1588,8 +1707,16 @@ impl Core {
             }
             self.accept_feedback(value, at);
         }
-        if let Some(e) = read_error {
-            self.fault("communication_error", e);
+        if let Some(error) = read_error {
+            match error {
+                BusError::Io(message) => self.fault("communication_error", message),
+                BusError::Reference {
+                    generation,
+                    epoch,
+                    held,
+                    reason,
+                } => self.reject_send_reference(generation, epoch, held, reason),
+            }
         }
         if self.phase == Phase::Connecting && self.measured(Instant::now()).is_ok() {
             self.phase = Phase::Disabled;
@@ -1995,6 +2122,451 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn late_send_rejection_cannot_cancel_a_new_context_or_pending_host_stop() {
+        let now = Instant::now();
+        let (mut core, _directory) = observed_core(now);
+        core.enabled = true;
+        let idle = core.outgoing_reference();
+        start_joint(&mut core, "new", now, false);
+        let anchor = core.reference;
+        assert_eq!(idle.generation, core.generation);
+        assert_ne!(idle.epoch, core.reference_version);
+        core.reject_send_reference(
+            idle.generation,
+            idle.epoch,
+            [999.0; 7],
+            crate::reference::SampleStatus::Constraint,
+        );
+        assert_eq!(core.reference, anchor);
+        assert_eq!(core.motion.as_ref().unwrap().request_id, "new");
+        let active = core.outgoing_reference();
+        core.reference_epoch.fetch_add(1, Ordering::AcqRel);
+        core.reject_send_reference(
+            active.generation,
+            active.epoch,
+            [999.0; 7],
+            crate::reference::SampleStatus::Stale,
+        );
+        assert_eq!(core.reference, anchor);
+        assert_eq!(core.motion.as_ref().unwrap().request_id, "new");
+    }
+
+    #[test]
+    fn send_rejection_finishes_pending_enable_before_feedback_can_confirm_it() {
+        let now = Instant::now();
+        let (mut core, _directory) = observed_core(now);
+        core.port = Some("memory-only".into());
+        core.enable_request = Some(("enable".into(), now));
+        let source = core.outgoing_reference();
+        let held = core.reference.map(|q| q - 0.02);
+        // poll drains fresh mode=1 feedback before dispatching a writer rejection,
+        // then tries to finish enabling. Reproduce that exact event order.
+        for i in 0..7 {
+            let value = core.feedback[i].as_ref().unwrap().value.clone();
+            core.accept_feedback(value, now + Duration::from_millis(10));
+        }
+        core.reject_send_reference(
+            source.generation,
+            source.epoch,
+            held,
+            crate::reference::SampleStatus::Constraint,
+        );
+        core.settle_transitions(now + Duration::from_millis(10));
+        assert!(core.enable_request.is_none() && !core.enabled);
+        assert!(!matches!(core.phase, Phase::Ready | Phase::Enabling));
+        assert_eq!(core.reference, held);
+        assert_eq!(core.results.front().unwrap().request_id, "enable");
+        assert_eq!(core.results.front().unwrap().status, "failed");
+        assert_eq!(core.results.front().unwrap().code, "send_reference");
+        assert!(core.at_rest() && core.port.is_some());
+    }
+
+    #[test]
+    fn a_rejected_return_holds_the_sent_target_and_never_disconnects_later() {
+        let mut now = Instant::now();
+        let (mut core, _directory) = observed_core(now);
+        core.enabled = true;
+        core.port = Some("memory-only".into());
+        let mut goal = core.reference;
+        goal[1] += 0.1;
+        core.begin_return("return", goal, 0.05, true, now).unwrap();
+        let reference = core.outgoing_reference();
+        let held = core.reference;
+        core.reject_send_reference(
+            reference.generation,
+            reference.epoch,
+            held,
+            crate::reference::SampleStatus::Constraint,
+        );
+        assert!(core.motion.is_none() && !core.stopping && core.enabled);
+        assert!(core.port.is_some());
+        assert_eq!(core.results.front().unwrap().code, "send_reference");
+        for _ in 0..500 {
+            now += Duration::from_millis(10);
+            follow_reference(&mut core, now);
+            core.advance(now, 0.01);
+        }
+        assert!(core.port.is_some() && core.enabled);
+        assert_eq!(core.reference, held);
+        assert!(core.at_rest());
+    }
+
+    #[test]
+    fn sampling_context_keeps_tcp_center_during_stop_and_removes_input_deadline() {
+        let mut now = Instant::now();
+        let (mut core, _directory) = observed_core(now);
+        core.enabled = true;
+        core.tcp = Some(Pose {
+            translation: [0.0, 0.0, 0.1],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+        });
+        let expires = now + Duration::from_millis(150);
+        core.begin(
+            "cartesian",
+            Space::Cartesian,
+            3,
+            1,
+            0.01,
+            Frame::Tool,
+            false,
+            0.0,
+            Some(expires),
+            0,
+            now,
+        )
+        .unwrap();
+        now += Duration::from_millis(10);
+        follow_reference(&mut core, now);
+        core.advance(now, 0.01);
+        assert!(core.error.is_none());
+        let moving = core.outgoing_reference();
+        assert_eq!(moving.valid_until, Some(expires));
+        let path = moving.cartesian.as_ref().unwrap().path;
+        core.end_motion("cancelled", "stopped", "已停止");
+        let stopped = core.outgoing_reference();
+        assert!(stopped.valid_until.is_none());
+        assert!(stopped.joint_goal.is_none());
+        if core.stopping {
+            let guard = stopped.cartesian.as_ref().unwrap();
+            assert_eq!(guard.path.origin, path.origin);
+            assert_eq!(guard.tcp, core.tcp.unwrap());
+            assert!(guard.goal.is_none());
+        }
+    }
+
+    #[test]
+    fn return_settling_and_optional_disconnect_follow_time_sampled_wire_targets() {
+        for disconnect_after in [false, true] {
+            let mut now = Instant::now();
+            let (mut core, _directory) = observed_core(now);
+            core.enabled = true;
+            core.port = Some("memory-only".into());
+            let mut goal = core.reference;
+            for (q, d) in goal
+                .iter_mut()
+                .zip([0.08, -0.04, 0.06, 0.03, -0.02, 0.01, 0.04])
+            {
+                *q += d;
+            }
+            core.begin_return("return", goal, 0.05, disconnect_after, now)
+                .unwrap();
+            let (mut applied_q, mut applied_dq) = (core.reference, [0.0; 7]);
+            let mut previous = None;
+            for _ in 0..1000 {
+                now += Duration::from_millis(10);
+                for i in 0..7 {
+                    let mut feedback = core.feedback[i].as_ref().unwrap().value.clone();
+                    feedback.q = applied_q[i];
+                    feedback.dq = applied_dq[i];
+                    core.accept_feedback(feedback, now);
+                }
+                core.advance(now, 0.01);
+                assert!(core.error.is_none());
+                if core.motion.is_none() {
+                    break;
+                }
+                let at = now + Duration::from_millis(2);
+                let sample = core.outgoing_reference().sample(at, previous).unwrap();
+                (applied_q, applied_dq) =
+                    crate::protocol::test_wire_targets("right", sample.q, sample.dq);
+                previous = Some(crate::reference::Previous {
+                    at,
+                    q: sample.q,
+                    dq: sample.dq,
+                });
+                assert!(core.enabled && core.port.is_some());
+            }
+            assert!(core.motion.is_none());
+            assert_eq!(core.enabled, !disconnect_after);
+            assert_eq!(core.port.is_none(), disconnect_after);
+            assert_eq!(
+                core.results.front().unwrap().code,
+                if disconnect_after {
+                    "parked"
+                } else {
+                    "returned"
+                }
+            );
+            assert!(core.at_rest());
+            assert!((0..7).all(|i| (core.reference[i] - goal[i]).abs() <= 0.01));
+        }
+    }
+
+    #[test]
+    fn repeated_jogs_handoff_the_sent_hold_before_rotating_an_offset_tcp() {
+        use crate::{protocol::SentReference, reference::Previous};
+        let mut now = Instant::now();
+        let (mut core, _directory) = observed_core(now);
+        let q = [0.3, 0.7, 1.1, 0.9, -0.4, 0.2, -0.3];
+        core.reference = q;
+        core.enabled = true;
+        core.port = Some("memory-only".into());
+        core.tcp = Some(Pose {
+            translation: [0.0, 0.0, 0.1],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+        });
+        for (i, value) in q.into_iter().enumerate() {
+            let mut feedback = core.feedback[i].as_ref().unwrap().value.clone();
+            feedback.q = value;
+            core.accept_feedback(feedback, now);
+        }
+        core.advance(now, 0.01);
+        let (bus, sent) = BusHandle::test_idle_bus();
+        core.bus = Some(bus);
+        assert_eq!(core.motion_anchor(now).unwrap_err().code, "motion_busy");
+        sent.send_replace(Some(SentReference {
+            at: now,
+            generation: core.generation,
+            epoch: core.reference_version,
+            q,
+            dq: [0.0; 7],
+        }));
+        let mut previous = Some(Previous {
+            at: now,
+            q,
+            dq: [0.0; 7],
+        });
+        let (mut applied_q, mut applied_dq) = (q, [0.0; 7]);
+        let mut next_send = now + Duration::from_millis(2);
+        for segment in 0..11 {
+            let held = sent.borrow().unwrap();
+            let cartesian = segment == 10;
+            core.begin(
+                "chain",
+                if cartesian {
+                    Space::Cartesian
+                } else {
+                    Space::Joint
+                },
+                if cartesian { 3 } else { 0 },
+                1,
+                if cartesian { 0.02 } else { 0.2 },
+                Frame::Base,
+                false,
+                0.0,
+                None,
+                0,
+                now,
+            )
+            .unwrap();
+            assert_eq!(core.motion.as_ref().unwrap().initial, held.q);
+            let path = Core::motion_path(core.motion.as_ref().unwrap());
+            let started = now;
+            let mut stopped = false;
+            let mut source = core.outgoing_reference();
+            for tick in 0..400 {
+                let dt = [0.040, 0.002, 0.007, 0.003][tick % 4];
+                let control_at = now + Duration::from_secs_f64(dt);
+                while next_send < control_at {
+                    if source.epoch == core.reference_version {
+                        let sample = source.sample(next_send, previous).unwrap();
+                        if let Some(path) = path {
+                            path.check(
+                                &core
+                                    .model
+                                    .as_ref()
+                                    .unwrap()
+                                    .fk(&sample.q, core.tcp.as_ref().unwrap())
+                                    .unwrap(),
+                            )
+                            .unwrap();
+                        }
+                        (applied_q, applied_dq) =
+                            crate::protocol::test_wire_targets("right", sample.q, sample.dq);
+                        previous = Some(Previous {
+                            at: next_send,
+                            q: sample.q,
+                            dq: sample.dq,
+                        });
+                        sent.send_replace(Some(SentReference {
+                            at: next_send,
+                            generation: source.generation,
+                            epoch: source.epoch,
+                            q: sample.q,
+                            dq: sample.dq,
+                        }));
+                    }
+                    next_send += Duration::from_millis(10);
+                }
+                now = control_at;
+                for i in 0..7 {
+                    let mut feedback = core.feedback[i].as_ref().unwrap().value.clone();
+                    feedback.q = applied_q[i];
+                    feedback.dq = applied_dq[i];
+                    core.accept_feedback(feedback, now);
+                }
+                if !stopped && now.duration_since(started) >= Duration::from_millis(730) {
+                    core.apply("stop", Operation::Stop, now, now).unwrap();
+                    stopped = true;
+                }
+                core.advance(now, dt);
+                assert!(core.error.is_none(), "{:?}", core.error);
+                source = core.outgoing_reference();
+                let sent_hold = sent.borrow().is_some_and(|last| {
+                    last.epoch == core.reference_version && last.dq.iter().all(|v| v.abs() < 1e-12)
+                });
+                if stopped && core.motion.is_none() && core.at_rest() && sent_hold {
+                    break;
+                }
+            }
+            assert!(core.motion.is_none() && core.at_rest(), "segment {segment}");
+            assert!(core.enabled && core.port.is_some());
+            assert_eq!(core.motion_anchor(now).unwrap(), sent.borrow().unwrap().q);
+        }
+        // Stale history cannot anchor another action, even with fresh feedback.
+        let later = now + MAX_REFERENCE_AGE + Duration::from_millis(1);
+        follow_reference(&mut core, later);
+        assert_eq!(core.motion_anchor(later).unwrap_err().code, "motion_busy");
+    }
+
+    #[test]
+    fn cartesian_steps_complete_on_recorded_send_clock_with_an_offset_tcp() {
+        #[derive(Deserialize)]
+        struct Clock {
+            control_us: Vec<u64>,
+            sends: Vec<Send>,
+        }
+        #[derive(Deserialize)]
+        struct Send {
+            at_us: u64,
+            source: usize,
+        }
+        let clock: Clock =
+            serde_json::from_str(include_str!("../tests/fixtures/send-clock.json")).unwrap();
+        for frame in [Frame::Base, Frame::Tool] {
+            for axis in 0..6 {
+                for direction in [-1, 1] {
+                    let origin = Instant::now();
+                    let (mut core, _directory) = observed_core(origin);
+                    let q = [1.5576, -0.035, 0.0102, -0.0217, 1.6217, 0.0088, 0.1133];
+                    for (i, value) in q.into_iter().enumerate() {
+                        let mut feedback = core.feedback[i].as_ref().unwrap().value.clone();
+                        feedback.q = value;
+                        core.accept_feedback(feedback, origin);
+                    }
+                    core.reference = q;
+                    core.enabled = true;
+                    core.port = Some("memory-only".into());
+                    core.tcp = Some(Pose {
+                        translation: [0.0, 0.0, 0.1],
+                        rotation: [0.0, 0.0, 0.0, 1.0],
+                    });
+                    core.begin(
+                        "sampled-step",
+                        Space::Cartesian,
+                        axis,
+                        direction,
+                        if axis < 3 { 0.002 } else { 0.02 },
+                        frame,
+                        true,
+                        if axis < 3 { 0.002 } else { 0.02 },
+                        None,
+                        0,
+                        origin,
+                    )
+                    .unwrap();
+                    let path = Core::motion_path(core.motion.as_ref().unwrap()).unwrap();
+                    let target = core.motion.as_ref().unwrap().target_pose.unwrap();
+                    let mut references = Vec::new();
+                    let (mut applied_q, mut applied_dq) = (q, [0.0; 7]);
+                    let mut previous = None;
+                    let mut sent = 0;
+                    let mut last_control = origin;
+                    for &control_us in &clock.control_us {
+                        let at = origin + Duration::from_micros(control_us);
+                        // Replay all writes before this control tick. The selected
+                        // source is taken from the recorded clock, not a new solver.
+                        while let Some(send) =
+                            clock.sends.get(sent).filter(|s| s.at_us < control_us)
+                        {
+                            let source: &Reference = &references[send.source];
+                            if source.epoch == core.reference_version {
+                                let send_at = origin + Duration::from_micros(send.at_us);
+                                let sample = source.sample(send_at, previous).unwrap_or_else(|e| {
+                                    panic!(
+                                        "{frame:?} axis={axis} direction={direction} \
+                                        source={} at={} {e:?}",
+                                        send.source, send.at_us
+                                    )
+                                });
+                                (applied_q, applied_dq) = crate::protocol::test_wire_targets(
+                                    "right", sample.q, sample.dq,
+                                );
+                                previous = Some(crate::reference::Previous {
+                                    at: send_at,
+                                    q: sample.q,
+                                    dq: sample.dq,
+                                });
+                            }
+                            sent += 1;
+                        }
+                        for i in 0..7 {
+                            let mut feedback = core.feedback[i].as_ref().unwrap().value.clone();
+                            feedback.q = applied_q[i];
+                            feedback.dq = applied_dq[i];
+                            core.accept_feedback(feedback, at);
+                        }
+                        core.advance(at, at.duration_since(last_control).as_secs_f64());
+                        last_control = at;
+                        assert!(core.error.is_none(), "{:?}", core.error);
+                        path.check(
+                            &core
+                                .model
+                                .as_ref()
+                                .unwrap()
+                                .fk(&core.reference, core.tcp.as_ref().unwrap())
+                                .unwrap(),
+                        )
+                        .unwrap();
+                        references.push(core.outgoing_reference());
+                        if core.motion.is_none() {
+                            break;
+                        }
+                    }
+                    assert!(
+                        core.motion.is_none() && core.at_rest(),
+                        "{frame:?} axis={axis} direction={direction}"
+                    );
+                    assert_eq!(core.results.front().unwrap().code, "completed");
+                    let actual = core
+                        .model
+                        .as_ref()
+                        .unwrap()
+                        .fk(&applied_q, core.tcp.as_ref().unwrap())
+                        .unwrap();
+                    let error = crate::kinematics::pose_error(&actual, &target);
+                    assert!(error[..3].iter().map(|v| v * v).sum::<f64>().sqrt() <= 0.001);
+                    assert!(
+                        error[3..].iter().map(|v| v * v).sum::<f64>().sqrt()
+                            <= 1.0_f64.to_radians()
+                    );
+                    assert!(core.enabled && core.port.is_some());
+                }
+            }
+        }
+    }
     fn core() -> (Core, tempfile::TempDir) {
         let directory = tempfile::tempdir().unwrap();
         let journal = Journal::start(directory.path().join("events.sqlite3")).unwrap();

@@ -83,7 +83,7 @@ pub struct SmoothingState {
 }
 
 impl CartesianPath {
-    fn axis_in_base(self) -> Result<Vector3<f64>, String> {
+    pub(crate) fn axis_in_base(self) -> Result<Vector3<f64>, String> {
         if self.axis >= 6 {
             return Err("invalid Cartesian path axis".into());
         }

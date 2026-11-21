@@ -263,13 +263,35 @@ J1 正向连续点动，速度 0.1 rad/s：
 
 ### 5.7 参考导数与停止
 
-关节、末端点动与收纳返回共用离散参考限制：关节速度不超过 0.20 rad/s，加速度不超过 0.60 rad/s²，jerk 的当前离线默认值为 6 rad/s³。控制器先求满足导数窗口的最终速度，再按实际周期积分 `q_ref`；`ddq_ref` 和 `jerk_ref` 分别从相邻速度和加速度求得。
+关节、末端点动与收纳返回共用离散参考限制：关节速度不超过 0.20 rad/s，加速度不超过 0.60 rad/s²，jerk 的当前离线默认值为 6 rad/s³。控制器保留原有 Euler 积分，先求满足导数窗口的最终速度，再按实际周期积分 `q_ref`；`ddq_ref` 和 `jerk_ref` 分别从相邻速度和加速度求得。
 
 末端求解把动态窗口直接纳入 Jacobian 的有界二次规划，避免逐轴独立平滑改变所选 TCP 路径。候选继续受参考偏差与单步增量限制，经 FK 检查路径偏差和速度；路径模型阈值为 50 μm、0.002 rad。全局 TCP 速度上限预留 10% 目标余量，接近上限时目标为 13.5 mm/s、0.135 rad/s；低于这两个阈值的请求不因该余量额外缩放。最终 FK 仍检查 15 mm/s、0.15 rad/s 的硬上限。模型阈值用于筛选参考候选，机械臂实际精度仍待测。
 
 停止权限、租约与 generation 校验、原请求的 cancelled 结果保持原有语义。正常停止按 jerk 限制减速，可能需要更长时间；`action:null` 后仍须等待 `stopping` 结束。停止求解惩罚关节速度本身，使冗余方向的速度也减至零，连续性由导数硬约束维持。笛卡尔路径无法满足制动约束时，写入 `control/stop_path` 警告并转为受限关节制动。故障、失能和关闭继续优先处理。
 
-串口发送线程可重复最后目标，也可合并尚未发送的参考更新。离散参考的导数限制不能直接视为实际发送或机械臂物理运动的 jerk 保证。新轨迹与采样尚未真机验证；伺服仍使用 `kp=60`、`kd=10` 和限幅 ±8 Nm 的 URDF 重力前馈。
+离散参考的导数限制不保证实际 TX 节拍或机械臂物理运动的 jerk。发送时间对齐、轨迹与采样尚未真机验收；伺服仍使用 `kp=60`、`kd=10` 和限幅 ±8 Nm 的 URDF 重力前馈。
+
+### 5.8 发送时间对齐
+
+普通七轴发送保持原始 10 ms 截止时间网格，跳过错过的槽位，不补发。新参考或唤醒延迟不重设网格；普通批次的主机起点至少相隔 5 ms。源参考可被合并，也可在多个发送时刻重复取样。
+
+发送线程在本批次主机起点选取最新源参考，以其来源时间计算 `age`，要求 `0 ≤ age ≤ 50 ms`。先按 `dq + ddq*age` 取样速度，在关节速度上限或首次速度零点封顶；已零速的停止参考不会自行启动。首次伺服取样按该段速度积分位置，未触边界时为 `q + dq*age + 0.5*ddq*age²`。
+
+有上一成功整批伺服目标时，位置按 `q_previous + 0.5*(dq_previous + dq_sample)*Δt_tx` 连续积分，使用两次主机批次起点的实际间隔。新控制参考只更新取样速度，不重新锚定发送位置，避免控制器离散积分与外推交接时的位置回跳。与源参考投影位置的偏离不得超过 0.01 rad。本次不修改控制器 Euler 积分或 jerk 限制。
+
+新点动、固定步长和收纳回程从最近成功发送的静止目标建立起点，避免多次动作积累控制参考与发送位置的残差。该目标必须属于当前 generation/epoch、年龄不超过 50 ms、七轴指令速度均为零；未确认时返回 `motion_busy`，不排队启动下一段。目标仍需满足相对实测的 0.6 rad 偏差限制。此交接读取单值内存快照，不访问日志或数据库。
+
+取样沿用动作的不可变 TCP、路径起点与方向，不随新源参考重设路径。候选经 FK 复核路径、全局 TCP 速度上限及相对实测偏差。首次取样以源参考为速度检查起点，后续以最近成功批次的目标和实际发送间隔检查 TCP 速度。
+
+上一成功伺服目标保留位置、速度和批次主机起点。相对该目标的关节位移同时受 0.01 rad 与 `JOINT_SPEED × 实际发送间隔` 约束，即 `|Δq| ≤ min(0.01 rad, 0.20 rad/s × Δt)`；两端速度同向时，位置不得反向变化。越过位移预算或方向检查失败均为 `constraint`，按下述规则保持或拒绝。
+
+关节目标越界时限制在目标或本次积分起点，并将对应速度置零；末端目标越界时保持上一成功伺服位置（无历史则保持源位置），整组速度置零。取消后的减速不再追逐旧目标。
+
+源参考携带 generation、epoch 与有效截止时间；运动期间截止时间取输入有效期与租约到期时间的较早者。取样前及写入前复查 epoch 和有效期，写入前同时检查优先命令；失效候选不提交。已开始写入的七轴批次仍使用原有 20 ms 整批预算，不在批次中途插入其它报文；这不是实际线上 TX 或电机确认的时限保证。
+
+参考过旧、来自未来、无效或不满足约束时，若有上一成功写完整批的七轴伺服目标，就保持其位置、将速度置零；同一 epoch 的拒绝原因保持到上下文更新。控制器只处理 generation 与 epoch 仍匹配的拒绝，将当前动作记为 `failed/send_reference`，同步保持目标并清零导数，保留控制权；已使能时继续保持使能。
+
+使能确认中的匹配拒绝同样有效：结束 `enable_request`，记录 `failed/send_reference`，维持原有 `enabled=false`，同次新鲜反馈不能再将其置为 Ready。迟到拒绝不能取消新动作。首次无效且没有成功伺服历史时走 I/O 错误处理。已换代或到期而在写前跳过的批次不产生 `transmit` 样本。
 
 ## 6. 命令输出与执行结果
 
@@ -459,15 +481,31 @@ TCP 未设置或控制反馈无效时，`tcp:null`。`action.mode` 为 `continuo
 
 所有七元素数组按 J1..J7 排列。关节位置单位 rad、速度 rad/s、加速度 rad/s²、jerk rad/s³、扭矩 Nm、电压 V、温度 °C；`at_us/age_us/write_us` 单位 μs。
 
-| `source`   | 其余字段                                                                                                                                                                                                                                                                        |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `control`  | `seq`、`generation`（u64），`enabled/stopping`（boolean），`motion`（0..5），`axis`（整数或 null）；`q_ref/dq_ref/ddq_ref/jerk_ref/tau_ff` 为七个数值；`q/dq/tau/voltage` 为七个数值或 null；`age_us` 为七个 u64 或 null。缺失反馈的对应元素为 null，已有旧反馈保留数值与年龄。 |
-| `transmit` | `seq`（u64），`mode` 为七个实际编码的命令模式（0 disabled、1 servo、6 clear）；理想 `q_ref/dq_ref/tau_ff`、编码后反标定为关节 SI 的 `q_wire/dq_wire/tau_wire`、`kp/kd` 均为七个数值，`write_us`（u64）为主机成功写入整个七轴批次的耗时。                                        |
-| `feedback` | `joint`（0..6），`q/dq/tau/temperature/voltage`（number），`error`（u32）、`mode`（u8）、`timeout`（boolean）。                                                                                                                                                                 |
+| `source`   | 其余字段                                                                                                                                                                                                                                                                                  |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `control`  | `seq`、`generation`（u64），`enabled/stopping`（boolean），`motion`（0..5），`axis`（整数或 null）；`q_ref/dq_ref/ddq_ref/jerk_ref/tau_ff` 为七个数值；`q/dq/tau/voltage` 为七个数值或 null；`age_us` 为七个 u64 或 null。缺失反馈的对应元素为 null，已有旧反馈保留数值与年龄。           |
+| `transmit` | `seq`（u64），`timing`（对象或 null，可缺省），`mode` 为七个实际编码的命令模式（0 disabled、1 servo、6 clear）；对齐后理想 `q_ref/dq_ref`、源前馈 `tau_ff`、编码后反标定为关节 SI 的 `q_wire/dq_wire/tau_wire`、`kp/kd` 均为七个数值，`write_us`（u64）为主机成功写入整个七轴批次的耗时。 |
+| `feedback` | `joint`（0..6），`q/dq/tau/temperature/voltage`（number），`error`（u32）、`mode`（u8）、`timeout`（boolean）。                                                                                                                                                                           |
 
 `control.motion`：0 无当前动作、1 关节连续、2 关节步长、3 笛卡尔连续、4 笛卡尔步长、5 收纳返回。`axis` 在无动作或收纳返回时为 null，关节为 0..6，笛卡尔为 0..5；减速阶段可能为 `motion:0,stopping:true`。
 
-`transmit.seq` 关联被串口线程选中的 `control.seq`。同一序号重复说明重复发送参考，序号跳过说明部分参考未被选中或采样有丢弃。`seq:0` 用于初始或直接停止/清错写入，不要求存在对应的控制样本；普通 disabled 心跳也可以使用非零序号。`q_wire/dq_wire/tau_wire` 来自实际编码值并转回关节 SI，用于观察量化、截断与理想参考的差异。每轴只有 `mode:1` 时这些字段才是伺服目标；`mode:0/6` 保留停机/清错报文字段的反标定结果，诊断编码误差时应排除。`write_us` 描述主机批次写入，不是 USB 线上时间或电机确认。完整三类样本示例见 [OpenAPI](openapi.json) 的 `TraceSample` 和读取响应。
+`transmit.seq` 关联被串口线程选中的源 `control.seq`，仍是源索引。重复序号表示同一源被再次取样，不表示相同的 `q_ref` 或 `q_wire`；序号跳过可能是参考被合并或采样丢弃。`seq:0` 用于初始或直接停止/清错写入，不要求存在对应的控制样本；普通 disabled 心跳也可以使用非零序号。
+
+`control.q_ref/dq_ref` 是控制器原始参考；`transmit.q_ref/dq_ref` 是发送时对齐或回退保持的编码前理想目标，不要求与同序号控制样本相同。`q_wire/dq_wire/tau_wire` 来自实际编码值并转回关节 SI，用于观察量化、截断与理想目标的差异。每轴只有 `mode:1` 时这些字段才是伺服目标；`mode:0/6` 保留停机/清错报文字段的反标定结果，诊断编码误差时应排除。`write_us` 描述主机批次写入，不是 USB 线上时间或电机确认。
+
+发送样本的 `timing` 为 `{"status":"aligned","age_us":100}` 这样的对象或 null。对象包含 `status` 和 `age_us`；后者为 u64 微秒或 null，无法计算非负源年龄时为 null。未执行发送端取样的直接写入、disabled/clear 批次为 `timing:null`。该字段以 `#[serde(default)]` 读取，旧 JSON 缺省时按 null 处理，接口不要求旧文件补字段。
+
+| `timing.status` | 含义                                                       |
+| --------------- | ---------------------------------------------------------- |
+| `aligned`       | 完成发送时刻取样；速度上限或首次零点封顶也归此类。         |
+| `bounded`       | 关节目标使候选限幅，或末端目标越界后保持位置。             |
+| `stale`         | 源年龄超过 50 ms。                                         |
+| `future`        | 取样时刻早于源时刻，或不晚于上一成功伺服批次起点。         |
+| `invalid`       | 数值非有限、源速度/加速度超限或取样参数无效。              |
+| `constraint`    | 路径、TCP 速度、相对实测偏差或相邻成功目标增量检查未通过。 |
+| `expired`       | 已到输入或租约的有效截止时间。                             |
+
+完整三类样本示例见 [OpenAPI](openapi.json) 的 `TraceSample` 和读取响应。事件日志与短时采样仍使用单次 `try_lock`、竞争即丢弃和独立 SQLite writer，不等待队列或磁盘。
 
 当前协议速度量化步距为 `2π/(64r)`，位置步距为 `2π/(32768r)`，分组如下。极低的 `dq_ref` 可编码为 `dq_wire:0`，而 `q_wire` 随位置字段按阶梯前进；采样同时保留理想参考和编码值，可分别查看参考变化与量化。这是已确认的编码行为，是否造成实机抖动仍需测量。
 
@@ -496,6 +534,8 @@ cargo run --manifest-path src-tauri/Cargo.toml --example analyze_trace -- /path/
 ```
 
 此示例只读取 JSON，输出 JSON 统计：控制、发送和各关节反馈的间隔 p50/p95/max，七轴批次写入耗时，参考速度/加速度/jerk 峰值，逐关节位置/速度跟随 RMS，编码值与理想参考的最大差异，发送序号重复/跳过/倒退，以及采样汇总与完整性计数。RMS 使用已使能且该轴 `q/dq` 均存在、反馈年龄不超过 200 ms 的控制样本；编码差异只比较 `seq!=0` 且该轴 `mode:1` 的数据，发送序号统计排除 `seq:0`，时间统计保留所有模式。无有效样本时对应统计为 null。间隔是主机来源时间的统计；这些数值用于比较采样，单项异常不能直接确定抖动原因。
+
+发送一致性回放另外比较相邻批次的 `Δq_wire/Δt` 与 `dq_wire`，只度量指令位置与速度的一致性，不代表真机减抖或物理 jerk。私有 capture 的 Rust 回放结果见[测试记录](implementation-status.md)；公开的[匿名相对时序 fixture](../src-tauri/tests/fixtures/send-clock.json)仅保留控制/发送相对时间与源索引，不发布私有 capture。
 
 真机采集每次记录一种场景，保留速度、轴、方向、姿态、TCP 和负载说明，便于重复对照：
 
@@ -532,19 +572,20 @@ cargo run --manifest-path src-tauri/Cargo.toml --example analyze_trace -- /path/
 
 `POST /v1/commands` 的业务校验在入队后完成。例如控制权不符，通常是 **202 入队后出现 `rejected/not_owner`**，而非该请求直接返回 409。
 
-| 异步结果或故障中的 `code`                                                                                                        | 含义与处理                                 |
-| -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------ |
-| `not_owner`、`stale_context`                                                                                                     | 控制权或上下文变化；读取状态，重新确认操作 |
-| `not_connected`、`fault`、`enable_busy`、`motion_busy`                                                                           | 当前运行阶段不接受该操作                   |
-| `invalid_motion`、`invalid_step`、`speed_limit`、`invalid_tcp`、`invalid_ttl`                                                    | 修改输入                                   |
-| `feedback_missing`、`feedback_stale`、`invalid_feedback`、`feedback_span`                                                        | 反馈不满足控制条件                         |
-| `tcp_missing`                                                                                                                    | 设置 TCP 后再使用末端点动                  |
-| `support_required`、`disable_first`                                                                                              | 确认支撑后释放保持；清错前先失能           |
-| `invalid_pose`                                                                                                                   | 检查收纳位的七轴数值和相对行程             |
-| `no_action`、`stale_input`、`input_expired`                                                                                      | 连续点动已经结束，或更新序号/有效期不符    |
-| `joint_dynamics`、`kinematics`、`following_error`、`target_timeout`                                                              | 本次运动不能继续，结合状态和日志检查原因   |
-| `communication_error`、`feedback_timeout`、`device_error`、`device_timeout`、`device_disabled`、`enable_timeout`、`clear_failed` | 通信、设备或确认失败                       |
-| `stopped`、`host_stop`、`released`、`lease_expired`、`disabled`、`disconnected`、`clearing`、`closing`                           | 动作取消原因                               |
+| 异步结果或故障中的 `code`                                                                                                        | 含义与处理                                                        |
+| -------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| `not_owner`、`stale_context`                                                                                                     | 控制权或上下文变化；读取状态，重新确认操作                        |
+| `not_connected`、`fault`、`enable_busy`、`motion_busy`                                                                           | 当前运行阶段不接受该操作                                          |
+| `invalid_motion`、`invalid_step`、`speed_limit`、`invalid_tcp`、`invalid_ttl`                                                    | 修改输入                                                          |
+| `feedback_missing`、`feedback_stale`、`invalid_feedback`、`feedback_span`                                                        | 反馈不满足控制条件                                                |
+| `tcp_missing`                                                                                                                    | 设置 TCP 后再使用末端点动                                         |
+| `support_required`、`disable_first`                                                                                              | 确认支撑后释放保持；清错前先失能                                  |
+| `invalid_pose`                                                                                                                   | 检查收纳位的七轴数值和相对行程                                    |
+| `no_action`、`stale_input`、`input_expired`                                                                                      | 连续点动已经结束，或更新序号/有效期不符                           |
+| `joint_dynamics`、`kinematics`、`following_error`、`target_timeout`                                                              | 本次运动不能继续，结合状态和日志检查原因                          |
+| `send_reference`                                                                                                                 | 参考无法安全取样；动作或使能请求 failed，保留原有使能状态与控制权 |
+| `communication_error`、`feedback_timeout`、`device_error`、`device_timeout`、`device_disabled`、`enable_timeout`、`clear_failed` | 通信、设备或确认失败                                              |
+| `stopped`、`host_stop`、`released`、`lease_expired`、`disabled`、`disconnected`、`clearing`、`closing`                           | 动作取消原因                                                      |
 
 程序逻辑依据 `code`，`message` 用于显示。上表列出常用处理分组；接口中的 `code` 为字符串，不限制为这张表中的枚举。
 
@@ -584,7 +625,15 @@ Tauri 仅向主窗口提供三个命令：
 
 导出 `DriveMode::{Disabled,Servo,ClearFault}`、`Setpoint {mode,q,dq,tau,kp,kd}`，数值均为标定后的 URDF 关节量。`Feedback {id,q,dq,tau,temperature,voltage,error,warning,mode,timeout}`。伺服模式默认 `kp=60`、`kd=10`；`tau` 由 URDF 质量/质心在指令姿态计算的重力前馈填充，逐轴限幅 ±8 Nm。
 
-`BusHandle::open_recorded(port:&str,side:&str,baud:u32,timeout:Duration,journal:Journal)->Result<BusHandle,String>`；`send(setpoints:[Setpoint;7])->Result<(),String>` 发布最新七轴目标，`send_with_sequence(setpoints,seq)` 关联控制序号；`drain()->(Vec<(Feedback,Instant)>,Option<String>)` 读取已到达的带时间戳反馈；`disable()` 和 `write_blocking()` 用于停止/清错等需要确认的写操作；`stats()->BusStats` 读取通信与批次时间统计。内部串口 I/O 线程按 10 ms 目标间隔写七轴、每包保留 200 μs 间隔，并在无新目标时重复最后目标作为保持心跳，因此控制线程不等待七帧。成功写入记录 transmit，接收反馈记录 feedback。测试保留单周期 `exchange_all` 作为协议对照。标定从 resources/calibration 的官方文件编译内嵌。
+`BusHandle::open_recorded(port,side,baud,timeout,journal,reference_epoch)` 创建串口会话；`publish(values,seq,reference)` 发布最新七轴参考及其来源时间、导数和动作约束。`drain()->(Vec<(Feedback,Instant)>,Option<BusError>)` 读取带时间戳反馈，以及 I/O 错误或带 generation/epoch 的参考拒绝。`disable()` 和 `write_blocking()` 提交优先停机/清错写入；`stats()->BusStats` 读取通信与批次时间统计。原始 `send` / `send_with_sequence` 只用于协议测试。
+
+发送线程沿原始 10 ms 网格取样，跳过错过槽位；每包保留 200 μs 间隔，控制线程不等待七帧。仅成功写完整批后更新历史目标并记录 transmit，接收线程独立记录 feedback。测试保留单周期 `exchange_all` 作为协议对照。标定从 resources/calibration 的官方文件编译内嵌。
+
+`latest_reference()->Option<SentReference>` 返回最近成功整批伺服目标的单值快照，包含批次起点、generation/epoch、位置和速度；用于静止后的动作交接。停机、清错或发送失败时清空，不保存额外历史。
+
+### reference.rs
+
+`Reference::sample(at,previous)` 是无 I/O 的取样函数。`Reference` 保存来源时刻、七轴位置/速度/加速度、generation、epoch、有效截止时间和当前目标/路径；`Previous {at,q,dq}` 只来自成功整批发送。取样先计算当前速度，再连续积分位置，检查新鲜度、数值、源偏离、实际发送增量、方向、目标与 TCP 路径。`Sample {q,dq,timing}` 返回理想发送量；拒绝原因用 `SampleStatus` 表示，保持与动作状态转换由 protocol.rs / arm.rs 处理。该模块不写日志或数据库。
 
 ### kinematics.rs
 
