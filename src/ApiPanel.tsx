@@ -56,6 +56,7 @@ const exampleLabels: Record<string, string> = {
   jog_update: "续期连续点动",
   step: "固定步长",
   stop: "停止",
+  return_to_pose: "返回收纳位",
 };
 const resultLabels: Record<ResultStatus, string> = {
   accepted: "已接受",

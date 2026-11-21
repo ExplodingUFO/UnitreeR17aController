@@ -1,6 +1,6 @@
 # API 接入说明
 
-本文对应当前桌面软件的实现，说明请求、返回值、状态订阅和动作确认方式。更新日期：2026-11-10。机器可读定义见 [OpenAPI 3.1](openapi.json)。
+本文对应当前桌面软件的实现，说明请求、返回值、状态订阅和动作确认方式。更新日期：2026-11-21。机器可读定义见 [OpenAPI 3.1](openapi.json)。
 
 ## 1. 连接与认证
 
@@ -40,7 +40,7 @@
 5. 使用末端点动前，发送 `configure_tcp` 设置工具变换。
 6. 发送 `enable`，等待使能确认，再发送 `step` 或 `jog_start`。
 7. 操作期间独立续期控制权；连续点动还需发送 `jog_update`。
-8. 结束动作时发送 `stop`；结束控制时按需失能、断开并释放控制权。
+8. 结束动作时发送 `stop`。需要断开时，先返回有支撑的收纳位，或明确确认机械臂已支撑后释放保持扭矩，再断开并释放控制权。
 
 每个会改变状态的步骤都等待确认，再从最新状态读取 `generation`。调用方不自行递增该值。关节点动不要求设置 TCP。
 
@@ -110,22 +110,25 @@
 
 ### 5.2 操作参数与确认条件
 
-| `kind`          | 附加输入                                              | 确认方式                                                                |
-| --------------- | ----------------------------------------------------- | ----------------------------------------------------------------------- |
-| `connect`       | `port:string`，`side:"left"\|"right"`                 | 请求被接受后，等待 `phase:"disabled"`，七轴反馈齐全且新鲜               |
-| `disconnect`    | 无                                                    | `phase:"disconnected"`、`port:null`                                     |
-| `enable`        | 无                                                    | 该请求 `completed/enabled`，`enabled:true`、`phase:"ready"`             |
-| `disable`       | 无                                                    | 请求被接受且 `enabled:false`；若已有故障，`phase` 仍可为 `fault`        |
-| `clear_fault`   | 无                                                    | 该请求 `completed/cleared`，`error:null`、`enabled:false`               |
-| `configure_tcp` | `tcp:Pose`                                            | 请求被接受，`tcp_configured:true`，`tcp_transform` 与归一化后的输入一致 |
-| `jog_start`     | `space,axis,direction,speed,frame?,ttl_ms?,input_seq` | 请求被接受且 `action.request_id` 等于本次 `request_id`                  |
-| `jog_update`    | `action_id,input_seq,ttl_ms?`                         | 成功更新不产生 `accepted` 记录；按当前动作与后续状态判断                |
-| `step`          | `space,axis,direction,amount,speed,frame?`            | 该请求 `completed/completed`                                            |
-| `stop`          | 无                                                    | 原动作收到 `cancelled`、`action:null`，等待 `stopping` 结束             |
+| `kind`           | 附加输入                                              | 确认方式                                                                |
+| ---------------- | ----------------------------------------------------- | ----------------------------------------------------------------------- |
+| `connect`        | `port:string`，`side:"left"\|"right"`                 | 请求被接受后，等待 `phase:"disabled"`，七轴反馈齐全且新鲜               |
+| `disconnect`     | `allow_release?:boolean`                              | `phase:"disconnected"`、`port:null`                                     |
+| `enable`         | 无                                                    | 该请求 `completed/enabled`，`enabled:true`、`phase:"ready"`             |
+| `disable`        | `allow_release?:boolean`                              | 请求被接受且 `enabled:false`；若已有故障，`phase` 仍可为 `fault`        |
+| `clear_fault`    | 无                                                    | 该请求 `completed/cleared`，`error:null`、`enabled:false`               |
+| `configure_tcp`  | `tcp:Pose`                                            | 请求被接受，`tcp_configured:true`，`tcp_transform` 与归一化后的输入一致 |
+| `jog_start`      | `space,axis,direction,speed,frame?,ttl_ms?,input_seq` | 请求被接受且 `action.request_id` 等于本次 `request_id`                  |
+| `jog_update`     | `action_id,input_seq,ttl_ms?`                         | 成功更新不产生 `accepted` 记录；按当前动作与后续状态判断                |
+| `step`           | `space,axis,direction,amount,speed,frame?`            | 该请求 `completed/completed`                                            |
+| `return_to_pose` | `joints:[number;7],speed,disconnect_after?:boolean`   | 该请求 `completed/returned`（继续保持）或 `completed/parked`（已断开）  |
+| `stop`           | 无                                                    | 原动作收到 `cancelled`、`action:null`，等待 `stopping` 结束             |
 
 `connect.port` 使用枚举返回的 `name`，非空且 UTF-8 不超过 300 字节。串口当前使用 6,000,000 波特率。更换串口或左右臂前先断开连接；切换左右臂会清除已设置的 TCP。
 
 连接被接受表示串口已经打开，连接确认仍需反馈。使能进入 `enabling` 后，最多等待一秒，收齐七轴在使能请求之后的新鲜反馈，并确认设备模式、错误与超时状态。清错也需要反馈确认，完成后不会自动使能。
+
+`disconnect` 与 `disable` 的 `allow_release` 默认 `false`。设备已使能或正在使能时，必须由调用方明确传 `true`；否则异步返回 `rejected/support_required`，保持当前状态。该字段表示操作意图，软件不检测机械支撑。`clear_fault` 在已使能或正在使能时返回 `rejected/disable_first`。
 
 ### 5.3 坐标、单位与范围
 
@@ -137,7 +140,7 @@
 
 `speed`、`amount` 必须为正数，方向由 `direction:-1|1` 指定。`frame` 默认 `base`：`base` 沿固定基座轴运动，`tool` 沿当前 TCP 轴运动。关节点动建议传 `base`，该字段不影响关节轴。
 
-平移保持姿态；旋转围绕 TCP。一次请求只操作一个轴；当前没有绝对位姿移动、轨迹批量下发或原始电机控制接口。
+平移保持姿态；旋转围绕 TCP。点动一次请求只操作一个轴；收纳返回为七轴关节插值。当前没有绝对笛卡尔位姿移动、轨迹批量下发或原始电机控制接口。
 
 `Pose` 的格式如下，`rotation` 是 **x、y、z、w 顺序的四元数**：
 
@@ -149,7 +152,7 @@
 
 ### 5.4 完整请求示例
 
-下列标识与 `generation` 为示例值，实际调用使用本次会话返回的数据。全部十种命令的完整输入见 [OpenAPI](openapi.json) 的 `POST /v1/commands` 示例。
+下列标识与 `generation` 为示例值，实际调用使用本次会话返回的数据。全部十一种命令的完整输入见 [OpenAPI](openapi.json) 的 `POST /v1/commands` 示例。
 
 连接右臂：
 
@@ -226,6 +229,31 @@ J1 正向连续点动，速度 0.1 rad/s：
 停止发送更新后，动作在输入过期时取消。主动松开按钮时同时发送 `stop`，缩短等待。过期或已结束的动作不能通过迟到的更新恢复。WebSocket 断开不会直接释放控制权；点动输入有效期与控制权有效期分别计时。
 
 固定步长一次执行一个动作，不将后续点击排成运动队列。`progress` 按时间估计，达到 1 不表示已完成；以 `completed` 结果为准。完成前会同时检查实测值与参考值，并在减速结束后报告结果。
+
+### 5.6 收纳返回与断开
+
+先在桌面记录有支撑的收纳姿态，或由调用方保存实测七轴位置，再提交 `return_to_pose`。`joints` 按 J1..J7 排列，单位 rad；`speed` 为正且不超过 0.20 rad/s。各轴相对当前参考位置的行程不得超过 2π rad。请求需要控制权、已使能状态、完整新鲜反馈，且没有其他动作。
+
+七轴按共同的五次多项式插值返回，起止速度和加速度为零；最终下发仍受关节速度与加速度限制。回程是关节插值，不提供碰撞规划。界面按左右臂与串口保存收纳位，没有预置角度。
+
+`disconnect_after` 默认 `false`，到位后产生 `completed/returned` 并继续使能保持。设为 `true` 时，到位后失能并关闭串口，再产生 `completed/parked`。到位要求七轴实测和参考位置均在目标的 0.01 rad 内、指令速度归零、实测速度不超过 0.02 rad/s，并连续稳定 200 ms。时间进度到达 1 不能作为断开依据。
+
+返回时 `action.mode` 为 `return`、`space` 为 `joint`、`axis` 为 `null`。原有点动仍返回数值轴索引。接口调用方需要处理这个新增动作类型。使能状态下的旧 `disconnect`/`disable` 请求若未传 `allow_release:true`，现在会被拒绝；该变更自 2026-11-21 起生效。
+
+中途停止、控制权释放/过期、跟随偏差超限或到位超时，会取消返回且不再执行计划中的断开。收纳返回的到位超时与跟随偏差处理保留连接和使能；设备故障、反馈丢失或实际通信中断仍按原故障流程处理。软件不检测支撑，收纳位必须由使用者按实际支撑位置记录。突然断电后的保持需要机械支撑或制动机构。
+
+明确确认支撑后，也可以直接提交下面的断开请求；`generation` 和凭据取自当前会话：
+
+```json
+{
+  "request_id": "req-disconnect-001",
+  "client_id": "example-service",
+  "lease_id": "11111111-1111-4111-8111-111111111111",
+  "generation": 6,
+  "kind": "disconnect",
+  "allow_release": true
+}
+```
 
 ## 6. 命令输出与执行结果
 
@@ -390,6 +418,8 @@ JSON 解析与类型错误由 HTTP 框架直接返回纯文本：格式错误 40
 | `invalid_motion`、`invalid_step`、`speed_limit`、`invalid_tcp`、`invalid_ttl`                                                    | 修改输入                                   |
 | `feedback_missing`、`feedback_stale`、`invalid_feedback`、`feedback_span`                                                        | 反馈不满足控制条件                         |
 | `tcp_missing`                                                                                                                    | 设置 TCP 后再使用末端点动                  |
+| `support_required`、`disable_first`                                                                                              | 确认支撑后释放保持；清错前先失能           |
+| `invalid_pose`                                                                                                                   | 检查收纳位的七轴数值和相对行程             |
 | `no_action`、`stale_input`、`input_expired`                                                                                      | 连续点动已经结束，或更新序号/有效期不符    |
 | `joint_dynamics`、`kinematics`、`following_error`、`target_timeout`                                                              | 本次运动不能继续，结合状态和日志检查原因   |
 | `communication_error`、`feedback_timeout`、`device_error`、`device_timeout`、`device_disabled`、`enable_timeout`、`clear_failed` | 通信、设备或确认失败                       |
@@ -399,12 +429,13 @@ JSON 解析与类型错误由 HTTP 框架直接返回纯文本：格式错误 40
 
 ## 11. 桌面专用调用
 
-Tauri 仅向主窗口提供两个命令：
+Tauri 仅向主窗口提供三个命令：
 
-| 命令           | 输入            | 输出          | 用途                                   |
-| -------------- | --------------- | ------------- | -------------------------------------- |
-| `session_info` | 无              | `SessionInfo` | 取得本次会话地址、令牌、版本与日志位置 |
-| `host_stop`    | `reason:string` | `null`        | 请求取消任意客户端的当前动作，原因写入日志 |
+| 命令           | 输入                    | 输出          | 用途                                                      |
+| -------------- | ----------------------- | ------------- | --------------------------------------------------------- |
+| `session_info` | 无                      | `SessionInfo` | 取得本次会话地址、令牌、版本与日志位置                    |
+| `host_stop`    | `reason:string`         | `null`        | 请求取消任意客户端的当前动作，原因写入日志                |
+| `close_app`    | `allowRelease?:boolean` | `null`        | 请求退出；保持中且未允许释放时发送 `close-requested` 事件 |
 
 `SessionInfo` 示例：
 
@@ -419,6 +450,8 @@ Tauri 仅向主窗口提供两个命令：
 ```
 
 桌面的停止权限不取得控制权、不自动失能。HTTP `stop` 则需要当前控制权及 `generation`；把 HTTP 的 `client_id` 写成 `desktop` 不会取得桌面停止权限。
+
+普通窗口关闭与菜单退出也在控制线程检查是否仍在保持。存在已确认或待确认使能时，先向主窗口发送 `close-requested`，保留连接并显示收纳/释放操作。用户明确确认支撑后，可调用 `close_app({allowRelease:true})`；收纳后退出则等待本次 `return_to_pose` 的 `completed/parked`，再调用 `close_app`。退出检查通过后拒绝已排队的使能和运动请求，避免关闭期间重新开始保持。
 
 ## 12. 模块对应关系
 

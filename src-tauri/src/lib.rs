@@ -9,7 +9,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 #[derive(Clone, serde::Serialize)]
 struct SessionInfo {
@@ -62,6 +62,51 @@ fn host_stop(
     Ok(())
 }
 
+#[tauri::command]
+async fn close_app(
+    window: tauri::WebviewWindow,
+    allow_release: Option<bool>,
+) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("无权访问此入口".into());
+    }
+    prepare_close(window.app_handle(), allow_release.unwrap_or(false)).await
+}
+
+async fn prepare_close(app: &tauri::AppHandle, allow_release: bool) -> Result<(), String> {
+    let Some(runtime) = app.try_state::<RuntimeState>().map(|state| state.0.clone()) else {
+        app.exit(0);
+        return Ok(());
+    };
+    if runtime.closing.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    match runtime.arm.prepare_close(allow_release).await {
+        Ok(()) => shutdown(app),
+        Err(error) if error.code == "support_required" => {
+            app.emit_to("main", "close-requested", ())
+                .map_err(|error| error.to_string())?;
+        }
+        Err(error) => return Err(error.message),
+    }
+    Ok(())
+}
+
+fn request_close(app: &tauri::AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = prepare_close(&app, false).await {
+            if let Some(runtime) = app.try_state::<RuntimeState>() {
+                runtime
+                    .0
+                    .journal
+                    .log("error", "app", "close_failed", &error, None);
+            }
+            let _ = app.emit_to("main", "close-requested", ());
+        }
+    });
+}
+
 fn shutdown(app: &tauri::AppHandle) {
     let Some(runtime) = app.try_state::<RuntimeState>().map(|state| state.0.clone()) else {
         return;
@@ -100,11 +145,12 @@ fn shutdown(app: &tauri::AppHandle) {
 
 pub fn run() {
     let application = tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![session_info, host_stop])
+        .invoke_handler(tauri::generate_handler![session_info, host_stop, close_app])
         .setup(|app| {
             let path = app.path().app_log_dir()?.join("events.sqlite3");
             let journal = journal::Journal::start(path.clone()).map_err(std::io::Error::other)?;
             let arm = arm::ArmHandle::spawn(journal.clone()).map_err(std::io::Error::other)?;
+            let mut states = arm.subscribe();
             let token = uuid::Uuid::new_v4().to_string();
             let launched = tauri::async_runtime::block_on(server::launch(
                 arm.clone(),
@@ -138,12 +184,26 @@ pub fn run() {
                 closing: AtomicBool::new(false),
                 exit_ready: AtomicBool::new(false),
             })));
+            let app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    if states.borrow().phase == arm::Phase::Closing {
+                        // An approved close can outlive its IPC timeout. The
+                        // committed state must still finish server/log cleanup.
+                        shutdown(&app);
+                        break;
+                    }
+                    if states.changed().await.is_err() {
+                        break;
+                    }
+                }
+            });
             Ok(())
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                shutdown(window.app_handle());
+                request_close(window.app_handle());
             }
         })
         .build(tauri::generate_context!())
@@ -155,7 +215,7 @@ pub fn run() {
                 .is_none_or(|state| state.0.exit_ready.load(Ordering::Acquire));
             if !ready {
                 api.prevent_exit();
-                shutdown(app);
+                request_close(app);
             }
         }
     });

@@ -33,6 +33,7 @@ const SERVO_KP: f64 = 60.0;
 // The official R1-7A teleoperation stack uses kd=10 with gravity feedforward.
 const SERVO_KD: f64 = 10.0;
 const TAU_FF_LIMIT: f64 = 8.0;
+const RETURN_SETTLE_TIME: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ApiError {
@@ -91,7 +92,7 @@ pub struct ActionSnapshot {
     pub request_id: String,
     pub space: Space,
     pub mode: String,
-    pub axis: usize,
+    pub axis: Option<usize>,
     pub progress: f64,
 }
 #[derive(Clone, Debug, Default, Serialize)]
@@ -163,9 +164,15 @@ pub enum Operation {
         port: String,
         side: String,
     },
-    Disconnect,
+    Disconnect {
+        #[serde(default)]
+        allow_release: bool,
+    },
     Enable,
-    Disable,
+    Disable {
+        #[serde(default)]
+        allow_release: bool,
+    },
     ClearFault,
     ConfigureTcp {
         tcp: Pose,
@@ -196,26 +203,34 @@ pub enum Operation {
         #[serde(default = "base_frame")]
         frame: Frame,
     },
+    ReturnToPose {
+        joints: [f64; 7],
+        speed: f64,
+        #[serde(default)]
+        disconnect_after: bool,
+    },
     Stop,
 }
 impl Operation {
     fn name(&self) -> &'static str {
         match self {
             Self::Connect { .. } => "connect",
-            Self::Disconnect => "disconnect",
+            Self::Disconnect { .. } => "disconnect",
             Self::Enable => "enable",
-            Self::Disable => "disable",
+            Self::Disable { .. } => "disable",
             Self::ClearFault => "clear_fault",
             Self::ConfigureTcp { .. } => "configure_tcp",
             Self::JogStart { .. } => "jog_start",
             Self::JogUpdate { .. } => "jog_update",
             Self::Step { .. } => "step",
+            Self::ReturnToPose { .. } => "return_to_pose",
             Self::Stop => "stop",
         }
     }
 }
 
 enum Work {
+    PrepareClose(bool, Instant, oneshot::Sender<Result<(), ApiError>>),
     Control(
         ControlRequest,
         Instant,
@@ -303,6 +318,24 @@ impl ArmHandle {
         self.request_shutdown();
         self.finished.recv_timeout(timeout).is_ok()
     }
+    /// Check release intent on the control thread before admitting shutdown.
+    pub async fn prepare_close(&self, allow_release: bool) -> Result<(), ApiError> {
+        if self.is_closing() {
+            return Ok(());
+        }
+        let (reply, result) = oneshot::channel();
+        self.priority
+            .try_send(Work::PrepareClose(
+                allow_release,
+                Instant::now() + Duration::from_millis(300),
+                reply,
+            ))
+            .map_err(|_| ApiError::new("queue_full", "请求队列已满"))?;
+        tokio::time::timeout(Duration::from_millis(350), result)
+            .await
+            .map_err(|_| ApiError::new("timeout", "关闭请求超时"))?
+            .map_err(|_| ApiError::new("closing", "控制线程已结束"))?
+    }
     pub async fn control(&self, request: ControlRequest) -> Result<ControlReply, ApiError> {
         if self.is_closing() {
             return Err(ApiError::new("closing", "应用正在关闭"));
@@ -360,6 +393,24 @@ struct Observation {
     value: Feedback,
     at: Instant,
 }
+#[derive(Clone, Copy)]
+enum MotionMode {
+    Continuous,
+    Step,
+    Return { disconnect_after: bool },
+}
+impl MotionMode {
+    fn timed(self) -> bool {
+        !matches!(self, Self::Continuous)
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Continuous => "continuous",
+            Self::Step => "step",
+            Self::Return { .. } => "return",
+        }
+    }
+}
 struct Motion {
     request_id: String,
     space: Space,
@@ -367,7 +418,7 @@ struct Motion {
     direction: f64,
     speed: f64,
     frame: Frame,
-    step: bool,
+    mode: MotionMode,
     amount: f64,
     started: Instant,
     duration: f64,
@@ -377,6 +428,7 @@ struct Motion {
     target_pose: Option<Pose>,
     deadline: Option<Instant>,
     input_seq: u64,
+    settled_since: Option<Instant>,
 }
 struct Core {
     journal: Journal,
@@ -389,6 +441,7 @@ struct Core {
     velocity: [f64; 7],
     tcp: Option<Pose>,
     enabled: bool,
+    close_requested: bool,
     phase: Phase,
     lease: Option<Lease>,
     motion: Option<Motion>,
@@ -430,6 +483,7 @@ impl Core {
             velocity: [0.0; 7],
             tcp: None,
             enabled: false,
+            close_requested: false,
             phase: Phase::Disconnected,
             lease: None,
             motion: None,
@@ -573,6 +627,9 @@ impl Core {
         }
     }
     fn control(&mut self, request: ControlRequest, now: Instant) -> Result<ControlReply, ApiError> {
+        if self.close_requested {
+            return Err(ApiError::new("closing", "应用正在关闭"));
+        }
         self.expire_lease(now);
         if request.client_id.is_empty() || request.client_id.len() > 64 {
             return Err(ApiError::new("invalid_client", "客户端标识无效"));
@@ -627,6 +684,14 @@ impl Core {
         let now = Instant::now();
         self.expire_lease(now);
         match work {
+            Work::PrepareClose(allow_release, deadline, reply) => {
+                let result = if now > deadline {
+                    Err(ApiError::new("timeout", "关闭请求已过期"))
+                } else {
+                    self.prepare_close(allow_release)
+                };
+                let _ = reply.send(result);
+            }
             Work::Control(request, deadline, reply) => {
                 let result = if now > deadline {
                     Err(ApiError::new("timeout", "控制请求已过期"))
@@ -645,6 +710,10 @@ impl Core {
     }
     fn command(&mut self, request: CommandRequest, received: Instant, now: Instant) {
         let id = request.request_id.clone();
+        if self.close_requested {
+            self.record(&id, "rejected", "closing", "应用正在关闭");
+            return;
+        }
         if let Err(e) = self.validate_owner(&request.client_id, &request.lease_id, now) {
             self.record(&id, "rejected", &e.code, e.message);
             return;
@@ -720,17 +789,9 @@ impl Core {
                 self.journal
                     .log("info", "device", "connected", "串口连接已建立", Some(id));
             }
-            Operation::Disconnect => {
-                self.end_motion("cancelled", "disconnected", "设备连接已断开");
-                self.enabled = false;
-                self.send_disable();
-                self.bus = None;
-                self.port = None;
-                self.feedback = std::array::from_fn(|_| None);
-                self.error = None;
-                self.clear_request = None;
-                self.clear_pending = [false; 7];
-                self.phase = Phase::Disconnected;
+            Operation::Disconnect { allow_release } => {
+                self.require_release(allow_release)?;
+                self.disconnect();
             }
             Operation::Enable => {
                 if self.bus.is_none() {
@@ -756,7 +817,8 @@ impl Core {
                 self.phase = Phase::Enabling;
                 self.generation += 1;
             }
-            Operation::Disable => {
+            Operation::Disable { allow_release } => {
+                self.require_release(allow_release)?;
                 self.end_motion("cancelled", "disabled", "设备已失能");
                 self.enabled = false;
                 self.velocity = [0.0; 7];
@@ -764,6 +826,9 @@ impl Core {
                 self.phase();
             }
             Operation::ClearFault => {
+                if self.enabled || self.enable_request.is_some() {
+                    return Err(ApiError::new("disable_first", "请先失能再清错"));
+                }
                 if self.bus.is_none() {
                     return Err(ApiError::new("not_connected", "设备未连接"));
                 }
@@ -838,6 +903,11 @@ impl Core {
                     id, space, axis, direction, speed, frame, true, amount, None, 0, now,
                 )?;
             }
+            Operation::ReturnToPose {
+                joints,
+                speed,
+                disconnect_after,
+            } => self.begin_return(id, joints, speed, disconnect_after, now)?,
             Operation::JogUpdate {
                 action_id,
                 input_seq,
@@ -848,7 +918,7 @@ impl Core {
                     .motion
                     .as_mut()
                     .ok_or_else(|| ApiError::new("no_action", "连续动作已结束"))?;
-                if motion.step
+                if motion.mode.timed()
                     || motion.request_id != action_id
                     || input_seq <= motion.input_seq
                     || motion.deadline.is_some_and(|expires| now >= expires)
@@ -860,6 +930,108 @@ impl Core {
             }
         }
         self.dirty = true;
+        Ok(())
+    }
+    fn require_release(&self, allow_release: bool) -> Result<(), ApiError> {
+        if !allow_release && (self.enabled || self.enable_request.is_some()) {
+            return Err(ApiError::new(
+                "support_required",
+                "请先收纳或确认机械臂已支撑",
+            ));
+        }
+        Ok(())
+    }
+    fn prepare_close(&mut self, allow_release: bool) -> Result<(), ApiError> {
+        self.require_release(allow_release)?;
+        // Subsequent queued enable/motion requests must not pass this decision.
+        self.close_requested = true;
+        Ok(())
+    }
+    fn disconnect(&mut self) {
+        self.end_motion("cancelled", "disconnected", "设备连接已断开");
+        self.enabled = false;
+        self.velocity = [0.0; 7];
+        self.stopping = false;
+        self.send_disable();
+        self.bus = None;
+        self.port = None;
+        self.feedback = std::array::from_fn(|_| None);
+        self.error = None;
+        self.clear_request = None;
+        self.clear_pending = [false; 7];
+        self.phase = Phase::Disconnected;
+    }
+    fn motion_anchor(&self, now: Instant) -> Result<[f64; 7], ApiError> {
+        if self.close_requested {
+            return Err(ApiError::new("closing", "应用正在关闭"));
+        }
+        if !self.enabled || self.error.is_some() {
+            return Err(ApiError::new("not_ready", "设备尚未就绪"));
+        }
+        if self.motion.is_some() || self.stopping {
+            return Err(ApiError::new("motion_busy", "当前动作尚未结束"));
+        }
+        let measured = self.measured(now)?;
+        self.check_positions(&measured)?;
+        let preserve_reference = self.reference.iter().all(|value| value.is_finite())
+            && (0..7).all(|i| (self.reference[i] - measured[i]).abs() <= MAX_TRACKING_ERROR);
+        Ok(if preserve_reference {
+            self.reference
+        } else {
+            measured
+        })
+    }
+    fn begin_return(
+        &mut self,
+        id: &str,
+        target: [f64; 7],
+        speed: f64,
+        disconnect_after: bool,
+        now: Instant,
+    ) -> Result<(), ApiError> {
+        let anchor = self.motion_anchor(now)?;
+        if !speed.is_finite() || speed <= 0.0 || speed > JOINT_SPEED {
+            return Err(ApiError::new("speed_limit", "收纳速度超出当前限制"));
+        }
+        if target.iter().any(|q| !q.is_finite()) {
+            return Err(ApiError::new("invalid_pose", "收纳位参数无效"));
+        }
+        let distance = (0..7)
+            .map(|i| (target[i] - anchor[i]).abs())
+            .fold(0.0, f64::max);
+        if distance > std::f64::consts::TAU {
+            return Err(ApiError::new("invalid_pose", "收纳位与当前位置相差过大"));
+        }
+        // Quintic interpolation: zero velocity and acceleration at both ends.
+        // Peak |ds/dt|=1.875/T, peak |d²s/dt²|=10/sqrt(3)/T².
+        let duration = (1.875 * distance / speed)
+            .max((10.0 / 3.0_f64.sqrt() * distance / JOINT_ACCELERATION).sqrt())
+            .max(0.2);
+        if !duration.is_finite() {
+            return Err(ApiError::new("invalid_pose", "收纳轨迹时长无效"));
+        }
+        self.reference = anchor;
+        self.velocity = [0.0; 7];
+        self.motion = Some(Motion {
+            request_id: id.into(),
+            space: Space::Joint,
+            axis: 0,
+            direction: 0.0,
+            speed,
+            frame: Frame::Base,
+            mode: MotionMode::Return { disconnect_after },
+            amount: distance,
+            started: now,
+            duration,
+            initial: anchor,
+            target,
+            initial_pose: None,
+            target_pose: None,
+            deadline: None,
+            input_seq: 0,
+            settled_since: None,
+        });
+        self.phase = Phase::Moving;
         Ok(())
     }
     #[allow(clippy::too_many_arguments)]
@@ -877,12 +1049,7 @@ impl Core {
         input_seq: u64,
         now: Instant,
     ) -> Result<(), ApiError> {
-        if !self.enabled || self.error.is_some() {
-            return Err(ApiError::new("not_ready", "设备尚未就绪"));
-        }
-        if self.motion.is_some() || self.stopping {
-            return Err(ApiError::new("motion_busy", "当前动作尚未结束"));
-        }
+        let anchor = self.motion_anchor(now)?;
         if axis >= if space == Space::Joint { 7 } else { 6 }
             || ![-1, 1].contains(&direction)
             || !speed.is_finite()
@@ -900,16 +1067,6 @@ impl Core {
         if speed > limit {
             return Err(ApiError::new("speed_limit", "速度超出当前限制"));
         }
-        let measured = self.measured(now)?;
-        self.check_positions(&measured)?;
-        let preserve_reference = self.enabled
-            && self.reference.iter().all(|value| value.is_finite())
-            && (0..7).all(|i| (self.reference[i] - measured[i]).abs() <= MAX_TRACKING_ERROR);
-        let anchor = if preserve_reference {
-            self.reference
-        } else {
-            measured
-        };
         self.reference = anchor;
         self.velocity = [0.0; 7];
         let mut target = anchor;
@@ -958,7 +1115,11 @@ impl Core {
             direction: direction as f64,
             speed,
             frame,
-            step,
+            mode: if step {
+                MotionMode::Step
+            } else {
+                MotionMode::Continuous
+            },
             amount,
             started: now,
             duration,
@@ -968,6 +1129,7 @@ impl Core {
             target_pose,
             deadline,
             input_seq,
+            settled_since: None,
         });
         self.phase = Phase::Moving;
         Ok(())
@@ -1027,6 +1189,14 @@ impl Core {
         if self
             .motion
             .as_ref()
+            .is_some_and(|motion| matches!(motion.mode, MotionMode::Return { .. }))
+            && (0..7).any(|i| (self.reference[i] - measured[i]).abs() > MAX_TRACKING_ERROR)
+        {
+            self.end_motion("failed", "following_error", "收纳跟随偏差超限，已停止返回");
+        }
+        if self
+            .motion
+            .as_ref()
             .is_some_and(|motion| motion.deadline.is_some_and(|deadline| now >= deadline))
         {
             self.end_motion("cancelled", "input_expired", "连续输入已过期");
@@ -1047,12 +1217,21 @@ impl Core {
             return;
         };
         let elapsed = now.saturating_duration_since(motion.started).as_secs_f64();
-        let t = if motion.step {
+        let mode = motion.mode;
+        if matches!(mode, MotionMode::Return { .. }) && elapsed > motion.duration + 3.0 {
+            self.end_motion("failed", "target_timeout", "收纳到位超时，已停止返回");
+            return;
+        }
+        let t = if mode.timed() {
             (elapsed / motion.duration).clamp(0.0, 1.0)
         } else {
             0.0
         };
-        let smooth = t * t * (3.0 - 2.0 * t);
+        let smooth = if matches!(mode, MotionMode::Return { .. }) {
+            t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
+        } else {
+            t * t * (3.0 - 2.0 * t)
+        };
         let within_target = |q: &[f64; 7]| {
             if motion.space == Space::Joint {
                 (0..7).all(|i| (q[i] - motion.target[i]).abs() <= 0.01)
@@ -1071,13 +1250,48 @@ impl Core {
             }
         };
         let at_target =
-            motion.step && t >= 1.0 && within_target(&measured) && within_target(&self.reference);
+            mode.timed() && t >= 1.0 && within_target(&measured) && within_target(&self.reference);
         if at_target {
             if let Err(e) = self.commit_joint_velocity([0.0; 7], dt) {
                 self.fault(&e.code, e.message);
                 return;
             }
             if self.velocity.iter().all(|v| v.abs() < 1e-12) {
+                if let MotionMode::Return { disconnect_after } = mode {
+                    let slow = self.feedback.iter().all(|sample| {
+                        sample.as_ref().is_some_and(|sample| {
+                            sample.value.dq.is_finite() && sample.value.dq.abs() <= 0.02
+                        })
+                    });
+                    let motion = self.motion.as_mut().unwrap();
+                    if !slow {
+                        motion.settled_since = None;
+                        return;
+                    }
+                    let since = *motion.settled_since.get_or_insert(now);
+                    let observed_until = self
+                        .feedback
+                        .iter()
+                        .flatten()
+                        .map(|sample| sample.at)
+                        .min()
+                        .unwrap();
+                    if now.saturating_duration_since(since) < RETURN_SETTLE_TIME
+                        || observed_until.saturating_duration_since(since) < RETURN_SETTLE_TIME
+                    {
+                        return;
+                    }
+                    let id = self.motion.take().unwrap().request_id;
+                    if disconnect_after {
+                        self.disconnect();
+                        self.record(&id, "completed", "parked", "收纳到位，连接已断开");
+                    } else {
+                        self.generation += 1;
+                        self.record(&id, "completed", "returned", "已返回收纳位");
+                        self.phase();
+                    }
+                    return;
+                }
                 let id = self.motion.take().unwrap().request_id;
                 self.generation += 1;
                 self.record(&id, "completed", "completed", "动作已完成");
@@ -1085,8 +1299,12 @@ impl Core {
             }
             return;
         }
+        if matches!(mode, MotionMode::Return { .. }) {
+            self.motion.as_mut().unwrap().settled_since = None;
+        }
+        let motion = self.motion.as_ref().unwrap();
         if motion.space == Space::Joint {
-            let desired_velocity = if motion.step {
+            let desired_velocity = if motion.mode.timed() {
                 let next: [f64; 7] = std::array::from_fn(|i| {
                     motion.initial[i] + (motion.target[i] - motion.initial[i]) * smooth
                 });
@@ -1105,7 +1323,7 @@ impl Core {
             }
         } else {
             let tcp = *self.tcp.as_ref().unwrap();
-            let target = if motion.step {
+            let target = if motion.mode.timed() {
                 let mut delta = [0.0; 6];
                 delta[motion.axis] = motion.direction * motion.amount * smooth;
                 match kinematics::offset_pose(
@@ -1157,7 +1375,7 @@ impl Core {
         if self
             .motion
             .as_ref()
-            .is_some_and(|m| m.step && elapsed > m.duration + 3.0)
+            .is_some_and(|m| m.mode.timed() && elapsed > m.duration + 3.0)
         {
             self.end_motion("failed", "target_timeout", "目标到达超时");
         }
@@ -1310,9 +1528,16 @@ impl Core {
             .motion
             .as_ref()
             .map(|motion| {
+                if matches!(motion.mode, MotionMode::Return { .. }) {
+                    return "return joint".into();
+                }
                 format!(
                     "{}{}J{}",
-                    if motion.step { "step " } else { "continuous " },
+                    if motion.mode.timed() {
+                        "step "
+                    } else {
+                        "continuous "
+                    },
                     if motion.space == Space::Joint {
                         "joint "
                     } else {
@@ -1362,6 +1587,17 @@ impl Core {
         let error = value.error;
         let timeout = value.timeout;
         let mode = value.mode;
+        if let Some(motion) = &mut self.motion
+            && matches!(motion.mode, MotionMode::Return { .. })
+            && (!value.q.is_finite()
+                || !value.dq.is_finite()
+                || (value.q - motion.target[id]).abs() > 0.01
+                || value.dq.abs() > 0.02)
+        {
+            // Do not let a later frame in the same receive batch conceal
+            // a position/velocity excursion during the settle interval.
+            motion.settled_since = None;
+        }
         self.feedback[id] = Some(Observation { value, at });
         if error != 0 && self.clear_request.is_none() {
             self.fault("device_error", format!("J{} 故障码 {}", id + 1, error));
@@ -1474,9 +1710,9 @@ impl Core {
             action: self.motion.as_ref().map(|motion| ActionSnapshot {
                 request_id: motion.request_id.clone(),
                 space: motion.space,
-                mode: if motion.step { "step" } else { "continuous" }.into(),
-                axis: motion.axis,
-                progress: if motion.step {
+                mode: motion.mode.name().into(),
+                axis: (!matches!(motion.mode, MotionMode::Return { .. })).then_some(motion.axis),
+                progress: if motion.mode.timed() {
                     (now.saturating_duration_since(motion.started).as_secs_f64() / motion.duration)
                         .min(1.0)
                 } else {
@@ -1540,7 +1776,8 @@ fn run(
             core.end_motion("cancelled", "host_stop", "宿主已取消当前动作");
             seen_epoch = epoch;
         }
-        if shutdown.load(Ordering::Acquire) {
+        if shutdown.load(Ordering::Acquire) || core.close_requested {
+            shutdown.store(true, Ordering::Release);
             core.end_motion("cancelled", "closing", "应用正在关闭");
             core.lease = None;
             core.enabled = false;
@@ -1568,7 +1805,10 @@ fn run(
             }
         }
         // Recheck after potentially slow connection operations, before committing references.
-        if host_epoch.load(Ordering::Acquire) != seen_epoch || shutdown.load(Ordering::Acquire) {
+        if host_epoch.load(Ordering::Acquire) != seen_epoch
+            || shutdown.load(Ordering::Acquire)
+            || core.close_requested
+        {
             continue;
         }
         let at = Instant::now();
@@ -1580,7 +1820,10 @@ fn run(
         last_control = at;
         core.expire_lease(at);
         core.advance(at, dt);
-        if host_epoch.load(Ordering::Acquire) != seen_epoch || shutdown.load(Ordering::Acquire) {
+        if host_epoch.load(Ordering::Acquire) != seen_epoch
+            || shutdown.load(Ordering::Acquire)
+            || core.close_requested
+        {
             continue;
         }
         core.expire_lease(Instant::now());
@@ -1665,6 +1908,358 @@ mod tests {
             assert!((core.reference[i] - q[i] - core.velocity[i] * dt).abs() < 1e-10);
             assert!(core.velocity[i].abs() <= JOINT_SPEED + 1e-10);
         }
+    }
+    #[test]
+    fn return_pose_moves_all_joints_with_bounded_dynamics_before_optional_disconnect() {
+        for disconnect_after in [false, true] {
+            let mut now = Instant::now();
+            let (mut core, _directory) = observed_core(now);
+            core.enabled = true;
+            core.port = Some("memory-only".into());
+            let initial = core.reference;
+            let delta = [0.14, 0.08, -0.12, 0.06, 0.02, -0.04, 0.07];
+            let target = std::array::from_fn(|i| initial[i] + delta[i]);
+            core.begin_return("return", target, 0.08, disconnect_after, now)
+                .unwrap();
+            let snapshot = core.snapshot(now);
+            assert_eq!(snapshot.action.as_ref().unwrap().mode, "return");
+            assert_eq!(snapshot.action.as_ref().unwrap().axis, None);
+            for dt in [0.040, 0.002, 0.007, 0.003].into_iter().cycle().take(700) {
+                now += Duration::from_secs_f64(dt);
+                follow_reference(&mut core, now);
+                let q = core.reference;
+                let dq = core.velocity;
+                core.advance(now, dt);
+                assert_integrated_dynamics(&core, q, dq, dt);
+                assert!(core.velocity.iter().all(|v| v.abs() <= 0.08 + 1e-10));
+                if core.motion.is_none() {
+                    break;
+                }
+                assert!(core.enabled);
+                assert!(core.port.is_some());
+            }
+            assert!(core.motion.is_none());
+            assert!((0..7).all(|i| (core.reference[i] - target[i]).abs() <= 0.01));
+            assert!(core.velocity.iter().all(|v| v.abs() < 1e-12));
+            assert_eq!(core.enabled, !disconnect_after);
+            assert_eq!(core.port.is_none(), disconnect_after);
+            let result = core.results.front().unwrap();
+            assert_eq!(result.status, "completed");
+            assert_eq!(
+                result.code,
+                if disconnect_after {
+                    "parked"
+                } else {
+                    "returned"
+                }
+            );
+        }
+    }
+    #[test]
+    fn stopped_return_never_disconnects_later() {
+        let mut now = Instant::now();
+        let (mut core, _directory) = observed_core(now);
+        core.enabled = true;
+        core.port = Some("memory-only".into());
+        let mut target = core.reference;
+        target[1] += 0.1;
+        core.begin_return("return", target, 0.08, true, now)
+            .unwrap();
+        now += Duration::from_millis(10);
+        follow_reference(&mut core, now);
+        core.advance(now, 0.01);
+        core.apply("stop", Operation::Stop, now, now).unwrap();
+        for _ in 0..500 {
+            now += Duration::from_millis(10);
+            follow_reference(&mut core, now);
+            core.advance(now, 0.01);
+        }
+        assert!(core.enabled);
+        assert!(core.port.is_some());
+        assert_eq!(core.results.front().unwrap().status, "cancelled");
+        assert!(core.results.iter().all(|r| r.code != "parked"));
+    }
+    #[test]
+    fn return_timeout_keeps_connection_and_never_reports_parked() {
+        let mut now = Instant::now();
+        let (mut core, _directory) = observed_core(now);
+        core.enabled = true;
+        core.port = Some("memory-only".into());
+        let mut target = core.reference;
+        target[1] += 0.1;
+        core.begin_return("return", target, 0.1, true, now).unwrap();
+        // Fresh feedback is stationary: elapsed time alone is not arrival.
+        for _ in 0..600 {
+            now += Duration::from_millis(10);
+            for sample in core.feedback.iter_mut().flatten() {
+                sample.at = now;
+            }
+            core.advance(now, 0.01);
+            if core.motion.is_none() {
+                break;
+            }
+        }
+        assert!(core.motion.is_none());
+        assert!(core.enabled);
+        assert!(core.port.is_some());
+        assert_eq!(core.results.front().unwrap().code, "target_timeout");
+        assert!(core.results.iter().all(|r| r.code != "parked"));
+    }
+    #[test]
+    fn return_requires_a_fresh_uninterrupted_stationary_settle_window() {
+        let mut now = Instant::now();
+        let (mut core, _directory) = observed_core(now);
+        core.enabled = true;
+        core.port = Some("memory-only".into());
+        core.begin_return("return", core.reference, 0.1, true, now)
+            .unwrap();
+        for tick in 1..=50 {
+            now += Duration::from_millis(10);
+            follow_reference(&mut core, now);
+            if tick <= 25 {
+                core.feedback[0].as_mut().unwrap().value.dq = 0.1;
+            }
+            // A new position excursion resets the earlier settle interval.
+            if tick == 40 {
+                core.feedback[0].as_mut().unwrap().value.q += 0.02;
+            }
+            core.advance(now, 0.01);
+            assert!(core.motion.is_some());
+            assert!(core.enabled);
+        }
+        for _ in 0..12 {
+            now += Duration::from_millis(10);
+            follow_reference(&mut core, now);
+            core.advance(now, 0.01);
+            if core.motion.is_none() {
+                break;
+            }
+        }
+        assert!(!core.enabled);
+        assert!(core.port.is_none());
+        assert_eq!(core.results.front().unwrap().code, "parked");
+    }
+    #[test]
+    fn release_without_confirmation_preserves_holding_and_current_motion() {
+        for enabling in [false, true] {
+            let now = Instant::now();
+            let (mut core, _directory) = observed_core(now);
+            core.port = Some("memory-only".into());
+            core.enabled = true;
+            start_joint(&mut core, "joint", now, true);
+            if enabling {
+                core.enabled = false;
+                core.enable_request = Some(("enable".into(), now));
+            }
+            for operation in [
+                Operation::Disconnect {
+                    allow_release: false,
+                },
+                Operation::Disable {
+                    allow_release: false,
+                },
+            ] {
+                let generation = core.generation;
+                assert_eq!(
+                    core.apply("release", operation, now, now).unwrap_err().code,
+                    "support_required"
+                );
+                assert_eq!(core.generation, generation);
+                assert_eq!(core.enabled, !enabling);
+                assert!(core.port.is_some());
+                assert!(core.motion.is_some());
+            }
+            assert_eq!(
+                core.prepare_close(false).unwrap_err().code,
+                "support_required"
+            );
+            assert!(!core.close_requested);
+            assert_eq!(
+                core.apply("clear", Operation::ClearFault, now, now)
+                    .unwrap_err()
+                    .code,
+                "disable_first"
+            );
+            core.prepare_close(true).unwrap();
+            assert!(core.close_requested);
+        }
+    }
+    #[test]
+    fn accepted_close_rejects_already_queued_enable_requests() {
+        let now = Instant::now();
+        let (mut core, _directory) = observed_core(now);
+        core.prepare_close(false).unwrap();
+        core.command(
+            CommandRequest {
+                request_id: "enable".into(),
+                client_id: "desktop".into(),
+                lease_id: "unused".into(),
+                generation: core.generation,
+                operation: Operation::Enable,
+            },
+            now,
+            now,
+        );
+        assert!(!core.enabled);
+        assert!(core.enable_request.is_none());
+        assert_eq!(core.results.front().unwrap().code, "closing");
+    }
+    #[tokio::test]
+    async fn approved_close_publishes_terminal_state_even_if_reply_is_gone() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = Journal::start(directory.path().join("events.sqlite3")).unwrap();
+        let arm = ArmHandle::spawn(journal.clone()).unwrap();
+        let mut states = arm.subscribe();
+        let (reply, response) = oneshot::channel();
+        drop(response);
+        arm.priority
+            .try_send(Work::PrepareClose(
+                false,
+                Instant::now() + Duration::from_millis(300),
+                reply,
+            ))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if states.borrow().phase == Phase::Closing {
+                    break;
+                }
+                states.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(arm.is_closing());
+        assert!(arm.shutdown(Duration::from_millis(100)));
+        journal.shutdown(Duration::from_millis(200));
+    }
+    #[test]
+    fn return_cannot_wait_forever_on_nonzero_measured_velocity() {
+        let mut now = Instant::now();
+        let (mut core, _directory) = observed_core(now);
+        core.enabled = true;
+        core.port = Some("memory-only".into());
+        core.begin_return("return", core.reference, 0.1, true, now)
+            .unwrap();
+        for _ in 0..400 {
+            now += Duration::from_millis(10);
+            for sample in core.feedback.iter_mut().flatten() {
+                sample.at = now;
+                sample.value.dq = 0.1;
+            }
+            core.advance(now, 0.01);
+            if core.motion.is_none() {
+                break;
+            }
+        }
+        assert!(core.motion.is_none());
+        assert!(core.enabled);
+        assert!(core.port.is_some());
+        assert_eq!(core.results.front().unwrap().code, "target_timeout");
+    }
+    #[test]
+    fn return_settle_observes_every_feedback_even_if_a_later_frame_recovers() {
+        let mut now = Instant::now();
+        let (mut core, _directory) = observed_core(now);
+        core.enabled = true;
+        core.port = Some("memory-only".into());
+        core.begin_return("return", core.reference, 0.1, true, now)
+            .unwrap();
+        for _ in 0..39 {
+            now += Duration::from_millis(10);
+            follow_reference(&mut core, now);
+            core.advance(now, 0.01);
+        }
+        assert!(core.motion.as_ref().unwrap().settled_since.is_some());
+        let mut spike = core.feedback[0].as_ref().unwrap().value.clone();
+        spike.dq = 0.1;
+        core.accept_feedback(spike.clone(), now + Duration::from_millis(2));
+        spike.dq = 0.0;
+        core.accept_feedback(spike, now + Duration::from_millis(3));
+        now += Duration::from_millis(10);
+        follow_reference(&mut core, now);
+        core.advance(now, 0.01);
+        assert!(
+            core.enabled,
+            "a recovered last sample must not conceal a speed spike"
+        );
+        assert!(core.port.is_some());
+        assert!(core.motion.is_some());
+    }
+    #[test]
+    fn return_needs_feedback_timestamps_that_cover_the_settle_window() {
+        let mut now = Instant::now();
+        let (mut core, _directory) = observed_core(now);
+        core.enabled = true;
+        core.port = Some("memory-only".into());
+        core.begin_return("return", core.reference, 0.1, true, now)
+            .unwrap();
+        for _ in 0..20 {
+            now += Duration::from_millis(10);
+            follow_reference(&mut core, now);
+            core.advance(now, 0.01);
+        }
+        // A cached sample can stay inside FEEDBACK_MS without observing the end
+        // of the settle interval. It must not authorize releasing the arm.
+        for _ in 0..20 {
+            now += Duration::from_millis(10);
+            core.advance(now, 0.01);
+        }
+        assert!(core.enabled);
+        assert!(core.motion.is_some());
+        now += Duration::from_millis(10);
+        follow_reference(&mut core, now);
+        core.advance(now, 0.01);
+        assert!(!core.enabled);
+        assert_eq!(core.results.front().unwrap().code, "parked");
+    }
+    #[test]
+    fn release_confirmation_is_explicit_in_json_requests() {
+        for kind in ["disconnect", "disable"] {
+            let now = Instant::now();
+            let (mut core, _directory) = observed_core(now);
+            core.enabled = true;
+            core.port = Some("memory-only".into());
+            let implicit: Operation =
+                serde_json::from_value(serde_json::json!({"kind": kind})).unwrap();
+            assert_eq!(
+                core.apply("implicit", implicit, now, now).unwrap_err().code,
+                "support_required"
+            );
+            assert!(core.enabled);
+            let confirmed: Operation =
+                serde_json::from_value(serde_json::json!({"kind": kind, "allow_release": true}))
+                    .unwrap();
+            core.apply("confirmed", confirmed, now, now).unwrap();
+            assert!(!core.enabled);
+            assert_eq!(core.port.is_none(), kind == "disconnect");
+        }
+    }
+    #[test]
+    fn invalid_return_does_not_mutate_hold_reference() {
+        let now = Instant::now();
+        let (mut core, _directory) = observed_core(now);
+        core.enabled = true;
+        let initial = core.reference;
+        let mut invalid = initial;
+        invalid[0] = f64::NAN;
+        assert_eq!(
+            core.begin_return("bad", invalid, 0.1, true, now)
+                .unwrap_err()
+                .code,
+            "invalid_pose"
+        );
+        for speed in [0.0, -0.1, 0.21, f64::NAN] {
+            assert_eq!(
+                core.begin_return("bad", initial, speed, true, now)
+                    .unwrap_err()
+                    .code,
+                "speed_limit"
+            );
+        }
+        assert!(core.motion.is_none());
+        assert_eq!(core.reference, initial);
+        assert!(core.enabled);
     }
     #[test]
     fn joint_step_respects_final_dynamics_under_period_jitter_through_completion() {

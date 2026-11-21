@@ -40,6 +40,26 @@ export interface Result {
   code: string;
   message: string;
 }
+export type JointPositions = [
+  number,
+  number,
+  number,
+  number,
+  number,
+  number,
+  number,
+];
+export const isJointPositions = (value: unknown): value is JointPositions =>
+  Array.isArray(value) &&
+  value.length === 7 &&
+  Array.from(value).every((q) => typeof q === "number" && Number.isFinite(q));
+export type Action = {
+  request_id: string;
+  progress: number;
+} & (
+  | { space: Space; mode: "continuous" | "step"; axis: number }
+  | { space: "joint"; mode: "return"; axis: null }
+);
 export interface Snapshot {
   seq: number;
   generation: number;
@@ -53,13 +73,7 @@ export interface Snapshot {
   tcp_transform: Pose | null;
   tcp_configured: boolean;
   feedback_age_ms: number | null;
-  action: {
-    request_id: string;
-    space: Space;
-    mode: string;
-    axis: number;
-    progress: number;
-  } | null;
+  action: Action | null;
   last_result: Result | null;
   results: Result[];
   error: { code: string; message: string } | null;
@@ -109,9 +123,16 @@ export interface MotionArguments {
   speed: number;
   frame?: Frame;
 }
+export interface ReturnToPoseArguments {
+  joints: JointPositions;
+  speed: number;
+  disconnect_after?: boolean;
+}
 export type Operation =
   | { kind: "connect"; port: string; side: Side }
-  | { kind: "disconnect" | "enable" | "disable" | "clear_fault" | "stop" }
+  | { kind: "disconnect" | "disable"; allow_release?: boolean }
+  | { kind: "enable" | "clear_fault" | "stop" }
+  | ({ kind: "return_to_pose" } & ReturnToPoseArguments)
   | { kind: "configure_tcp"; tcp: Pose }
   | ({
       kind: "jog_start";
@@ -161,6 +182,22 @@ export interface View {
   baseUrl: string;
   hasControl: boolean;
 }
+export function hasFreshFeedback(view: View, now = performance.now()) {
+  const s = view.snapshot;
+  const elapsed = Math.max(0, now - view.receivedAt);
+  const fresh = (age: number | null) =>
+    age !== null &&
+    Number.isFinite(age) &&
+    age >= 0 &&
+    age + elapsed <= FEEDBACK_MAX_AGE_MS;
+  return (
+    view.online &&
+    !["disconnected", "connecting", "closing"].includes(s.phase) &&
+    fresh(s.feedback_age_ms) &&
+    isJointPositions(s.joints.map((joint) => joint.q)) &&
+    s.joints.every((joint) => fresh(joint.age_ms))
+  );
+}
 class DesktopApi {
   private session: Session | null = null;
   private lease: string | null = null;
@@ -179,6 +216,7 @@ class DesktopApi {
   private renewing = false;
   private leaseEpoch = 0;
   private polling = false;
+  private cancelReturn: (() => void) | null = null;
   view: View = {
     snapshot: emptySnapshot,
     online: false,
@@ -302,6 +340,8 @@ class DesktopApi {
       this.pollTimer = setInterval(() => void this.poll(), 1500);
   }
   dispose() {
+    if (this.cancelReturn)
+      void this.hostStop("desktop_disposed").catch((error) => this.fail(error));
     this.stopped = true;
     this.clearJog();
     this.dropLease();
@@ -311,7 +351,8 @@ class DesktopApi {
   }
   private accept(snapshot: Snapshot) {
     if (this.view.online && snapshot.seq < this.view.snapshot.seq) return;
-    if (this.lease && snapshot.owner?.client_id !== "desktop") this.dropLease();
+    if (this.lease && snapshot.owner?.client_id !== "desktop")
+      this.dropLease(false);
     if (
       this.jog &&
       (snapshot.generation !== this.jog.generation ||
@@ -350,10 +391,10 @@ class DesktopApi {
     };
     ws.onclose = () => {
       if (this.socket !== ws) return;
-      const active = !!this.jog;
+      const active = !!this.jog || !!this.cancelReturn;
       this.clearJog();
-      this.dropLease();
-      this.publish({ online: false });
+      this.dropLease(false);
+      this.publish({ online: false, hasControl: false });
       if (active)
         void this.hostStop("websocket_closed").catch((e) => this.fail(e));
       if (!this.stopped)
@@ -379,12 +420,12 @@ class DesktopApi {
       this.polling = false;
     }
   }
-  private dropLease() {
+  private dropLease(notify = true) {
     this.leaseEpoch++;
     this.lease = null;
     if (this.renewTimer) clearTimeout(this.renewTimer);
     this.renewTimer = null;
-    this.publish({ hasControl: false });
+    if (notify) this.publish({ hasControl: false });
   }
   async control(action: "acquire" | "release" | "renew") {
     if (action === "release") {
@@ -434,7 +475,7 @@ class DesktopApi {
   async command(
     kind: string,
     params: Record<string, unknown> = {},
-    requestId = crypto.randomUUID(),
+    requestId: string = crypto.randomUUID(),
     generation = this.view.snapshot.generation,
   ) {
     if (!this.view.online) throw new Error("未连接");
@@ -447,6 +488,115 @@ class DesktopApi {
       lease_id: this.lease,
       generation,
     });
+  }
+  async returnToPose(
+    params: ReturnToPoseArguments,
+    signal: AbortSignal,
+    requestId: string = crypto.randomUUID(),
+  ): Promise<Result> {
+    if (signal.aborted) throw new Error("返回已取消");
+    if (this.cancelReturn) throw new Error("正在返回收纳位");
+    if (!isJointPositions(params.joints))
+      throw new Error("收纳位必须包含七个有效关节位置");
+    if (
+      !Number.isFinite(params.speed) ||
+      params.speed <= 0 ||
+      params.speed > 0.2
+    )
+      throw new Error("返回速度须大于 0，且不超过 0.20 rad/s");
+    const s = this.view.snapshot;
+    if (!hasFreshFeedback(this.view))
+      throw new Error("需要完整、新鲜的七轴反馈");
+    if (!s.enabled || s.phase !== "ready" || s.action || this.jog)
+      throw new Error("请先停止动作，并等待使能就绪");
+    if (!this.view.hasControl) throw new Error("请先取得控制权");
+    if (
+      params.joints.some(
+        (q, index) => Math.abs(q - s.joints[index].q!) > Math.PI * 2,
+      )
+    )
+      throw new Error("返回行程不能超过单轴一圈（2π rad）");
+    const generation = s.generation;
+    return new Promise<Result>((resolve, reject) => {
+      let settled = false;
+      let cancelled = false;
+      let unsubscribe = () => {};
+      const finish = (error: Error | null, result?: Result) => {
+        if (settled) return;
+        settled = true;
+        unsubscribe();
+        signal.removeEventListener("abort", abort);
+        if (this.cancelReturn === cancel) this.cancelReturn = null;
+        if (error) reject(error);
+        else resolve(result!);
+      };
+      const cancel = () => {
+        cancelled = true;
+        finish(new Error("返回已停止"));
+      };
+      const abort = () => {
+        cancel();
+        void this.hostStop("parking_dialog_cancelled").catch((error) =>
+          this.fail(error),
+        );
+      };
+      this.cancelReturn = cancel;
+      signal.addEventListener("abort", abort, { once: true });
+      unsubscribe = this.subscribe((view) => {
+        if (!view.online) {
+          cancelled = true;
+          finish(new Error("状态连接已断开"));
+          return;
+        }
+        // Results are newest first. An older accepted/terminal entry must never
+        // override the latest result for this exact request.
+        const result = view.snapshot.results.find(
+          (item) => item.request_id === requestId,
+        );
+        if (result && result.status !== "accepted") {
+          const expectedCode = params.disconnect_after ? "parked" : "returned";
+          if (result.status === "completed" && result.code === expectedCode)
+            finish(null, result);
+          else finish(new Error(result.message || "返回未完成"));
+          return;
+        }
+        if (
+          view.snapshot.generation !== generation ||
+          !view.hasControl ||
+          !view.snapshot.enabled ||
+          view.snapshot.phase === "fault"
+        ) {
+          cancelled = true;
+          finish(new Error("返回条件已变化，已停止"));
+          void this.hostStop("parking_context_changed").catch((error) =>
+            this.fail(error),
+          );
+        }
+      });
+      void this.command(
+        "return_to_pose",
+        { ...params, joints: [...params.joints] },
+        requestId,
+        generation,
+      )
+        .then(() => {
+          if (cancelled) return this.hostStop("parking_cancelled_before_ack");
+        })
+        .catch((error) => {
+          if (settled && !cancelled) return;
+          cancelled = true;
+          finish(new Error(this.errorMessage(error)));
+          void this.hostStop("parking_request_failed").catch((stopError) =>
+            this.fail(stopError),
+          );
+        });
+    });
+  }
+  async cancelReturnToPose(reason = "return_cancelled") {
+    if (this.cancelReturn) await this.hostStop(reason);
+  }
+  async closeApp(allowRelease = false) {
+    await invoke("close_app", { allowRelease });
   }
   async startJog(params: Record<string, unknown>) {
     if (this.jog || this.view.snapshot.action) throw new Error("运动中");
@@ -512,6 +662,7 @@ class DesktopApi {
   }
   async hostStop(reason = "unspecified") {
     this.clearJog();
+    this.cancelReturn?.();
     await invoke("host_stop", { reason });
   }
 }

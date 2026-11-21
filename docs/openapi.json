@@ -373,7 +373,8 @@
                     "client_id": "example-service",
                     "lease_id": "11111111-1111-4111-8111-111111111111",
                     "generation": 6,
-                    "kind": "disconnect"
+                    "kind": "disconnect",
+                    "allow_release": true
                   }
                 },
                 "enable": {
@@ -391,7 +392,8 @@
                     "client_id": "example-service",
                     "lease_id": "11111111-1111-4111-8111-111111111111",
                     "generation": 6,
-                    "kind": "disable"
+                    "kind": "disable",
+                    "allow_release": true
                   }
                 },
                 "clear_fault": {
@@ -466,6 +468,19 @@
                     "lease_id": "11111111-1111-4111-8111-111111111111",
                     "generation": 5,
                     "kind": "stop"
+                  }
+                },
+                "return_to_pose": {
+                  "summary": "返回示教收纳位并断开（角度仅为格式示例）",
+                  "value": {
+                    "request_id": "req-return-001",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 5,
+                    "kind": "return_to_pose",
+                    "joints": [0.2, 0.3, -0.1, -0.3, 0.1, 0.2, 0.0],
+                    "speed": 0.08,
+                    "disconnect_after": true
                   }
                 }
               }
@@ -1139,19 +1154,25 @@
               "kind": {
                 "type": "string",
                 "const": "disconnect"
+              },
+              "allow_release": {
+                "type": "boolean",
+                "default": false,
+                "description": "明确允许释放保持扭矩。已使能或正在使能时，缺省/false 会异步 rejected/support_required，保持当前状态。该字段表示调用方确认，软件不检测机械支撑。"
               }
             },
             "required": ["kind"]
           }
         ],
-        "description": "取消动作、失能、关闭串口；确认 phase=disconnected 且 port=null。",
+        "description": "取消动作、失能、关闭串口；确认 phase=disconnected 且 port=null。 已使能或正在使能时必须显式传 allow_release=true。",
         "examples": [
           {
             "request_id": "req-disconnect-001",
             "client_id": "example-service",
             "lease_id": "11111111-1111-4111-8111-111111111111",
             "generation": 6,
-            "kind": "disconnect"
+            "kind": "disconnect",
+            "allow_release": true
           }
         ]
       },
@@ -1193,19 +1214,25 @@
               "kind": {
                 "type": "string",
                 "const": "disable"
+              },
+              "allow_release": {
+                "type": "boolean",
+                "default": false,
+                "description": "明确允许释放保持扭矩。已使能或正在使能时，缺省/false 会异步 rejected/support_required，保持当前状态。该字段表示调用方确认，软件不检测机械支撑。"
               }
             },
             "required": ["kind"]
           }
         ],
-        "description": "取消动作并失能；确认 accepted 且 enabled=false。已有故障时 phase 可保持 fault。",
+        "description": "取消动作并失能；确认 accepted 且 enabled=false。已有故障时 phase 可保持 fault。 已使能或正在使能时必须显式传 allow_release=true。",
         "examples": [
           {
             "request_id": "req-disable-001",
             "client_id": "example-service",
             "lease_id": "11111111-1111-4111-8111-111111111111",
             "generation": 6,
-            "kind": "disable"
+            "kind": "disable",
+            "allow_release": true
           }
         ]
       },
@@ -1225,7 +1252,7 @@
             "required": ["kind"]
           }
         ],
-        "description": "取消动作，保持未使能；以新鲜反馈确认清错，报告 completed/cleared 或 failed/clear_failed。",
+        "description": "取消动作，保持未使能；以新鲜反馈确认清错，报告 completed/cleared 或 failed/clear_failed。 已使能或正在使能时 rejected/disable_first，须先确认支撑并失能。",
         "examples": [
           {
             "request_id": "req-clear-fault-001",
@@ -1493,6 +1520,9 @@
           },
           {
             "$ref": "#/components/schemas/StopCommand"
+          },
+          {
+            "$ref": "#/components/schemas/ReturnToPoseCommand"
           }
         ],
         "discriminator": {
@@ -1507,7 +1537,8 @@
             "jog_start": "#/components/schemas/JogStartCommand",
             "jog_update": "#/components/schemas/JogUpdateCommand",
             "step": "#/components/schemas/StepCommand",
-            "stop": "#/components/schemas/StopCommand"
+            "stop": "#/components/schemas/StopCommand",
+            "return_to_pose": "#/components/schemas/ReturnToPoseCommand"
           }
         },
         "description": "全部操作参数与公共字段位于同一层。范围表示有效业务输入；HTTP 202 后仍可能异步 rejected。未知 JSON 字段当前会被忽略。",
@@ -1526,7 +1557,8 @@
             "client_id": "example-service",
             "lease_id": "11111111-1111-4111-8111-111111111111",
             "generation": 6,
-            "kind": "disconnect"
+            "kind": "disconnect",
+            "allow_release": true
           },
           {
             "request_id": "req-enable-001",
@@ -1540,7 +1572,8 @@
             "client_id": "example-service",
             "lease_id": "11111111-1111-4111-8111-111111111111",
             "generation": 6,
-            "kind": "disable"
+            "kind": "disable",
+            "allow_release": true
           },
           {
             "request_id": "req-clear-fault-001",
@@ -1603,6 +1636,16 @@
             "lease_id": "11111111-1111-4111-8111-111111111111",
             "generation": 5,
             "kind": "stop"
+          },
+          {
+            "request_id": "req-return-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 5,
+            "kind": "return_to_pose",
+            "joints": [0.2, 0.3, -0.1, -0.3, 0.1, 0.2, 0.0],
+            "speed": 0.08,
+            "disconnect_after": true
           }
         ]
       },
@@ -1793,12 +1836,13 @@
           },
           "mode": {
             "type": "string",
-            "enum": ["continuous", "step"]
+            "enum": ["continuous", "step", "return"]
           },
           "axis": {
-            "type": "integer",
+            "type": ["integer", "null"],
             "minimum": 0,
-            "maximum": 6
+            "maximum": 6,
+            "description": "点动轴索引；收纳返回涉及七轴，mode=return 时为 null。"
           },
           "progress": {
             "type": "number",
@@ -1807,7 +1851,36 @@
             "description": "时间进度估计；达到 1 不代表完成。"
           }
         },
-        "required": ["request_id", "space", "mode", "axis", "progress"]
+        "required": ["request_id", "space", "mode", "axis", "progress"],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "mode": {
+                  "const": "return"
+                }
+              },
+              "required": ["mode"]
+            },
+            "then": {
+              "properties": {
+                "axis": {
+                  "type": "null"
+                },
+                "space": {
+                  "const": "joint"
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "axis": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        ]
       },
       "JournalStats": {
         "type": "object",
@@ -2375,6 +2448,56 @@
             "journal_path": "/path/to/events.sqlite3"
           }
         ]
+      },
+      "ReturnToPoseCommand": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CommandEnvelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "return_to_pose"
+              },
+              "joints": {
+                "type": "array",
+                "items": {
+                  "type": "number"
+                },
+                "minItems": 7,
+                "maxItems": 7,
+                "description": "J1..J7 的已记录收纳位，单位 rad。各轴相对当前参考的行程不得超过 2π rad。示例不作为默认收纳位。"
+              },
+              "speed": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "maximum": 0.2,
+                "description": "最大关节速度，rad/s。"
+              },
+              "disconnect_after": {
+                "type": "boolean",
+                "default": false,
+                "description": "到位稳定后释放扭矩并关闭串口；false 则保持使能连接。调用方需先确保收纳位存在机械支撑。"
+              }
+            },
+            "required": ["kind", "joints", "speed"]
+          }
+        ],
+        "description": "七轴通过五次多项式共同返回记录姿态，限速并限制加速度。须已使能、反馈齐全新鲜且无其他动作。位置误差≤0.01 rad、实测速度≤0.02 rad/s并稳定200ms后返回 completed/returned 或 completed/parked。到位超时、取消或跟随偏差超限不会继续断开。关节插值不提供碰撞规划。",
+        "examples": [
+          {
+            "request_id": "req-return-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 5,
+            "kind": "return_to_pose",
+            "joints": [0.2, 0.3, -0.1, -0.3, 0.1, 0.2, 0.0],
+            "speed": 0.08,
+            "disconnect_after": true
+          }
+        ]
       }
     },
     "responses": {
@@ -2556,12 +2679,38 @@
       "description": "仅主窗口调用，不通过 HTTP 获取 token。"
     },
     "host_stop": {
-      "arguments": {},
+      "arguments": {
+        "type": "object",
+        "properties": {
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "description": "停止来源，UTF-8不超过80字节。"
+          }
+        },
+        "required": ["reason"]
+      },
       "result": {
         "type": "null"
       },
       "example": null,
       "description": "仅主窗口调用。立即发出取消请求，可停止任意客户端动作，不取得控制权、不自动失能。"
+    },
+    "close_app": {
+      "arguments": {
+        "type": "object",
+        "properties": {
+          "allowRelease": {
+            "type": "boolean",
+            "default": false
+          }
+        }
+      },
+      "result": {
+        "type": "null"
+      },
+      "example": null,
+      "description": "仅主窗口调用。控制线程检查是否仍在使能保持；未允许释放时发送 close-requested 事件并继续保持。allowRelease=true 明确允许释放后退出；无保持时正常退出。"
     }
   }
 }

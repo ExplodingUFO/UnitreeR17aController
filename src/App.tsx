@@ -1,10 +1,14 @@
 import { useEffect, useRef, useState, type PointerEvent } from "react";
+import { listen } from "@tauri-apps/api/event";
 import RobotScene from "./RobotScene";
 import ApiPanel from "./ApiPanel";
 import { PanelDivider, usePanelLayout } from "./PanelLayout";
 import {
   api,
   FEEDBACK_MAX_AGE_MS,
+  hasFreshFeedback,
+  isJointPositions,
+  type JointPositions,
   type Phase,
   type Side,
   type Space,
@@ -12,6 +16,7 @@ import {
 } from "./api";
 const DEG = 180 / Math.PI;
 type Page = "control" | "api" | "logs";
+type SafetyIntent = "parking" | "disconnect" | "disable" | "exit";
 const pages: { id: Page; label: string }[] = [
   { id: "control", label: "控制" },
   { id: "api", label: "接口" },
@@ -80,6 +85,15 @@ export default function App() {
   const [tcpOpen, setTcpOpen] = useState(false);
   const [tcpFields, setTcpFields] = useState(["0", "0", "0", "0", "0", "0"]);
   const [interfaceOpen, setInterfaceOpen] = useState(false);
+  const [safetyIntent, setSafetyIntent] = useState<SafetyIntent | null>(null);
+  const [safetyDevice, setSafetyDevice] = useState({
+    side: "right" as Side,
+    port: "",
+  });
+  const [safetyStopGeneration, setSafetyStopGeneration] = useState<
+    number | null
+  >(null);
+  const closeRequested = useRef(() => {});
   const [enablePending, setEnablePending] = useState<string | null>(null);
   const enableRequest = useRef<string | null>(null);
   const [pressed, setPressed] = useState<string | null>(null);
@@ -94,6 +108,21 @@ export default function App() {
       unsub();
       clearInterval(timer);
       api.dispose();
+    };
+  }, []);
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen("close-requested", () => closeRequested.current())
+      .then((stopListening) => {
+        if (disposed) stopListening();
+        else unlisten = stopListening;
+      })
+      .catch((error) => api.fail(error));
+    return () => {
+      disposed = true;
+      unlisten?.();
     };
   }, []);
   useEffect(() => {
@@ -174,17 +203,7 @@ export default function App() {
       : s.feedback_age_ms + Math.max(0, now - view.receivedAt);
   const feedbackExpired =
     feedbackAge !== null && feedbackAge > FEEDBACK_MAX_AGE_MS;
-  const valid =
-    connected &&
-    feedbackAge !== null &&
-    feedbackAge <= FEEDBACK_MAX_AGE_MS &&
-    s.joints.length === 7 &&
-    s.joints.every(
-      (j) =>
-        j.q !== null &&
-        j.age_ms !== null &&
-        j.age_ms + Math.max(0, now - view.receivedAt) <= FEEDBACK_MAX_AGE_MS,
-    );
+  const valid = hasFreshFeedback(view, now);
   const feedbackStatus = !connected
     ? "未连接"
     : feedbackAge === null
@@ -200,7 +219,8 @@ export default function App() {
     }
   }, [valid, view.hasControl]);
   const hasOwner = !!s.owner && view.online;
-  const deviceWritable = view.online && view.hasControl && !busy;
+  const deviceWritable =
+    view.online && view.hasControl && !busy && !safetyIntent;
   const motionReason =
     !view.online || !connected
       ? "未连接"
@@ -225,7 +245,7 @@ export default function App() {
                     : s.action || motionPending
                       ? "运动中"
                       : "";
-  const motionAllowed = !motionReason && !busy;
+  const motionAllowed = !motionReason && !busy && !safetyIntent;
   useEffect(() => {
     if (connected) setSide(s.side);
   }, [connected, s.side]);
@@ -265,12 +285,12 @@ export default function App() {
       setBusy(false);
     }
   };
-  const toggleEnable = () =>
+  const toggleEnable = () => {
+    if (s.enabled || enableInProgress) {
+      openSafety("disable");
+      return;
+    }
     void run(async () => {
-      if (s.enabled) {
-        await api.command("disable");
-        return;
-      }
       if (enableRequest.current || s.phase === "enabling") return;
       const requestId = crypto.randomUUID();
       enableRequest.current = requestId;
@@ -285,6 +305,7 @@ export default function App() {
         throw error;
       }
     });
+  };
   const stop = () => {
     pointer.current = null;
     setPressed(null);
@@ -292,12 +313,38 @@ export default function App() {
     stepGate.current = false;
     void api.hostStop("stop_button").catch((e) => api.fail(e));
   };
+  const openSafety = (intent: SafetyIntent) => {
+    if (safetyIntent === intent) return;
+    const moving =
+      !!s.action ||
+      !!motionPending ||
+      pointer.current !== null ||
+      ["moving", "stopping"].includes(s.phase);
+    setSafetyStopGeneration(moving ? s.generation : null);
+    setSafetyDevice({
+      side: modelSide,
+      port: connected ? (s.port ?? port) : port,
+    });
+    if (moving) stop();
+    cancel("safety_dialog");
+    setTcpOpen(false);
+    setInterfaceOpen(false);
+    setSafetyIntent(intent);
+  };
+  closeRequested.current = () => openSafety("exit");
+  const dismissSafety = () => {
+    void api
+      .cancelReturnToPose("parking_dialog_closed")
+      .catch((error) => api.fail(error));
+    setSafetyIntent(null);
+  };
   const changeControls = (fn: () => void) => {
     cancel("controls_changed");
     fn();
   };
   const navigate = (next: Page) => {
     cancel("navigation");
+    dismissSafety();
     setTcpOpen(false);
     setInterfaceOpen(false);
     setPage(next);
@@ -306,6 +353,10 @@ export default function App() {
   useEffect(() => {
     const changed = () => {
       cancel("hashchange");
+      void api
+        .cancelReturnToPose("navigation")
+        .catch((error) => api.fail(error));
+      setSafetyIntent(null);
       setTcpOpen(false);
       setInterfaceOpen(false);
       setPage(currentPage());
@@ -481,7 +532,12 @@ export default function App() {
         </div>
         <button
           className="control-lease"
-          disabled={!view.online || busy || (hasOwner && !view.hasControl)}
+          disabled={
+            !view.online ||
+            busy ||
+            !!safetyIntent ||
+            (hasOwner && !view.hasControl)
+          }
           onClick={() =>
             void run(() => api.control(view.hasControl ? "release" : "acquire"))
           }
@@ -503,6 +559,9 @@ export default function App() {
         <section className="panel left-panel" id="device-panel">
           <div className="panel-heading">
             <h2>连接</h2>
+            <button disabled={busy} onClick={() => openSafety("parking")}>
+              收纳
+            </button>
           </div>
           <div className="connection-form">
             <label htmlFor="side">机械臂</label>
@@ -549,12 +608,9 @@ export default function App() {
                 (!connected && !port)
               }
               onClick={() =>
-                void run(() =>
-                  api.command(
-                    connected ? "disconnect" : "connect",
-                    connected ? {} : { port, side },
-                  ),
-                )
+                connected
+                  ? openSafety("disconnect")
+                  : void run(() => api.command("connect", { port, side }))
               }
             >
               {connected ? "断开" : "连接"}
@@ -564,16 +620,21 @@ export default function App() {
               disabled={
                 !deviceWritable ||
                 !connected ||
-                enableInProgress ||
-                s.phase === "fault" ||
-                (!s.enabled && !valid)
+                (!s.enabled &&
+                  !enableInProgress &&
+                  (s.phase === "fault" || !valid))
               }
               onClick={toggleEnable}
             >
-              {enableInProgress ? "使能中" : s.enabled ? "失能" : "使能"}
+              {enableInProgress ? "取消使能" : s.enabled ? "失能" : "使能"}
             </button>
             <button
-              disabled={!deviceWritable || !connected}
+              disabled={
+                !deviceWritable || !connected || s.enabled || enableInProgress
+              }
+              title={
+                s.enabled || enableInProgress ? "请先失能，再清错" : undefined
+              }
               onClick={() => void run(() => api.command("clear_fault"))}
             >
               清错
@@ -888,7 +949,11 @@ export default function App() {
             )}
           </div>
           <div className="motion-state">
-            <span>{motionReason || "就绪"}</span>
+            <span>
+              {s.action?.mode === "return"
+                ? "返回收纳位"
+                : motionReason || "就绪"}
+            </span>
             {space === "cartesian" && connected && !s.tcp_configured && (
               <button
                 className="motion-tcp"
@@ -1086,7 +1151,435 @@ export default function App() {
       {interfaceOpen && (
         <ConnectionInfoDialog onClose={() => setInterfaceOpen(false)} />
       )}
+      {safetyIntent && (
+        <ParkingDialog
+          key={`${safetyIntent}:${safetyDevice.side}:${safetyDevice.port}`}
+          intent={safetyIntent}
+          side={safetyDevice.side}
+          port={safetyDevice.port}
+          view={view}
+          now={now}
+          stoppingFrom={safetyStopGeneration}
+          enablePending={!!enablePending}
+          motionPending={!!motionPending}
+          onClose={dismissSafety}
+        />
+      )}
       <EscapeStop onStop={stop} />
+    </div>
+  );
+}
+type ParkingPose = { joints: JointPositions; savedAt: number };
+const RETURN_MAX_DEGREES = Math.floor(0.2 * DEG * 100) / 100;
+function readParkingPose(key: string): {
+  pose: ParkingPose | null;
+  error: string;
+} {
+  try {
+    const stored = localStorage.getItem(key);
+    if (stored === null) return { pose: null, error: "" };
+    const value: unknown = JSON.parse(stored);
+    if (
+      !value ||
+      typeof value !== "object" ||
+      !("joints" in value) ||
+      !isJointPositions(value.joints) ||
+      !("savedAt" in value) ||
+      typeof value.savedAt !== "number" ||
+      !Number.isFinite(value.savedAt) ||
+      value.savedAt <= 0 ||
+      !Number.isFinite(new Date(value.savedAt).getTime())
+    )
+      return { pose: null, error: "收纳位数据无效，请重新记录。" };
+    return {
+      pose: { joints: value.joints, savedAt: value.savedAt },
+      error: "",
+    };
+  } catch {
+    return { pose: null, error: "收纳位读取失败。" };
+  }
+}
+function ParkingDialog({
+  intent,
+  side,
+  port,
+  view,
+  now,
+  stoppingFrom,
+  enablePending,
+  motionPending,
+  onClose,
+}: {
+  intent: SafetyIntent;
+  side: Side;
+  port: string;
+  view: View;
+  now: number;
+  stoppingFrom: number | null;
+  enablePending: boolean;
+  motionPending: boolean;
+  onClose: () => void;
+}) {
+  const storageKey = `unitree.parking.v1:${side}:${encodeURIComponent(port)}`;
+  const [stored, setStored] = useState(() =>
+    port ? readParkingPose(storageKey) : { pose: null, error: "" },
+  );
+  const [speed, setSpeed] = useState("5");
+  const [pending, setPending] = useState<"return" | "park" | "release" | null>(
+    null,
+  );
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const dialog = useRef<HTMLElement>(null);
+  const alive = useRef(true);
+  const returning = useRef<{ controller: AbortController; id: string } | null>(
+    null,
+  );
+  const s = view.snapshot;
+  const matchedDevice = !!port && s.port === port && s.side === side;
+  const connected =
+    view.online &&
+    matchedDevice &&
+    !["disconnected", "connecting", "closing"].includes(s.phase);
+  const fresh = connected && hasFreshFeedback(view, now);
+  const moving =
+    view.online &&
+    (!!s.action || motionPending || ["moving", "stopping"].includes(s.phase));
+  const waitingForStop =
+    view.online && stoppingFrom !== null && s.generation === stoppingFrom;
+  const enabling = enablePending || s.phase === "enabling";
+  const saveAllowed =
+    fresh && !moving && !waitingForStop && !enabling && !pending;
+  const validSpeed =
+    speed.trim() !== "" &&
+    Number.isFinite(Number(speed)) &&
+    Number(speed) > 0 &&
+    Number(speed) <= RETURN_MAX_DEGREES;
+  const overTravel =
+    fresh &&
+    !!stored.pose &&
+    stored.pose.joints.some(
+      (q, index) => Math.abs(q - s.joints[index].q!) > Math.PI * 2,
+    );
+  const returnReason = !port
+    ? "请先选择串口。"
+    : !stored.pose
+      ? "尚未记录收纳位。"
+      : !view.online
+        ? "状态连接已断开。"
+        : !connected
+          ? "请连接此机械臂。"
+          : !view.hasControl
+            ? "请先取得控制权。"
+            : moving || waitingForStop
+              ? "等待动作停止。"
+              : enabling
+                ? "请等待使能完成。"
+                : !s.enabled || s.phase !== "ready"
+                  ? "需要使能就绪后返回。"
+                  : !fresh
+                    ? "需要完整、新鲜的七轴反馈。"
+                    : overTravel
+                      ? "返回行程超过单轴一圈。"
+                      : !validSpeed
+                        ? `速度须大于 0，且不超过 ${RETURN_MAX_DEGREES}°/s。`
+                        : "";
+  const releaseAllowed =
+    !pending &&
+    !moving &&
+    !waitingForStop &&
+    (intent === "exit" || (connected && view.hasControl));
+  const releaseLabel =
+    intent === "exit" ? "退出" : intent === "disable" ? "失能" : "断开";
+  const title = intent === "parking" ? "收纳" : `确认${releaseLabel}`;
+  useEffect(() => {
+    alive.current = true;
+    const previous = document.activeElement;
+    dialog.current?.focus();
+    return () => {
+      alive.current = false;
+      returning.current?.controller.abort();
+      if (previous instanceof HTMLElement && previous.isConnected)
+        previous.focus();
+    };
+  }, []);
+  const dismiss = () => {
+    returning.current?.controller.abort();
+    onClose();
+  };
+  const save = () => {
+    const current = api.view;
+    const snapshot = current.snapshot;
+    const joints = snapshot.joints.map((joint) => joint.q);
+    if (
+      pending ||
+      !port ||
+      snapshot.side !== side ||
+      snapshot.port !== port ||
+      !hasFreshFeedback(current) ||
+      snapshot.action ||
+      motionPending ||
+      ["moving", "stopping", "enabling"].includes(snapshot.phase) ||
+      enablePending ||
+      (stoppingFrom !== null && snapshot.generation === stoppingFrom) ||
+      !isJointPositions(joints)
+    ) {
+      setError("请停止动作并等待七轴反馈。");
+      return;
+    }
+    const pose: ParkingPose = { joints, savedAt: Date.now() };
+    try {
+      localStorage.setItem(storageKey, JSON.stringify(pose));
+      setStored({ pose, error: "" });
+      setError("");
+      setMessage("收纳位已记录");
+    } catch {
+      setError("收纳位保存失败。");
+    }
+  };
+  const startReturn = async (disconnectAfter: boolean) => {
+    if (pending || returning.current || returnReason || !stored.pose) return;
+    if (api.view.snapshot.side !== side || api.view.snapshot.port !== port) {
+      setError("连接设备已变化。");
+      return;
+    }
+    const task = { controller: new AbortController(), id: crypto.randomUUID() };
+    returning.current = task;
+    setPending(disconnectAfter ? "park" : "return");
+    setError("");
+    setMessage("");
+    try {
+      const result = await api.returnToPose(
+        {
+          joints: stored.pose.joints,
+          speed: Number(speed) / DEG,
+          disconnect_after: disconnectAfter,
+        },
+        task.controller.signal,
+        task.id,
+      );
+      if (
+        !alive.current ||
+        task.controller.signal.aborted ||
+        returning.current !== task
+      )
+        return;
+      if (intent === "exit" && disconnectAfter) {
+        const current = api.view;
+        const latest = current.snapshot.results.find(
+          (item) => item.request_id === task.id,
+        );
+        if (
+          !current.online ||
+          latest?.status !== "completed" ||
+          latest.code !== "parked" ||
+          result.request_id !== task.id ||
+          current.snapshot.enabled ||
+          current.snapshot.phase !== "disconnected" ||
+          current.snapshot.action
+        )
+          throw new Error("尚未确认收纳完成。");
+        await api.closeApp();
+        if (alive.current && !task.controller.signal.aborted) onClose();
+      } else if (disconnectAfter && intent !== "parking") {
+        onClose();
+      } else {
+        setMessage(
+          disconnectAfter ? "已收纳并断开。" : "已返回收纳位，保持使能。",
+        );
+      }
+    } catch (error) {
+      if (alive.current && returning.current === task)
+        setError(error instanceof Error ? error.message : "返回未完成");
+    } finally {
+      if (returning.current === task) {
+        returning.current = null;
+        if (alive.current) setPending(null);
+      }
+    }
+  };
+  const release = async () => {
+    if (!releaseAllowed) return;
+    setPending("release");
+    setError("");
+    try {
+      if (intent === "exit") await api.closeApp(true);
+      else
+        await api.command(intent === "disable" ? "disable" : "disconnect", {
+          allow_release: true,
+        });
+      if (alive.current) onClose();
+    } catch (error) {
+      if (alive.current)
+        setError(
+          error instanceof Error ? error.message : `${releaseLabel}失败`,
+        );
+    } finally {
+      if (alive.current) setPending(null);
+    }
+  };
+  const progress =
+    s.action && s.action.request_id === returning.current?.id
+      ? s.action.progress
+      : null;
+  return (
+    <div
+      className="modal-backdrop"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) dismiss();
+      }}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          dismiss();
+          void api.hostStop("parking_escape").catch((error) => api.fail(error));
+        } else if (event.key === "Tab") {
+          const controls = Array.from(
+            dialog.current?.querySelectorAll<HTMLElement>(
+              'button:not(:disabled), input:not(:disabled), [tabindex="0"]',
+            ) ?? [],
+          );
+          const first = controls[0];
+          const last = controls[controls.length - 1];
+          if (
+            event.shiftKey &&
+            (document.activeElement === first ||
+              document.activeElement === dialog.current)
+          ) {
+            event.preventDefault();
+            last?.focus();
+          } else if (
+            !event.shiftKey &&
+            (document.activeElement === last ||
+              document.activeElement === dialog.current)
+          ) {
+            event.preventDefault();
+            first?.focus();
+          }
+        }
+      }}
+    >
+      <section
+        ref={dialog}
+        tabIndex={-1}
+        className="tcp-dialog parking-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="parking-title"
+        aria-describedby="parking-support"
+      >
+        <div className="panel-heading">
+          <h2 id="parking-title">{title}</h2>
+          <button aria-label="关闭收纳窗口" onClick={dismiss}>
+            ×
+          </button>
+        </div>
+        <div className="parking-body">
+          {intent !== "parking" && (
+            <p className="parking-warning">
+              {releaseLabel}会停止保持，请确认机械臂已有支撑。
+            </p>
+          )}
+          <p id="parking-support">将机械臂放在支撑上，再记录收纳位。</p>
+          <div className="parking-device">
+            <b>{side === "right" ? "右臂" : "左臂"}</b>
+            <span title={port}>{port || "未选择串口"}</span>
+          </div>
+          <div className="parking-record">
+            <span>
+              {stored.pose
+                ? `记录于 ${new Date(stored.pose.savedAt).toLocaleString("zh-CN", { hour12: false })}`
+                : "尚未记录收纳位"}
+            </span>
+            <button disabled={!saveAllowed} onClick={save}>
+              {stored.pose ? "更新收纳位" : "记录当前姿态"}
+            </button>
+          </div>
+          {stored.pose && (
+            <dl
+              className="parking-joints"
+              aria-label="已保存的关节位置，单位度"
+            >
+              {stored.pose.joints.map((q, index) => (
+                <div key={index}>
+                  <dt>J{index + 1}</dt>
+                  <dd>{fmt(q * DEG, 1)}°</dd>
+                </div>
+              ))}
+            </dl>
+          )}
+          <label className="parking-speed" htmlFor="parking-speed">
+            <span>返回速度</span>
+            <input
+              id="parking-speed"
+              type="number"
+              min="0.1"
+              max={RETURN_MAX_DEGREES}
+              step="0.5"
+              value={speed}
+              disabled={!!pending}
+              onChange={(event) => setSpeed(event.target.value)}
+            />
+            <span>°/s</span>
+            <small>最高 {RETURN_MAX_DEGREES}°/s</small>
+          </label>
+          {returnReason && !pending && (
+            <p className="parking-hint">{returnReason}</p>
+          )}
+          {(stored.error || error) && (
+            <p className="parking-error" role="alert">
+              {error || stored.error}
+            </p>
+          )}
+          <p className="parking-status" role="status" aria-live="polite">
+            {pending === "release"
+              ? `正在${releaseLabel}…`
+              : pending
+                ? `正在返回收纳位${progress === null ? "…" : ` · ${Math.round(progress * 100)}%`}`
+                : message}
+          </p>
+        </div>
+        <div className="parking-choices">
+          {intent === "parking" && (
+            <button
+              disabled={!!pending || !!returnReason}
+              onClick={() => void startReturn(false)}
+            >
+              返回收纳位
+            </button>
+          )}
+          <button
+            className="primary"
+            disabled={!!pending || !!returnReason}
+            onClick={() => void startReturn(true)}
+          >
+            {intent === "exit" ? "收纳后退出" : "收纳后断开"}
+          </button>
+          {intent !== "parking" && (
+            <button disabled={!releaseAllowed} onClick={() => void release()}>
+              已支撑，{releaseLabel}
+            </button>
+          )}
+        </div>
+        <div className="dialog-actions parking-footer">
+          {(pending === "return" ||
+            pending === "park" ||
+            moving ||
+            waitingForStop) && (
+            <button
+              onClick={() => {
+                setMessage("");
+                void api
+                  .hostStop("parking_stop_button")
+                  .catch((error) => api.fail(error));
+              }}
+            >
+              停止
+            </button>
+          )}
+          <button onClick={dismiss}>{pending ? "停止并取消" : "取消"}</button>
+        </div>
+      </section>
     </div>
   );
 }
