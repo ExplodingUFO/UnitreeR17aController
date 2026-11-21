@@ -8,6 +8,7 @@ mod send_replay;
 mod server;
 mod trace;
 mod trajectory;
+mod tuning;
 
 use std::sync::{
     Arc, Mutex,

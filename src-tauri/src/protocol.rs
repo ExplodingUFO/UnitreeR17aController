@@ -5,6 +5,7 @@
 use crate::{
     journal::{Journal, TraceData},
     reference::{Previous, Reference, SampleStatus, Timing},
+    trace::ServoSample,
 };
 use crossbeam_channel::{Receiver as EventReceiver, Sender, bounded, unbounded};
 use serde::{Deserialize, Serialize};
@@ -594,7 +595,7 @@ impl Bus {
     fn write_all_recorded(
         &mut self,
         setpoints: &[Setpoint; 7],
-        recording: Option<(&Journal, Instant, u64, Option<Timing>)>,
+        recording: Option<(&Journal, Instant, TransmitMetadata)>,
     ) -> Result<(), String> {
         if self.incomplete_write {
             return Err("previous command was partially written; reconnect serial port".into());
@@ -610,13 +611,12 @@ impl Bus {
             // the last one, before the adapter turns around to receive.
             std::thread::sleep(Duration::from_micros(200));
         }
-        if let Some((journal, started, seq, timing)) = recording {
+        if let Some((journal, started, metadata)) = recording {
             sample_transmit(
                 journal,
                 started,
                 setpoints,
-                seq,
-                timing,
+                metadata,
                 &packets,
                 &self.calibration,
             );
@@ -769,12 +769,29 @@ struct Prepared {
     values: [Setpoint; 7],
     timing: Option<Timing>,
     rejection: Option<SampleStatus>,
+    motion_velocity: [f64; 7],
+    gravity: [f64; 7],
+    tuning: Option<ServoSample>,
+}
+impl Prepared {
+    fn direct(values: [Setpoint; 7]) -> Self {
+        Self {
+            values,
+            timing: None,
+            rejection: None,
+            motion_velocity: values.map(|s| s.dq),
+            gravity: values.map(|s| s.tau),
+            tuning: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
 struct Committed {
     at: Instant,
     values: [Setpoint; 7],
+    motion_velocity: [f64; 7],
+    gravity: [f64; 7],
 }
 
 /// Latest successfully written servo batch, for idle action handoff only.
@@ -787,6 +804,14 @@ pub struct SentReference {
     pub dq: [f64; 7],
 }
 impl Committed {
+    fn direct(at: Instant, values: [Setpoint; 7]) -> Self {
+        Self {
+            at,
+            values,
+            motion_velocity: values.map(|s| s.dq),
+            gravity: values.map(|s| s.tau),
+        }
+    }
     fn servo(&self) -> Option<Previous> {
         self.values
             .iter()
@@ -794,7 +819,7 @@ impl Committed {
             .then(|| Previous {
                 at: self.at,
                 q: self.values.map(|s| s.q),
-                dq: self.values.map(|s| s.dq),
+                dq: self.motion_velocity,
             })
     }
 }
@@ -814,18 +839,10 @@ impl PublishedSetpoints {
         latched: Option<SampleStatus>,
     ) -> Result<Prepared, String> {
         if self.values.iter().all(|s| s.mode != DriveMode::Servo) {
-            return Ok(Prepared {
-                values: self.values,
-                timing: None,
-                rejection: None,
-            });
+            return Ok(Prepared::direct(self.values));
         }
         let Some(reference) = &self.reference else {
-            return Ok(Prepared {
-                values: self.values,
-                timing: None,
-                rejection: None,
-            });
+            return Ok(Prepared::direct(self.values));
         };
         let previous = committed.and_then(|c| c.servo());
         let sample = if let Some(reason) = latched {
@@ -833,32 +850,72 @@ impl PublishedSetpoints {
         } else {
             reference.sample(at, previous)
         };
-        match sample {
-            Ok(sample) => {
-                let mut values = self.values;
-                for (i, value) in values.iter_mut().enumerate() {
-                    if value.mode == DriveMode::Servo {
-                        value.q = sample.q[i];
-                        value.dq = sample.dq[i];
-                    }
-                }
-                Ok(Prepared {
-                    values,
-                    timing: Some(sample.timing),
-                    rejection: None,
-                })
-            }
+        let (mut values, q, dq, gravity, timing, rejection) = match sample {
+            Ok(sample) => (
+                self.values,
+                sample.q,
+                sample.dq,
+                self.values.map(|s| s.tau),
+                sample.timing,
+                None,
+            ),
             Err(reason) => {
                 let committed = committed.filter(|c| c.servo().is_some()).ok_or_else(|| {
                     format!("send reference {reason:?} before a valid servo target")
                 })?;
-                let values = committed.values.map(|s| Setpoint { dq: 0.0, ..s });
-                Ok(Prepared {
-                    values,
-                    timing: Some(reference.timing(at, reason)),
-                    rejection: Some(reason),
-                })
+                (
+                    committed.values,
+                    committed.values.map(|s| s.q),
+                    [0.0; 7],
+                    committed.gravity,
+                    reference.timing(at, reason),
+                    Some(reason),
+                )
             }
+        };
+        // Actuator feedforward is separate from the velocity used to integrate
+        // positions. A zero feedforward weight must not stop the trajectory.
+        let applied = reference.servo_tuning.apply(dq, gravity)?;
+        for (i, value) in values.iter_mut().enumerate() {
+            if value.mode == DriveMode::Servo {
+                value.q = q[i];
+                value.dq = applied.dq_feedforward[i];
+                value.tau = applied.tau[i];
+                value.kd = reference.servo_tuning.joints[i].kd;
+            }
+        }
+        Ok(Prepared {
+            values,
+            motion_velocity: dq,
+            gravity,
+            timing: Some(timing),
+            rejection,
+            tuning: Some(ServoSample {
+                revision: reference.tuning_revision,
+                dq_feedforward: applied.dq_feedforward,
+                tau_gravity: gravity,
+                friction_requested: applied.friction_requested,
+                friction_applied: applied.friction_applied,
+                clamped: applied.clamped,
+            }),
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TransmitMetadata {
+    seq: u64,
+    timing: Option<Timing>,
+    motion_velocity: Option<[f64; 7]>,
+    tuning: Option<ServoSample>,
+}
+impl TransmitMetadata {
+    fn direct(seq: u64) -> Self {
+        Self {
+            seq,
+            timing: None,
+            motion_velocity: None,
+            tuning: None,
         }
     }
 }
@@ -879,8 +936,7 @@ fn sample_transmit(
     journal: &Journal,
     started: Instant,
     values: &[Setpoint; 7],
-    seq: u64,
-    timing: Option<Timing>,
+    metadata: TransmitMetadata,
     packets: &[[u8; COMMAND_LEN]; 7],
     calibration: &[Calibration; 7],
 ) {
@@ -900,11 +956,14 @@ fn sample_transmit(
     journal.sample(
         started,
         TraceData::Transmit {
-            seq,
-            timing,
+            seq: metadata.seq,
+            timing: metadata.timing,
+            tuning: metadata.tuning,
             mode: std::array::from_fn(|i| (packets[i][2] >> 4) & 0x07),
             q_ref: std::array::from_fn(|i| values[i].q),
-            dq_ref: std::array::from_fn(|i| values[i].dq),
+            dq_ref: metadata
+                .motion_velocity
+                .unwrap_or_else(|| values.map(|s| s.dq)),
             tau_ff: std::array::from_fn(|i| values[i].tau),
             q_wire: std::array::from_fn(|i| wire[i][0]),
             dq_wire: std::array::from_fn(|i| wire[i][1]),
@@ -1007,15 +1066,12 @@ impl BusHandle {
                                 let values = stopped_setpoints();
                                 let result = bus.write_all_recorded(
                                     &values,
-                                    writer_journal
-                                        .as_ref()
-                                        .map(|journal| (journal, started, 0, None)),
+                                    writer_journal.as_ref().map(|journal| {
+                                        (journal, started, TransmitMetadata::direct(0))
+                                    }),
                                 );
                                 if result.is_ok() {
-                                    committed = Some(Committed {
-                                        at: started,
-                                        values,
-                                    });
+                                    committed = Some(Committed::direct(started, values));
                                 }
                                 sent_tx.send_replace(None);
                                 let _ = reply.send(result);
@@ -1026,9 +1082,9 @@ impl BusHandle {
                                 let started = Instant::now();
                                 let result = bus.write_all_recorded(
                                     &setpoints,
-                                    writer_journal
-                                        .as_ref()
-                                        .map(|journal| (journal, started, 0, None)),
+                                    writer_journal.as_ref().map(|journal| {
+                                        (journal, started, TransmitMetadata::direct(0))
+                                    }),
                                 );
                                 if result.is_ok() {
                                     last = PublishedSetpoints {
@@ -1036,10 +1092,7 @@ impl BusHandle {
                                         seq: 0,
                                         reference: None,
                                     };
-                                    committed = Some(Committed {
-                                        at: started,
-                                        values: *setpoints,
-                                    });
+                                    committed = Some(Committed::direct(started, *setpoints));
                                     rejected = None;
                                     next_write = next_deadline(next_write, started, Instant::now());
                                     if let Ok(mut shared) = writer_stats.lock() {
@@ -1085,7 +1138,16 @@ impl BusHandle {
                                 if let Err(error) = bus.write_all_recorded(
                                     &prepared.values,
                                     writer_journal.as_ref().map(|journal| {
-                                        (journal, started, last.seq, prepared.timing)
+                                        (
+                                            journal,
+                                            started,
+                                            TransmitMetadata {
+                                                seq: last.seq,
+                                                timing: prepared.timing,
+                                                motion_velocity: Some(prepared.motion_velocity),
+                                                tuning: prepared.tuning,
+                                            },
+                                        )
                                     }),
                                 ) {
                                     sent_tx.send_replace(None);
@@ -1095,6 +1157,8 @@ impl BusHandle {
                                 committed = Some(Committed {
                                     at: started,
                                     values: prepared.values,
+                                    gravity: prepared.gravity,
+                                    motion_velocity: prepared.motion_velocity,
                                 });
                                 let sent_reference = last
                                     .reference
@@ -1107,7 +1171,7 @@ impl BusHandle {
                                         generation: r.generation,
                                         epoch: r.epoch,
                                         q: prepared.values.map(|s| s.q),
-                                        dq: prepared.values.map(|s| s.dq),
+                                        dq: prepared.motion_velocity,
                                     });
                                 sent_tx.send_replace(sent_reference);
                                 if let Some(reason) = prepared.rejection
@@ -1347,6 +1411,348 @@ mod tests {
     use super::*;
 
     #[test]
+    fn baseline_tuning_keeps_encoded_commands_and_disabled_packets_unchanged() {
+        let now = Instant::now();
+        let values = [Setpoint {
+            mode: DriveMode::Servo,
+            q: 0.5,
+            dq: 0.05,
+            tau: 0.3,
+            kp: 60.0,
+            kd: 10.0,
+        }; 7];
+        let mut reference = Reference::joint(now, [0.5; 7], [0.05; 7], [0.0; 7], 1, 0);
+        // Nonzero coefficients are inert while the global switch is off.
+        for joint in &mut reference.servo_tuning.joints {
+            joint.coulomb = 0.4;
+            joint.viscous = 1.0;
+        }
+        let published = PublishedSetpoints {
+            values,
+            seq: 1,
+            reference: Some(reference),
+        };
+        let prepared = published
+            .prepare(now + Duration::from_millis(20), None, None)
+            .unwrap();
+        for side in ["left", "right"] {
+            let calibration = calibrations(side).unwrap();
+            for (i, cal) in calibration.iter().enumerate() {
+                let baseline = Setpoint {
+                    q: 0.501,
+                    ..values[i]
+                };
+                assert_eq!(
+                    encode(i as u8, cal.command(prepared.values[i])).unwrap(),
+                    encode(i as u8, cal.command(baseline)).unwrap()
+                );
+            }
+        }
+        assert_eq!(prepared.tuning.unwrap().friction_applied, [0.0; 7]);
+        let direct = PublishedSetpoints {
+            values: stopped_setpoints(),
+            ..published
+        }
+        .prepare(now + Duration::from_secs(1), None, None)
+        .unwrap();
+        assert!(direct.tuning.is_none());
+        assert_eq!(direct.values.map(|v| v.mode), [DriveMode::Disabled; 7]);
+    }
+
+    #[test]
+    fn zero_velocity_feedforward_does_not_change_position_sampling_or_hold_friction() {
+        let now = Instant::now();
+        let values = [Setpoint {
+            mode: DriveMode::Servo,
+            q: 0.5,
+            dq: 0.05,
+            tau: 0.3,
+            kp: 60.0,
+            kd: 10.0,
+        }; 7];
+        let mut reference = Reference::joint(now, [0.5; 7], [0.05; 7], [0.0; 7], 1, 0);
+        reference.servo_tuning.friction_enabled = true;
+        reference.tuning_revision = 4;
+        for (i, joint) in reference.servo_tuning.joints.iter_mut().enumerate() {
+            joint.velocity_ff = 0.0;
+            joint.kd = 3.0 + i as f64;
+            joint.coulomb = 0.2;
+            joint.viscous = 1.0;
+            joint.velocity_scale = 0.01;
+        }
+        let published = PublishedSetpoints {
+            values,
+            seq: 2,
+            reference: Some(reference),
+        };
+        let at = now + Duration::from_millis(20);
+        let first = published.prepare(at, None, None).unwrap();
+        assert_eq!(first.values.map(|s| s.dq), [0.0; 7]);
+        assert_eq!(first.motion_velocity, [0.05; 7]);
+        assert_eq!(first.values.map(|s| s.q), [0.501; 7]);
+        assert!(first.values.iter().all(|s| s.tau > 0.54 && s.tau < 0.55));
+        assert_eq!(
+            first.values.map(|s| s.kd),
+            [3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
+        );
+        let committed = Committed {
+            at,
+            values: first.values,
+            motion_velocity: first.motion_velocity,
+            gravity: first.gravity,
+        };
+        let next = published
+            .prepare(now + Duration::from_millis(30), Some(committed), None)
+            .unwrap();
+        assert_trace_numbers(next.values.map(|s| s.q), [0.5015; 7]);
+        let held = published
+            .prepare(now + Duration::from_millis(60), Some(committed), None)
+            .unwrap();
+        assert_eq!(held.rejection, Some(SampleStatus::Stale));
+        assert_eq!(held.values.map(|s| s.q), [0.501; 7]);
+        assert_eq!(held.values.map(|s| s.dq), [0.0; 7]);
+        assert_eq!(held.values.map(|s| s.tau), [0.3; 7]);
+        assert_eq!(held.motion_velocity, [0.0; 7]);
+        let details = held.tuning.unwrap();
+        assert_eq!(details.revision, 4);
+        assert_eq!(details.friction_applied, [0.0; 7]);
+    }
+
+    #[test]
+    fn tuned_transmit_records_the_trajectory_feedforward_and_successful_motion_velocity() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = Journal::start(directory.path().join("events.db")).unwrap();
+        let trace = journal
+            .trace_start(20_000, "right", Some("memory-only"))
+            .unwrap();
+        let (bus, wire) = fake_bus(Wire {
+            write_chunk: COMMAND_LEN,
+            ..Wire::default()
+        });
+        let handle = BusHandle::start_recorded(bus, Some(journal.clone())).unwrap();
+        let now = Instant::now();
+        let mut reference = Reference::joint(now, [0.5; 7], [0.05; 7], [0.0; 7], 1, 0);
+        reference.tuning_revision = 7;
+        reference.servo_tuning.friction_enabled = true;
+        for joint in &mut reference.servo_tuning.joints {
+            joint.velocity_ff = 0.0;
+            joint.coulomb = 0.2;
+        }
+        let values = [Setpoint {
+            mode: DriveMode::Servo,
+            q: 0.5,
+            dq: 0.05,
+            tau: 0.3,
+            kp: 60.0,
+            kd: 10.0,
+        }; 7];
+        handle.publish(values, 77, reference).unwrap();
+        wait_for_protocol(|| {
+            handle
+                .latest_reference()
+                .is_some_and(|sent| sent.q[0] > 0.5)
+        });
+        let sent = handle.latest_reference().unwrap();
+        assert_eq!(sent.dq, [0.05; 7]);
+        let bytes = wire.lock().unwrap().written.clone();
+        let servo: Vec<_> = bytes
+            .as_chunks::<COMMAND_LEN>()
+            .0
+            .iter()
+            .filter(|p| (p[2] >> 4) & 7 == 1)
+            .collect();
+        assert!(servo.len() >= 7);
+        assert!(servo.iter().all(|p| p[6..8] == [0, 0]));
+        handle.disable().unwrap();
+        let recording = finish_trace(&journal, &trace.id);
+        let transmit = recording
+            .samples
+            .iter()
+            .find_map(|s| match s.data {
+                TraceData::Transmit {
+                    seq: 77,
+                    tuning: Some(t),
+                    dq_ref,
+                    dq_wire,
+                    tau_ff,
+                    ..
+                } => Some((t, dq_ref, dq_wire, tau_ff)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(transmit.0.revision, 7);
+        assert_eq!(transmit.0.dq_feedforward, [0.0; 7]);
+        assert_eq!(transmit.1, [0.05; 7]);
+        assert_eq!(transmit.2, [0.0; 7]);
+        assert!(transmit.3.iter().all(|t| *t > 0.49));
+        assert_eq!(transmit.0.tau_gravity, [0.3; 7]);
+    }
+
+    #[test]
+    fn tuned_cartesian_sends_keep_the_tcp_path_and_brake_to_zero_friction() {
+        use crate::{
+            kinematics::{
+                CartesianPath, Frame, Kinematics, LocalTarget, MotionLimits, Pose, SmoothingState,
+                StepInput,
+            },
+            reference::CartesianGuard,
+            trajectory::{JOINT_ACCELERATION, JOINT_JERK, JOINT_SPEED},
+        };
+        let origin = Instant::now();
+        let tcp = Pose {
+            translation: [0.0, 0.0, 0.1],
+            ..Pose::identity()
+        };
+        for side in ["left", "right"] {
+            let model = Arc::new(Kinematics::load(side).unwrap());
+            for frame in [Frame::Base, Frame::Tool] {
+                for axis in 0..6 {
+                    let mut q = [0.3, 0.7, 1.1, 0.9, -0.4, 0.2, -0.3];
+                    let (mut dq, mut ddq) = ([0.0; 7], [0.0; 7]);
+                    let path = CartesianPath {
+                        origin: model.fk(&q, &tcp).unwrap(),
+                        axis,
+                        frame,
+                    };
+                    let (mut baseline, mut tuned) = (None, None);
+                    let mut peak_friction = 0.0_f64;
+                    for tick in 0..150 {
+                        let stopping = tick >= 60;
+                        let mut twist = [0.0; 6];
+                        if !stopping {
+                            twist[axis] = if axis < 3 { 0.014 } else { 0.14 };
+                        }
+                        let step = model
+                            .step(StepInput {
+                                reference: q,
+                                measured: q,
+                                previous_velocity: dq,
+                                target: LocalTarget::Velocity { twist, frame },
+                                dt: 0.01,
+                                tcp,
+                                limits: MotionLimits {
+                                    joint_velocity: [JOINT_SPEED; 7],
+                                    joint_acceleration: [JOINT_ACCELERATION; 7],
+                                    max_reference_error: 0.60,
+                                    max_joint_step: 0.01,
+                                    linear_speed: 0.015,
+                                    angular_speed: 0.15,
+                                },
+                                smoothing: Some(SmoothingState {
+                                    acceleration: ddq,
+                                    jerk: [JOINT_JERK; 7],
+                                    path: Some(path),
+                                    stopping,
+                                }),
+                            })
+                            .unwrap();
+                        (q, dq, ddq) = (step.q, step.dq, step.ddq);
+                        let at = origin + Duration::from_millis(tick * 10);
+                        let mut reference = Reference::joint(at, q, dq, ddq, 1, 0);
+                        reference.stopping = stopping;
+                        reference.cartesian = Some(CartesianGuard {
+                            model: model.clone(),
+                            tcp,
+                            path,
+                            goal: None,
+                            linear_speed: 0.015,
+                            angular_speed: 0.15,
+                            measured: q,
+                            max_reference_error: 0.60,
+                        });
+                        let values = std::array::from_fn(|i| Setpoint {
+                            mode: DriveMode::Servo,
+                            q: q[i],
+                            dq: dq[i],
+                            tau: 0.3,
+                            kp: 60.0,
+                            kd: 10.0,
+                        });
+                        let at = at + Duration::from_millis(2);
+                        let normal = PublishedSetpoints {
+                            values,
+                            seq: tick,
+                            reference: Some(reference.clone()),
+                        }
+                        .prepare(at, baseline, None)
+                        .unwrap();
+                        reference.servo_tuning.friction_enabled = true;
+                        for (i, joint) in reference.servo_tuning.joints.iter_mut().enumerate() {
+                            joint.kd = 3.0 + i as f64;
+                            joint.velocity_ff = 0.0;
+                            joint.coulomb = 0.3;
+                            joint.viscous = 1.0;
+                        }
+                        let actual = PublishedSetpoints {
+                            values,
+                            seq: tick,
+                            reference: Some(reference),
+                        }
+                        .prepare(at, tuned, None)
+                        .unwrap();
+                        assert!(normal.rejection.is_none() && actual.rejection.is_none());
+                        assert_eq!(actual.values.map(|s| s.q), normal.values.map(|s| s.q));
+                        assert_eq!(actual.motion_velocity, normal.motion_velocity);
+                        assert_eq!(actual.values.map(|s| s.dq), [0.0; 7]);
+                        let (wire_q, _) = test_wire_targets(
+                            side,
+                            actual.values.map(|s| s.q),
+                            actual.values.map(|s| s.dq),
+                        );
+                        path.check(&model.fk(&wire_q, &tcp).unwrap()).unwrap();
+                        let friction = actual.tuning.unwrap().friction_applied;
+                        peak_friction = friction
+                            .into_iter()
+                            .fold(peak_friction, |peak, f| peak.max(f.abs()));
+                        baseline = Some(Committed {
+                            at,
+                            values: normal.values,
+                            motion_velocity: normal.motion_velocity,
+                            gravity: normal.gravity,
+                        });
+                        tuned = Some(Committed {
+                            at,
+                            values: actual.values,
+                            motion_velocity: actual.motion_velocity,
+                            gravity: actual.gravity,
+                        });
+                    }
+                    assert!(peak_friction > 0.01);
+                    let held = tuned.unwrap();
+                    assert!(held.motion_velocity.iter().all(|v| v.abs() < 1e-5));
+                    // The controller finishes its brake with a zero-velocity
+                    // hold. No previous friction is carried into that hold.
+                    let mut idle = Reference::joint(
+                        held.at,
+                        held.values.map(|s| s.q),
+                        [0.0; 7],
+                        [0.0; 7],
+                        1,
+                        0,
+                    );
+                    idle.servo_tuning.friction_enabled = true;
+                    for joint in &mut idle.servo_tuning.joints {
+                        joint.coulomb = 0.3;
+                        joint.viscous = 1.0;
+                        joint.velocity_ff = 0.0;
+                    }
+                    let rest = PublishedSetpoints {
+                        values: held.values.map(|s| Setpoint { tau: 0.3, ..s }),
+                        seq: 151,
+                        reference: Some(idle),
+                    };
+                    let rest = rest
+                        .prepare(held.at + WRITE_PERIOD, Some(held), None)
+                        .unwrap();
+                    assert_eq!(rest.motion_velocity, [0.0; 7]);
+                    assert_eq!(rest.tuning.unwrap().friction_applied, [0.0; 7]);
+                    assert_eq!(rest.values.map(|s| s.tau), [0.3; 7]);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn deadline_grid_does_not_accumulate_wakeup_delay_or_catch_up() {
         let origin = Instant::now();
         let mut scheduled = origin;
@@ -1361,6 +1767,16 @@ mod tests {
         assert!(next > finished);
         assert!(next >= started + WRITE_PERIOD / 2);
         assert_eq!(next.duration_since(origin).as_millis() % 10, 0);
+        for late_ms in 0..10 {
+            for write_ms in [0, 1, 5, 20] {
+                let started = origin + Duration::from_millis(late_ms);
+                let finished = started + Duration::from_millis(write_ms);
+                let next = next_deadline(origin, started, finished);
+                assert!(next >= started + WRITE_PERIOD / 2);
+                assert!(next > finished);
+                assert_eq!(next.duration_since(origin).as_millis() % 10, 0);
+            }
+        }
         // An out-of-band clear can finish before an already scheduled slot.
         // Keep that slot if the ordinary minimum spacing still fits.
         assert_eq!(
@@ -1454,10 +1870,10 @@ mod tests {
         };
         let at = now + Duration::from_millis(60);
         assert!(published.prepare(at, None, None).is_err());
-        let committed = Committed {
-            at: now + Duration::from_millis(10),
-            values: values.map(|s| Setpoint { q: 0.501, ..s }),
-        };
+        let committed = Committed::direct(
+            now + Duration::from_millis(10),
+            values.map(|s| Setpoint { q: 0.501, ..s }),
+        );
         let held = published.prepare(at, Some(committed), None).unwrap();
         assert_eq!(held.values.map(|s| s.q), [0.501; 7]);
         assert_eq!(held.values.map(|s| s.dq), [0.0; 7]);
@@ -1473,14 +1889,7 @@ mod tests {
         // An initial disabled target is not an observed servo position.
         assert!(
             published
-                .prepare(
-                    at,
-                    Some(Committed {
-                        at: now,
-                        values: stopped_setpoints()
-                    }),
-                    None
-                )
+                .prepare(at, Some(Committed::direct(now, stopped_setpoints())), None)
                 .is_err()
         );
     }
@@ -2181,6 +2590,7 @@ mod tests {
                     kd,
                     write_us,
                     timing: _,
+                    tuning: _,
                 } = sample.data
                 else {
                     unreachable!()
@@ -2332,8 +2742,11 @@ mod tests {
                 // queue-consumption, serialization or SQLite completion time.
                 thread::sleep(Duration::from_millis(20));
             }
-            bus.write_all_recorded(&values, Some((&journal, started, seq as u64, None)))
-                .unwrap();
+            bus.write_all_recorded(
+                &values,
+                Some((&journal, started, TransmitMetadata::direct(seq as u64))),
+            )
+            .unwrap();
             sources.push(started);
             values_by_sequence.push(values);
         }
@@ -2347,8 +2760,11 @@ mod tests {
                 kd: 1.0,
             });
             let started = Instant::now();
-            bus.write_all_recorded(&values, Some((&journal, started, (n + 6) as u64, None)))
-                .unwrap();
+            bus.write_all_recorded(
+                &values,
+                Some((&journal, started, TransmitMetadata::direct((n + 6) as u64))),
+            )
+            .unwrap();
             sources.push(started);
             values_by_sequence.push(values);
         }
@@ -2361,8 +2777,11 @@ mod tests {
             kd: 1.0,
         });
         let started = Instant::now();
-        bus.write_all_recorded(&negative, Some((&journal, started, 8, None)))
-            .unwrap();
+        bus.write_all_recorded(
+            &negative,
+            Some((&journal, started, TransmitMetadata::direct(8))),
+        )
+        .unwrap();
         sources.push(started);
         values_by_sequence.push(negative);
         let recording = finish_trace(&journal, &trace.id);
@@ -2466,14 +2885,17 @@ mod tests {
             ..stop()
         };
         assert!(
-            bus.write_all_recorded(&invalid, Some((&journal, Instant::now(), 81, None)))
-                .is_err()
+            bus.write_all_recorded(
+                &invalid,
+                Some((&journal, Instant::now(), TransmitMetadata::direct(81)))
+            )
+            .is_err()
         );
         assert!(wire.lock().unwrap().written.is_empty());
         assert!(
             bus.write_all_recorded(
                 &stopped_setpoints(),
-                Some((&journal, Instant::now(), 82, None))
+                Some((&journal, Instant::now(), TransmitMetadata::direct(82)))
             )
             .is_err()
         );
@@ -2481,7 +2903,7 @@ mod tests {
         assert!(
             bus.write_all_recorded(
                 &stopped_setpoints(),
-                Some((&journal, Instant::now(), 83, None))
+                Some((&journal, Instant::now(), TransmitMetadata::direct(83)))
             )
             .unwrap_err()
             .contains("reconnect")
@@ -2638,7 +3060,8 @@ mod tests {
         let handle = BusHandle::start(bus).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         // A producer update just after an entire heartbeat batch is legal.
-        // It must not force a second batch at a fraction of the stated 10ms period.
+        // Updates cannot bypass the writer's deadline grid. A late wakeup can
+        // shorten the next interval to the existing half-period spacing floor.
         while wire.lock().unwrap().command_times.len() < 14 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_micros(100));
         }
@@ -2670,9 +3093,12 @@ mod tests {
             .map(|pair| pair[1].duration_since(pair[0]).as_secs_f64() * 1000.0)
             .collect();
         println!("TX batch intervals (ms): {intervals:?}");
+        // The fake driver timestamps the first packet after preparation; allow
+        // 0.5 ms variation there. The grid's exact floor is checked above.
+        let observed_floor_ms = (WRITE_PERIOD / 2).as_secs_f64() * 1000.0 - 0.5;
         assert!(
-            intervals.iter().all(|ms| *ms >= 9.0),
-            "watch updates bypass the 10ms writer cadence: {intervals:?}"
+            intervals.iter().all(|ms| *ms >= observed_floor_ms),
+            "watch updates bypass the writer spacing floor: {intervals:?}"
         );
     }
 

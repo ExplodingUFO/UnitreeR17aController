@@ -2,6 +2,7 @@
 use crate::{
     kinematics::{CartesianPath, Kinematics, Pose, pose_error},
     trajectory::{JOINT_ACCELERATION, JOINT_SPEED},
+    tuning::ServoTuning,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -23,6 +24,8 @@ pub struct Reference {
     pub stopping: bool,
     pub joint_goal: Option<[f64; 7]>,
     pub cartesian: Option<CartesianGuard>,
+    pub servo_tuning: ServoTuning,
+    pub tuning_revision: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -89,6 +92,8 @@ impl Reference {
             stopping: false,
             joint_goal: None,
             cartesian: None,
+            servo_tuning: ServoTuning::default(),
+            tuning_revision: 0,
         }
     }
 

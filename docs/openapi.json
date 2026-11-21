@@ -4,7 +4,7 @@
   "info": {
     "title": "R1-7a Controller 本机 API",
     "version": "0.1.0",
-    "description": "对应当前桌面软件。应用从 127.0.0.1:8177 提供 HTTP 与 WebSocket，随桌面启停。token 从桌面“接口”面板取得，每次启动变化。POST /v1/commands 的 202 仅代表入队，执行结果从 Snapshot.results 按 request_id 读取。字段范围表示有效业务输入；业务校验可在入队后返回 rejected。所有量采用 m、rad、s，显式 _ms 字段采用 ms，_us 字段采用 μs。UTF-8 字节上限使用 x-utf8-max-bytes 表示。示例数值为协议示例。 短时采样沿用 Bearer/Origin 校验，无需运动租约。关节参考速度/加速度/jerk 上限为 0.20 rad/s、0.60 rad/s²、6 rad/s³，jerk 为离线默认值；实际串口发送可重复或合并参考，物理 jerk 尚未验证。",
+    "description": "对应当前桌面软件。应用从 127.0.0.1:8177 提供 HTTP 与 WebSocket，随桌面启停。token 从桌面“接口”面板取得，每次启动变化。POST /v1/commands 的 202 仅代表入队，执行结果从 Snapshot.results 按 request_id 读取。字段范围表示有效业务输入；业务校验可在入队后返回 rejected。所有量采用 m、rad、s，显式 _ms 字段采用 ms，_us 字段采用 μs。UTF-8 字节上限使用 x-utf8-max-bytes 表示。示例数值为协议示例。 短时采样沿用 Bearer/Origin 校验，无需运动租约。关节参考速度/加速度/jerk 上限为 0.20 rad/s、0.60 rad/s²、6 rad/s³，jerk 为离线默认值；实际串口发送可重复或合并参考，物理 jerk 尚未验证。 伺服调试提供逐轴阻尼/速度前馈权重和可开关平滑摩擦，完整配置见 ServoTuning；仅当前连接内存生效，连接/断开恢复基线，算法尚未真机验证。",
     "license": {
       "name": "BSD-3-Clause",
       "url": "https://opensource.org/license/bsd-3-clause"
@@ -42,7 +42,9 @@
     "/v1/ports": {
       "get": {
         "operationId": "listPorts",
-        "tags": ["状态"],
+        "tags": [
+          "状态"
+        ],
         "summary": "枚举串口",
         "description": "按设备身份去重；macOS 合并同一设备的 /dev/cu.* 与 /dev/tty.* 并优先 cu。结果按 name 排序。系统枚举错误当前返回空数组；后台枚举任务本身失败时返回 ports_failed。",
         "responses": {
@@ -92,7 +94,9 @@
     "/v1/state": {
       "get": {
         "operationId": "getState",
-        "tags": ["状态"],
+        "tags": [
+          "状态"
+        ],
         "summary": "读取最近状态快照",
         "description": "返回 Snapshot 本体。快照通常约 30 Hz 更新，状态变化可提前发布；此接口读取缓存，非设备同步查询。",
         "responses": {
@@ -209,7 +213,69 @@
                     "received": 0,
                     "crc_errors": 0,
                     "timeouts": 0
-                  }
+                  },
+                  "servo_tuning": {
+                    "friction_enabled": false,
+                    "joints": [
+                      {
+                        "kd": 10.0,
+                        "velocity_ff": 1.0,
+                        "coulomb": 0.0,
+                        "viscous": 0.0,
+                        "velocity_scale": 0.02,
+                        "max_friction": 0.5
+                      },
+                      {
+                        "kd": 10.0,
+                        "velocity_ff": 1.0,
+                        "coulomb": 0.0,
+                        "viscous": 0.0,
+                        "velocity_scale": 0.02,
+                        "max_friction": 0.5
+                      },
+                      {
+                        "kd": 10.0,
+                        "velocity_ff": 1.0,
+                        "coulomb": 0.0,
+                        "viscous": 0.0,
+                        "velocity_scale": 0.02,
+                        "max_friction": 0.5
+                      },
+                      {
+                        "kd": 10.0,
+                        "velocity_ff": 1.0,
+                        "coulomb": 0.0,
+                        "viscous": 0.0,
+                        "velocity_scale": 0.02,
+                        "max_friction": 0.5
+                      },
+                      {
+                        "kd": 10.0,
+                        "velocity_ff": 1.0,
+                        "coulomb": 0.0,
+                        "viscous": 0.0,
+                        "velocity_scale": 0.02,
+                        "max_friction": 0.5
+                      },
+                      {
+                        "kd": 10.0,
+                        "velocity_ff": 1.0,
+                        "coulomb": 0.0,
+                        "viscous": 0.0,
+                        "velocity_scale": 0.02,
+                        "max_friction": 0.5
+                      },
+                      {
+                        "kd": 10.0,
+                        "velocity_ff": 1.0,
+                        "coulomb": 0.0,
+                        "viscous": 0.0,
+                        "velocity_scale": 0.02,
+                        "max_friction": 0.5
+                      }
+                    ]
+                  },
+                  "servo_tuning_revision": 1
                 }
               }
             }
@@ -226,7 +292,9 @@
     "/v1/control": {
       "post": {
         "operationId": "updateControl",
-        "tags": ["控制权"],
+        "tags": [
+          "控制权"
+        ],
         "summary": "取得、续期或释放控制权",
         "description": "同一时间一名控制者，已有控制者时 acquire 返回 409，即使 client_id 相同。有效期 2500 ms，建议每 800 ms 续期。release/过期取消动作，不自动失能。接口等待控制线程处理后返回；排队截止 300 ms，等待上限 350 ms。",
         "requestBody": {
@@ -348,9 +416,11 @@
     "/v1/commands": {
       "post": {
         "operationId": "submitCommand",
-        "tags": ["命令"],
+        "tags": [
+          "命令"
+        ],
         "summary": "提交设备操作或点动请求",
-        "description": "HTTP 202 仅确认入队。控制权、generation、运行阶段、运动范围在控制线程中校验，失败通过 Snapshot.results 返回 rejected。results 新到旧，按 request_id 取第一条，最多 32 条记录。相同 generation/request_id 有最多 256 项的内存去重历史；网络超时后先查结果，不自动重发运动。",
+        "description": "HTTP 202 仅确认入队。控制权、generation、运行阶段、运动范围在控制线程中校验，失败通过 Snapshot.results 返回 rejected。results 新到旧，按 request_id 取第一条，最多 32 条记录。相同 generation/request_id 有最多 256 项的内存去重历史；网络超时后先查结果，不自动重发运动。 configure_servo 同样先返回 202 queued；参数范围越限等业务错误通过 rejected 返回。",
         "requestBody": {
           "required": true,
           "content": {
@@ -416,8 +486,17 @@
                     "generation": 3,
                     "kind": "configure_tcp",
                     "tcp": {
-                      "translation": [0.0, 0.0, 0.0],
-                      "rotation": [0.0, 0.0, 0.0, 1.0]
+                      "translation": [
+                        0.0,
+                        0.0,
+                        0.0
+                      ],
+                      "rotation": [
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0
+                      ]
                     }
                   }
                 },
@@ -481,9 +560,88 @@
                     "lease_id": "11111111-1111-4111-8111-111111111111",
                     "generation": 5,
                     "kind": "return_to_pose",
-                    "joints": [0.2, 0.3, -0.1, -0.3, 0.1, 0.2, 0.0],
+                    "joints": [
+                      0.2,
+                      0.3,
+                      -0.1,
+                      -0.3,
+                      0.1,
+                      0.2,
+                      0.0
+                    ],
                     "speed": 0.08,
                     "disconnect_after": true
+                  }
+                },
+                "configure_servo": {
+                  "summary": "应用完整伺服基线（需已有连接）",
+                  "value": {
+                    "request_id": "req-configure-servo-001",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 4,
+                    "kind": "configure_servo",
+                    "config": {
+                      "friction_enabled": false,
+                      "joints": [
+                        {
+                          "kd": 10.0,
+                          "velocity_ff": 1.0,
+                          "coulomb": 0.0,
+                          "viscous": 0.0,
+                          "velocity_scale": 0.02,
+                          "max_friction": 0.5
+                        },
+                        {
+                          "kd": 10.0,
+                          "velocity_ff": 1.0,
+                          "coulomb": 0.0,
+                          "viscous": 0.0,
+                          "velocity_scale": 0.02,
+                          "max_friction": 0.5
+                        },
+                        {
+                          "kd": 10.0,
+                          "velocity_ff": 1.0,
+                          "coulomb": 0.0,
+                          "viscous": 0.0,
+                          "velocity_scale": 0.02,
+                          "max_friction": 0.5
+                        },
+                        {
+                          "kd": 10.0,
+                          "velocity_ff": 1.0,
+                          "coulomb": 0.0,
+                          "viscous": 0.0,
+                          "velocity_scale": 0.02,
+                          "max_friction": 0.5
+                        },
+                        {
+                          "kd": 10.0,
+                          "velocity_ff": 1.0,
+                          "coulomb": 0.0,
+                          "viscous": 0.0,
+                          "velocity_scale": 0.02,
+                          "max_friction": 0.5
+                        },
+                        {
+                          "kd": 10.0,
+                          "velocity_ff": 1.0,
+                          "coulomb": 0.0,
+                          "viscous": 0.0,
+                          "velocity_scale": 0.02,
+                          "max_friction": 0.5
+                        },
+                        {
+                          "kd": 10.0,
+                          "velocity_ff": 1.0,
+                          "coulomb": 0.0,
+                          "viscous": 0.0,
+                          "velocity_scale": 0.02,
+                          "max_friction": 0.5
+                        }
+                      ]
+                    }
                   }
                 }
               }
@@ -552,7 +710,9 @@
     "/v1/logs": {
       "get": {
         "operationId": "getLogs",
-        "tags": ["日志"],
+        "tags": [
+          "日志"
+        ],
         "summary": "查询最近日志",
         "description": "SQLite 按 id 降序返回。日志异步写入，新事件可能尚未提交。保留最近 100000 条；查询在独立阻塞任务中执行。",
         "parameters": [
@@ -621,7 +781,9 @@
     "/v1/events": {
       "get": {
         "operationId": "subscribeState",
-        "tags": ["状态"],
+        "tags": [
+          "状态"
+        ],
         "summary": "升级为 WebSocket 并订阅状态",
         "security": [],
         "description": "连接 ws://127.0.0.1:8177/v1/events；升级后 2 秒内首个文本帧发送 {\"token\":\"...\"}。不通过 URL 认证，HTTP Bearer 不能替代首帧。首条输出直接是状态，没有认证确认消息。随后只接收协议层 Ping/Pong，额外应用文本或二进制输入会关闭连接。最多 16 个连接，客户端输入帧/消息最多 8 KiB，服务端发送超时 500 ms。",
@@ -770,7 +932,69 @@
                   "received": 0,
                   "crc_errors": 0,
                   "timeouts": 0
-                }
+                },
+                "servo_tuning": {
+                  "friction_enabled": false,
+                  "joints": [
+                    {
+                      "kd": 10.0,
+                      "velocity_ff": 1.0,
+                      "coulomb": 0.0,
+                      "viscous": 0.0,
+                      "velocity_scale": 0.02,
+                      "max_friction": 0.5
+                    },
+                    {
+                      "kd": 10.0,
+                      "velocity_ff": 1.0,
+                      "coulomb": 0.0,
+                      "viscous": 0.0,
+                      "velocity_scale": 0.02,
+                      "max_friction": 0.5
+                    },
+                    {
+                      "kd": 10.0,
+                      "velocity_ff": 1.0,
+                      "coulomb": 0.0,
+                      "viscous": 0.0,
+                      "velocity_scale": 0.02,
+                      "max_friction": 0.5
+                    },
+                    {
+                      "kd": 10.0,
+                      "velocity_ff": 1.0,
+                      "coulomb": 0.0,
+                      "viscous": 0.0,
+                      "velocity_scale": 0.02,
+                      "max_friction": 0.5
+                    },
+                    {
+                      "kd": 10.0,
+                      "velocity_ff": 1.0,
+                      "coulomb": 0.0,
+                      "viscous": 0.0,
+                      "velocity_scale": 0.02,
+                      "max_friction": 0.5
+                    },
+                    {
+                      "kd": 10.0,
+                      "velocity_ff": 1.0,
+                      "coulomb": 0.0,
+                      "viscous": 0.0,
+                      "velocity_scale": 0.02,
+                      "max_friction": 0.5
+                    },
+                    {
+                      "kd": 10.0,
+                      "velocity_ff": 1.0,
+                      "coulomb": 0.0,
+                      "viscous": 0.0,
+                      "velocity_scale": 0.02,
+                      "max_friction": 0.5
+                    }
+                  ]
+                },
+                "servo_tuning_revision": 1
               }
             }
           },
@@ -785,7 +1009,9 @@
     "/v1/traces": {
       "get": {
         "operationId": "listTraces",
-        "tags": ["采样"],
+        "tags": [
+          "采样"
+        ],
         "summary": "查询最近采样",
         "description": "返回最近的汇总，最多 10 次。默认 limit=20，再限制到 1..10。沿用 Bearer 与 Origin 校验，无需运动租约。查询在独立阻塞任务中执行；采样计数与事件 journal 分开。",
         "parameters": [
@@ -849,9 +1075,11 @@
       },
       "post": {
         "operationId": "startTrace",
-        "tags": ["采样"],
+        "tags": [
+          "采样"
+        ],
         "summary": "开始短时采样",
-        "description": "观察现有端口连接；要求 port 非 null 且 phase 不在 disconnected/connecting/closing。无需控制权或 lease，不申请控制权、打开端口、使能或启动运动。默认 10000 ms，范围 1000..20000。预分配队列容量 4096，生产者 Mutex.try_lock 竞争或队列满立即计 dropped，无等待、SQL、JSON 编码或分配；独立 writer 轮询取出后写入 events.sqlite3.traces.sqlite3。",
+        "description": "观察现有端口连接；要求 port 非 null 且 phase 不在 disconnected/connecting/closing。无需控制权或 lease，不申请控制权、打开端口、使能或启动运动。默认 10000 ms，范围 1000..20000。预分配队列容量 4096，内联完整伺服配置后样本存储约 5 MiB（不含 writer/SQLite 开销），生产者 Mutex.try_lock 竞争或队列满立即计 dropped，无等待、SQL、JSON 编码或分配；独立 writer 轮询取出后写入 events.sqlite3.traces.sqlite3。",
         "requestBody": {
           "required": true,
           "content": {
@@ -958,7 +1186,9 @@
     "/v1/traces/stop": {
       "post": {
         "operationId": "stopTrace",
-        "tags": ["采样"],
+        "tags": [
+          "采样"
+        ],
         "summary": "结束当前采样",
         "description": "无需请求体或运动租约。只结束样本接收，不取消机械臂动作、失能或改变控制权。后台可继续写入；没有正在记录的采样时返回 JSON null。",
         "responses": {
@@ -1014,7 +1244,9 @@
     "/v1/traces/{id}": {
       "get": {
         "operationId": "readTrace",
-        "tags": ["采样"],
+        "tags": [
+          "采样"
+        ],
         "summary": "读取或下载采样 JSON",
         "description": "返回 {trace,samples}，序列化与读取在独立阻塞任务中执行。download=true 或 attachment=true 时返回附件头，JSON 结构相同。来源时间不是入库时间；transmit.seq 索引源控制周期，重复序号可有不同对齐目标，跳号也可能由采样丢弃造成。transmit.timing 可为 null，旧文件可缺省。",
         "parameters": [
@@ -1099,35 +1331,297 @@
                       "stopping": false,
                       "motion": 1,
                       "axis": 0,
-                      "q_ref": [0.1, 0.2, -0.1, -0.2, 0.1, 0.0, 0.1],
-                      "dq_ref": [0.001, 0, 0, 0, 0, 0, 0],
-                      "ddq_ref": [0.05, 0, 0, 0, 0, 0, 0],
-                      "jerk_ref": [5.0, 0, 0, 0, 0, 0, 0],
-                      "tau_ff": [0.1, -0.2, 0.05, 0, 0, 0, 0],
-                      "q": [0.099, 0.2, -0.1, -0.2, 0.1, 0.0, 0.1],
-                      "dq": [0.0005, 0, 0, 0, 0, 0, 0],
-                      "tau": [0.1, -0.2, 0.05, 0, 0, 0, 0],
-                      "voltage": [48.0, 48.0, 48.0, 48.0, 48.0, 48.0, 48.0],
-                      "age_us": [500, 500, 500, 500, 500, 500, 500]
+                      "q_ref": [
+                        0.1,
+                        0.2,
+                        -0.1,
+                        -0.2,
+                        0.1,
+                        0.0,
+                        0.1
+                      ],
+                      "dq_ref": [
+                        0.001,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0
+                      ],
+                      "ddq_ref": [
+                        0.05,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0
+                      ],
+                      "jerk_ref": [
+                        5.0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0
+                      ],
+                      "tau_ff": [
+                        0.1,
+                        -0.2,
+                        0.05,
+                        0,
+                        0,
+                        0,
+                        0
+                      ],
+                      "q": [
+                        0.099,
+                        0.2,
+                        -0.1,
+                        -0.2,
+                        0.1,
+                        0.0,
+                        0.1
+                      ],
+                      "dq": [
+                        0.0005,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0
+                      ],
+                      "tau": [
+                        0.1,
+                        -0.2,
+                        0.05,
+                        0,
+                        0,
+                        0,
+                        0
+                      ],
+                      "voltage": [
+                        48.0,
+                        48.0,
+                        48.0,
+                        48.0,
+                        48.0,
+                        48.0,
+                        48.0
+                      ],
+                      "age_us": [
+                        500,
+                        500,
+                        500,
+                        500,
+                        500,
+                        500,
+                        500
+                      ],
+                      "servo_tuning": {
+                        "friction_enabled": false,
+                        "joints": [
+                          {
+                            "kd": 10.0,
+                            "velocity_ff": 1.0,
+                            "coulomb": 0.0,
+                            "viscous": 0.0,
+                            "velocity_scale": 0.02,
+                            "max_friction": 0.5
+                          },
+                          {
+                            "kd": 10.0,
+                            "velocity_ff": 1.0,
+                            "coulomb": 0.0,
+                            "viscous": 0.0,
+                            "velocity_scale": 0.02,
+                            "max_friction": 0.5
+                          },
+                          {
+                            "kd": 10.0,
+                            "velocity_ff": 1.0,
+                            "coulomb": 0.0,
+                            "viscous": 0.0,
+                            "velocity_scale": 0.02,
+                            "max_friction": 0.5
+                          },
+                          {
+                            "kd": 10.0,
+                            "velocity_ff": 1.0,
+                            "coulomb": 0.0,
+                            "viscous": 0.0,
+                            "velocity_scale": 0.02,
+                            "max_friction": 0.5
+                          },
+                          {
+                            "kd": 10.0,
+                            "velocity_ff": 1.0,
+                            "coulomb": 0.0,
+                            "viscous": 0.0,
+                            "velocity_scale": 0.02,
+                            "max_friction": 0.5
+                          },
+                          {
+                            "kd": 10.0,
+                            "velocity_ff": 1.0,
+                            "coulomb": 0.0,
+                            "viscous": 0.0,
+                            "velocity_scale": 0.02,
+                            "max_friction": 0.5
+                          },
+                          {
+                            "kd": 10.0,
+                            "velocity_ff": 1.0,
+                            "coulomb": 0.0,
+                            "viscous": 0.0,
+                            "velocity_scale": 0.02,
+                            "max_friction": 0.5
+                          }
+                        ]
+                      },
+                      "servo_tuning_revision": 1
                     },
                     {
                       "at_us": 1100,
                       "source": "transmit",
                       "seq": 101,
-                      "timing": { "status": "aligned", "age_us": 100 },
-                      "q_ref": [0.10000010025, 0.2, -0.1, -0.2, 0.1, 0.0, 0.1],
-                      "dq_ref": [0.001005, 0, 0, 0, 0, 0, 0],
-                      "tau_ff": [0.1, -0.2, 0.05, 0, 0, 0, 0],
-                      "q_wire": [
-                        0.0999999, 0.1999999, -0.0999999, -0.1999999, 0.0999999,
-                        0.0, 0.0999999
+                      "timing": {
+                        "status": "aligned",
+                        "age_us": 100
+                      },
+                      "q_ref": [
+                        0.10000010025,
+                        0.2,
+                        -0.1,
+                        -0.2,
+                        0.1,
+                        0.0,
+                        0.1
                       ],
-                      "dq_wire": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                      "tau_wire": [0.099, -0.199, 0.049, 0, 0, 0, 0],
-                      "kp": [60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0],
-                      "kd": [10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0],
+                      "dq_ref": [
+                        0.001005,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0
+                      ],
+                      "tau_ff": [
+                        0.1,
+                        -0.2,
+                        0.05,
+                        0,
+                        0,
+                        0,
+                        0
+                      ],
+                      "q_wire": [
+                        0.0999999,
+                        0.1999999,
+                        -0.0999999,
+                        -0.1999999,
+                        0.0999999,
+                        0.0,
+                        0.0999999
+                      ],
+                      "dq_wire": [
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0
+                      ],
+                      "tau_wire": [
+                        0.099,
+                        -0.199,
+                        0.049,
+                        0,
+                        0,
+                        0,
+                        0
+                      ],
+                      "kp": [
+                        60.0,
+                        60.0,
+                        60.0,
+                        60.0,
+                        60.0,
+                        60.0,
+                        60.0
+                      ],
+                      "kd": [
+                        10.0,
+                        10.0,
+                        10.0,
+                        10.0,
+                        10.0,
+                        10.0,
+                        10.0
+                      ],
                       "write_us": 6000,
-                      "mode": [1, 1, 1, 1, 1, 1, 1]
+                      "mode": [
+                        1,
+                        1,
+                        1,
+                        1,
+                        1,
+                        1,
+                        1
+                      ],
+                      "tuning": {
+                        "revision": 1,
+                        "dq_feedforward": [
+                          0.001005,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0,
+                          0
+                        ],
+                        "tau_gravity": [
+                          0.1,
+                          -0.2,
+                          0.05,
+                          0,
+                          0,
+                          0,
+                          0
+                        ],
+                        "friction_requested": [
+                          0.0,
+                          0.0,
+                          0.0,
+                          0.0,
+                          0.0,
+                          0.0,
+                          0.0
+                        ],
+                        "friction_applied": [
+                          0.0,
+                          0.0,
+                          0.0,
+                          0.0,
+                          0.0,
+                          0.0,
+                          0.0
+                        ],
+                        "clamped": [
+                          false,
+                          false,
+                          false,
+                          false,
+                          false,
+                          false,
+                          false
+                        ]
+                      }
                     },
                     {
                       "at_us": 15000,
@@ -1187,7 +1681,10 @@
             "description": "供显示的说明文字。"
           }
         },
-        "required": ["code", "message"]
+        "required": [
+          "code",
+          "message"
+        ]
       },
       "PortInfo": {
         "type": "object",
@@ -1201,10 +1698,19 @@
           },
           "kind": {
             "type": "string",
-            "enum": ["usb", "bluetooth", "pci", "unknown"]
+            "enum": [
+              "usb",
+              "bluetooth",
+              "pci",
+              "unknown"
+            ]
           }
         },
-        "required": ["name", "label", "kind"],
+        "required": [
+          "name",
+          "label",
+          "kind"
+        ],
         "examples": [
           {
             "name": "/dev/cu.usbserial-001",
@@ -1235,11 +1741,23 @@
             "description": "四元数 [x,y,z,w]，不是欧拉角。"
           }
         },
-        "required": ["translation", "rotation"],
+        "required": [
+          "translation",
+          "rotation"
+        ],
         "examples": [
           {
-            "translation": [0.0, 0.0, 0.0],
-            "rotation": [0.0, 0.0, 0.0, 1.0]
+            "translation": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "rotation": [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ]
           }
         ]
       },
@@ -1268,8 +1786,17 @@
         "description": "Link7 → TCP 工具变换。四元数范数至少 1e-9，后端归一化；此条件在控制线程中校验。",
         "examples": [
           {
-            "translation": [0.0, 0.0, 0.0],
-            "rotation": [0.0, 0.0, 0.0, 1.0]
+            "translation": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "rotation": [
+              0.0,
+              0.0,
+              0.0,
+              1.0
+            ]
           }
         ]
       },
@@ -1278,7 +1805,11 @@
         "properties": {
           "action": {
             "type": "string",
-            "enum": ["acquire", "renew", "release"]
+            "enum": [
+              "acquire",
+              "renew",
+              "release"
+            ]
           },
           "client_id": {
             "type": "string",
@@ -1299,16 +1830,24 @@
             ]
           }
         },
-        "required": ["action", "client_id"],
+        "required": [
+          "action",
+          "client_id"
+        ],
         "allOf": [
           {
             "if": {
               "properties": {
                 "action": {
-                  "enum": ["renew", "release"]
+                  "enum": [
+                    "renew",
+                    "release"
+                  ]
                 }
               },
-              "required": ["action"]
+              "required": [
+                "action"
+              ]
             },
             "then": {
               "properties": {
@@ -1318,7 +1857,9 @@
                   "description": "取得控制权时返回的私有凭据。"
                 }
               },
-              "required": ["lease_id"]
+              "required": [
+                "lease_id"
+              ]
             }
           }
         ],
@@ -1367,7 +1908,11 @@
             "description": "当前控制上下文编号；提交命令时使用最新值。"
           }
         },
-        "required": ["lease_id", "expires_in_ms", "generation"],
+        "required": [
+          "lease_id",
+          "expires_in_ms",
+          "generation"
+        ],
         "examples": [
           {
             "lease_id": "11111111-1111-4111-8111-111111111111",
@@ -1413,14 +1958,22 @@
             "description": "来自最新 Snapshot 或 ControlReply，不自行递增。"
           }
         },
-        "required": ["request_id", "client_id", "lease_id", "generation"]
+        "required": [
+          "request_id",
+          "client_id",
+          "lease_id",
+          "generation"
+        ]
       },
       "MotionArguments": {
         "type": "object",
         "properties": {
           "space": {
             "type": "string",
-            "enum": ["joint", "cartesian"]
+            "enum": [
+              "joint",
+              "cartesian"
+            ]
           },
           "axis": {
             "type": "integer",
@@ -1430,7 +1983,10 @@
           },
           "direction": {
             "type": "integer",
-            "enum": [-1, 1]
+            "enum": [
+              -1,
+              1
+            ]
           },
           "speed": {
             "type": "number",
@@ -1439,12 +1995,20 @@
           },
           "frame": {
             "type": "string",
-            "enum": ["base", "tool"],
+            "enum": [
+              "base",
+              "tool"
+            ],
             "default": "base",
             "description": "base 沿固定基座轴，tool 沿当前 TCP 轴；关节点动忽略该字段。"
           }
         },
-        "required": ["space", "axis", "direction", "speed"],
+        "required": [
+          "space",
+          "axis",
+          "direction",
+          "speed"
+        ],
         "oneOf": [
           {
             "properties": {
@@ -1510,10 +2074,17 @@
               },
               "side": {
                 "type": "string",
-                "enum": ["left", "right"]
+                "enum": [
+                  "left",
+                  "right"
+                ]
               }
             },
-            "required": ["kind", "port", "side"]
+            "required": [
+              "kind",
+              "port",
+              "side"
+            ]
           }
         ],
         "description": "打开串口，当前波特率 6000000。已有连接时需先断开；切换左右臂会清除 TCP。accepted 后等待 disabled 与七轴有效反馈。",
@@ -1547,7 +2118,9 @@
                 "description": "明确允许释放保持扭矩。已使能或正在使能时，缺省/false 会异步 rejected/support_required，保持当前状态。该字段表示调用方确认，软件不检测机械支撑。"
               }
             },
-            "required": ["kind"]
+            "required": [
+              "kind"
+            ]
           }
         ],
         "description": "取消动作、失能、关闭串口；确认 phase=disconnected 且 port=null。 已使能或正在使能时必须显式传 allow_release=true。",
@@ -1575,7 +2148,9 @@
                 "const": "enable"
               }
             },
-            "required": ["kind"]
+            "required": [
+              "kind"
+            ]
           }
         ],
         "description": "进入 enabling；一秒内收齐请求后的七轴新鲜反馈并确认设备状态后，报告 completed/enabled。",
@@ -1607,7 +2182,9 @@
                 "description": "明确允许释放保持扭矩。已使能或正在使能时，缺省/false 会异步 rejected/support_required，保持当前状态。该字段表示调用方确认，软件不检测机械支撑。"
               }
             },
-            "required": ["kind"]
+            "required": [
+              "kind"
+            ]
           }
         ],
         "description": "取消动作并失能；确认 accepted 且 enabled=false。已有故障时 phase 可保持 fault。 已使能或正在使能时必须显式传 allow_release=true。",
@@ -1635,7 +2212,9 @@
                 "const": "clear_fault"
               }
             },
-            "required": ["kind"]
+            "required": [
+              "kind"
+            ]
           }
         ],
         "description": "取消动作，保持未使能；以新鲜反馈确认清错，报告 completed/cleared 或 failed/clear_failed。 已使能或正在使能时 rejected/disable_first，须先确认支撑并失能。",
@@ -1665,7 +2244,10 @@
                 "$ref": "#/components/schemas/TcpPose"
               }
             },
-            "required": ["kind", "tcp"]
+            "required": [
+              "kind",
+              "tcp"
+            ]
           }
         ],
         "description": "设置 Link7 → TCP 变换，可在取得控制权后离线设置。运动、停止减速或待确认使能时拒绝。本次运行内存配置。",
@@ -1677,9 +2259,380 @@
             "generation": 3,
             "kind": "configure_tcp",
             "tcp": {
-              "translation": [0.0, 0.0, 0.0],
-              "rotation": [0.0, 0.0, 0.0, 1.0]
+              "translation": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "rotation": [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
             }
+          }
+        ]
+      },
+      "JointTuning": {
+        "type": "object",
+        "properties": {
+          "kd": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 30,
+            "default": 10,
+            "description": "阻尼，Nm·s/rad；默认值表示基线，请求仍须显式提供。"
+          },
+          "velocity_ff": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 1,
+            "description": "速度前馈权重，无量纲；仅缩放 wire dq，不改变轨迹速度、位置积分、TCP 或停止/收纳时序；默认值表示基线，请求仍须显式提供。"
+          },
+          "coulomb": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 2,
+            "default": 0,
+            "description": "库仑摩擦幅值 Fc，Nm；默认值表示基线，请求仍须显式提供。"
+          },
+          "viscous": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 10,
+            "default": 0,
+            "description": "黏性系数 B，Nm·s/rad；默认值表示基线，请求仍须显式提供。"
+          },
+          "velocity_scale": {
+            "type": "number",
+            "minimum": 0.001,
+            "maximum": 0.2,
+            "default": 0.02,
+            "description": "平滑过零尺度 epsilon，rad/s；默认值表示基线，请求仍须显式提供。"
+          },
+          "max_friction": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 2,
+            "default": 0.5,
+            "description": "摩擦补偿幅值上限，Nm；默认值表示基线，请求仍须显式提供。"
+          }
+        },
+        "required": [
+          "kd",
+          "velocity_ff",
+          "coulomb",
+          "viscous",
+          "velocity_scale",
+          "max_friction"
+        ],
+        "description": "单轴完整配置，所有数值必须有限。范围为有效业务输入，有限数值越限可在 HTTP 202 入队后 rejected/invalid_servo_tuning；不表示 HTTP 立即 400。",
+        "examples": [
+          {
+            "kd": 10.0,
+            "velocity_ff": 1.0,
+            "coulomb": 0.0,
+            "viscous": 0.0,
+            "velocity_scale": 0.02,
+            "max_friction": 0.5
+          }
+        ]
+      },
+      "ServoTuning": {
+        "type": "object",
+        "properties": {
+          "friction_enabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "全局摩擦开关；关闭时摩擦严格为零，不影响独立速度前馈权重。请求必填。"
+          },
+          "joints": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/JointTuning"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "J1..J7 顺序，必须完整提供七项。"
+          }
+        },
+        "required": [
+          "friction_enabled",
+          "joints"
+        ],
+        "description": "完整配置，不支持部分更新或请求缺字段补默认。每次连接/断开恢复基线，仅当前连接内存生效，不自动持久化。摩擦为 clamp(Fc*tanh(v/epsilon)+B*v,±max_friction)，与重力相加后 clamp 到 ±8 Nm；v 为未缩放轨迹速度，v=0 时摩擦严格为零。无独立扭矩变化率限制、自动辨识、观测器或量化补偿；算法尚未真机验证。",
+        "examples": [
+          {
+            "friction_enabled": false,
+            "joints": [
+              {
+                "kd": 10.0,
+                "velocity_ff": 1.0,
+                "coulomb": 0.0,
+                "viscous": 0.0,
+                "velocity_scale": 0.02,
+                "max_friction": 0.5
+              },
+              {
+                "kd": 10.0,
+                "velocity_ff": 1.0,
+                "coulomb": 0.0,
+                "viscous": 0.0,
+                "velocity_scale": 0.02,
+                "max_friction": 0.5
+              },
+              {
+                "kd": 10.0,
+                "velocity_ff": 1.0,
+                "coulomb": 0.0,
+                "viscous": 0.0,
+                "velocity_scale": 0.02,
+                "max_friction": 0.5
+              },
+              {
+                "kd": 10.0,
+                "velocity_ff": 1.0,
+                "coulomb": 0.0,
+                "viscous": 0.0,
+                "velocity_scale": 0.02,
+                "max_friction": 0.5
+              },
+              {
+                "kd": 10.0,
+                "velocity_ff": 1.0,
+                "coulomb": 0.0,
+                "viscous": 0.0,
+                "velocity_scale": 0.02,
+                "max_friction": 0.5
+              },
+              {
+                "kd": 10.0,
+                "velocity_ff": 1.0,
+                "coulomb": 0.0,
+                "viscous": 0.0,
+                "velocity_scale": 0.02,
+                "max_friction": 0.5
+              },
+              {
+                "kd": 10.0,
+                "velocity_ff": 1.0,
+                "coulomb": 0.0,
+                "viscous": 0.0,
+                "velocity_scale": 0.02,
+                "max_friction": 0.5
+              }
+            ]
+          }
+        ]
+      },
+      "ConfigureServoCommand": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CommandEnvelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "configure_servo"
+              },
+              "config": {
+                "$ref": "#/components/schemas/ServoTuning"
+              }
+            },
+            "required": [
+              "kind",
+              "config"
+            ]
+          }
+        ],
+        "description": "先连接并等待确认，持有者显式应用完整配置。未连接/connecting 拒绝 not_connected，关闭按原有 closing 检查拒绝；故障或待清错拒绝 fault；运动/减速停止/使能确认拒绝 motion_busy。已使能空闲时须有完整新鲜反馈及当前 generation/epoch 下 50 ms 内的静止成功发送目标，复制其 q 再应用。接受后配置版本及 generation 提升，旧运动请求 stale_context。HTTP 202 queued 后结果为 accepted/configure_servo 或 rejected，不产生独立 completed；不表示设备确认。",
+        "examples": [
+          {
+            "request_id": "req-configure-servo-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 4,
+            "kind": "configure_servo",
+            "config": {
+              "friction_enabled": false,
+              "joints": [
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "ServoSample": {
+        "type": "object",
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "该发送批次使用的配置版本，关联 control.servo_tuning_revision；源周期由 transmit.seq → control.seq 关联。"
+          },
+          "dq_feedforward": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "七轴加权后的编码前速度前馈，rad/s；应与 dq_wire 比较速度编码误差。"
+          },
+          "tau_gravity": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "七轴重力前馈，Nm。"
+          },
+          "friction_requested": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "七轴经自身 max_friction 限幅后的摩擦请求，Nm。"
+          },
+          "friction_applied": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "七轴合计前馈限幅后的实际摩擦增量 tau_ff-tau_gravity，Nm；仍为编码前值。"
+          },
+          "clamped": {
+            "type": "array",
+            "items": {
+              "type": "boolean"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "逐轴标记摩擦自身或合计前馈任一发生截断；恰好等于边界不算截断。"
+          }
+        },
+        "required": [
+          "revision",
+          "dq_feedforward",
+          "tau_gravity",
+          "friction_requested",
+          "friction_applied",
+          "clamped"
+        ],
+        "description": "软件发送诊断，不代表测得电机总输出或物理补偿效果。所有数值必须有限。",
+        "examples": [
+          {
+            "revision": 1,
+            "dq_feedforward": [
+              0.001005,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "tau_gravity": [
+              0.1,
+              -0.2,
+              0.05,
+              0,
+              0,
+              0,
+              0
+            ],
+            "friction_requested": [
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0
+            ],
+            "friction_applied": [
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0
+            ],
+            "clamped": [
+              false,
+              false,
+              false,
+              false,
+              false,
+              false,
+              false
+            ]
           }
         ]
       },
@@ -1709,7 +2662,10 @@
                 "description": "本动作的输入序号，可从 0 开始。"
               }
             },
-            "required": ["kind", "input_seq"]
+            "required": [
+              "kind",
+              "input_seq"
+            ]
           },
           {
             "$ref": "#/components/schemas/MotionArguments"
@@ -1763,7 +2719,11 @@
                 "description": "输入有效期，单位 ms；从后端首次接收开始计算。"
               }
             },
-            "required": ["kind", "action_id", "input_seq"]
+            "required": [
+              "kind",
+              "action_id",
+              "input_seq"
+            ]
           }
         ],
         "description": "只延长当前连续动作，不创建动作或更改运动参数。只保留最新待处理更新；成功时不产生 accepted 结果。",
@@ -1798,7 +2758,10 @@
                 "description": "正步长；关节/旋转用 rad，平移用 m；方向由 direction 指定。"
               }
             },
-            "required": ["kind", "amount"]
+            "required": [
+              "kind",
+              "amount"
+            ]
           },
           {
             "$ref": "#/components/schemas/MotionArguments"
@@ -1813,7 +2776,10 @@
                   "maximum": 2
                 }
               },
-              "required": ["space", "axis"]
+              "required": [
+                "space",
+                "axis"
+              ]
             },
             "then": {
               "properties": {
@@ -1861,7 +2827,9 @@
                 "const": "stop"
               }
             },
-            "required": ["kind"]
+            "required": [
+              "kind"
+            ]
           }
         ],
         "description": "需要当前控制权和 generation；取消原动作，递增 generation，保留控制者与使能状态。仍可能需要等待 stopping 结束。 正常停止在参考域按 jerk 限制减速，可能需要更长时间。末端停止的求解目标惩罚关节速度本身，连续性由导数硬约束维持。笛卡尔制动不可行时记录 stop_path 并转为受限关节制动；故障、失能和关闭继续优先处理。实际串口可重复或合并参考更新，物理 jerk 尚未验证。",
@@ -1896,6 +2864,9 @@
             "$ref": "#/components/schemas/ConfigureTcpCommand"
           },
           {
+            "$ref": "#/components/schemas/ConfigureServoCommand"
+          },
+          {
             "$ref": "#/components/schemas/JogStartCommand"
           },
           {
@@ -1924,7 +2895,8 @@
             "jog_update": "#/components/schemas/JogUpdateCommand",
             "step": "#/components/schemas/StepCommand",
             "stop": "#/components/schemas/StopCommand",
-            "return_to_pose": "#/components/schemas/ReturnToPoseCommand"
+            "return_to_pose": "#/components/schemas/ReturnToPoseCommand",
+            "configure_servo": "#/components/schemas/ConfigureServoCommand"
           }
         },
         "description": "全部操作参数与公共字段位于同一层。范围表示有效业务输入；HTTP 202 后仍可能异步 rejected。未知 JSON 字段当前会被忽略。",
@@ -1975,8 +2947,17 @@
             "generation": 3,
             "kind": "configure_tcp",
             "tcp": {
-              "translation": [0.0, 0.0, 0.0],
-              "rotation": [0.0, 0.0, 0.0, 1.0]
+              "translation": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "rotation": [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
             }
           },
           {
@@ -2029,9 +3010,85 @@
             "lease_id": "11111111-1111-4111-8111-111111111111",
             "generation": 5,
             "kind": "return_to_pose",
-            "joints": [0.2, 0.3, -0.1, -0.3, 0.1, 0.2, 0.0],
+            "joints": [
+              0.2,
+              0.3,
+              -0.1,
+              -0.3,
+              0.1,
+              0.2,
+              0.0
+            ],
             "speed": 0.08,
             "disconnect_after": true
+          },
+          {
+            "request_id": "req-configure-servo-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 4,
+            "kind": "configure_servo",
+            "config": {
+              "friction_enabled": false,
+              "joints": [
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                }
+              ]
+            }
           }
         ]
       },
@@ -2046,7 +3103,10 @@
             "const": "queued"
           }
         },
-        "required": ["request_id", "status"],
+        "required": [
+          "request_id",
+          "status"
+        ],
         "description": "仅确认入队，不表示执行成功。",
         "examples": [
           {
@@ -2063,7 +3123,13 @@
           },
           "status": {
             "type": "string",
-            "enum": ["accepted", "rejected", "completed", "cancelled", "failed"]
+            "enum": [
+              "accepted",
+              "rejected",
+              "completed",
+              "cancelled",
+              "failed"
+            ]
           },
           "code": {
             "type": "string",
@@ -2074,7 +3140,12 @@
             "description": "显示文字。"
           }
         },
-        "required": ["request_id", "status", "code", "message"],
+        "required": [
+          "request_id",
+          "status",
+          "code",
+          "message"
+        ],
         "examples": [
           {
             "request_id": "req-step-001",
@@ -2087,6 +3158,18 @@
             "status": "rejected",
             "code": "stale_context",
             "message": "操作上下文已改变"
+          },
+          {
+            "request_id": "req-configure-servo-001",
+            "status": "accepted",
+            "code": "configure_servo",
+            "message": "操作已接受"
+          },
+          {
+            "request_id": "req-configure-servo-002",
+            "status": "rejected",
+            "code": "invalid_servo_tuning",
+            "message": "J1 kd超限"
           }
         ]
       },
@@ -2102,7 +3185,10 @@
             "maximum": 18446744073709551615
           }
         },
-        "required": ["client_id", "expires_in_ms"]
+        "required": [
+          "client_id",
+          "expires_in_ms"
+        ]
       },
       "JointSnapshot": {
         "type": "object",
@@ -2114,7 +3200,15 @@
           },
           "name": {
             "type": "string",
-            "enum": ["J1", "J2", "J3", "J4", "J5", "J6", "J7"]
+            "enum": [
+              "J1",
+              "J2",
+              "J3",
+              "J4",
+              "J5",
+              "J6",
+              "J7"
+            ]
           },
           "q": {
             "anyOf": [
@@ -2218,14 +3312,24 @@
           },
           "space": {
             "type": "string",
-            "enum": ["joint", "cartesian"]
+            "enum": [
+              "joint",
+              "cartesian"
+            ]
           },
           "mode": {
             "type": "string",
-            "enum": ["continuous", "step", "return"]
+            "enum": [
+              "continuous",
+              "step",
+              "return"
+            ]
           },
           "axis": {
-            "type": ["integer", "null"],
+            "type": [
+              "integer",
+              "null"
+            ],
             "minimum": 0,
             "maximum": 6,
             "description": "点动轴索引；收纳返回涉及七轴，mode=return 时为 null。"
@@ -2237,7 +3341,13 @@
             "description": "时间进度估计；达到 1 不代表完成。"
           }
         },
-        "required": ["request_id", "space", "mode", "axis", "progress"],
+        "required": [
+          "request_id",
+          "space",
+          "mode",
+          "axis",
+          "progress"
+        ],
         "allOf": [
           {
             "if": {
@@ -2246,7 +3356,9 @@
                   "const": "return"
                 }
               },
-              "required": ["mode"]
+              "required": [
+                "mode"
+              ]
             },
             "then": {
               "properties": {
@@ -2299,7 +3411,13 @@
             "type": "boolean"
           }
         },
-        "required": ["pending", "written", "dropped", "errors", "healthy"],
+        "required": [
+          "pending",
+          "written",
+          "dropped",
+          "errors",
+          "healthy"
+        ],
         "description": "事件日志统计，按本次进程计数。生产者只尝试一次取得预分配队列锁，竞争或满队列立即计 dropped；后台取出后执行 SQL。短时采样独立计数。"
       },
       "Communication": {
@@ -2321,7 +3439,11 @@
             "maximum": 18446744073709551615
           }
         },
-        "required": ["received", "crc_errors", "timeouts"]
+        "required": [
+          "received",
+          "crc_errors",
+          "timeouts"
+        ]
       },
       "Snapshot": {
         "type": "object",
@@ -2354,7 +3476,10 @@
           },
           "side": {
             "type": "string",
-            "enum": ["left", "right"]
+            "enum": [
+              "left",
+              "right"
+            ]
           },
           "port": {
             "anyOf": [
@@ -2467,6 +3592,15 @@
           },
           "communication": {
             "$ref": "#/components/schemas/Communication"
+          },
+          "servo_tuning": {
+            "$ref": "#/components/schemas/ServoTuning"
+          },
+          "servo_tuning_revision": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "当前配置版本，应用及连接/断开恢复基线时提升；不跨应用重启保存。"
           }
         },
         "required": [
@@ -2487,7 +3621,9 @@
           "results",
           "error",
           "journal",
-          "communication"
+          "communication",
+          "servo_tuning",
+          "servo_tuning_revision"
         ],
         "description": "完整状态；所有键均存在，可选值用 null。tcp 是实测关节计算的基座 → TCP；未设置 TCP 或反馈无效时为 null。",
         "examples": [
@@ -2597,7 +3733,69 @@
               "received": 0,
               "crc_errors": 0,
               "timeouts": 0
-            }
+            },
+            "servo_tuning": {
+              "friction_enabled": false,
+              "joints": [
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                }
+              ]
+            },
+            "servo_tuning_revision": 1
           }
         ]
       },
@@ -2612,7 +3810,10 @@
             "$ref": "#/components/schemas/Snapshot"
           }
         },
-        "required": ["type", "data"],
+        "required": [
+          "type",
+          "data"
+        ],
         "examples": [
           {
             "type": "state",
@@ -2722,7 +3923,69 @@
                 "received": 0,
                 "crc_errors": 0,
                 "timeouts": 0
-              }
+              },
+              "servo_tuning": {
+                "friction_enabled": false,
+                "joints": [
+                  {
+                    "kd": 10.0,
+                    "velocity_ff": 1.0,
+                    "coulomb": 0.0,
+                    "viscous": 0.0,
+                    "velocity_scale": 0.02,
+                    "max_friction": 0.5
+                  },
+                  {
+                    "kd": 10.0,
+                    "velocity_ff": 1.0,
+                    "coulomb": 0.0,
+                    "viscous": 0.0,
+                    "velocity_scale": 0.02,
+                    "max_friction": 0.5
+                  },
+                  {
+                    "kd": 10.0,
+                    "velocity_ff": 1.0,
+                    "coulomb": 0.0,
+                    "viscous": 0.0,
+                    "velocity_scale": 0.02,
+                    "max_friction": 0.5
+                  },
+                  {
+                    "kd": 10.0,
+                    "velocity_ff": 1.0,
+                    "coulomb": 0.0,
+                    "viscous": 0.0,
+                    "velocity_scale": 0.02,
+                    "max_friction": 0.5
+                  },
+                  {
+                    "kd": 10.0,
+                    "velocity_ff": 1.0,
+                    "coulomb": 0.0,
+                    "viscous": 0.0,
+                    "velocity_scale": 0.02,
+                    "max_friction": 0.5
+                  },
+                  {
+                    "kd": 10.0,
+                    "velocity_ff": 1.0,
+                    "coulomb": 0.0,
+                    "viscous": 0.0,
+                    "velocity_scale": 0.02,
+                    "max_friction": 0.5
+                  },
+                  {
+                    "kd": 10.0,
+                    "velocity_ff": 1.0,
+                    "coulomb": 0.0,
+                    "viscous": 0.0,
+                    "velocity_scale": 0.02,
+                    "max_friction": 0.5
+                  }
+                ]
+              },
+              "servo_tuning_revision": 1
             }
           }
         ]
@@ -2735,7 +3998,9 @@
             "description": "本次应用启动的令牌。"
           }
         },
-        "required": ["token"],
+        "required": [
+          "token"
+        ],
         "examples": [
           {
             "token": "example-application-token"
@@ -2869,7 +4134,11 @@
                 "description": "到位稳定后释放扭矩并关闭串口；false 则保持使能连接。调用方需先确保收纳位存在机械支撑。"
               }
             },
-            "required": ["kind", "joints", "speed"]
+            "required": [
+              "kind",
+              "joints",
+              "speed"
+            ]
           }
         ],
         "description": "七轴通过五次多项式生成共同返回目标，最终控制参考按速度、加速度与 jerk 限制后积分；上限为 0.20 rad/s、0.60 rad/s²、6 rad/s³，jerk 为离线默认值。须已使能、反馈齐全新鲜且无其他动作。位置误差≤0.01 rad、实测速度≤0.02 rad/s并稳定200ms后返回 completed/returned 或 completed/parked。到位超时、取消或跟随偏差超限不会继续断开。关节插值不提供碰撞规划。",
@@ -2880,7 +4149,15 @@
             "lease_id": "11111111-1111-4111-8111-111111111111",
             "generation": 5,
             "kind": "return_to_pose",
-            "joints": [0.2, 0.3, -0.1, -0.3, 0.1, 0.2, 0.0],
+            "joints": [
+              0.2,
+              0.3,
+              -0.1,
+              -0.3,
+              0.1,
+              0.2,
+              0.0
+            ],
             "speed": 0.08,
             "disconnect_after": true
           }
@@ -2890,7 +4167,10 @@
         "type": "object",
         "properties": {
           "duration_ms": {
-            "type": ["integer", "null"],
+            "type": [
+              "integer",
+              "null"
+            ],
             "minimum": 1000,
             "maximum": 20000,
             "default": 10000,
@@ -2931,15 +4211,26 @@
           },
           "side": {
             "type": "string",
-            "enum": ["left", "right"]
+            "enum": [
+              "left",
+              "right"
+            ]
           },
           "port": {
-            "type": ["string", "null"],
+            "type": [
+              "string",
+              "null"
+            ],
             "description": "采样开始时的串口上下文。"
           },
           "status": {
             "type": "string",
-            "enum": ["recording", "writing", "complete", "failed"],
+            "enum": [
+              "recording",
+              "writing",
+              "complete",
+              "failed"
+            ],
             "description": "recording 接收中；writing 接收结束、后台写入中；complete 已提交；failed 有已接收数据被放弃或上次运行中断。"
           },
           "accepted": {
@@ -3075,11 +4366,21 @@
           },
           "motion": {
             "type": "integer",
-            "enum": [0, 1, 2, 3, 4, 5],
+            "enum": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5
+            ],
             "description": "0 无当前动作；1 关节连续；2 关节步长；3 笛卡尔连续；4 笛卡尔步长；5 收纳返回。减速期间可为 0。"
           },
           "axis": {
-            "type": ["integer", "null"],
+            "type": [
+              "integer",
+              "null"
+            ],
             "minimum": 0,
             "maximum": 6,
             "description": "关节 0..6；笛卡尔 0..5；无动作或收纳返回时为 null。"
@@ -3211,6 +4512,25 @@
             "minItems": 7,
             "maxItems": 7,
             "description": "控制周期开始时距各关节主机接收反馈的年龄，μs；无反馈的元素为 null。"
+          },
+          "servo_tuning": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ServoTuning"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "该源周期完整配置；旧文件可以缺省，按 null 读取。"
+          },
+          "servo_tuning_revision": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "该源周期配置版本；旧文件缺省按 0 读取。",
+            "default": 0
           }
         },
         "required": [
@@ -3255,7 +4575,10 @@
             "description": "被选中源参考的 control.seq，仍为源索引；重复序号表示同一源再次取样，不表示相同 q_ref 或 q_wire。0 用于初始或直接停止/清错写入。非零序号也可对应 disabled 心跳，需按每轴 mode 判断是否为有效伺服目标。"
           },
           "timing": {
-            "type": ["object", "null"],
+            "type": [
+              "object",
+              "null"
+            ],
             "properties": {
               "status": {
                 "type": "string",
@@ -3271,13 +4594,19 @@
                 "description": "aligned 已按发送时刻取样速度并连续积分位置，含速度/首次零点封顶；bounded 受目标边界限制或保持；stale 源年龄超过 50 ms；future 取样时刻早于源或不晚于上一成功伺服批次；invalid 数值或参数无效；constraint 路径/TCP 速度/参考偏差/相邻成功目标位移或方向检查失败；expired 输入或租约有效期已到。"
               },
               "age_us": {
-                "type": ["integer", "null"],
+                "type": [
+                  "integer",
+                  "null"
+                ],
                 "minimum": 0,
                 "maximum": 18446744073709551615,
                 "description": "本批次主机起点相对源参考的年龄，μs；无法计算非负年龄时为 null。新鲜参考满足 0 ≤ age_us ≤ 50000。"
               }
             },
-            "required": ["status", "age_us"],
+            "required": [
+              "status",
+              "age_us"
+            ],
             "default": null,
             "description": "发送端取样状态与源年龄。未执行取样的直接写入、disabled/clear 批次为 null；旧文件可以缺少此字段，Rust 通过 #[serde(default)] 按 null 读取。匹配当前上下文的拒绝会结束动作或使能请求，结果为 failed/send_reference，保留原有使能状态；使能确认被拒绝后不能由同次反馈进入 Ready。写前已换代或到期而跳过的批次不生成 transmit 样本。"
           },
@@ -3297,7 +4626,7 @@
             },
             "minItems": 7,
             "maxItems": 7,
-            "description": "发送时对齐后的编码前理想关节速度，rad/s，J1..J7；回退保持时为零，可与同 seq 的 control.dq_ref 不同。timing 为 null 的旧文件或未取样批次保留原始理想字段。"
+            "description": "发送时对齐或回退保持的未缩放轨迹速度，rad/s，J1..J7；用于位置积分、TCP/目标检查和停止/收纳时序，不受 velocity_ff 权重影响。可与同 seq 的 control.dq_ref 不同。"
           },
           "tau_ff": {
             "type": "array",
@@ -3306,7 +4635,7 @@
             },
             "minItems": 7,
             "maxItems": 7,
-            "description": "该批次编码前前馈扭矩，Nm，J1..J7；发送时间对齐只更新 q/dq，不重新计算源前馈。"
+            "description": "该批次编码前最终总附加前馈扭矩，Nm，J1..J7；重力与可选摩擦合成后逐轴限制到 ±8 Nm。与 tau_wire 比较编码误差，不是电机总输出扭矩。"
           },
           "q_wire": {
             "type": "array",
@@ -3324,7 +4653,7 @@
             },
             "minItems": 7,
             "maxItems": 7,
-            "description": "从实际报文速度字段解码并按标定转回关节坐标，rad/s，J1..J7。"
+            "description": "从实际报文速度字段解码并按标定转回关节坐标，rad/s，J1..J7；与加权后 tuning.dq_feedforward 比较，旧样本回退 dq_ref。"
           },
           "tau_wire": {
             "type": "array",
@@ -3363,11 +4692,27 @@
             "type": "array",
             "items": {
               "type": "integer",
-              "enum": [0, 1, 6]
+              "enum": [
+                0,
+                1,
+                6
+              ]
             },
             "minItems": 7,
             "maxItems": 7,
             "description": "J1..J7 实际编码的命令模式：0 disabled、1 servo、6 clear。非零 seq 也可为 disabled 心跳；只有 mode=1 的字段是有效伺服目标。"
+          },
+          "tuning": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ServoSample"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "发送时使用的前馈与限幅诊断；直接写入或非伺服批次可为 null。旧文件缺省按 null 读取。速度编码误差优先比较 tuning.dq_feedforward，缺省/null 时回退 dq_ref；仍只计 seq!=0 且逐轴 mode=1。"
           }
         },
         "required": [
@@ -3488,35 +4833,297 @@
             "stopping": false,
             "motion": 1,
             "axis": 0,
-            "q_ref": [0.1, 0.2, -0.1, -0.2, 0.1, 0.0, 0.1],
-            "dq_ref": [0.001, 0, 0, 0, 0, 0, 0],
-            "ddq_ref": [0.05, 0, 0, 0, 0, 0, 0],
-            "jerk_ref": [5.0, 0, 0, 0, 0, 0, 0],
-            "tau_ff": [0.1, -0.2, 0.05, 0, 0, 0, 0],
-            "q": [0.099, 0.2, -0.1, -0.2, 0.1, 0.0, 0.1],
-            "dq": [0.0005, 0, 0, 0, 0, 0, 0],
-            "tau": [0.1, -0.2, 0.05, 0, 0, 0, 0],
-            "voltage": [48.0, 48.0, 48.0, 48.0, 48.0, 48.0, 48.0],
-            "age_us": [500, 500, 500, 500, 500, 500, 500]
+            "q_ref": [
+              0.1,
+              0.2,
+              -0.1,
+              -0.2,
+              0.1,
+              0.0,
+              0.1
+            ],
+            "dq_ref": [
+              0.001,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "ddq_ref": [
+              0.05,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "jerk_ref": [
+              5.0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "tau_ff": [
+              0.1,
+              -0.2,
+              0.05,
+              0,
+              0,
+              0,
+              0
+            ],
+            "q": [
+              0.099,
+              0.2,
+              -0.1,
+              -0.2,
+              0.1,
+              0.0,
+              0.1
+            ],
+            "dq": [
+              0.0005,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "tau": [
+              0.1,
+              -0.2,
+              0.05,
+              0,
+              0,
+              0,
+              0
+            ],
+            "voltage": [
+              48.0,
+              48.0,
+              48.0,
+              48.0,
+              48.0,
+              48.0,
+              48.0
+            ],
+            "age_us": [
+              500,
+              500,
+              500,
+              500,
+              500,
+              500,
+              500
+            ],
+            "servo_tuning": {
+              "friction_enabled": false,
+              "joints": [
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                }
+              ]
+            },
+            "servo_tuning_revision": 1
           },
           {
             "at_us": 1100,
             "source": "transmit",
             "seq": 101,
-            "timing": { "status": "aligned", "age_us": 100 },
-            "q_ref": [0.10000010025, 0.2, -0.1, -0.2, 0.1, 0.0, 0.1],
-            "dq_ref": [0.001005, 0, 0, 0, 0, 0, 0],
-            "tau_ff": [0.1, -0.2, 0.05, 0, 0, 0, 0],
+            "timing": {
+              "status": "aligned",
+              "age_us": 100
+            },
+            "q_ref": [
+              0.10000010025,
+              0.2,
+              -0.1,
+              -0.2,
+              0.1,
+              0.0,
+              0.1
+            ],
+            "dq_ref": [
+              0.001005,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "tau_ff": [
+              0.1,
+              -0.2,
+              0.05,
+              0,
+              0,
+              0,
+              0
+            ],
             "q_wire": [
-              0.0999999, 0.1999999, -0.0999999, -0.1999999, 0.0999999, 0.0,
+              0.0999999,
+              0.1999999,
+              -0.0999999,
+              -0.1999999,
+              0.0999999,
+              0.0,
               0.0999999
             ],
-            "dq_wire": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            "tau_wire": [0.099, -0.199, 0.049, 0, 0, 0, 0],
-            "kp": [60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0],
-            "kd": [10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0],
+            "dq_wire": [
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0
+            ],
+            "tau_wire": [
+              0.099,
+              -0.199,
+              0.049,
+              0,
+              0,
+              0,
+              0
+            ],
+            "kp": [
+              60.0,
+              60.0,
+              60.0,
+              60.0,
+              60.0,
+              60.0,
+              60.0
+            ],
+            "kd": [
+              10.0,
+              10.0,
+              10.0,
+              10.0,
+              10.0,
+              10.0,
+              10.0
+            ],
             "write_us": 6000,
-            "mode": [1, 1, 1, 1, 1, 1, 1]
+            "mode": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "tuning": {
+              "revision": 1,
+              "dq_feedforward": [
+                0.001005,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ],
+              "tau_gravity": [
+                0.1,
+                -0.2,
+                0.05,
+                0,
+                0,
+                0,
+                0
+              ],
+              "friction_requested": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "friction_applied": [
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              "clamped": [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ]
+            }
           },
           {
             "at_us": 15000,
@@ -3530,6 +5137,197 @@
             "error": 0,
             "mode": 1,
             "timeout": false
+          },
+          {
+            "at_us": 1000,
+            "source": "control",
+            "seq": 101,
+            "generation": 5,
+            "enabled": true,
+            "stopping": false,
+            "motion": 1,
+            "axis": 0,
+            "q_ref": [
+              0.1,
+              0.2,
+              -0.1,
+              -0.2,
+              0.1,
+              0.0,
+              0.1
+            ],
+            "dq_ref": [
+              0.001,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "ddq_ref": [
+              0.05,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "jerk_ref": [
+              5.0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "tau_ff": [
+              0.1,
+              -0.2,
+              0.05,
+              0,
+              0,
+              0,
+              0
+            ],
+            "q": [
+              0.099,
+              0.2,
+              -0.1,
+              -0.2,
+              0.1,
+              0.0,
+              0.1
+            ],
+            "dq": [
+              0.0005,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "tau": [
+              0.1,
+              -0.2,
+              0.05,
+              0,
+              0,
+              0,
+              0
+            ],
+            "voltage": [
+              48.0,
+              48.0,
+              48.0,
+              48.0,
+              48.0,
+              48.0,
+              48.0
+            ],
+            "age_us": [
+              500,
+              500,
+              500,
+              500,
+              500,
+              500,
+              500
+            ]
+          },
+          {
+            "at_us": 1100,
+            "source": "transmit",
+            "seq": 101,
+            "timing": {
+              "status": "aligned",
+              "age_us": 100
+            },
+            "q_ref": [
+              0.10000010025,
+              0.2,
+              -0.1,
+              -0.2,
+              0.1,
+              0.0,
+              0.1
+            ],
+            "dq_ref": [
+              0.001005,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "tau_ff": [
+              0.1,
+              -0.2,
+              0.05,
+              0,
+              0,
+              0,
+              0
+            ],
+            "q_wire": [
+              0.0999999,
+              0.1999999,
+              -0.0999999,
+              -0.1999999,
+              0.0999999,
+              0.0,
+              0.0999999
+            ],
+            "dq_wire": [
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0
+            ],
+            "tau_wire": [
+              0.099,
+              -0.199,
+              0.049,
+              0,
+              0,
+              0,
+              0
+            ],
+            "kp": [
+              60.0,
+              60.0,
+              60.0,
+              60.0,
+              60.0,
+              60.0,
+              60.0
+            ],
+            "kd": [
+              10.0,
+              10.0,
+              10.0,
+              10.0,
+              10.0,
+              10.0,
+              10.0
+            ],
+            "write_us": 6000,
+            "mode": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ]
           }
         ]
       },
@@ -3545,10 +5343,13 @@
               "$ref": "#/components/schemas/TraceSample"
             },
             "maxItems": 100000,
-            "description": "同一数据库快照内已提交的数据，按 at_us 排序，同一时间保留提交顺序。重复 transmit.seq 保留，各条对齐目标可以不同；旧样本可以缺少 timing。"
+            "description": "同一数据库快照内已提交的数据，按 at_us 排序，同一时间保留提交顺序。重复 transmit.seq 保留，各条对齐目标可以不同；旧样本可以缺少 timing。 旧控制样本可缺 servo_tuning/servo_tuning_revision（null/0），旧发送样本可缺 tuning（null）。"
           }
         },
-        "required": ["trace", "samples"],
+        "required": [
+          "trace",
+          "samples"
+        ],
         "description": "采样汇总与数据。正在记录/写入时可读取已提交部分；完整性使用 trace.status 与各计数判断。最多保留 10 次采样，每次仅前 100000 次提交尝试可入队。"
       }
     },
@@ -3854,7 +5655,9 @@
             "description": "停止来源，UTF-8不超过80字节。"
           }
         },
-        "required": ["reason"]
+        "required": [
+          "reason"
+        ]
       },
       "result": {
         "type": "null"

@@ -2,6 +2,7 @@
 //! once and drop on contention or overflow; they never wait for its lock or allocate.
 //! Serialization and disk work run on readers/writer after releasing the queue lock.
 use crate::reference::Timing;
+use crate::tuning::ServoTuning;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -39,6 +40,10 @@ pub enum TraceData {
     Control {
         seq: u64,
         generation: u64,
+        #[serde(default)]
+        servo_tuning: Option<ServoTuning>,
+        #[serde(default)]
+        servo_tuning_revision: u64,
         enabled: bool,
         stopping: bool,
         motion: u8,
@@ -56,6 +61,8 @@ pub enum TraceData {
     },
     Transmit {
         seq: u64,
+        #[serde(default)]
+        tuning: Option<ServoSample>,
         /// Missing in captures made before send-time sampling was introduced.
         #[serde(default)]
         timing: Option<Timing>,
@@ -82,6 +89,16 @@ pub enum TraceData {
         mode: u8,
         timeout: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ServoSample {
+    pub revision: u64,
+    pub dq_feedforward: [f64; 7],
+    pub tau_gravity: [f64; 7],
+    pub friction_requested: [f64; 7],
+    pub friction_applied: [f64; 7],
+    pub clamped: [bool; 7],
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -755,6 +772,7 @@ fn finite(data: &TraceData) -> bool {
             dq,
             tau,
             voltage,
+            servo_tuning,
             ..
         } => {
             [q_ref, dq_ref, ddq_ref, jerk_ref, tau_ff]
@@ -763,6 +781,20 @@ fn finite(data: &TraceData) -> bool {
                 && [q, dq, tau, voltage]
                     .iter()
                     .all(|a| a.iter().all(|x| x.is_none_or(f64::is_finite)))
+                && servo_tuning.as_ref().is_none_or(|config| {
+                    config.joints.iter().all(|j| {
+                        [
+                            j.kd,
+                            j.velocity_ff,
+                            j.coulomb,
+                            j.viscous,
+                            j.velocity_scale,
+                            j.max_friction,
+                        ]
+                        .into_iter()
+                        .all(f64::is_finite)
+                    })
+                })
         }
         TraceData::Transmit {
             q_ref,
@@ -770,10 +802,24 @@ fn finite(data: &TraceData) -> bool {
             tau_ff,
             kp,
             kd,
+            tuning,
             ..
-        } => [q_ref, dq_ref, tau_ff, kp, kd]
-            .iter()
-            .all(|a| a.iter().all(|x| x.is_finite())),
+        } => {
+            [q_ref, dq_ref, tau_ff, kp, kd]
+                .iter()
+                .all(|a| a.iter().all(|x| x.is_finite()))
+                && tuning.as_ref().is_none_or(|sample| {
+                    [
+                        sample.dq_feedforward,
+                        sample.tau_gravity,
+                        sample.friction_requested,
+                        sample.friction_applied,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .all(f64::is_finite)
+                })
+        }
         TraceData::Feedback {
             q,
             dq,
@@ -1037,6 +1083,8 @@ mod tests {
     fn control(seq: u64) -> TraceData {
         TraceData::Control {
             seq,
+            servo_tuning: None,
+            servo_tuning_revision: 0,
             generation: 5,
             enabled: true,
             stopping: false,
@@ -1058,6 +1106,7 @@ mod tests {
     fn transmit(seq: u64) -> TraceData {
         TraceData::Transmit {
             seq,
+            tuning: None,
             timing: None,
             mode: [1; 7],
             q_ref: [0.1; 7],
@@ -1103,11 +1152,118 @@ mod tests {
     }
 
     #[test]
+    fn legacy_samples_decode_without_tuning_and_new_samples_round_trip() {
+        let mut config = ServoTuning {
+            friction_enabled: true,
+            ..ServoTuning::default()
+        };
+        config.joints[3].coulomb = 0.3;
+        let applied = config.apply([0.04; 7], [0.2; 7]).unwrap();
+        let mut tx = transmit(5);
+        if let TraceData::Transmit { tuning, .. } = &mut tx {
+            *tuning = Some(ServoSample {
+                revision: 8,
+                dq_feedforward: applied.dq_feedforward,
+                tau_gravity: [0.2; 7],
+                friction_requested: applied.friction_requested,
+                friction_applied: applied.friction_applied,
+                clamped: applied.clamped,
+            });
+        }
+        let mut ctrl = control(5);
+        if let TraceData::Control {
+            servo_tuning,
+            servo_tuning_revision,
+            ..
+        } = &mut ctrl
+        {
+            *servo_tuning = Some(config);
+            *servo_tuning_revision = 8;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let recorder = Recorder::start(&directory.path().join("events.db")).unwrap();
+        let trace = recorder.trace_start(1000, "right", None).unwrap();
+        sample_until_queued(&recorder, Instant::now(), ctrl);
+        sample_until_queued(&recorder, Instant::now(), tx);
+        recorder.trace_stop().unwrap();
+        wait_for(|| summary(&recorder, &trace.id).status == "complete");
+        let recording = recorder.trace_read(&trace.id).unwrap();
+        assert_eq!(recording.samples.len(), 2);
+        for (sample, expected) in recording.samples.iter().zip([ctrl, tx]) {
+            assert_eq!(
+                serde_json::to_value(sample.data).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            let mut legacy = serde_json::to_value(sample).unwrap();
+            let object = legacy.as_object_mut().unwrap();
+            for field in ["servo_tuning", "servo_tuning_revision", "tuning", "timing"] {
+                object.remove(field);
+            }
+            match serde_json::from_value::<TraceSample>(legacy).unwrap().data {
+                TraceData::Control {
+                    servo_tuning,
+                    servo_tuning_revision,
+                    ..
+                } => {
+                    assert!(servo_tuning.is_none());
+                    assert_eq!(servo_tuning_revision, 0);
+                }
+                TraceData::Transmit { tuning, timing, .. } => {
+                    assert!(tuning.is_none() && timing.is_none());
+                }
+                _ => panic!("wrong sample source"),
+            }
+        }
+        close(&recorder);
+    }
+
+    #[test]
+    fn tuning_capture_finite_check_covers_configuration_and_transmit_arrays() {
+        let mut ctrl = control(5);
+        if let TraceData::Control { servo_tuning, .. } = &mut ctrl {
+            *servo_tuning = Some(ServoTuning::default());
+        }
+        assert!(finite(&ctrl));
+        if let TraceData::Control { servo_tuning, .. } = &mut ctrl {
+            servo_tuning.as_mut().unwrap().joints[6].velocity_scale = f64::NAN;
+        }
+        assert!(!finite(&ctrl));
+        let mut tx = transmit(5);
+        if let TraceData::Transmit { tuning, .. } = &mut tx {
+            *tuning = Some(ServoSample {
+                revision: 2,
+                dq_feedforward: [0.0; 7],
+                tau_gravity: [0.0; 7],
+                friction_requested: [0.0; 7],
+                friction_applied: [0.0; 7],
+                clamped: [false; 7],
+            });
+        }
+        assert!(finite(&tx));
+        for field in 0..4 {
+            let mut bad = tx;
+            if let TraceData::Transmit { tuning, .. } = &mut bad {
+                let t = tuning.as_mut().unwrap();
+                let array = match field {
+                    0 => &mut t.dq_feedforward,
+                    1 => &mut t.tau_gravity,
+                    2 => &mut t.friction_requested,
+                    _ => &mut t.friction_applied,
+                };
+                array[6] = f64::INFINITY;
+            }
+            assert!(!finite(&bad));
+        }
+    }
+
+    #[test]
     fn source_time_boundaries_duplicate_transmit_and_reopen() {
         let directory = tempfile::tempdir().unwrap();
         let event_path = directory.path().join("events.db");
         let recorder = Recorder::start(&event_path).unwrap();
-        assert!(std::mem::size_of::<TraceData>() <= 1024);
+        // The full seven-joint configuration stays inline: no producer allocation,
+        // with the 4096-slot queue still bounded to at most 6 MiB of payloads.
+        assert!(std::mem::size_of::<TraceData>() <= 1536);
         for duration in [0, 999, 20_001, u64::MAX] {
             assert_eq!(
                 recorder.trace_start(duration, "left", None).unwrap_err(),

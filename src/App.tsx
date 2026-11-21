@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import RobotScene from "./RobotScene";
 import ApiPanel from "./ApiPanel";
 import TracePanel from "./TracePanel";
+import ServoPanel from "./ServoPanel";
 import { PanelDivider, usePanelLayout } from "./PanelLayout";
 import {
   api,
@@ -16,16 +17,19 @@ import {
   type View,
 } from "./api";
 const DEG = 180 / Math.PI;
-type Page = "control" | "api" | "logs";
+type Page = "control" | "tuning" | "api" | "logs";
 type SafetyIntent = "parking" | "disconnect" | "disable" | "exit";
 const pages: { id: Page; label: string }[] = [
   { id: "control", label: "控制" },
+  { id: "tuning", label: "调试" },
   { id: "api", label: "接口" },
   { id: "logs", label: "日志" },
 ];
 const currentPage = (): Page => {
   const page = location.hash.slice(1).split("/")[0];
-  return page === "api" || page === "logs" ? page : "control";
+  return page === "tuning" || page === "api" || page === "logs"
+    ? page
+    : "control";
 };
 const phaseLabels: Record<Phase, string> = {
   disconnected: "未连接",
@@ -971,6 +975,24 @@ export default function App() {
       </main>
       <section
         className="secondary-screen"
+        id="tuning-view"
+        role="tabpanel"
+        aria-labelledby="page-tuning"
+        hidden={page !== "tuning"}
+      >
+        <ServoPanel
+          key={
+            view.connectionEpoch ??
+            `${s.side}:${s.port ?? ""}:${["disconnected", "connecting", "closing"].includes(s.phase)}`
+          }
+          view={view}
+          blocked={
+            busy || enableInProgress || !!motionPending || !!safetyIntent
+          }
+        />
+      </section>
+      <section
+        className="secondary-screen"
         id="api-view"
         role="tabpanel"
         aria-labelledby="page-api"
@@ -993,7 +1015,7 @@ export default function App() {
         className="panel logs-panel"
         id="logs-panel"
         aria-label="运行日志"
-        hidden={page === "api"}
+        hidden={page !== "control" && page !== "logs"}
         data-fullscreen={page === "logs"}
         data-collapsed={page === "control" && layout.logsCollapsed}
       >

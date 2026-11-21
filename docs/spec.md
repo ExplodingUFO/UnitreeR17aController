@@ -8,7 +8,7 @@
 
 当前测试环境为 macOS arm64。真机、Windows 和 Linux 的测试项目见[测试记录](implementation-status.md)。
 
-范围包括连接、状态、使能/停止、七轴关节和末端六维的连续/步长点动、基座/工具坐标、当前七轴局部运动学、实测模型、本机调用、短时采样与必要诊断。工作台始终可以取消当前动作，不取得控制权，也不自动失能。
+范围包括连接、状态、使能/停止、七轴关节和末端六维的连续/步长点动、基座/工具坐标、当前七轴局部运动学、实测模型、本机调用、短时采样、逐轴伺服调试与必要诊断。工作台始终可以取消当前动作，不取得控制权，也不自动失能。
 
 首版不包含全局位姿搜索、任意轨迹规划、相机/点云、双臂/灵巧手、录制回放、图表平台、插件、无窗口驻留或局域网预留。
 
@@ -39,7 +39,7 @@ Tauri 命令只向打包的主窗口开放，不授权远程页面。开发与�
 
 ```text
 ┌───────────────────────────────────────────────────────────────┐
-│ [控制] [接口] [日志]      设备状态      控制者   [取得控制] [停止]│
+│ [控制] [调试] [接口] [日志]  设备状态  控制者   [取得控制] [停止]│
 ├─────────────────┬──────────────────────────┬──────────────────┤
 │ 连接与关节       │                          │ 点动             │
 │ 左/右臂型号      │        3D 机械臂         │ 末端 / 关节      │
@@ -62,9 +62,11 @@ Tauri 命令只向打包的主窗口开放，不授权远程页面。开发与�
 | 右侧点动 | 末端/关节页签；XYZ/姿态或七关节；基座/工具、连续/步长、速度与步长 | 页签共享一种动作状态；无有效控制权、未使能、反馈过期或故障时说明禁用原因 |
 | 底部诊断 | 近期有限条日志、错误、请求结果、通信计数、本机接口信息            | 不暴露控制凭据；不做曲线、回放和监控平台                                 |
 
-窗口最小尺寸为 800×600。控制页同时显示连接、七轴反馈、3D、末端坐标和点动；日志默认收起。顶部“接口”页包含接入信息、接口参考和请求结果，顶部“日志”页提供完整日志与筛选。各页面保留停止按钮，切走控制页时结束连续点动。布局测量结果见测试记录。
+窗口最小尺寸为 800×600。控制页同时显示连接、七轴反馈、3D、末端坐标和点动；日志默认收起。顶部“调试”页提供伺服参数草稿与显式应用；“接口”页包含接入信息、接口参考和请求结果，顶部“日志”页提供完整日志与筛选。各页面保留停止按钮，切走控制页时结束连续点动。布局测量结果见测试记录。
 
 “日志”页分为事件和采样。采样默认 10 秒，可选 1–20 秒；端口已连接时可开始，无需控制权或使能。界面显示“控制参考 · 实际发送 · 关节反馈”、采样状态、样本/写入/待写/丢弃/错误数，完成或失败后可下载 JSON，写入中暂不可下载。“停止采样”只结束记录，工作台停止按钮继续负责取消机械臂动作。
+
+“调试”页提供全局摩擦开关及 J1..J7 的阻尼、速度前馈权重和摩擦参数草稿，可恢复基线、显式应用或复制 JSON。编辑与恢复基线只更新草稿；取得控制权、连接就绪且无动作后才能应用。连接、断开均恢复后端基线，参数不自动持久化。
 
 左右栏边界、3D/末端坐标区边界及日志上边界均可拖动，尺寸保存在本机，双击恢复对应项默认值。日志默认收起为 36 px，可展开或拖动调整；工作区至少 390 px，末端坐标区至少 128 px。窗口缩小或日志拉高时，关节表和点动列表允许内部滚动，各模块继续保留在当前页面。3D 画布跟随实际面板尺寸更新。
 
@@ -100,6 +102,16 @@ Tauri 命令只向打包的主窗口开放，不授权远程页面。开发与�
 
 正常停止继续受 jerk 限制减速，可能比此前需要更长时间。停止求解惩罚关节速度本身，使冗余方向的速度也减至零，连续性由导数硬约束维持。笛卡尔路径上无法继续制动时，记录 `stop_path` 并转为受限关节制动；故障、失能和关闭仍优先处理。同一源参考可以在不同发送时刻取样，尚未发送的更新也可合并；控制器导数约束不保证实际 TX 节拍或物理 jerk。发送时间对齐、轨迹和采样尚未真机验收。
 
+### 伺服调试
+
+`ServoTuning` 必须完整包含 `friction_enabled:boolean` 及七个关节的 `kd/velocity_ff/coulomb/viscous/velocity_scale/max_friction`。基线为摩擦关闭，每轴依次为 `10/1/0/0/0.02/0.5`。闭区间范围依次为 `[0,30] Nm·s/rad`、`[0,1]`、`[0,2] Nm`、`[0,10] Nm·s/rad`、`[0.001,0.2] rad/s`、`[0,2] Nm`；拒绝非有限值。
+
+发送端按未缩放的轨迹速度 `v` 计算 `friction=clamp(Fc*tanh(v/epsilon)+B*v, ±max_friction)`，与重力相加后再限制到 ±8 Nm。摩擦关闭或 `v=0` 时摩擦项严格为零；开关不影响独立的速度前馈权重。`velocity_ff*v` 仅用于报文 `dq`，轨迹积分、TCP 路径、停止及收纳返回时序继续使用原始速度。±8 Nm 限制的是附加前馈通道，不能视为电机总输出上限。
+
+持有者通过 `configure_servo` 显式应用整份配置；HTTP 202 表示入队，结果为 `accepted/configure_servo` 或 `rejected`。运动、停止减速和使能确认期间返回 `motion_busy`，连接中/未连接不接受，故障或待清错返回 `fault`。已使能空闲时须取得当前 generation/epoch、新鲜且静止的成功发送目标，复制其位置再应用；配置和 generation 版本提升，旧运动请求失效。认证、租约与停止权限沿用原约定。详见[伺服调试配置](implementation-contract.md#59-伺服调试配置)。
+
+以上前馈计算无内部状态，参数标定与减抖效果尚未真机验证。候选方案与证据见[补偿方案调查](research/motion-compensation-repositories-2026-11-21.md)。
+
 ### 状态语义
 
 | 状态         | 含义                                                                    | 可发生的下一步                                |
@@ -132,12 +144,13 @@ Tauri 命令只向打包的主窗口开放，不授权远程页面。开发与�
 | src-tauri/src/arm.rs                                                 | 唯一设备/控制权/动作状态，控制线程、超时与快照           | 串口调度、当前目标、有效期和状态转换                       |
 | src-tauri/src/protocol.rs                                            | 当前报文、CRC、反馈组帧、单位与标定映射                  | 包字段、缩放、字节序和恢复缓冲                             |
 | src-tauri/src/reference.rs                                           | 发送时刻取样、源年龄、目标与路径复核                     | 速度/首次零点封顶、与上一成功伺服目标比较、取样状态        |
+| src-tauri/src/tuning.rs | 完整伺服配置、范围校验与无状态前馈计算 | 速度权重、摩擦与总前馈限幅；不改变运动参考 |
 | src-tauri/src/kinematics.rs                                          | 不可变模型/TCP、显式输入的 FK/Jacobian、候选局部步与诊断 | 7R 递推、加权/阻尼、内部矩阵；不持有持续动作目标           |
 | src-tauri/src/trajectory.rs                                          | 离散导数窗口、参考积分、有界二次规划                     | 速度/加速度/jerk 的共同限制与数值求解                      |
 | src-tauri/src/server.rs                                              | HTTP/WS、序列化、会话与请求映射                          | 网络连接与慢消费者处理；日志查询移交 spawn_blocking        |
 | src-tauri/src/journal.rs                                             | SQLite 结构化事件、只读查询与原子统计                    | 队列单次尝试取锁、专用 writer、事务/重试/保留与 checkpoint |
 | src-tauri/src/trace.rs                                               | 有界短时采样、采样汇总与读取                             | 预分配队列、独立 SQLite writer、保留与采样计数             |
-| src/App.tsx、PanelLayout.tsx、RobotScene.tsx、TracePanel.tsx、api.ts | 工作台、面板尺寸、三维渲染、采样、单一本机客户端         | 不拥有设备运动状态                                         |
+| src/App.tsx、PanelLayout.tsx、RobotScene.tsx、TracePanel.tsx、ServoPanel.tsx、api.ts | 工作台、面板尺寸、三维渲染、采样、伺服调试、单一本机客户端         | 不拥有设备运动状态                                         |
 
 同一 Rust 应用里，串口与控制用专用线程，网络使用异步运行时，渲染在 WebView。命令交接有界，状态发送采用最新快照；慢 UI/订阅者不能阻塞电机循环。
 
@@ -153,7 +166,7 @@ arm 独占求解 seed、上个已接受参考和当前目标。kinematics 只计
 
 保留最近 100000 条事件，清理和 checkpoint 均在 writer 执行。`recent` 是阻塞只读接口，server 必须使用 spawn_blocking；按 id 降序、limit 最多 500。`shutdown(timeout)` 仅供应用关闭协调线程有界等待，超时返回失败并请求后台停止；不承诺强制中断 OS 调用，Drop 不阻塞。
 
-短时采样单独存放在 `events.sqlite3.traces.sqlite3`，保留最近 10 次，每次最多接纳前 100000 次样本提交尝试。预分配队列容量为 4096；生产者使用 `Mutex.try_lock`，竞争或满队列时立即丢弃并计数，路径中无等待、SQL、JSON 编码或分配。独立 writer 轮询并取出数据后执行序列化与 SQLite 写入。采样的 `accepted/written/pending/dropped/errors` 按次统计，与事件 `journal` 统计分开。
+短时采样单独存放在 `events.sqlite3.traces.sqlite3`，保留最近 10 次，每次最多接纳前 100000 次样本提交尝试。预分配队列容量为 4096，内联完整伺服配置后样本存储约 5 MiB（不含 writer/SQLite 开销）；生产者使用 `Mutex.try_lock`，竞争或满队列时立即丢弃并计数，路径中无等待、SQL、JSON 编码或分配。独立 writer 轮询并取出数据后执行序列化与 SQLite 写入。采样的 `accepted/written/pending/dropped/errors` 按次统计，与事件 `journal` 统计分开。
 
 ## 6. 本机接口 v1
 
@@ -164,7 +177,7 @@ arm 独占求解 seed、上个已接受参考和当前目标。kinematics 只计
 | GET /v1/ports         | 端口列表和可得的设备信息                                                                                                      | 只读，不打开或使能设备                                  |
 | GET /v1/state         | 完整状态快照                                                                                                                  | 当前状态，不用查询成功推断设备健康                      |
 | POST /v1/control      | acquire / renew / release                                                                                                     | 控制模块决定后返回结果；控制者获得私有租约凭据          |
-| POST /v1/commands     | connect / disconnect / enable / disable / clear_fault / configure_tcp / jog_start / jog_update / step / return_to_pose / stop | 请求入队不等于被控制器接受或设备执行完成                |
+| POST /v1/commands     | connect / disconnect / enable / disable / clear_fault / configure_tcp / configure_servo / jog_start / jog_update / step / return_to_pose / stop | 请求入队不等于被控制器接受或设备执行完成                |
 | GET /v1/logs?limit=50 | 最近结构化事件                                                                                                                | 按 id 降序，最多 500 条；阻塞读通过 spawn_blocking 执行 |
 | GET /v1/traces        | 最近采样汇总                                                                                                                  | 默认 limit=20，实际限制到 1..10                         |
 | POST /v1/traces       | 开始短时观察，duration_ms 默认 10000、范围 1000..20000                                                                        | 200 TraceSummary；需要已有端口连接，无需租约            |
@@ -177,6 +190,8 @@ arm 独占求解 seed、上个已接受参考和当前目标。kinematics 只计
 全部采样接口使用同一 Bearer 与 Origin 校验，开始/停止采样无需运动租约，也不申请控制权、打开端口、使能或启动运动。开始要求快照已有端口，且不在 `disconnected/connecting/closing`。采样返回 `recording/writing/complete/failed` 状态，停止记录后可继续写入；完整性需同时检查各计数。样本的 `source` 为 `control/transmit/feedback`，`at_us` 为来源单调时间相对采样开始的微秒数。
 
 `transmit.seq` 仍是源 `control.seq`，重复序号不表示相同位置。`control.q_ref/dq_ref` 保留控制器参考；`transmit.q_ref/dq_ref` 为发送时对齐或回退保持的理想目标，`q_wire/dq_wire/tau_wire` 为实际编码后反标定的关节 SI 值。发送样本增加 `timing:{status,age_us}|null`，表示取样状态和源年龄；旧文件缺省时按 null 读取。完整字段与状态取值见[接口说明](implementation-contract.md#92-样本字段与时间)，路由不变。
+
+控制样本新增可缺省的 `servo_tuning`（完整配置或 null）与 `servo_tuning_revision`（u64），旧文件按 null/0 读取。发送样本新增可缺省的 `tuning:ServoSample|null`，记录配置版本、加权后的 `dq_feedforward`、重力、摩擦请求/实际增量及逐轴限幅标识；旧文件按 null 读取。`transmit.dq_ref` 始终是未缩放的轨迹速度，`tau_ff` 为最终总附加前馈；编码误差应以 `dq_feedforward` 对照 `dq_wire`，旧样本回退到 `dq_ref`。
 
 工作台停止通过主窗口的 Tauri 命令调用 arm，不需要运动租约。外部 HTTP 客户端的停止权限按控制权校验：持有者可以停止自己的动作，其他客户端保持只读。
 
@@ -191,6 +206,7 @@ HTTP 在请求头中携带应用会话凭据；WebSocket 升级后首帧认证�
 | 数据         | 必需信息                                                                                                 |
 | ------------ | -------------------------------------------------------------------------------------------------------- |
 | 上下文       | side、port、TCP 配置状态、控制者、generation、快照序号                                                   |
+| 伺服配置 | servo_tuning 完整配置、servo_tuning_revision 当前版本；每次连接/断开恢复基线 |
 | 实测关节     | 固定七个关节的名称/ID、q/dq/tau、逐关节 age_ms、可得的温度/电压/error；无反馈字段为 null                 |
 | 反馈计算 TCP | 当前关节快照经当前模型/TCP 的 FK 结果；TCP 未配置或无有效完整反馈时为 null，四元数为 x/y/z/w             |
 | 动作         | space、mode、axis、request_id、progress；last_result 与有限 results 保存请求结果和原因                   |
@@ -198,7 +214,7 @@ HTTP 在请求头中携带应用会话凭据；WebSocket 升级后首帧认证�
 | 连续输入     | jog_start 给出 space/axis/direction/speed/frame；jog_update 仅用 action_id/input_seq/ttl_ms 续期现有动作 |
 | 日志统计     | pending、written、dropped、errors、healthy，控制线程只读原子值                                           |
 
-generation 在连接重建、模式/TCP 改变、停止、动作完成、控制权失效等上下文变化时推进。input_seq 按租约、generation 和当前动作校验；续输入只更新显式开始的当前动作，不能隐式创建动作。快照序号只表示观测顺序，不代替上述上下文。
+generation 在连接重建、模式/TCP/伺服配置改变、停止、动作完成、控制权失效等上下文变化时推进。input_seq 按租约、generation 和当前动作校验；续输入只更新显式开始的当前动作，不能隐式创建动作。快照序号只表示观测顺序，不代替上述上下文。
 
 连续输入的截止时间在后端首次接收时用单调时钟确定，排队、重试和出队均不延长；每周期先处理取消，再计算和最终复核候选。停止后迟到的旧输入不能重新启动动作。
 
@@ -244,11 +260,12 @@ npm run tauri dev
 | 界面/API                | 完整快照与请求结果一致；实测、参考和过期状态可辨识；800×600 及常用桌面尺寸无页面滚动；打包 WebView 的本机访问成功                                                                                                |
 | SQLite 日志             | 持久化后查询、降序/上限、保留清理、队列饱和/数据库不可写时生产者返回、后台恢复和关闭边界                                                                                                                         |
 | 轨迹与短时采样          | 不等控制周期下最终参考的速度/加速度/jerk、TCP 路径约束与停止回退；来源时间与发送序号、编码值、队列竞争/饱和计数、独立持久化和认证下载                                                                            |
+| 伺服调试 | 完整配置与范围、默认行为、零速/全局开关、逐轴隔离、静止发送目标交接、版本推进/旧请求失效、新旧 Trace 与加权速度编码误差 |
 | 发送时间对齐            | 原始 10 ms 网格与跳槽、普通起点间距、50 ms 新鲜边界、速度/首次零点封顶、固定 TCP 路径与目标、上一成功伺服目标、写前 epoch/有效期复查、无效参考保持与首个无效参考 I/O 错误、旧 JSON 兼容                          |
 
 真机测试包括 6 Mbps 通信、七关节反馈与标定、本体方向、TCP、六维运动，以及停止、失联和重连。测试状态见[测试记录](implementation-status.md)。
 
-短时采样的离线分析入口为 `cargo run --manifest-path src-tauri/Cargo.toml --example analyze_trace -- <capture.json>`。示例只读取 JSON，输出来源间隔、参考导数、跟随与编码差异、发送序号及完整性计数；采集和验收顺序见[接口说明](implementation-contract.md#93-采样与验收流程)。
+短时采样的离线分析入口为 `cargo run --manifest-path src-tauri/Cargo.toml --example analyze_trace -- <capture.json>`。示例只读取 JSON，输出来源间隔、参考导数、跟随与编码差异、发送序号、配置版本/补偿限幅次数及完整性计数；采集和验收顺序见[接口说明](implementation-contract.md#93-采样与验收流程)。
 
 ## 10. 关键操作
 

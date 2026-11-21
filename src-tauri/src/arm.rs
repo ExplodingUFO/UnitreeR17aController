@@ -7,6 +7,7 @@ use crate::{
     protocol::{BusError, BusHandle, DriveMode, Feedback, Setpoint},
     reference::{CartesianGuard, MAX_REFERENCE_AGE, Reference},
     trajectory::{self, JOINT_ACCELERATION, JOINT_JERK, JOINT_SPEED},
+    tuning::ServoTuning,
 };
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use serde::{Deserialize, Serialize};
@@ -124,6 +125,8 @@ pub struct Snapshot {
     pub error: Option<ApiError>,
     pub journal: JournalStats,
     pub communication: Communication,
+    pub servo_tuning: ServoTuning,
+    pub servo_tuning_revision: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -180,6 +183,9 @@ pub enum Operation {
     ConfigureTcp {
         tcp: Pose,
     },
+    ConfigureServo {
+        config: Box<ServoTuning>,
+    },
     JogStart {
         space: Space,
         axis: usize,
@@ -223,6 +229,7 @@ impl Operation {
             Self::Disable { .. } => "disable",
             Self::ClearFault => "clear_fault",
             Self::ConfigureTcp { .. } => "configure_tcp",
+            Self::ConfigureServo { .. } => "configure_servo",
             Self::JogStart { .. } => "jog_start",
             Self::JogUpdate { .. } => "jog_update",
             Self::Step { .. } => "step",
@@ -442,6 +449,8 @@ struct Core {
     model: Option<Arc<Kinematics>>,
     reference_epoch: Arc<AtomicU64>,
     reference_version: u64,
+    servo_tuning: ServoTuning,
+    servo_tuning_revision: u64,
     side: String,
     port: Option<String>,
     bus: Option<BusHandle>,
@@ -491,6 +500,8 @@ impl Core {
             model: loaded.ok().map(Arc::new),
             reference_epoch: Arc::new(AtomicU64::new(0)),
             reference_version: 0,
+            servo_tuning: ServoTuning::default(),
+            servo_tuning_revision: 1,
             side: "right".into(),
             port: None,
             bus: None,
@@ -537,6 +548,10 @@ impl Core {
     fn bump_generation(&mut self) {
         self.generation += 1;
         self.invalidate_reference();
+    }
+    fn reset_servo_tuning(&mut self) {
+        self.servo_tuning = ServoTuning::default();
+        self.servo_tuning_revision += 1;
     }
     fn record(&mut self, id: &str, status: &str, code: &str, message: impl Into<String>) {
         let result = CommandResult {
@@ -818,6 +833,7 @@ impl Core {
                     });
                 }
                 self.model = Some(Arc::new(model));
+                self.reset_servo_tuning();
                 self.side = side;
                 self.port = Some(port);
                 self.bus = Some(bus);
@@ -899,6 +915,48 @@ impl Core {
                 tcp.rotation.iter_mut().for_each(|q| *q /= norm);
                 self.tcp = Some(tcp);
                 self.bump_generation();
+            }
+            Operation::ConfigureServo { config } => {
+                if self.bus.is_none()
+                    || matches!(
+                        self.phase,
+                        Phase::Disconnected | Phase::Connecting | Phase::Closing
+                    )
+                {
+                    return Err(ApiError::new("not_connected", "请先连接机械臂"));
+                }
+                if self.error.is_some() || self.clear_request.is_some() {
+                    return Err(ApiError::new("fault", "请先清除当前故障"));
+                }
+                if self.motion.is_some() || self.stopping || self.enable_request.is_some() {
+                    return Err(ApiError::new("motion_busy", "当前动作尚未结束"));
+                }
+                config
+                    .validate()
+                    .map_err(|e| ApiError::new("invalid_servo_tuning", e))?;
+                if self.enabled {
+                    let held = self.motion_anchor(now)?;
+                    self.reference = held;
+                    self.reset_derivatives();
+                }
+                self.servo_tuning = *config;
+                self.servo_tuning_revision += 1;
+                self.bump_generation();
+                self.journal.log(
+                    "info",
+                    "control",
+                    "servo_tuning",
+                    &format!(
+                        "伺服参数已应用，版本 {}，摩擦补偿{}",
+                        self.servo_tuning_revision,
+                        if config.friction_enabled {
+                            "开启"
+                        } else {
+                            "关闭"
+                        }
+                    ),
+                    Some(id),
+                );
             }
             Operation::JogStart {
                 space,
@@ -994,6 +1052,7 @@ impl Core {
     fn disconnect(&mut self) {
         self.end_motion("cancelled", "disconnected", "设备连接已断开");
         self.enabled = false;
+        self.reset_servo_tuning();
         self.reset_derivatives();
         self.stopping = false;
         self.send_disable();
@@ -1541,6 +1600,8 @@ impl Core {
             self.generation,
             self.reference_version,
         );
+        reference.servo_tuning = self.servo_tuning;
+        reference.tuning_revision = self.servo_tuning_revision;
         reference.stopping = self.stopping || self.stop_path.is_some();
         let motion = self.motion.as_ref();
         if let Some(motion) = motion {
@@ -1641,6 +1702,8 @@ impl Core {
             TraceData::Control {
                 seq: self.control_seq,
                 generation: self.generation,
+                servo_tuning: Some(self.servo_tuning),
+                servo_tuning_revision: self.servo_tuning_revision,
                 enabled: self.enabled,
                 stopping: self.stopping,
                 motion: motion.map_or(0, |m| match (m.space, m.mode) {
@@ -2001,6 +2064,8 @@ impl Core {
                 crc_errors: self.communication.crc_errors,
                 timeouts: self.communication.timeouts,
             },
+            servo_tuning: self.servo_tuning,
+            servo_tuning_revision: self.servo_tuning_revision,
         }
     }
 }
@@ -2122,6 +2187,150 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn servo_configuration_is_atomic_owner_only_and_resets_on_disconnect() {
+        let now = Instant::now();
+        let (mut core, _directory) = observed_core(now);
+        let (bus, _sent) = BusHandle::test_idle_bus();
+        core.bus = Some(bus);
+        core.port = Some("memory-only".into());
+        core.phase = Phase::Disabled;
+        let lease = core
+            .control(
+                ControlRequest {
+                    action: "acquire".into(),
+                    client_id: "owner".into(),
+                    lease_id: None,
+                },
+                now,
+            )
+            .unwrap();
+        let secret = lease.lease_id.unwrap();
+        let old_generation = core.generation;
+        let old_revision = core.servo_tuning_revision;
+        let mut config = ServoTuning {
+            friction_enabled: true,
+            ..ServoTuning::default()
+        };
+        config.joints[3].kd = 4.0;
+        config.joints[3].velocity_ff = 0.0;
+        config.joints[3].coulomb = 0.2;
+        let request = |id: &str, client: &str, generation, config| CommandRequest {
+            request_id: id.into(),
+            client_id: client.into(),
+            lease_id: secret.clone(),
+            generation,
+            operation: Operation::ConfigureServo {
+                config: Box::new(config),
+            },
+        };
+        core.command(
+            request("wrong-owner", "reader", old_generation, config),
+            now,
+            now,
+        );
+        assert_eq!(core.results.front().unwrap().code, "not_owner");
+        assert_eq!(core.servo_tuning, ServoTuning::default());
+        let mut invalid = config;
+        invalid.joints[2].kd = f64::NAN;
+        core.command(
+            request("invalid", "owner", old_generation, invalid),
+            now,
+            now,
+        );
+        assert_eq!(core.results.front().unwrap().code, "invalid_servo_tuning");
+        assert_eq!(core.generation, old_generation);
+        assert_eq!(core.servo_tuning_revision, old_revision);
+        core.command(request("apply", "owner", old_generation, config), now, now);
+        assert_eq!(core.results.front().unwrap().status, "accepted");
+        assert_eq!(core.servo_tuning, config);
+        assert_eq!(core.servo_tuning_revision, old_revision + 1);
+        let state = core.snapshot(now);
+        assert_eq!(state.servo_tuning, config);
+        assert_eq!(state.servo_tuning_revision, old_revision + 1);
+        core.command(
+            request("stale", "owner", old_generation, ServoTuning::default()),
+            now,
+            now,
+        );
+        assert_eq!(core.results.front().unwrap().code, "stale_context");
+        assert_eq!(core.servo_tuning, config);
+        core.disconnect();
+        assert_eq!(core.servo_tuning, ServoTuning::default());
+        assert!(core.servo_tuning_revision > old_revision + 1);
+    }
+
+    #[test]
+    fn servo_configuration_preserves_the_hold_tcp_and_rejects_motion_or_enabling() {
+        let now = Instant::now();
+        let (mut core, _directory) = observed_core(now);
+        let (bus, sent) = BusHandle::test_idle_bus();
+        core.bus = Some(bus);
+        core.port = Some("memory-only".into());
+        core.enabled = true;
+        core.phase = Phase::Ready;
+        core.tcp = Some(Pose {
+            translation: [0.0, 0.0, 0.1],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+        });
+        let tcp = core.tcp;
+        let held = core.reference.map(|q| q + 0.0003);
+        sent.send_replace(Some(crate::protocol::SentReference {
+            at: now,
+            generation: core.generation,
+            epoch: core.reference_version,
+            q: held,
+            dq: [0.0; 7],
+        }));
+        let mut config = ServoTuning::default();
+        config.joints[0].velocity_ff = 0.0;
+        core.apply(
+            "tune",
+            Operation::ConfigureServo {
+                config: Box::new(config),
+            },
+            now,
+            now,
+        )
+        .unwrap();
+        assert!(core.enabled && core.port.is_some());
+        assert_eq!(core.reference, held);
+        assert_eq!(core.tcp, tcp);
+        let r = core.outgoing_reference();
+        assert_eq!(r.servo_tuning, config);
+        assert_eq!(r.tuning_revision, core.servo_tuning_revision);
+        core.stopping = true;
+        assert_eq!(
+            core.apply(
+                "blocked",
+                Operation::ConfigureServo {
+                    config: Box::new(config),
+                },
+                now,
+                now,
+            )
+            .unwrap_err()
+            .code,
+            "motion_busy"
+        );
+        core.stopping = false;
+        core.enable_request = Some(("enable".into(), now));
+        assert_eq!(
+            core.apply(
+                "blocked",
+                Operation::ConfigureServo {
+                    config: Box::new(config),
+                },
+                now,
+                now,
+            )
+            .unwrap_err()
+            .code,
+            "motion_busy"
+        );
+        assert_eq!(core.servo_tuning, config);
+    }
 
     #[test]
     fn late_send_rejection_cannot_cancel_a_new_context_or_pending_host_stop() {
@@ -2258,11 +2467,22 @@ mod tests {
 
     #[test]
     fn return_settling_and_optional_disconnect_follow_time_sampled_wire_targets() {
-        for disconnect_after in [false, true] {
+        for (disconnect_after, tuned) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let mut now = Instant::now();
             let (mut core, _directory) = observed_core(now);
             core.enabled = true;
             core.port = Some("memory-only".into());
+            if tuned {
+                core.servo_tuning.friction_enabled = true;
+                for joint in &mut core.servo_tuning.joints {
+                    joint.kd = 5.0;
+                    joint.velocity_ff = 0.0;
+                    joint.coulomb = 0.3;
+                }
+            }
+            let config = core.servo_tuning;
             let mut goal = core.reference;
             for (q, d) in goal
                 .iter_mut()
@@ -2288,7 +2508,9 @@ mod tests {
                     break;
                 }
                 let at = now + Duration::from_millis(2);
-                let sample = core.outgoing_reference().sample(at, previous).unwrap();
+                let reference = core.outgoing_reference();
+                assert_eq!(reference.servo_tuning, config);
+                let sample = reference.sample(at, previous).unwrap();
                 (applied_q, applied_dq) =
                     crate::protocol::test_wire_targets("right", sample.q, sample.dq);
                 previous = Some(crate::reference::Previous {
@@ -2311,6 +2533,14 @@ mod tests {
             );
             assert!(core.at_rest());
             assert!((0..7).all(|i| (core.reference[i] - goal[i]).abs() <= 0.01));
+            assert_eq!(
+                core.servo_tuning,
+                if disconnect_after {
+                    ServoTuning::default()
+                } else {
+                    config
+                }
+            );
         }
     }
 

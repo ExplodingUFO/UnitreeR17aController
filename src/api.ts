@@ -28,6 +28,81 @@ export interface Pose {
   translation: [number, number, number];
   rotation: [number, number, number, number];
 }
+export interface JointTuning {
+  kd: number;
+  velocity_ff: number;
+  coulomb: number;
+  viscous: number;
+  velocity_scale: number;
+  max_friction: number;
+}
+export interface ServoTuning {
+  friction_enabled: boolean;
+  joints: [
+    JointTuning,
+    JointTuning,
+    JointTuning,
+    JointTuning,
+    JointTuning,
+    JointTuning,
+    JointTuning,
+  ];
+}
+export const SERVO_TUNING_RANGES = {
+  kd: [0, 30],
+  velocity_ff: [0, 1],
+  coulomb: [0, 2],
+  viscous: [0, 10],
+  velocity_scale: [0.001, 0.2],
+  max_friction: [0, 2],
+} as const;
+export function createServoTuning(): ServoTuning {
+  return {
+    friction_enabled: false,
+    joints: Array.from({ length: 7 }, () => ({
+      kd: 10,
+      velocity_ff: 1,
+      coulomb: 0,
+      viscous: 0,
+      velocity_scale: 0.02,
+      max_friction: 0.5,
+    })) as ServoTuning["joints"],
+  };
+}
+export function isServoTuning(value: unknown): value is ServoTuning {
+  if (!value || typeof value !== "object") return false;
+  const config = value as Partial<ServoTuning>;
+  return (
+    typeof config.friction_enabled === "boolean" &&
+    Array.isArray(config.joints) &&
+    config.joints.length === 7 &&
+    Array.from(config.joints).every(
+      (joint) =>
+        joint &&
+        Object.entries(SERVO_TUNING_RANGES).every(([key, [min, max]]) => {
+          const number = joint[key as keyof JointTuning];
+          return (
+            typeof number === "number" &&
+            Number.isFinite(number) &&
+            number >= min &&
+            number <= max
+          );
+        }),
+    )
+  );
+}
+export function sameServoTuning(a: ServoTuning, b: ServoTuning): boolean {
+  return (
+    a.friction_enabled === b.friction_enabled &&
+    a.joints.length === 7 &&
+    b.joints.length === 7 &&
+    a.joints.every((joint, index) =>
+      (Object.keys(SERVO_TUNING_RANGES) as (keyof JointTuning)[]).every(
+        (key) => joint[key] === b.joints[index][key],
+      ),
+    )
+  );
+}
 export type ResultStatus =
   | "accepted"
   | "rejected"
@@ -72,6 +147,8 @@ export interface Snapshot {
   tcp: Pose | null;
   tcp_transform: Pose | null;
   tcp_configured: boolean;
+  servo_tuning: ServoTuning;
+  servo_tuning_revision: number;
   feedback_age_ms: number | null;
   action: Action | null;
   last_result: Result | null;
@@ -147,6 +224,7 @@ export type Operation =
   | { kind: "enable" | "clear_fault" | "stop" }
   | ({ kind: "return_to_pose" } & ReturnToPoseArguments)
   | { kind: "configure_tcp"; tcp: Pose }
+  | { kind: "configure_servo"; config: ServoTuning }
   | ({
       kind: "jog_start";
       input_seq: number;
@@ -177,6 +255,8 @@ export const emptySnapshot: Snapshot = {
   tcp: null,
   tcp_transform: null,
   tcp_configured: false,
+  servo_tuning: createServoTuning(),
+  servo_tuning_revision: 0,
   feedback_age_ms: null,
   action: null,
   last_result: null,
@@ -187,6 +267,7 @@ export const emptySnapshot: Snapshot = {
 };
 export interface View {
   snapshot: Snapshot;
+  connectionEpoch?: number;
   online: boolean;
   receivedAt: number;
   error: string;
@@ -232,6 +313,7 @@ class DesktopApi {
   private cancelReturn: (() => void) | null = null;
   view: View = {
     snapshot: emptySnapshot,
+    connectionEpoch: 0,
     online: false,
     receivedAt: 0,
     error: "",
@@ -396,6 +478,18 @@ class DesktopApi {
   }
   private accept(snapshot: Snapshot) {
     if (this.view.online && snapshot.seq < this.view.snapshot.seq) return;
+    const previous = this.view.snapshot;
+    const detached = (s: Snapshot) =>
+      ["disconnected", "connecting", "closing"].includes(s.phase);
+    const connectionChanged =
+      snapshot.side !== previous.side ||
+      snapshot.port !== previous.port ||
+      detached(snapshot) !== detached(previous);
+    snapshot = {
+      ...snapshot,
+      servo_tuning: snapshot.servo_tuning ?? createServoTuning(),
+      servo_tuning_revision: snapshot.servo_tuning_revision ?? 0,
+    };
     if (this.lease && snapshot.owner?.client_id !== "desktop")
       this.dropLease(false);
     if (
@@ -412,6 +506,8 @@ class DesktopApi {
       this.clearJog();
     this.publish({
       snapshot,
+      connectionEpoch:
+        (this.view.connectionEpoch ?? 0) + (connectionChanged ? 1 : 0),
       online: true,
       receivedAt: performance.now(),
       hasControl: !!this.lease && snapshot.owner?.client_id === "desktop",
@@ -532,6 +628,119 @@ class DesktopApi {
       client_id: "desktop",
       lease_id: this.lease,
       generation,
+    });
+  }
+  async configureServo(
+    config: ServoTuning,
+    signal?: AbortSignal,
+  ): Promise<Result> {
+    if (signal?.aborted) throw new Error("参数确认已取消");
+    if (!isServoTuning(config)) throw new Error("请输入七轴有效参数");
+    const current = this.view;
+    const initial = current.snapshot;
+    if (!current.online) throw new Error("未连接");
+    if (!current.hasControl) throw new Error("未持有控制权");
+    if (
+      !["disabled", "ready"].includes(initial.phase) ||
+      initial.action ||
+      this.jog ||
+      this.cancelReturn
+    )
+      throw new Error("请等待机械臂静止");
+    const submitted = structuredClone(config);
+    const requestId = crypto.randomUUID();
+    const revision = initial.servo_tuning_revision ?? 0;
+    const connectionEpoch = current.connectionEpoch ?? 0;
+    return new Promise<Result>((resolve, reject) => {
+      let settled = false;
+      let acknowledged = false;
+      let accepted: Result | null = null;
+      let unsubscribe = () => {};
+      const finish = (error: Error | null, result?: Result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        unsubscribe();
+        signal?.removeEventListener("abort", abort);
+        if (error) reject(error);
+        else resolve(result!);
+      };
+      const abort = () => finish(new Error("参数确认已取消"));
+      const timer = setTimeout(() => finish(new Error("未确认参数生效")), 8000);
+      const inspect = (view: View) => {
+        if (settled) return;
+        const snapshot = view.snapshot;
+        const result =
+          snapshot.results?.find((item) => item.request_id === requestId) ??
+          (snapshot.last_result?.request_id === requestId
+            ? snapshot.last_result
+            : null);
+        if (result) {
+          if (result.status === "accepted" && result.code === "configure_servo")
+            accepted = result;
+          else {
+            finish(
+              new Error(
+                [
+                  ["accepted", "completed"].includes(result.status)
+                    ? "参数结果不匹配"
+                    : "",
+                  result.code,
+                  result.message,
+                ]
+                  .filter(Boolean)
+                  .join(" · ") || "参数未应用",
+              ),
+            );
+            return;
+          }
+        }
+        if (
+          !view.online ||
+          (view.connectionEpoch ?? 0) !== connectionEpoch ||
+          snapshot.side !== initial.side ||
+          snapshot.port !== initial.port ||
+          ["disconnected", "connecting", "closing"].includes(snapshot.phase)
+        ) {
+          finish(new Error("连接已变化，参数未确认"));
+          return;
+        }
+        if (
+          acknowledged &&
+          accepted &&
+          snapshot.servo_tuning_revision === revision + 1 &&
+          snapshot.servo_tuning &&
+          sameServoTuning(snapshot.servo_tuning, submitted)
+        ) {
+          finish(null, accepted);
+          return;
+        }
+        if (snapshot.servo_tuning_revision > revision + 1)
+          finish(new Error("配置版本已变化，参数未确认"));
+        // Ownership and generation gate dispatch. After dispatch, observe this
+        // request's result even if another controller takes over; never resend.
+      };
+      signal?.addEventListener("abort", abort, { once: true });
+      unsubscribe = this.subscribe(inspect);
+      if (settled) {
+        unsubscribe();
+        return;
+      }
+      void this.command(
+        "configure_servo",
+        { config: submitted },
+        requestId,
+        initial.generation,
+      )
+        .then((ack) => {
+          if (ack.request_id !== requestId || ack.status !== "queued") {
+            finish(new Error("参数请求响应无效"));
+            return;
+          }
+          acknowledged = true;
+          inspect(this.view);
+        })
+        .catch((error) => finish(new Error(this.errorMessage(error))));
     });
   }
   async returnToPose(
