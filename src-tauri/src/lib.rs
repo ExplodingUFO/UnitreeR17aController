@@ -3,6 +3,8 @@ mod journal;
 mod kinematics;
 mod protocol;
 mod server;
+mod trace;
+mod trajectory;
 
 use std::sync::{
     Arc, Mutex,

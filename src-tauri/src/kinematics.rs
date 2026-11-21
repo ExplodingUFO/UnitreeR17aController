@@ -1,7 +1,8 @@
 //! Fixed R1-7A local kinematics. SI units; geometric twists are [linear, angular]
 //! at the TCP, expressed in base axes. This module has no control-loop state.
+use crate::trajectory;
 use nalgebra::{
-    Isometry3, Quaternion, SMatrix, SVector, Translation3, Unit, UnitQuaternion, Vector3,
+    Isometry3, Matrix3, Quaternion, SMatrix, SVector, Translation3, Unit, UnitQuaternion, Vector3,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -63,12 +64,93 @@ pub struct StepInput {
     pub dt: f64,
     pub tcp: TcpTransform,
     pub limits: MotionLimits,
+    pub smoothing: Option<SmoothingState>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CartesianPath {
+    pub origin: Pose,
+    pub axis: usize,
+    pub frame: Frame,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SmoothingState {
+    pub acceleration: [f64; 7],
+    pub jerk: [f64; 7],
+    pub path: Option<CartesianPath>,
+    pub stopping: bool,
+}
+
+impl CartesianPath {
+    fn axis_in_base(self) -> Result<Vector3<f64>, String> {
+        if self.axis >= 6 {
+            return Err("invalid Cartesian path axis".into());
+        }
+        let axis = Vector3::ith(self.axis % 3, 1.0);
+        Ok(if self.frame == Frame::Tool {
+            to_isometry(&self.origin)?.rotation * axis
+        } else {
+            axis
+        })
+    }
+    fn correct(
+        self,
+        current: &Pose,
+        desired: Twist,
+    ) -> Result<(Twist, SMatrix<f64, 6, 6>), String> {
+        let axis = self.axis_in_base()?;
+        let perpendicular = Matrix3::identity() - axis * axis.transpose();
+        let error = Twist::from_row_slice(&pose_error(current, &self.origin));
+        let mut result = desired;
+        let mut priority = SMatrix::<f64, 6, 6>::identity();
+        for block in 0..2 {
+            let commanded = (block == 0) == (self.axis < 3);
+            let project = if commanded {
+                perpendicular
+            } else {
+                Matrix3::identity()
+            };
+            let offset = block * 3;
+            let requested = desired.fixed_rows::<3>(offset).into_owned();
+            let correction = error.fixed_rows::<3>(offset).into_owned();
+            result.fixed_rows_mut::<3>(offset).copy_from(
+                &((Matrix3::identity() - project) * requested + project * correction * 12.0),
+            );
+            priority
+                .fixed_view_mut::<3, 3>(offset, offset)
+                .copy_from(&(Matrix3::identity() + 100.0 * project));
+        }
+        Ok((result, priority))
+    }
+    pub(crate) fn check(self, candidate: &Pose) -> Result<(), String> {
+        let error = Twist::from_row_slice(&pose_error(&self.origin, candidate));
+        let axis = self.axis_in_base()?;
+        let orthogonal = Matrix3::identity() - axis * axis.transpose();
+        let linear = error.fixed_rows::<3>(0).into_owned();
+        let angular = error.fixed_rows::<3>(3).into_owned();
+        let linear_error = if self.axis < 3 {
+            (orthogonal * linear).norm()
+        } else {
+            linear.norm()
+        };
+        let angular_error = if self.axis >= 3 {
+            (orthogonal * angular).norm()
+        } else {
+            angular.norm()
+        };
+        if linear_error > 0.00005 || angular_error > 0.002 {
+            return Err("Cartesian path deviation exceeds the selected TCP constraint".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct StepCandidate {
     pub q: [f64; 7],
     pub dq: [f64; 7],
+    pub ddq: [f64; 7],
     /// Achieved projection along the requested twist, including all scaling.
     pub speed_scale: f64,
 }
@@ -314,6 +396,7 @@ impl Kinematics {
     /// Invalid dynamics, blocked constraints and unproductive numerical solutions
     /// return errors for the caller to stop/resynchronize. No hidden IK iteration.
     pub fn step(&self, input: StepInput) -> Result<StepCandidate, String> {
+        let smoothed_input = input.clone();
         let StepInput {
             reference,
             measured,
@@ -322,6 +405,7 @@ impl Kinematics {
             dt,
             tcp,
             limits,
+            smoothing,
         } = input;
         if !dt.is_finite() || !(1e-6..=0.1).contains(&dt) {
             return Err("dt must be between 1 microsecond and 100 milliseconds".into());
@@ -359,7 +443,7 @@ impl Kinematics {
             LocalTarget::Pose(p) => Some(*p),
             _ => None,
         };
-        let desired = match target {
+        let mut desired = match target {
             LocalTarget::Velocity { twist, frame } => {
                 if !twist.iter().all(|v| v.is_finite()) {
                     return Err("non-finite target twist".into());
@@ -382,13 +466,20 @@ impl Kinematics {
                 error * POSE_GAIN
             }
         };
+        if let Some(path) = smoothing.and_then(|state| state.path) {
+            desired = path.correct(&current, desired)?.0;
+        }
         if !desired.iter().all(|v| v.is_finite()) || !desired.norm().is_finite() {
             return Err("non-finite target velocity".into());
         }
         // One common task scale preserves the linear/angular ratio.
-        let task_scale = (limits.linear_speed / desired.fixed_rows::<3>(0).norm().max(1e-300))
-            .min(limits.angular_speed / desired.fixed_rows::<3>(3).norm().max(1e-300))
-            .min(1.0);
+        // Leave margin at the global TCP cap for finite FK curvature and
+        // jerk-bounded recovery. The final FK limit is still a hard check.
+        let headroom = if smoothing.is_some() { 0.90 } else { 1.0 };
+        let task_scale = (headroom * limits.linear_speed
+            / desired.fixed_rows::<3>(0).norm().max(1e-300))
+        .min(headroom * limits.angular_speed / desired.fixed_rows::<3>(3).norm().max(1e-300))
+        .min(1.0);
         let desired_bounded = desired * task_scale;
         let task_weights = Twist::from_row_slice(&[
             1.0 / limits.linear_speed,
@@ -428,6 +519,18 @@ impl Kinematics {
         let raw: SVector<f64, 7> = SVector::from_fn(|i, _| speeds[i] * normalized[i]);
         if !raw.iter().all(|v| v.is_finite()) {
             return Err("non-finite DLS result".into());
+        }
+        if smoothing.is_some() {
+            let mut candidate = self.smoothed_candidate(
+                &smoothed_input,
+                current,
+                jacobian,
+                desired_bounded,
+                raw,
+                damping,
+            )?;
+            candidate.speed_scale *= task_scale;
+            return Ok(candidate);
         }
         // alpha is an interval, not just an upper bound: acceleration can impose
         // a lower bound when already moving. Never scale below that bound.
@@ -504,6 +607,7 @@ impl Kinematics {
             return Ok(StepCandidate {
                 q,
                 dq,
+                ddq: std::array::from_fn(|i| (dq[i] - previous_velocity[i]) / dt),
                 speed_scale: if desired.norm() == 0.0 { 1.0 } else { 0.0 },
             });
         }
@@ -544,7 +648,122 @@ impl Kinematics {
         if !speed_scale.is_finite() {
             return Err("invalid achieved speed scale".into());
         }
-        Ok(StepCandidate { q, dq, speed_scale })
+        Ok(StepCandidate {
+            q,
+            dq,
+            ddq: std::array::from_fn(|i| (dq[i] - previous_velocity[i]) / dt),
+            speed_scale,
+        })
+    }
+
+    fn smoothed_candidate(
+        &self,
+        input: &StepInput,
+        current: Pose,
+        jacobian: Jacobian,
+        desired: Twist,
+        raw: SVector<f64, 7>,
+        damping: f64,
+    ) -> Result<StepCandidate, String> {
+        let state = input.smoothing.unwrap();
+        let limits = input.limits;
+        let dt = input.dt;
+        let speeds = std::array::from_fn(|i| limits.joint_velocity[i].min(self.joints[i].velocity));
+        let target = std::array::from_fn(|i| raw[i] * 0.999);
+        let mut window = trajectory::velocity_window(
+            input.previous_velocity,
+            state.acceleration,
+            target,
+            speeds,
+            limits.joint_acceleration,
+            state.jerk,
+            dt,
+        )?;
+        for i in 0..7 {
+            window.low[i] = window.low[i]
+                .max(-limits.max_joint_step / dt)
+                .max((input.measured[i] - limits.max_reference_error - input.reference[i]) / dt);
+            window.high[i] = window.high[i]
+                .min(limits.max_joint_step / dt)
+                .min((input.measured[i] + limits.max_reference_error - input.reference[i]) / dt);
+            if window.low[i] > window.high[i] {
+                return Err("Cartesian derivative and reference bounds conflict".into());
+            }
+        }
+        let mut weights = SMatrix::<f64, 6, 6>::identity();
+        for i in 0..6 {
+            weights[(i, i)] = 1.0
+                / if i < 3 {
+                    limits.linear_speed
+                } else {
+                    limits.angular_speed
+                };
+        }
+        let task_weights = weights;
+        if let Some(path) = state.path {
+            weights = path.correct(&current, desired)?.1 * weights;
+        }
+        let a = weights * jacobian;
+        let b = weights * desired;
+        let task_hessian = a.transpose() * a;
+        // Bound conditioning after path priorities are applied. Penalize joint
+        // speed itself, so an unobservable null-space velocity also stops.
+        // Continuity comes from hard derivative bounds, not a velocity-memory
+        // objective that could preserve redundant motion indefinitely.
+        let regularizer = SMatrix::<f64, 7, 7>::from_diagonal(&SVector::from_fn(|i, _| {
+            (damping.powi(2) / speeds[i].powi(2)).max(task_hessian.trace() * 1e-8)
+        }));
+        let h = task_hessian + regularizer;
+        let g = -a.transpose() * b;
+        let dq = trajectory::bounded_quadratic(h, g, window, input.previous_velocity)?;
+        let (q, ddq) = trajectory::integrate(input.reference, input.previous_velocity, dq, dt);
+        for i in 0..7 {
+            if !q[i].is_finite()
+                || !ddq[i].is_finite()
+                || dq[i].abs() > speeds[i] + 1e-10
+                || ddq[i].abs() > limits.joint_acceleration[i] + 1e-9
+                || (ddq[i] - state.acceleration[i]).abs() > state.jerk[i] * dt + 1e-8
+                || (q[i] - input.reference[i]).abs() > limits.max_joint_step + 1e-12
+                || (q[i] - input.measured[i]).abs() > limits.max_reference_error + 1e-12
+            {
+                return Err("smoothed output violates final joint derivatives".into());
+            }
+        }
+        let next = self.fk(&q, &input.tcp)?;
+        if let Some(path) = state.path {
+            path.check(&next)?;
+        }
+        let achieved = Twist::from_row_slice(&pose_error(&current, &next)) / dt;
+        if achieved.fixed_rows::<3>(0).norm() > limits.linear_speed + 1e-10
+            || achieved.fixed_rows::<3>(3).norm() > limits.angular_speed + 1e-10
+        {
+            return Err(format!(
+                "smoothed FK increment exceeds TCP speed limits: {:.9} m/s, {:.9} rad/s",
+                achieved.fixed_rows::<3>(0).norm(),
+                achieved.fixed_rows::<3>(3).norm()
+            ));
+        }
+        // Path-correction priorities belong to the objective, not the progress
+        // metric: a transverse correction can briefly oppose its old velocity
+        // while the commanded direction still makes useful progress.
+        let requested = task_weights * desired;
+        let projection = if requested.norm_squared() < 1e-20 {
+            1.0
+        } else {
+            (task_weights * achieved).dot(&requested) / requested.norm_squared()
+        };
+        if !projection.is_finite() {
+            return Err("invalid smoothed task projection".into());
+        }
+        if !state.stopping && desired.norm() > 1e-8 && projection < 1e-10 {
+            return Err("smoothed Cartesian motion is blocked".into());
+        }
+        Ok(StepCandidate {
+            q,
+            dq,
+            ddq,
+            speed_scale: projection.clamp(0.0, 1.0),
+        })
     }
 }
 
@@ -638,6 +857,7 @@ mod tests {
             reference: q,
             measured: q,
             previous_velocity: [0.0; 7],
+            smoothing: None,
             target,
             dt: 0.02,
             tcp: Pose::identity(),
@@ -766,6 +986,206 @@ mod tests {
             sample.reference = candidate.q;
             sample.measured = candidate.q;
             sample.previous_velocity = candidate.dq;
+        }
+    }
+
+    #[test]
+    fn jerk_bounded_rotation_preserves_offset_tcp_through_start_and_braking() {
+        let k = Kinematics::load("right").unwrap();
+        let q = [1.5576, -0.0350, 0.0102, -0.0217, 1.6217, 0.0088, 0.1133];
+        let tcp = Pose {
+            translation: [0.0, 0.0, 0.1],
+            ..Pose::identity()
+        };
+        let origin = k.fk(&q, &tcp).unwrap();
+        let path = CartesianPath {
+            origin,
+            axis: 3,
+            frame: Frame::Base,
+        };
+        let mut sample = StepInput {
+            dt: 0.01,
+            tcp,
+            limits: rotation_diagnostic_limits(),
+            smoothing: Some(SmoothingState {
+                acceleration: [0.0; 7],
+                jerk: [trajectory::JOINT_JERK; 7],
+                path: Some(path),
+                stopping: false,
+            }),
+            ..input(
+                q,
+                velocity([0.0, 0.0, 0.0, 0.0872664626, 0.0, 0.0], Frame::Base),
+            )
+        };
+        for tick in 0..350 {
+            if tick == 200 {
+                sample.target = velocity([0.0; 6], Frame::Base);
+                sample.smoothing.as_mut().unwrap().stopping = true;
+            }
+            let c = k
+                .step(sample.clone())
+                .unwrap_or_else(|e| panic!("tick {tick}: {e}"));
+            check_bounds(&k, &sample, &c);
+            for i in 0..7 {
+                let old = sample.smoothing.as_ref().unwrap().acceleration[i];
+                assert!((c.ddq[i] - old).abs() <= trajectory::JOINT_JERK * sample.dt + 1e-8);
+                assert!(
+                    (c.dq[i] - sample.previous_velocity[i] - c.ddq[i] * sample.dt).abs() < 1e-12
+                );
+            }
+            let next = k.fk(&c.q, &tcp).unwrap();
+            let error = pose_error(&origin, &next);
+            assert!(error[..3].iter().map(|x| x * x).sum::<f64>().sqrt() <= 0.00005);
+            sample.reference = c.q;
+            sample.measured = c.q;
+            sample.previous_velocity = c.dq;
+            sample.smoothing.as_mut().unwrap().acceleration = c.ddq;
+        }
+        assert!(
+            sample.previous_velocity.iter().all(|v| v.abs() < 1e-5),
+            "{:?}",
+            sample.previous_velocity
+        );
+    }
+
+    #[test]
+    fn smoothed_every_cartesian_axis_and_frame_preserves_path_under_jitter() {
+        for side in ["left", "right"] {
+            let k = Kinematics::load(side).unwrap();
+            for q in [
+                interior(),
+                [1.5576, -0.0350, 0.0102, -0.0217, 1.6217, 0.0088, 0.1133],
+            ] {
+                for frame in [Frame::Base, Frame::Tool] {
+                    for axis in 0..6 {
+                        let tcp = Pose {
+                            translation: [0.0, 0.0, 0.1],
+                            ..Pose::identity()
+                        };
+                        let origin = k.fk(&q, &tcp).unwrap();
+                        let path = CartesianPath {
+                            origin,
+                            axis,
+                            frame,
+                        };
+                        let mut twist = [0.0; 6];
+                        twist[axis] = if axis < 3 { 0.015 } else { 0.15 };
+                        let mut sample = StepInput {
+                            tcp,
+                            limits: rotation_diagnostic_limits(),
+                            smoothing: Some(SmoothingState {
+                                acceleration: [0.0; 7],
+                                jerk: [trajectory::JOINT_JERK; 7],
+                                path: Some(path),
+                                stopping: false,
+                            }),
+                            ..input(q, velocity(twist, frame))
+                        };
+                        for (tick, dt) in [0.040, 0.002, 0.007, 0.003]
+                            .into_iter()
+                            .cycle()
+                            .take(400)
+                            .enumerate()
+                        {
+                            sample.dt = dt;
+                            if tick == 160 {
+                                sample.target = velocity([0.0; 6], frame);
+                                sample.smoothing.as_mut().unwrap().stopping = true;
+                            }
+                            let c = k.step(sample.clone()).unwrap_or_else(|e| {
+                                panic!("{side} q={q:?} {frame:?} axis={axis} tick={tick}: {e}")
+                            });
+                            check_bounds(&k, &sample, &c);
+                            for i in 0..7 {
+                                assert!(
+                                    (c.ddq[i] - sample.smoothing.as_ref().unwrap().acceleration[i])
+                                        .abs()
+                                        <= trajectory::JOINT_JERK * dt + 1e-8
+                                );
+                            }
+                            path.check(&k.fk(&c.q, &tcp).unwrap()).unwrap();
+                            sample.reference = c.q;
+                            sample.measured = c.q;
+                            sample.previous_velocity = c.dq;
+                            sample.smoothing.as_mut().unwrap().acceleration = c.ddq;
+                        }
+                        assert!(
+                            sample.previous_velocity.iter().all(|v| v.abs() < 1e-5),
+                            "{side} {frame:?} {axis}: {:?}",
+                            sample.previous_velocity
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn held_low_speed_cartesian_jogs_have_a_steady_reference_after_ramp() {
+        for side in ["left", "right"] {
+            let k = Kinematics::load(side).unwrap();
+            for frame in [Frame::Base, Frame::Tool] {
+                for axis in 0..6 {
+                    let q = [1.5576, -0.0350, 0.0102, -0.0217, 1.6217, 0.0088, 0.1133];
+                    let tcp = Pose {
+                        translation: [0.0, 0.0, 0.1],
+                        ..Pose::identity()
+                    };
+                    let origin = k.fk(&q, &tcp).unwrap();
+                    let path = CartesianPath {
+                        origin,
+                        axis,
+                        frame,
+                    };
+                    let direction = path.axis_in_base().unwrap();
+                    let requested = if axis < 3 { 0.0005 } else { 0.005 };
+                    let mut twist = [0.0; 6];
+                    twist[axis] = requested;
+                    let mut sample = StepInput {
+                        tcp,
+                        limits: rotation_diagnostic_limits(),
+                        smoothing: Some(SmoothingState {
+                            acceleration: [0.0; 7],
+                            jerk: [trajectory::JOINT_JERK; 7],
+                            path: Some(path),
+                            stopping: false,
+                        }),
+                        ..input(q, velocity(twist, frame))
+                    };
+                    let mut steady = Vec::new();
+                    for tick in 0..360 {
+                        sample.dt = [0.040, 0.002, 0.007, 0.003][tick % 4];
+                        let old = k.fk(&sample.reference, &tcp).unwrap();
+                        let c = k.step(sample.clone()).unwrap_or_else(|e| {
+                            panic!("{side} {frame:?} axis={axis} tick={tick}: {e}")
+                        });
+                        check_bounds(&k, &sample, &c);
+                        let next = k.fk(&c.q, &tcp).unwrap();
+                        if tick >= 160 {
+                            let effective =
+                                Twist::from_row_slice(&pose_error(&old, &next)) / sample.dt;
+                            steady.push(
+                                effective
+                                    .fixed_rows::<3>(if axis < 3 { 0 } else { 3 })
+                                    .dot(&direction),
+                            );
+                        }
+                        sample.reference = c.q;
+                        sample.measured = c.q;
+                        sample.previous_velocity = c.dq;
+                        sample.smoothing.as_mut().unwrap().acceleration = c.ddq;
+                    }
+                    let mean = steady.iter().sum::<f64>() / steady.len() as f64;
+                    let min = steady.iter().copied().fold(f64::INFINITY, f64::min);
+                    let max = steady.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    assert!(
+                        mean > requested * 0.05 && (max - min) / mean < 0.03,
+                        "{side} {frame:?} axis={axis} mean={mean:e} spread={:e}",
+                        (max - min) / mean
+                    );
+                }
+            }
         }
     }
 
@@ -1255,6 +1675,7 @@ mod tests {
                                 dt: 0.02,
                                 tcp,
                                 limits,
+                                smoothing: None,
                             })
                             .unwrap_or_else(|error| {
                                 panic!("{side} {frame:?} axis {axis}: {error}")

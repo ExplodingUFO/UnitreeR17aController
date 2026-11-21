@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type PointerEvent } from "react";
 import { listen } from "@tauri-apps/api/event";
 import RobotScene from "./RobotScene";
 import ApiPanel from "./ApiPanel";
+import TracePanel from "./TracePanel";
 import { PanelDivider, usePanelLayout } from "./PanelLayout";
 import {
   api,
@@ -67,6 +68,7 @@ function quaternion(values: number[]): [number, number, number, number] {
 export default function App() {
   const layout = usePanelLayout();
   const [page, setPage] = useState<Page>(currentPage);
+  const [logTab, setLogTab] = useState<"events" | "traces">("events");
   const [logFilter, setLogFilter] = useState("");
   const [view, setView] = useState<View>(api.view);
   const [now, setNow] = useState(performance.now());
@@ -997,7 +999,50 @@ export default function App() {
       >
         <div className="logs-heading">
           <h2>日志</h2>
-          <div className="journal-counts">
+          {page === "logs" && (
+            <div
+              className="logs-view-tabs"
+              role="tablist"
+              aria-label="日志类型"
+              onKeyDown={(event) => {
+                const next =
+                  event.key === "Home"
+                    ? "events"
+                    : event.key === "End"
+                      ? "traces"
+                      : ["ArrowLeft", "ArrowRight"].includes(event.key)
+                        ? logTab === "events"
+                          ? "traces"
+                          : "events"
+                        : null;
+                if (next === null) return;
+                event.preventDefault();
+                setLogTab(next);
+                document.getElementById(`log-tab-${next}`)?.focus();
+              }}
+            >
+              {(["events", "traces"] as const).map((tab) => (
+                <button
+                  key={tab}
+                  type="button"
+                  id={`log-tab-${tab}`}
+                  role="tab"
+                  aria-selected={logTab === tab}
+                  aria-controls={
+                    tab === "events" ? "logs-scroll" : "trace-panel"
+                  }
+                  tabIndex={logTab === tab ? 0 : -1}
+                  onClick={() => setLogTab(tab)}
+                >
+                  {tab === "events" ? "事件" : "采样"}
+                </button>
+              ))}
+            </div>
+          )}
+          <div
+            className="journal-counts"
+            hidden={page === "logs" && logTab === "traces"}
+          >
             {!s.journal.healthy && <span className="warning">写入异常</span>}
             <span>
               本次写入 <b>{s.journal.written}</b>
@@ -1009,7 +1054,7 @@ export default function App() {
               丢弃 <b>{s.journal.dropped}</b>
             </span>
           </div>
-          {page === "logs" && (
+          {page === "logs" && logTab === "events" && (
             <label className="log-filter">
               <span>筛选</span>
               <input
@@ -1046,44 +1091,53 @@ export default function App() {
             </button>
           )}
         </div>
-        <div className="logs-scroll" id="logs-scroll">
-          {shownLogs.length ? (
-            <table>
-              {page === "logs" && (
-                <thead>
-                  <tr>
-                    <th>时间</th>
-                    <th>级别</th>
-                    <th>来源</th>
-                    <th>编号</th>
-                    <th>内容</th>
-                  </tr>
-                </thead>
-              )}
-              <tbody>
-                {shownLogs.map((log) => (
-                  <tr key={log.id}>
-                    <td>
-                      {new Date(log.ts_ms).toLocaleTimeString("zh-CN", {
-                        hour12: false,
-                      })}
-                    </td>
-                    <td className={`log-level ${log.level.toLowerCase()}`}>
-                      {log.level}
-                    </td>
-                    <td>{log.source}</td>
-                    <td title={log.code}>{log.code}</td>
-                    <td title={log.message}>{log.message}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          ) : (
-            <div className="logs-empty">
-              {logFilter && page === "logs" ? "没有匹配的日志" : "暂无日志"}
-            </div>
-          )}
-        </div>
+        {page === "logs" && logTab === "traces" ? (
+          <TracePanel online={view.online} connected={connected} />
+        ) : (
+          <div
+            className="logs-scroll"
+            id="logs-scroll"
+            role={page === "logs" ? "tabpanel" : undefined}
+            aria-labelledby={page === "logs" ? "log-tab-events" : undefined}
+          >
+            {shownLogs.length ? (
+              <table>
+                {page === "logs" && (
+                  <thead>
+                    <tr>
+                      <th>时间</th>
+                      <th>级别</th>
+                      <th>来源</th>
+                      <th>编号</th>
+                      <th>内容</th>
+                    </tr>
+                  </thead>
+                )}
+                <tbody>
+                  {shownLogs.map((log) => (
+                    <tr key={log.id}>
+                      <td>
+                        {new Date(log.ts_ms).toLocaleTimeString("zh-CN", {
+                          hour12: false,
+                        })}
+                      </td>
+                      <td className={`log-level ${log.level.toLowerCase()}`}>
+                        {log.level}
+                      </td>
+                      <td>{log.source}</td>
+                      <td title={log.code}>{log.code}</td>
+                      <td title={log.message}>{log.message}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : (
+              <div className="logs-empty">
+                {logFilter && page === "logs" ? "没有匹配的日志" : "暂无日志"}
+              </div>
+            )}
+          </div>
+        )}
       </section>
       {tcpOpen && (
         <div

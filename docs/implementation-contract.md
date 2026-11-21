@@ -4,15 +4,15 @@
 
 ## 1. 连接与认证
 
-| 项目           | 当前行为                                            |
-| -------------- | --------------------------------------------------- |
-| HTTP 地址      | `http://127.0.0.1:8177`                             |
-| WebSocket 地址 | `ws://127.0.0.1:8177/v1/events`                     |
-| 服务生命周期   | 随桌面应用启动和退出                                |
-| 访问范围       | 当前仅监听本机回环地址                              |
-| HTTP 认证      | `Authorization: Bearer <token>`                     |
-| POST 格式      | `Content-Type: application/json`，请求体最多 16 KiB |
-| 状态与数值     | JSON；长度用米，角度用弧度，时间间隔字段用毫秒      |
+| 项目           | 当前行为                                               |
+| -------------- | ------------------------------------------------------ |
+| HTTP 地址      | `http://127.0.0.1:8177`                                |
+| WebSocket 地址 | `ws://127.0.0.1:8177/v1/events`                        |
+| 服务生命周期   | 随桌面应用启动和退出                                   |
+| 访问范围       | 当前仅监听本机回环地址                                 |
+| HTTP 认证      | `Authorization: Bearer <token>`                        |
+| POST 格式      | `Content-Type: application/json`，请求体最多 16 KiB    |
+| 状态与数值     | JSON；长度用米，角度用弧度；`_ms` 用毫秒，`_us` 用微秒 |
 
 应用每次启动生成新的 `token`。外部程序从桌面顶部“接口”页复制令牌；当前没有通过 HTTP 获取令牌的接口。令牌用于访问应用，`lease_id` 用于持有控制权，两者用途不同。
 
@@ -20,14 +20,18 @@
 
 ## 2. 接口总表
 
-| 方法与路径              | 输入                         | 成功输出                           | 含义                     |
-| ----------------------- | ---------------------------- | ---------------------------------- | ------------------------ |
-| `GET /v1/ports`         | 无                           | `200 PortInfo[]`                   | 枚举本机串口             |
-| `GET /v1/state`         | 无                           | `200 Snapshot`                     | 读取最近一次状态快照     |
-| `POST /v1/control`      | `ControlRequest`             | `200 ControlReply`                 | 取得、续期或释放控制权   |
-| `POST /v1/commands`     | `CommandRequest`             | `202 {request_id,status:"queued"}` | 提交设备或动作请求       |
-| `GET /v1/events`        | WebSocket 升级后发送认证首帧 | `101`，随后推送 `StateEvent`       | 订阅完整状态快照         |
-| `GET /v1/logs?limit=50` | 可选条数                     | `200 LogRecord[]`                  | 查询 SQLite 中最近的日志 |
+| 方法与路径              | 输入                          | 成功输出                           | 含义                     |
+| ----------------------- | ----------------------------- | ---------------------------------- | ------------------------ |
+| `GET /v1/ports`         | 无                            | `200 PortInfo[]`                   | 枚举本机串口             |
+| `GET /v1/state`         | 无                            | `200 Snapshot`                     | 读取最近一次状态快照     |
+| `POST /v1/control`      | `ControlRequest`              | `200 ControlReply`                 | 取得、续期或释放控制权   |
+| `POST /v1/commands`     | `CommandRequest`              | `202 {request_id,status:"queued"}` | 提交设备或动作请求       |
+| `GET /v1/events`        | WebSocket 升级后发送认证首帧  | `101`，随后推送 `StateEvent`       | 订阅完整状态快照         |
+| `GET /v1/logs?limit=50` | 可选条数                      | `200 LogRecord[]`                  | 查询 SQLite 中最近的日志 |
+| `GET /v1/traces`        | 可选 `limit`                  | `200 TraceSummary[]`               | 查询最近采样             |
+| `POST /v1/traces`       | `{duration_ms?:number\|null}` | `200 TraceSummary`                 | 开始短时采样             |
+| `POST /v1/traces/stop`  | 无                            | `200 TraceSummary\|null`           | 结束当前采样             |
+| `GET /v1/traces/{id}`   | 可选 `download/attachment`    | `200 TraceRecording`               | 读取或下载采样 JSON      |
 
 普通 HTTP 返回值直接使用表中的结构，没有统一的 `data` 包装。只有 WebSocket 状态消息使用 `{type:"state",data:Snapshot}`。
 
@@ -43,6 +47,8 @@
 8. 结束动作时发送 `stop`。需要断开时，先返回有支撑的收纳位，或明确确认机械臂已支撑后释放保持扭矩，再断开并释放控制权。
 
 每个会改变状态的步骤都等待确认，再从最新状态读取 `generation`。调用方不自行递增该值。关节点动不要求设置 TCP。
+
+采样使用应用令牌即可，不需要上述控制权或运动步骤。已有端口连接时可直接开始采样，记录当前运行状态。
 
 ## 4. 控制权输入与输出
 
@@ -234,7 +240,7 @@ J1 正向连续点动，速度 0.1 rad/s：
 
 先在桌面记录有支撑的收纳姿态，或由调用方保存实测七轴位置，再提交 `return_to_pose`。`joints` 按 J1..J7 排列，单位 rad；`speed` 为正且不超过 0.20 rad/s。各轴相对当前参考位置的行程不得超过 2π rad。请求需要控制权、已使能状态、完整新鲜反馈，且没有其他动作。
 
-七轴按共同的五次多项式插值返回，起止速度和加速度为零；最终下发仍受关节速度与加速度限制。回程是关节插值，不提供碰撞规划。界面按左右臂与串口保存收纳位，没有预置角度。
+七轴按共同的五次多项式生成返回目标，起止速度和加速度为零；控制参考再经过关节速度、加速度和 jerk 限制，按实际控制间隔积分。回程是关节插值，不提供碰撞规划。界面按左右臂与串口保存收纳位，没有预置角度。
 
 `disconnect_after` 默认 `false`，到位后产生 `completed/returned` 并继续使能保持。设为 `true` 时，到位后失能并关闭串口，再产生 `completed/parked`。到位要求七轴实测和参考位置均在目标的 0.01 rad 内、指令速度归零、实测速度不超过 0.02 rad/s，并连续稳定 200 ms。时间进度到达 1 不能作为断开依据。
 
@@ -254,6 +260,16 @@ J1 正向连续点动，速度 0.1 rad/s：
   "allow_release": true
 }
 ```
+
+### 5.7 参考导数与停止
+
+关节、末端点动与收纳返回共用离散参考限制：关节速度不超过 0.20 rad/s，加速度不超过 0.60 rad/s²，jerk 的当前离线默认值为 6 rad/s³。控制器先求满足导数窗口的最终速度，再按实际周期积分 `q_ref`；`ddq_ref` 和 `jerk_ref` 分别从相邻速度和加速度求得。
+
+末端求解把动态窗口直接纳入 Jacobian 的有界二次规划，避免逐轴独立平滑改变所选 TCP 路径。候选继续受参考偏差与单步增量限制，经 FK 检查路径偏差和速度；路径模型阈值为 50 μm、0.002 rad。全局 TCP 速度上限预留 10% 目标余量，接近上限时目标为 13.5 mm/s、0.135 rad/s；低于这两个阈值的请求不因该余量额外缩放。最终 FK 仍检查 15 mm/s、0.15 rad/s 的硬上限。模型阈值用于筛选参考候选，机械臂实际精度仍待测。
+
+停止权限、租约与 generation 校验、原请求的 cancelled 结果保持原有语义。正常停止按 jerk 限制减速，可能需要更长时间；`action:null` 后仍须等待 `stopping` 结束。停止求解惩罚关节速度本身，使冗余方向的速度也减至零，连续性由导数硬约束维持。笛卡尔路径无法满足制动约束时，写入 `control/stop_path` 警告并转为受限关节制动。故障、失能和关闭继续优先处理。
+
+串口发送线程可重复最后目标，也可合并尚未发送的参考更新。离散参考的导数限制不能直接视为实际发送或机械臂物理运动的 jerk 保证。新轨迹与采样尚未真机验证；伺服仍使用 `kp=60`、`kd=10` 和限幅 ±8 Nm 的 URDF 重力前馈。
 
 ## 6. 命令输出与执行结果
 
@@ -387,7 +403,111 @@ TCP 未设置或控制反馈无效时，`tcp:null`。`action.mode` 为 `continuo
 
 `limit` 为可省略的 u32，默认 50；传入 0 时按 1 查询，超过 500 时按 500 查询。日志保留最近 100000 条。日志异步写入 SQLite，提交动作不会等待数据库；刚产生的事件可能尚未出现在查询中。
 
-`journal.pending` 表示已接收但尚未写入的记录，`written` 表示本次运行成功提交的数量；`dropped` 统计队列满、关闭后提交或退出时未写完的记录；`errors` 统计数据库操作失败。计数均针对本次应用运行，不等同于数据库总行数。查询使用独立阻塞任务，不在控制线程执行。
+`journal.pending` 表示已接收但尚未写入的记录，`written` 表示本次运行成功提交的数量；`dropped` 统计队列竞争、锁损坏、满队列、关闭后提交或退出时放弃的记录；`errors` 统计数据库操作失败。事件提交只尝试一次取得预分配队列的锁，失败立即返回；后台轮询取出数据后执行 SQL。计数均针对本次应用运行，不等同于数据库总行数。查询使用独立阻塞任务，不在控制线程执行。
+
+### 9.1 短时采样接口
+
+全部采样路由沿用 Bearer 与 Origin 校验，无需 `client_id`、`lease_id` 或 `generation`。开始只观察现有连接，不申请控制权、打开串口、使能或启动动作。开始要求状态中已有 `port`，且 `phase` 不为 `disconnected/connecting/closing`；否则返回 `400 not_connected`。停止采样不取消机械臂动作，也不改变控制权。
+
+| 请求                      | 行为                                                                                                                                                                                                              |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /v1/traces`         | JSON 对象，`duration_ms` 为整数，默认 10000，范围 1000..20000；`{}` 或 `{"duration_ms":null}` 使用默认值，未知字段被拒绝。返回 `200 TraceSummary`。                                                               |
+| `GET /v1/traces?limit=20` | `limit` 为可省略的 u32，默认 20；实际限制到 1..10，0 按 1，超过 10 按 10。返回最近的 `TraceSummary[]`。                                                                                                           |
+| `POST /v1/traces/stop`    | 无需请求体。结束当前记录并返回 `200 TraceSummary`；没有正在记录的采样时返回 JSON `null`。                                                                                                                         |
+| `GET /v1/traces/{id}`     | 返回 `{trace:TraceSummary,samples:TraceSample[]}`。`download=true` 或别名 `attachment=true` 增加 `Content-Disposition: attachment; filename="trace-{id}.json"`，内容仍为 JSON。响应带 `Cache-Control: no-store`。 |
+
+开始示例：
+
+```json
+{ "duration_ms": 10000 }
+```
+
+```json
+{
+  "id": "22222222-2222-4222-8222-222222222222",
+  "started_at_ms": 1795248000000,
+  "duration_ms": 10000,
+  "side": "right",
+  "port": "/dev/cu.example",
+  "status": "recording",
+  "accepted": 0,
+  "written": 0,
+  "dropped": 0,
+  "pending": 0,
+  "errors": 0
+}
+```
+
+`id` 为 UUID，`started_at_ms` 为 Unix UTC 毫秒，`duration_ms` 为请求的采样窗口；提前停止不改写该值。`side` 为 `left/right`，`port` 为开始时的串口名或 null。每次状态与计数分开解释：
+
+| 字段       | 含义                                                                                                                             |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `status`   | `recording` 正在接收；`writing` 已结束接收、后台仍在写入；`complete` 已完成提交；`failed` 写入数据被放弃或上次运行的采样被中断。 |
+| `accepted` | 成功接纳入队的样本数。                                                                                                           |
+| `written`  | 已成功提交的样本数；读取完整采样时对应该数据库快照内的样本数量。                                                                 |
+| `pending`  | 已接收但尚未提交的样本数。                                                                                                       |
+| `dropped`  | 队列竞争、满队列、达到提交尝试上限或已接收数据被放弃的数量。                                                                     |
+| `errors`   | 后台存储、序列化等操作的失败次数；恢复后仍保留计数。                                                                             |
+
+到时或停止后可先返回 `writing`，通过列表继续查看提交结果。`complete` 仍可能有 `dropped` 或此前的 `errors`；完整性需同时检查 `pending=0`、`written=accepted`、丢弃与错误数。读取记录中或写入中的采样只返回当时已提交的样本。
+
+采样单独写入事件库路径追加 `.traces.sqlite3` 的数据库；默认文件名为 `events.sqlite3.traces.sqlite3`。保留最近 10 次，每次前 100000 次样本提交尝试可入队，之后计 dropped。预分配队列容量 4096；生产者用 `Mutex.try_lock` 提交，竞争或满队列立即丢弃，无等待、SQL、JSON 编码或分配。独立 writer 轮询并取出数据后进行序列化和 SQLite 写入，查询和下载在阻塞任务中执行。这些计数按次采样统计，`Snapshot.journal` 仍只统计事件日志。
+
+### 9.2 样本字段与时间
+
+每条样本把 `TraceData` 直接展开在顶层，以 `source` 区分来源，没有额外 `data` 包装。`at_us` 是原始来源的单调时间相对采样开始的微秒数，使用控制周期开始、串口批次写入开始或主机接收反馈时的时间，不使用出队/提交时间。下载按 `at_us` 排序，同一时间保留提交顺序；七轴反馈仍是分别收到的观测。
+
+所有七元素数组按 J1..J7 排列。关节位置单位 rad、速度 rad/s、加速度 rad/s²、jerk rad/s³、扭矩 Nm、电压 V、温度 °C；`at_us/age_us/write_us` 单位 μs。
+
+| `source`   | 其余字段                                                                                                                                                                                                                                                                        |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `control`  | `seq`、`generation`（u64），`enabled/stopping`（boolean），`motion`（0..5），`axis`（整数或 null）；`q_ref/dq_ref/ddq_ref/jerk_ref/tau_ff` 为七个数值；`q/dq/tau/voltage` 为七个数值或 null；`age_us` 为七个 u64 或 null。缺失反馈的对应元素为 null，已有旧反馈保留数值与年龄。 |
+| `transmit` | `seq`（u64），`mode` 为七个实际编码的命令模式（0 disabled、1 servo、6 clear）；理想 `q_ref/dq_ref/tau_ff`、编码后反标定为关节 SI 的 `q_wire/dq_wire/tau_wire`、`kp/kd` 均为七个数值，`write_us`（u64）为主机成功写入整个七轴批次的耗时。                                        |
+| `feedback` | `joint`（0..6），`q/dq/tau/temperature/voltage`（number），`error`（u32）、`mode`（u8）、`timeout`（boolean）。                                                                                                                                                                 |
+
+`control.motion`：0 无当前动作、1 关节连续、2 关节步长、3 笛卡尔连续、4 笛卡尔步长、5 收纳返回。`axis` 在无动作或收纳返回时为 null，关节为 0..6，笛卡尔为 0..5；减速阶段可能为 `motion:0,stopping:true`。
+
+`transmit.seq` 关联被串口线程选中的 `control.seq`。同一序号重复说明重复发送参考，序号跳过说明部分参考未被选中或采样有丢弃。`seq:0` 用于初始或直接停止/清错写入，不要求存在对应的控制样本；普通 disabled 心跳也可以使用非零序号。`q_wire/dq_wire/tau_wire` 来自实际编码值并转回关节 SI，用于观察量化、截断与理想参考的差异。每轴只有 `mode:1` 时这些字段才是伺服目标；`mode:0/6` 保留停机/清错报文字段的反标定结果，诊断编码误差时应排除。`write_us` 描述主机批次写入，不是 USB 线上时间或电机确认。完整三类样本示例见 [OpenAPI](openapi.json) 的 `TraceSample` 和读取响应。
+
+当前协议速度量化步距为 `2π/(64r)`，位置步距为 `2π/(32768r)`，分组如下。极低的 `dq_ref` 可编码为 `dq_wire:0`，而 `q_wire` 随位置字段按阶梯前进；采样同时保留理想参考和编码值，可分别查看参考变化与量化。这是已确认的编码行为，是否造成实机抖动仍需测量。
+
+| 关节  | 减速比 r | 速度步距（rad/s） | 位置步距（rad） |
+| ----- | -------- | ----------------- | --------------- |
+| J1–J2 | 32       | 0.003067962       | 5.992×10⁻⁶      |
+| J3–J5 | 38/3     | 0.007750640       | 1.514×10⁻⁵      |
+| J6–J7 | 16       | 0.006135923       | 1.198×10⁻⁵      |
+
+### 9.3 采样与验收流程
+
+离线检查从仓库根目录运行：
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml --all-targets --locked
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+npm run format:check
+npm run build
+```
+
+下载的采样文件可单独分析：
+
+```bash
+cargo run --manifest-path src-tauri/Cargo.toml --example analyze_trace -- /path/to/capture.json
+```
+
+此示例只读取 JSON，输出 JSON 统计：控制、发送和各关节反馈的间隔 p50/p95/max，七轴批次写入耗时，参考速度/加速度/jerk 峰值，逐关节位置/速度跟随 RMS，编码值与理想参考的最大差异，发送序号重复/跳过/倒退，以及采样汇总与完整性计数。RMS 使用已使能且该轴 `q/dq` 均存在、反馈年龄不超过 200 ms 的控制样本；编码差异只比较 `seq!=0` 且该轴 `mode:1` 的数据，发送序号统计排除 `seq:0`，时间统计保留所有模式。无有效样本时对应统计为 null。间隔是主机来源时间的统计；这些数值用于比较采样，单项异常不能直接确定抖动原因。
+
+真机采集每次记录一种场景，保留速度、轴、方向、姿态、TCP 和负载说明，便于重复对照：
+
+| 场景           | 采集与确认                                                                                       |
+| -------------- | ------------------------------------------------------------------------------------------------ |
+| 已连接未使能   | 开始采样，等待窗口结束并下载；确认连接状态与控制权保持原值。                                     |
+| 静止保持       | 使用原有使能流程，采集当前保持状态；比较参考、编码值与反馈的变化。                               |
+| 关节连续与步长 | 在同一轴和姿态分别采集低速、常用速度及两个方向；每次记录起步、运动和停止，等待 `stopping` 结束。 |
+| 末端平移与旋转 | 在当前有效 TCP 下分别检查基座/工具坐标与六个轴；对照所选路径、实际跟随和停止过程。               |
+| 收纳返回       | 使用已有机械支撑处记录的收纳位；检查返回到位和稳定确认，取消后保持连接，不继续计划中的断开。     |
+
+每次先在“日志 → 采样”开始 10 秒记录，再从控制页手动执行场景，保留一段停止后的反馈。动作由工作台停止按钮取消；“停止采样”只结束记录。等待状态离开 `writing`，检查 `written=accepted`、`pending=0` 和丢弃/错误计数后下载；有数据损失时保留该记录，比较时标明缺口。对每个文件运行分析命令，再结合实际观察和已有事件日志判断下一次要测的条件。新轨迹、低速抖动改善、负载下跟随与实际 jerk 的验收结果分别记录。
 
 ## 10. 错误输入与输出
 
@@ -397,17 +517,18 @@ TCP 未设置或控制反馈无效时，`tcp:null`。`action.mode` 为 `continuo
 { "code": "owned", "message": "控制权已被占用" }
 ```
 
-| HTTP 状态 | 典型 `code`                                                           | 处理方式                                     |
-| --------- | --------------------------------------------------------------------- | -------------------------------------------- |
-| 400       | `invalid_request`、`invalid_client`、`invalid_action`、`ports_failed` | 修正输入或检查串口枚举                       |
-| 401       | `unauthorized`                                                        | 使用本次应用启动后的令牌                     |
-| 403       | `forbidden_origin`                                                    | 检查浏览器来源                               |
-| 409       | `owned`、`not_owner`                                                  | 当前用于同步控制权请求的冲突；重新读取控制者 |
-| 429       | `queue_full`、`too_many_connections`                                  | 降低提交速率或关闭多余订阅                   |
-| 503       | `closing`、`journal_unavailable`                                      | 应用退出或日志当前不可读                     |
-| 504       | `timeout`                                                             | 控制权请求等待超时；先读取状态               |
+| HTTP 状态 | 典型 `code`                                                                                                                                                        | 处理方式                                 |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------- |
+| 400       | `invalid_request`、`invalid_client`、`invalid_action`、`ports_failed`、`invalid_trace_request`、`invalid_trace_duration`、`invalid_trace_context`、`not_connected` | 修正输入或检查当前连接                   |
+| 401       | `unauthorized`                                                                                                                                                     | 使用本次应用启动后的令牌                 |
+| 403       | `forbidden_origin`                                                                                                                                                 | 检查浏览器来源                           |
+| 404       | `trace_not_found`                                                                                                                                                  | 采样 ID 无效、不存在或已被保留清理       |
+| 409       | `owned`、`not_owner`、`stale_context`、`motion_busy`、`trace_active`                                                                                               | 重新读取控制或采样状态                   |
+| 429       | `queue_full`、`too_many_connections`、`trace_capacity`                                                                                                             | 降低提交速率、关闭多余订阅或等待采样写入 |
+| 503       | `closing`、`journal_unavailable`、`trace_unavailable`                                                                                                              | 应用退出或存储当前不可读写               |
+| 504       | `timeout`                                                                                                                                                          | 控制权请求等待超时；先读取状态           |
 
-JSON 解析与类型错误由 HTTP 框架直接返回纯文本：格式错误 400、超大请求体 413、缺少或错误的 JSON Content-Type 415、字段缺失或类型/枚举错误 422。日志查询参数格式错误同样返回 400 纯文本。调用方先判断 HTTP 状态和 Content-Type，再解析错误内容。
+控制权和命令接口的 JSON 解析与类型错误由 HTTP 框架直接返回纯文本：格式错误 400、超大请求体 413、缺少或错误的 JSON Content-Type 415、字段缺失或类型/枚举错误 422。日志查询参数格式错误同样返回 400 纯文本。采样开始的 JSON 提取错误和采样查询参数错误统一返回 `400` JSON `invalid_trace_request`；有效整数但时长超出范围返回 `invalid_trace_duration`。调用方先判断 HTTP 状态和 Content-Type，再解析错误内容。
 
 `POST /v1/commands` 的业务校验在入队后完成。例如控制权不符，通常是 **202 入队后出现 `rejected/not_owner`**，而非该请求直接返回 409。
 
@@ -455,7 +576,7 @@ Tauri 仅向主窗口提供三个命令：
 
 ## 12. 模块对应关系
 
-控制状态集中在 `arm.rs`；`protocol.rs` 处理通信与标定；`kinematics.rs` 处理当前模型与局部运动学；`server.rs` 提供本机接口；`lib.rs` 管理 Tauri 生命周期；`journal.rs` 处理事件持久化。前端位于 `src`，模型与标定位于 `resources`。
+控制状态集中在 `arm.rs`；`protocol.rs` 处理通信与标定；`kinematics.rs` 处理当前模型与局部运动学，`trajectory.rs` 提供共享导数窗口和有界求解；`server.rs` 提供本机接口；`lib.rs` 管理 Tauri 生命周期；`journal.rs` 处理事件持久化并提供采样入口，`trace.rs` 管理短时采样。前端位于 `src`，模型与标定位于 `resources`。
 
 ### protocol.rs
 
@@ -463,7 +584,7 @@ Tauri 仅向主窗口提供三个命令：
 
 导出 `DriveMode::{Disabled,Servo,ClearFault}`、`Setpoint {mode,q,dq,tau,kp,kd}`，数值均为标定后的 URDF 关节量。`Feedback {id,q,dq,tau,temperature,voltage,error,warning,mode,timeout}`。伺服模式默认 `kp=60`、`kd=10`；`tau` 由 URDF 质量/质心在指令姿态计算的重力前馈填充，逐轴限幅 ±8 Nm。
 
-`BusHandle::open(port:&str,side:&str,baud:u32,timeout:Duration)->Result<BusHandle,String>`；`send(setpoints:[Setpoint;7])->Result<(),String>` 发布最新七轴目标，`drain()->(Vec<(Feedback,Instant)>,Option<String>)` 读取已到达的带时间戳反馈；`disable()` 和 `write_blocking()` 用于停止/清错等需要确认的写操作；`stats()->BusStats {received,crc_errors,timeouts}`。内部串口 I/O 线程按 10 ms 目标间隔写七轴、每包保留 200 μs 间隔，并在无新目标时重复最后目标作为保持心跳，因此控制线程不等待七帧。测试保留单周期 `exchange_all` 作为协议对照。标定从 resources/calibration 的官方文件编译内嵌。
+`BusHandle::open_recorded(port:&str,side:&str,baud:u32,timeout:Duration,journal:Journal)->Result<BusHandle,String>`；`send(setpoints:[Setpoint;7])->Result<(),String>` 发布最新七轴目标，`send_with_sequence(setpoints,seq)` 关联控制序号；`drain()->(Vec<(Feedback,Instant)>,Option<String>)` 读取已到达的带时间戳反馈；`disable()` 和 `write_blocking()` 用于停止/清错等需要确认的写操作；`stats()->BusStats` 读取通信与批次时间统计。内部串口 I/O 线程按 10 ms 目标间隔写七轴、每包保留 200 μs 间隔，并在无新目标时重复最后目标作为保持心跳，因此控制线程不等待七帧。成功写入记录 transmit，接收反馈记录 feedback。测试保留单周期 `exchange_all` 作为协议对照。标定从 resources/calibration 的官方文件编译内嵌。
 
 ### kinematics.rs
 
@@ -473,16 +594,26 @@ Tauri 仅向主窗口提供三个命令：
 
 `MotionLimits {joint_velocity:[f64;7],joint_acceleration:[f64;7],max_reference_error:f64,max_joint_step:f64,linear_speed:f64,angular_speed:f64}`。
 
-`LocalTarget::Velocity {twist:[f64;6],frame:Frame}` 或 `LocalTarget::Pose(Pose)`；`StepInput {reference:[f64;7],measured:[f64;7],previous_velocity:[f64;7],target:LocalTarget,dt:f64,tcp:TcpTransform,limits:MotionLimits}`；`step(input)->Result<StepCandidate,String>`，候选包含 `q:[f64;7],dq:[f64;7],speed_scale:f64`。统一局部加权 DLS，限制关节速度/加速度、单步增量和相对实测的参考偏差；绝对行程由物理限位约束。拒绝 NaN、无效 dt 和不能推进的候选，不随机跳构型。
+`LocalTarget::Velocity {twist:[f64;6],frame:Frame}` 或 `LocalTarget::Pose(Pose)`；`StepInput {reference:[f64;7],measured:[f64;7],previous_velocity:[f64;7],target:LocalTarget,dt:f64,tcp:TcpTransform,limits:MotionLimits,smoothing:Option<SmoothingState>}`；`SmoothingState {acceleration:[f64;7],jerk:[f64;7],path:Option<CartesianPath>,stopping:bool}`。`step(input)->Result<StepCandidate,String>`，候选包含 `q:[f64;7],dq:[f64;7],ddq:[f64;7],speed_scale:f64`。控制器传入前一周期导数和所选路径，把速度/加速度/jerk 窗口纳入有界 Jacobian 求解，再检查 FK、单步增量和相对实测的参考偏差；绝对行程由物理限位约束。拒绝 NaN、无效 dt 和不能推进的候选，不随机跳构型。
 
 提供 `offset_pose(pose:&Pose,delta:[f64;6],frame:Frame)->Result<Pose,String>` 和 `pose_error(current:&Pose,target:&Pose)->[f64;6]`。动作和目标由 arm.rs 管理，运动学模块只计算每一步的候选输出。
 
 资源：resources/models/{right,left}/robot.urdf 和 meshes/\*.STL；URDF mesh 引用统一为 meshes/文件名；Vite publicDir 指向 resources，前后端使用同一资源。manifest.json 记录 sides、joint_names、lower、upper、source，不改变原始轴与 origin。
 
+### trajectory.rs
+
+提供 `velocity_window`、`integrate` 和七变量盒约束的 `bounded_quadratic`。动态窗口由前一速度、加速度、目标、限制与实际 `dt` 计算；关节与末端求解使用相同的导数约束。当前常量为 `JOINT_SPEED=0.20`、`JOINT_ACCELERATION=0.60`、`JOINT_JERK=6.0`，单位分别为 rad/s、rad/s²、rad/s³。数值输入显式传入，可独立进行离线测试。
+
 ### journal.rs
 
-使用 rusqlite 0.41.1（bundled），只在专用 writer 线程使用写连接。`Journal` 可 Clone，`Journal::start(path:PathBuf)->Result<Self,String>`、`log(&self,level:&str,source:&str,code:&str,message:&str,request_id:Option<&str>)` 使用有界 try_send，不能等待数据库或队列。`stats()->JournalStats {pending,written,dropped,errors,healthy}` 仅原子读取。
+使用 rusqlite 0.41.1（bundled），只在专用 writer 线程使用写连接。`Journal` 可 Clone，`Journal::start(path:PathBuf)->Result<Self,String>`、`log(&self,level:&str,source:&str,code:&str,message:&str,request_id:Option<&str>)` 构造字段长度有界的字符串记录，再以 `Mutex.try_lock` 单次尝试提交到容量 1024 的预分配队列；竞争、锁损坏或满队列立即丢弃，不等待锁、队列或数据库。`stats()->JournalStats {pending,written,dropped,errors,healthy}` 仅原子读取。
 
 `recent(limit:u32)->Result<Vec<LogRecord>,String>` 是阻塞读取接口，调用方必须放到 spawn_blocking。`LogRecord {id:i64,ts_ms:i64,level,source,code,message,request_id:Option<String>}`，带 serde。`shutdown(timeout:Duration)->bool` 仅在应用关闭协调线程调用，有界等待；Drop 不阻塞。
 
-WAL、批量事务、有限 busy_timeout；记录连接、控制权、动作、故障和应用事件，不逐帧存储串口或遥测。不记录 token/lease。队列满计 dropped，写失败计 errors，后台重试不反向阻塞控制。保留最近 100000 条，清理与 checkpoint 都在 writer 内。测试覆盖持久化、队列满和数据库不可写时的行为。
+事件库使用 WAL、批量事务、有限 busy_timeout；记录连接、控制权、动作、故障和应用事件，不逐帧存储串口或遥测。不记录 token/lease。队列满计 dropped，写失败计 errors，后台重试不反向阻塞控制。保留最近 100000 条，清理与 checkpoint 都在 writer 内。测试覆盖持久化、队列满和数据库不可写时的行为。
+
+`trace_start(duration_ms,side,port)`、`trace_stop()`、`trace_list(limit)`、`trace_read(id)` 提供采样管理与读取，server 放到 `spawn_blocking`。`sample(at:Instant,data:TraceData)` 提交固定大小数据；采样有独立队列、writer、数据库与按次统计。
+
+### trace.rs
+
+定义 `TraceSummary`、带 `source` 标签的 `TraceData`、展开数据的 `TraceSample {at_us,data}` 和 `TraceRecording {trace,samples}`。`Recorder` 管理有界采样窗口和预分配队列；生产者只更新计数并尝试取得队列锁，失败立即丢弃。writer 取出数据后再执行序列化和持久化，不在生产者持锁期间执行 SQL。读取保留来源时间、重复发送序号和数据损失状态，字段见第 9 节及 OpenAPI。

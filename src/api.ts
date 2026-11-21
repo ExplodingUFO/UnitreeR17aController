@@ -100,6 +100,19 @@ export interface Log {
   message: string;
   request_id: string | null;
 }
+export interface TraceSummary {
+  id: string;
+  started_at_ms: number;
+  duration_ms: number;
+  side: string;
+  port: string | null;
+  status: "recording" | "writing" | "complete" | "failed";
+  accepted: number;
+  written: number;
+  dropped: number;
+  pending: number;
+  errors: number;
+}
 export interface Session {
   base_url: string;
   token: string;
@@ -276,9 +289,14 @@ class DesktopApi {
         .slice(0, 400) || "请求失败"
     );
   }
-  private async request<T>(path: string, body?: unknown): Promise<T> {
+  private async request<T>(
+    path: string,
+    body?: unknown,
+    options: { signal?: AbortSignal; download?: boolean } = {},
+  ): Promise<T> {
     if (!this.session) throw new Error("未连接");
     try {
+      const timeout = AbortSignal.timeout(options.download ? 20000 : 4000);
       const response = await fetch(
         `${this.session.base_url.replace(/\/$/, "")}${path}`,
         {
@@ -288,9 +306,12 @@ class DesktopApi {
             ...(body ? { "Content-Type": "application/json" } : {}),
           },
           body: body ? JSON.stringify(body) : undefined,
-          signal: AbortSignal.timeout(4000),
+          signal: options.signal
+            ? AbortSignal.any([options.signal, timeout])
+            : timeout,
         },
       );
+      if (response.ok && options.download) return (await response.blob()) as T;
       const text = await response.text();
       let data: unknown;
       try {
@@ -321,6 +342,30 @@ class DesktopApi {
     } catch (error) {
       throw new Error(this.errorMessage(error));
     }
+  }
+  async startTrace(durationMs = 10000, signal?: AbortSignal) {
+    return this.request<TraceSummary>(
+      "/v1/traces",
+      { duration_ms: durationMs },
+      { signal },
+    );
+  }
+  async listTraces(limit = 20, signal?: AbortSignal) {
+    return this.request<TraceSummary[]>(
+      `/v1/traces?limit=${limit}`,
+      undefined,
+      { signal },
+    );
+  }
+  async stopTrace(signal?: AbortSignal) {
+    return this.request<TraceSummary | null>("/v1/traces/stop", {}, { signal });
+  }
+  async downloadTrace(id: string, signal?: AbortSignal) {
+    return this.request<Blob>(
+      `/v1/traces/${encodeURIComponent(id)}?attachment=true`,
+      undefined,
+      { signal, download: true },
+    );
   }
   async readState(): Promise<Snapshot> {
     return this.request<Snapshot>("/v1/state");

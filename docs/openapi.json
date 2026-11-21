@@ -4,7 +4,7 @@
   "info": {
     "title": "R1-7a Controller 本机 API",
     "version": "0.1.0",
-    "description": "对应当前桌面软件。应用从 127.0.0.1:8177 提供 HTTP 与 WebSocket，随桌面启停。token 从桌面“接口”面板取得，每次启动变化。POST /v1/commands 的 202 仅代表入队，执行结果从 Snapshot.results 按 request_id 读取。字段范围表示有效业务输入；业务校验可在入队后返回 rejected。所有量采用 m、rad、s，显式 _ms 字段采用 ms。UTF-8 字节上限使用 x-utf8-max-bytes 表示。示例数值为协议示例。",
+    "description": "对应当前桌面软件。应用从 127.0.0.1:8177 提供 HTTP 与 WebSocket，随桌面启停。token 从桌面“接口”面板取得，每次启动变化。POST /v1/commands 的 202 仅代表入队，执行结果从 Snapshot.results 按 request_id 读取。字段范围表示有效业务输入；业务校验可在入队后返回 rejected。所有量采用 m、rad、s，显式 _ms 字段采用 ms，_us 字段采用 μs。UTF-8 字节上限使用 x-utf8-max-bytes 表示。示例数值为协议示例。 短时采样沿用 Bearer/Origin 校验，无需运动租约。关节参考速度/加速度/jerk 上限为 0.20 rad/s、0.60 rad/s²、6 rad/s³，jerk 为离线默认值；实际串口发送可重复或合并参考，物理 jerk 尚未验证。",
     "license": {
       "name": "BSD-3-Clause",
       "url": "https://opensource.org/license/bsd-3-clause"
@@ -33,6 +33,9 @@
     },
     {
       "name": "日志"
+    },
+    {
+      "name": "采样"
     }
   ],
   "paths": {
@@ -778,6 +781,388 @@
           "description": "订阅断开不直接释放控制权；连续点动 TTL 与控制权租期仍分别计时。退出时推送 closing 后关闭。"
         }
       }
+    },
+    "/v1/traces": {
+      "get": {
+        "operationId": "listTraces",
+        "tags": ["采样"],
+        "summary": "查询最近采样",
+        "description": "返回最近的汇总，最多 10 次。默认 limit=20，再限制到 1..10。沿用 Bearer 与 Origin 校验，无需运动租约。查询在独立阻塞任务中执行；采样计数与事件 journal 分开。",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "u32，默认 20；实际限制到 1..10，0 按 1，超过 10 按 10。",
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 20
+            },
+            "example": 20
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "最近采样汇总。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TraceSummary"
+                  },
+                  "maxItems": 10
+                },
+                "example": [
+                  {
+                    "id": "22222222-2222-4222-8222-222222222222",
+                    "started_at_ms": 1795248000000,
+                    "duration_ms": 10000,
+                    "side": "right",
+                    "port": "/dev/cu.example",
+                    "status": "complete",
+                    "accepted": 3,
+                    "written": 3,
+                    "dropped": 0,
+                    "pending": 0,
+                    "errors": 0
+                  }
+                ]
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/TraceInvalidQuery"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenOrigin"
+          },
+          "503": {
+            "$ref": "#/components/responses/TraceUnavailable"
+          }
+        }
+      },
+      "post": {
+        "operationId": "startTrace",
+        "tags": ["采样"],
+        "summary": "开始短时采样",
+        "description": "观察现有端口连接；要求 port 非 null 且 phase 不在 disconnected/connecting/closing。无需控制权或 lease，不申请控制权、打开端口、使能或启动运动。默认 10000 ms，范围 1000..20000。预分配队列容量 4096，生产者 Mutex.try_lock 竞争或队列满立即计 dropped，无等待、SQL、JSON 编码或分配；独立 writer 轮询取出后写入 events.sqlite3.traces.sqlite3。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TraceStartRequest"
+              },
+              "examples": {
+                "default": {
+                  "value": {}
+                },
+                "ten_seconds": {
+                  "value": {
+                    "duration_ms": 10000
+                  }
+                },
+                "null_uses_default": {
+                  "value": {
+                    "duration_ms": null
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "采样已开始；随后查询提交结果。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TraceSummary"
+                },
+                "example": {
+                  "id": "22222222-2222-4222-8222-222222222222",
+                  "started_at_ms": 1795248000000,
+                  "duration_ms": 10000,
+                  "side": "right",
+                  "port": "/dev/cu.example",
+                  "status": "recording",
+                  "accepted": 0,
+                  "written": 0,
+                  "dropped": 0,
+                  "pending": 0,
+                  "errors": 0
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "JSON 提取、字段、时长或连接上下文无效；采样提取错误统一返回 JSON。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "examples": {
+                  "invalid_trace_request": {
+                    "value": {
+                      "code": "invalid_trace_request",
+                      "message": "采样请求 JSON 无效"
+                    }
+                  },
+                  "invalid_trace_duration": {
+                    "value": {
+                      "code": "invalid_trace_duration",
+                      "message": "采样时长应为 1000–20000 毫秒"
+                    }
+                  },
+                  "invalid_trace_context": {
+                    "value": {
+                      "code": "invalid_trace_context",
+                      "message": "采样上下文无效"
+                    }
+                  },
+                  "not_connected": {
+                    "value": {
+                      "code": "not_connected",
+                      "message": "请先连接机械臂，再开始短时采样"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenOrigin"
+          },
+          "409": {
+            "$ref": "#/components/responses/TraceActive"
+          },
+          "429": {
+            "$ref": "#/components/responses/TraceCapacity"
+          },
+          "503": {
+            "$ref": "#/components/responses/TraceStartUnavailable"
+          }
+        }
+      }
+    },
+    "/v1/traces/stop": {
+      "post": {
+        "operationId": "stopTrace",
+        "tags": ["采样"],
+        "summary": "结束当前采样",
+        "description": "无需请求体或运动租约。只结束样本接收，不取消机械臂动作、失能或改变控制权。后台可继续写入；没有正在记录的采样时返回 JSON null。",
+        "responses": {
+          "200": {
+            "description": "已结束的采样汇总，或没有活动记录时的 null。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/TraceSummary"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "examples": {
+                  "writing": {
+                    "value": {
+                      "id": "22222222-2222-4222-8222-222222222222",
+                      "started_at_ms": 1795248000000,
+                      "duration_ms": 10000,
+                      "side": "right",
+                      "port": "/dev/cu.example",
+                      "status": "writing",
+                      "accepted": 3,
+                      "written": 2,
+                      "dropped": 0,
+                      "pending": 1,
+                      "errors": 0
+                    }
+                  },
+                  "no_recording": {
+                    "value": null
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenOrigin"
+          },
+          "503": {
+            "$ref": "#/components/responses/TraceUnavailable"
+          }
+        }
+      }
+    },
+    "/v1/traces/{id}": {
+      "get": {
+        "operationId": "readTrace",
+        "tags": ["采样"],
+        "summary": "读取或下载采样 JSON",
+        "description": "返回 {trace,samples}，序列化与读取在独立阻塞任务中执行。download=true 或 attachment=true 时返回附件头，JSON 结构相同。来源时间不是入库时间；重复发送序号保留，跳号也可能由采样丢弃造成。",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "example": "22222222-2222-4222-8222-222222222222"
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "required": false,
+            "description": "true 时添加附件下载头。",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "example": true
+          },
+          {
+            "name": "attachment",
+            "in": "query",
+            "required": false,
+            "description": "download 的别名；任一参数为 true 即下载。",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "采样汇总和当前已提交样本。",
+            "headers": {
+              "Cache-Control": {
+                "description": "禁用该响应的缓存。",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                },
+                "example": "no-store"
+              },
+              "Content-Disposition": {
+                "description": "download=true 或 attachment=true 时返回。",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "attachment; filename=\"trace-22222222-2222-4222-8222-222222222222.json\""
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TraceRecording"
+                },
+                "example": {
+                  "trace": {
+                    "id": "22222222-2222-4222-8222-222222222222",
+                    "started_at_ms": 1795248000000,
+                    "duration_ms": 10000,
+                    "side": "right",
+                    "port": "/dev/cu.example",
+                    "status": "complete",
+                    "accepted": 3,
+                    "written": 3,
+                    "dropped": 0,
+                    "pending": 0,
+                    "errors": 0
+                  },
+                  "samples": [
+                    {
+                      "at_us": 1000,
+                      "source": "control",
+                      "seq": 101,
+                      "generation": 5,
+                      "enabled": true,
+                      "stopping": false,
+                      "motion": 1,
+                      "axis": 0,
+                      "q_ref": [0.1, 0.2, -0.1, -0.2, 0.1, 0.0, 0.1],
+                      "dq_ref": [0.001, 0, 0, 0, 0, 0, 0],
+                      "ddq_ref": [0.05, 0, 0, 0, 0, 0, 0],
+                      "jerk_ref": [5.0, 0, 0, 0, 0, 0, 0],
+                      "tau_ff": [0.1, -0.2, 0.05, 0, 0, 0, 0],
+                      "q": [0.099, 0.2, -0.1, -0.2, 0.1, 0.0, 0.1],
+                      "dq": [0.0005, 0, 0, 0, 0, 0, 0],
+                      "tau": [0.1, -0.2, 0.05, 0, 0, 0, 0],
+                      "voltage": [48.0, 48.0, 48.0, 48.0, 48.0, 48.0, 48.0],
+                      "age_us": [500, 500, 500, 500, 500, 500, 500]
+                    },
+                    {
+                      "at_us": 1100,
+                      "source": "transmit",
+                      "seq": 101,
+                      "q_ref": [0.1, 0.2, -0.1, -0.2, 0.1, 0.0, 0.1],
+                      "dq_ref": [0.001, 0, 0, 0, 0, 0, 0],
+                      "tau_ff": [0.1, -0.2, 0.05, 0, 0, 0, 0],
+                      "q_wire": [
+                        0.0999999, 0.1999999, -0.0999999, -0.1999999, 0.0999999,
+                        0.0, 0.0999999
+                      ],
+                      "dq_wire": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                      "tau_wire": [0.099, -0.199, 0.049, 0, 0, 0, 0],
+                      "kp": [60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0],
+                      "kd": [10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0],
+                      "write_us": 6000,
+                      "mode": [1, 1, 1, 1, 1, 1, 1]
+                    },
+                    {
+                      "at_us": 15000,
+                      "source": "feedback",
+                      "joint": 0,
+                      "q": 0.09901,
+                      "dq": 0.0005,
+                      "tau": 0.1,
+                      "temperature": 25.0,
+                      "voltage": 48.0,
+                      "error": 0,
+                      "mode": 1,
+                      "timeout": false
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/TraceInvalidQuery"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenOrigin"
+          },
+          "404": {
+            "$ref": "#/components/responses/TraceNotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/TraceUnavailable"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1329,7 +1714,7 @@
             "$ref": "#/components/schemas/MotionArguments"
           }
         ],
-        "description": "开始单轴连续点动。本请求 request_id 同时作为 action_id；推荐 ttl_ms=350，每 100 ms 更新一次。",
+        "description": "开始单轴连续点动。本请求 request_id 同时作为 action_id；推荐 ttl_ms=350，每 100 ms 更新一次。 控制参考共用速度/加速度/jerk 约束。末端以有界 Jacobian 求解保持所选 TCP 路径，模型偏差阈值 50 μm、0.002 rad；全局 TCP 上限预留 10% 目标余量，近上限目标为 0.0135 m/s、0.135 rad/s，低于该阈值的请求不因这一余量额外缩放。最终 FK 仍检查 0.015 m/s、0.15 rad/s 硬上限；模型阈值不表示硬件精度。",
         "examples": [
           {
             "request_id": "req-jog-001",
@@ -1445,7 +1830,7 @@
             }
           }
         ],
-        "description": "执行一次固定步长动作，不排运动队列。以 completed/completed 为完成标志，progress=1 不是完成确认。",
+        "description": "执行一次固定步长动作，不排运动队列。以 completed/completed 为完成标志，progress=1 不是完成确认。 控制参考共用速度/加速度/jerk 约束。末端以有界 Jacobian 求解保持所选 TCP 路径，模型偏差阈值 50 μm、0.002 rad；全局 TCP 上限预留 10% 目标余量，近上限目标为 0.0135 m/s、0.135 rad/s，低于该阈值的请求不因这一余量额外缩放。最终 FK 仍检查 0.015 m/s、0.15 rad/s 硬上限；模型阈值不表示硬件精度。",
         "examples": [
           {
             "request_id": "req-step-001",
@@ -1478,7 +1863,7 @@
             "required": ["kind"]
           }
         ],
-        "description": "需要当前控制权和 generation；取消原动作，递增 generation，保留控制者与使能状态。仍可能需要等待 stopping 结束。",
+        "description": "需要当前控制权和 generation；取消原动作，递增 generation，保留控制者与使能状态。仍可能需要等待 stopping 结束。 正常停止在参考域按 jerk 限制减速，可能需要更长时间。末端停止的求解目标惩罚关节速度本身，连续性由导数硬约束维持。笛卡尔制动不可行时记录 stop_path 并转为受限关节制动；故障、失能和关闭继续优先处理。实际串口可重复或合并参考更新，物理 jerk 尚未验证。",
         "examples": [
           {
             "request_id": "req-stop-001",
@@ -1901,7 +2286,7 @@
             "type": "integer",
             "minimum": 0,
             "maximum": 18446744073709551615,
-            "description": "队列满、关闭后提交或退出未写完的数量。"
+            "description": "本次运行队列竞争、锁损坏、满队列、关闭后提交或退出放弃的数量。"
           },
           "errors": {
             "type": "integer",
@@ -1913,7 +2298,8 @@
             "type": "boolean"
           }
         },
-        "required": ["pending", "written", "dropped", "errors", "healthy"]
+        "required": ["pending", "written", "dropped", "errors", "healthy"],
+        "description": "事件日志统计，按本次进程计数。生产者只尝试一次取得预分配队列锁，竞争或满队列立即计 dropped；后台取出后执行 SQL。短时采样独立计数。"
       },
       "Communication": {
         "type": "object",
@@ -2485,7 +2871,7 @@
             "required": ["kind", "joints", "speed"]
           }
         ],
-        "description": "七轴通过五次多项式共同返回记录姿态，限速并限制加速度。须已使能、反馈齐全新鲜且无其他动作。位置误差≤0.01 rad、实测速度≤0.02 rad/s并稳定200ms后返回 completed/returned 或 completed/parked。到位超时、取消或跟随偏差超限不会继续断开。关节插值不提供碰撞规划。",
+        "description": "七轴通过五次多项式生成共同返回目标，最终控制参考按速度、加速度与 jerk 限制后积分；上限为 0.20 rad/s、0.60 rad/s²、6 rad/s³，jerk 为离线默认值。须已使能、反馈齐全新鲜且无其他动作。位置误差≤0.01 rad、实测速度≤0.02 rad/s并稳定200ms后返回 completed/returned 或 completed/parked。到位超时、取消或跟随偏差超限不会继续断开。关节插值不提供碰撞规划。",
         "examples": [
           {
             "request_id": "req-return-001",
@@ -2498,6 +2884,643 @@
             "disconnect_after": true
           }
         ]
+      },
+      "TraceStartRequest": {
+        "type": "object",
+        "properties": {
+          "duration_ms": {
+            "type": ["integer", "null"],
+            "minimum": 1000,
+            "maximum": 20000,
+            "default": 10000,
+            "description": "采样窗口，ms。省略或 null 使用 10000；整数范围外返回 invalid_trace_duration。"
+          }
+        },
+        "additionalProperties": false,
+        "description": "开始观察已有端口连接。无需 client_id、lease_id 或 generation。",
+        "examples": [
+          {},
+          {
+            "duration_ms": 10000
+          },
+          {
+            "duration_ms": null
+          }
+        ]
+      },
+      "TraceSummary": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "采样 ID。"
+          },
+          "started_at_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9223372036854775807,
+            "description": "采样开始的 Unix UTC 时间，ms。"
+          },
+          "duration_ms": {
+            "type": "integer",
+            "minimum": 1000,
+            "maximum": 20000,
+            "description": "请求的窗口，ms；提前停止不改写该值。"
+          },
+          "side": {
+            "type": "string",
+            "enum": ["left", "right"]
+          },
+          "port": {
+            "type": ["string", "null"],
+            "description": "采样开始时的串口上下文。"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["recording", "writing", "complete", "failed"],
+            "description": "recording 接收中；writing 接收结束、后台写入中；complete 已提交；failed 有已接收数据被放弃或上次运行中断。"
+          },
+          "accepted": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "成功接纳入队的样本数。"
+          },
+          "written": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "已提交的样本数；完整读取时对应同一数据库快照中的样本数量。"
+          },
+          "dropped": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "队列竞争、溢出、超过提交尝试上限或已接收数据被放弃的数量。"
+          },
+          "pending": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "已接纳但尚未提交的样本数。"
+          },
+          "errors": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "存储、序列化等后台操作的失败次数，恢复后保留。"
+          }
+        },
+        "required": [
+          "id",
+          "started_at_ms",
+          "duration_ms",
+          "side",
+          "port",
+          "status",
+          "accepted",
+          "written",
+          "dropped",
+          "pending",
+          "errors"
+        ],
+        "description": "按次采样统计，与 Snapshot.journal 的事件计数分开。complete 仍可能包含 dropped 或此前 errors；完整性同时检查 pending=0、written=accepted、dropped 和 errors。",
+        "examples": [
+          {
+            "id": "22222222-2222-4222-8222-222222222222",
+            "started_at_ms": 1795248000000,
+            "duration_ms": 10000,
+            "side": "right",
+            "port": "/dev/cu.example",
+            "status": "recording",
+            "accepted": 0,
+            "written": 0,
+            "dropped": 0,
+            "pending": 0,
+            "errors": 0
+          },
+          {
+            "id": "22222222-2222-4222-8222-222222222222",
+            "started_at_ms": 1795248000000,
+            "duration_ms": 10000,
+            "side": "right",
+            "port": "/dev/cu.example",
+            "status": "writing",
+            "accepted": 3,
+            "written": 2,
+            "dropped": 0,
+            "pending": 1,
+            "errors": 0
+          },
+          {
+            "id": "22222222-2222-4222-8222-222222222222",
+            "started_at_ms": 1795248000000,
+            "duration_ms": 10000,
+            "side": "right",
+            "port": "/dev/cu.example",
+            "status": "complete",
+            "accepted": 3,
+            "written": 3,
+            "dropped": 0,
+            "pending": 0,
+            "errors": 0
+          },
+          {
+            "id": "22222222-2222-4222-8222-222222222222",
+            "started_at_ms": 1795248000000,
+            "duration_ms": 10000,
+            "side": "right",
+            "port": "/dev/cu.example",
+            "status": "failed",
+            "accepted": 3,
+            "written": 2,
+            "dropped": 1,
+            "pending": 0,
+            "errors": 1
+          }
+        ]
+      },
+      "TraceControlSample": {
+        "type": "object",
+        "properties": {
+          "at_us": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "控制周期来源时间相对采样开始的微秒数，不是入库时间。"
+          },
+          "source": {
+            "type": "string",
+            "const": "control"
+          },
+          "seq": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "控制周期序号，用于关联 transmit。"
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "该控制周期的上下文版本。"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "stopping": {
+            "type": "boolean"
+          },
+          "motion": {
+            "type": "integer",
+            "enum": [0, 1, 2, 3, 4, 5],
+            "description": "0 无当前动作；1 关节连续；2 关节步长；3 笛卡尔连续；4 笛卡尔步长；5 收纳返回。减速期间可为 0。"
+          },
+          "axis": {
+            "type": ["integer", "null"],
+            "minimum": 0,
+            "maximum": 6,
+            "description": "关节 0..6；笛卡尔 0..5；无动作或收纳返回时为 null。"
+          },
+          "q_ref": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "J1..J7 的最终积分参考，rad。"
+          },
+          "dq_ref": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "J1..J7 的参考速度，rad/s。"
+          },
+          "ddq_ref": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "相邻参考速度按实际控制间隔计算的加速度，rad/s²。"
+          },
+          "jerk_ref": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "相邻参考加速度按实际控制间隔计算的 jerk，rad/s³。"
+          },
+          "tau_ff": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "指令重力前馈，Nm。"
+          },
+          "q": {
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "关节反馈位置，rad；无反馈的元素为 null。"
+          },
+          "dq": {
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "关节反馈速度，rad/s；无反馈的元素为 null。"
+          },
+          "tau": {
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "关节反馈估算扭矩，Nm；无反馈的元素为 null。"
+          },
+          "voltage": {
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "关节反馈电压，V；无反馈的元素为 null。"
+          },
+          "age_us": {
+            "type": "array",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 18446744073709551615,
+                  "description": "反馈年龄，μs。"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "控制周期开始时距各关节主机接收反馈的年龄，μs；无反馈的元素为 null。"
+          }
+        },
+        "required": [
+          "at_us",
+          "source",
+          "seq",
+          "generation",
+          "enabled",
+          "stopping",
+          "motion",
+          "axis",
+          "q_ref",
+          "dq_ref",
+          "ddq_ref",
+          "jerk_ref",
+          "tau_ff",
+          "q",
+          "dq",
+          "tau",
+          "voltage",
+          "age_us"
+        ],
+        "description": "TraceSample 的一种展开结构；字段均位于样本顶层。"
+      },
+      "TraceTransmitSample": {
+        "type": "object",
+        "properties": {
+          "at_us": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "主机七轴批次写入开始时间相对采样开始的微秒数。"
+          },
+          "source": {
+            "type": "string",
+            "const": "transmit"
+          },
+          "seq": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "被实际选中发送的 control.seq；重复序号表示重复参考。0 用于初始或直接停止/清错写入。 非零序号也可对应 disabled 心跳，需按每轴 mode 判断是否为有效伺服目标。"
+          },
+          "q_ref": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "编码前理想关节位置，rad，J1..J7。"
+          },
+          "dq_ref": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "编码前理想关节速度，rad/s，J1..J7。"
+          },
+          "tau_ff": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "编码前理想前馈扭矩，Nm，J1..J7。"
+          },
+          "q_wire": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "从实际报文位置字段解码并按标定转回关节坐标，rad，J1..J7。停机/清错时保留报文字段的反标定结果。"
+          },
+          "dq_wire": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "从实际报文速度字段解码并按标定转回关节坐标，rad/s，J1..J7。"
+          },
+          "tau_wire": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "从实际报文扭矩字段解码并按标定转回关节坐标，Nm，J1..J7。"
+          },
+          "kp": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "该批次编码前位置增益，J1..J7。"
+          },
+          "kd": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "该批次编码前速度增益，J1..J7。"
+          },
+          "write_us": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "主机成功写入整个七轴批次的耗时，μs；不是 USB 线上时间或电机确认。"
+          },
+          "mode": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "enum": [0, 1, 6]
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "J1..J7 实际编码的命令模式：0 disabled、1 servo、6 clear。非零 seq 也可为 disabled 心跳；只有 mode=1 的字段是有效伺服目标。"
+          }
+        },
+        "required": [
+          "at_us",
+          "source",
+          "seq",
+          "mode",
+          "q_ref",
+          "dq_ref",
+          "tau_ff",
+          "q_wire",
+          "dq_wire",
+          "tau_wire",
+          "kp",
+          "kd",
+          "write_us"
+        ],
+        "description": "TraceSample 的一种展开结构；字段均位于样本顶层。"
+      },
+      "TraceFeedbackSample": {
+        "type": "object",
+        "properties": {
+          "at_us": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615,
+            "description": "主机收到该关节反馈的时间相对采样开始的微秒数。"
+          },
+          "source": {
+            "type": "string",
+            "const": "feedback"
+          },
+          "joint": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 6,
+            "description": "J1..J7 对应 0..6。"
+          },
+          "q": {
+            "type": "number",
+            "description": "关节位置，rad。"
+          },
+          "dq": {
+            "type": "number",
+            "description": "关节速度，rad/s。"
+          },
+          "tau": {
+            "type": "number",
+            "description": "估算扭矩，Nm。"
+          },
+          "temperature": {
+            "type": "number",
+            "description": "温度，°C。"
+          },
+          "voltage": {
+            "type": "number",
+            "description": "电压，V。"
+          },
+          "error": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295,
+            "description": "设备错误字段。"
+          },
+          "mode": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255,
+            "description": "设备模式字段。"
+          },
+          "timeout": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "at_us",
+          "source",
+          "joint",
+          "q",
+          "dq",
+          "tau",
+          "temperature",
+          "voltage",
+          "error",
+          "mode",
+          "timeout"
+        ],
+        "description": "TraceSample 的一种展开结构；字段均位于样本顶层。"
+      },
+      "TraceSample": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/TraceControlSample"
+          },
+          {
+            "$ref": "#/components/schemas/TraceTransmitSample"
+          },
+          {
+            "$ref": "#/components/schemas/TraceFeedbackSample"
+          }
+        ],
+        "discriminator": {
+          "propertyName": "source",
+          "mapping": {
+            "control": "#/components/schemas/TraceControlSample",
+            "transmit": "#/components/schemas/TraceTransmitSample",
+            "feedback": "#/components/schemas/TraceFeedbackSample"
+          }
+        },
+        "description": "按 source 区分的顶层字段，等价于 TraceSample.at_us 与 flatten TraceData，没有 data 包装。at_us 来自原始来源单调时间，不使用出队或 SQLite 提交时间。",
+        "examples": [
+          {
+            "at_us": 1000,
+            "source": "control",
+            "seq": 101,
+            "generation": 5,
+            "enabled": true,
+            "stopping": false,
+            "motion": 1,
+            "axis": 0,
+            "q_ref": [0.1, 0.2, -0.1, -0.2, 0.1, 0.0, 0.1],
+            "dq_ref": [0.001, 0, 0, 0, 0, 0, 0],
+            "ddq_ref": [0.05, 0, 0, 0, 0, 0, 0],
+            "jerk_ref": [5.0, 0, 0, 0, 0, 0, 0],
+            "tau_ff": [0.1, -0.2, 0.05, 0, 0, 0, 0],
+            "q": [0.099, 0.2, -0.1, -0.2, 0.1, 0.0, 0.1],
+            "dq": [0.0005, 0, 0, 0, 0, 0, 0],
+            "tau": [0.1, -0.2, 0.05, 0, 0, 0, 0],
+            "voltage": [48.0, 48.0, 48.0, 48.0, 48.0, 48.0, 48.0],
+            "age_us": [500, 500, 500, 500, 500, 500, 500]
+          },
+          {
+            "at_us": 1100,
+            "source": "transmit",
+            "seq": 101,
+            "q_ref": [0.1, 0.2, -0.1, -0.2, 0.1, 0.0, 0.1],
+            "dq_ref": [0.001, 0, 0, 0, 0, 0, 0],
+            "tau_ff": [0.1, -0.2, 0.05, 0, 0, 0, 0],
+            "q_wire": [
+              0.0999999, 0.1999999, -0.0999999, -0.1999999, 0.0999999, 0.0,
+              0.0999999
+            ],
+            "dq_wire": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "tau_wire": [0.099, -0.199, 0.049, 0, 0, 0, 0],
+            "kp": [60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0],
+            "kd": [10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0],
+            "write_us": 6000,
+            "mode": [1, 1, 1, 1, 1, 1, 1]
+          },
+          {
+            "at_us": 15000,
+            "source": "feedback",
+            "joint": 0,
+            "q": 0.09901,
+            "dq": 0.0005,
+            "tau": 0.1,
+            "temperature": 25.0,
+            "voltage": 48.0,
+            "error": 0,
+            "mode": 1,
+            "timeout": false
+          }
+        ]
+      },
+      "TraceRecording": {
+        "type": "object",
+        "properties": {
+          "trace": {
+            "$ref": "#/components/schemas/TraceSummary"
+          },
+          "samples": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TraceSample"
+            },
+            "maxItems": 100000,
+            "description": "同一数据库快照内已提交的数据，按 at_us 排序，同一时间保留提交顺序。重复 transmit.seq 保留。"
+          }
+        },
+        "required": ["trace", "samples"],
+        "description": "采样汇总与数据。正在记录/写入时可读取已提交部分；完整性使用 trace.status 与各计数判断。最多保留 10 次采样，每次仅前 100000 次提交尝试可入队。"
       }
     },
     "responses": {
@@ -2654,6 +3677,120 @@
               "type": "string"
             },
             "example": "Failed to deserialize the JSON body into the target type"
+          }
+        }
+      },
+      "TraceInvalidQuery": {
+        "description": "采样查询参数格式、类型或范围错误。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "examples": {
+              "invalid_trace_request": {
+                "value": {
+                  "code": "invalid_trace_request",
+                  "message": "采样查询参数无效"
+                }
+              }
+            }
+          }
+        }
+      },
+      "TraceActive": {
+        "description": "已有采样正在记录。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "examples": {
+              "trace_active": {
+                "value": {
+                  "code": "trace_active",
+                  "message": "已有采样正在记录"
+                }
+              }
+            }
+          }
+        }
+      },
+      "TraceCapacity": {
+        "description": "采样保留槽仍在写入，暂不能接纳新采样。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "examples": {
+              "trace_capacity": {
+                "value": {
+                  "code": "trace_capacity",
+                  "message": "采样写入积压，请稍后重试"
+                }
+              }
+            }
+          }
+        }
+      },
+      "TraceNotFound": {
+        "description": "ID 无效、不存在或已被保留清理。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "examples": {
+              "trace_not_found": {
+                "value": {
+                  "code": "trace_not_found",
+                  "message": "采样不存在或已清理"
+                }
+              }
+            }
+          }
+        }
+      },
+      "TraceUnavailable": {
+        "description": "采样暂不可读写。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "examples": {
+              "trace_unavailable": {
+                "value": {
+                  "code": "trace_unavailable",
+                  "message": "采样暂不可读写"
+                }
+              }
+            }
+          }
+        }
+      },
+      "TraceStartUnavailable": {
+        "description": "采样暂不可读写或应用已关闭接收。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "examples": {
+              "trace_unavailable": {
+                "value": {
+                  "code": "trace_unavailable",
+                  "message": "采样暂不可读写"
+                }
+              },
+              "closing": {
+                "value": {
+                  "code": "closing",
+                  "message": "应用正在关闭"
+                }
+              }
+            }
           }
         }
       }

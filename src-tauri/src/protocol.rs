@@ -2,6 +2,7 @@
 //! 0803d033b530fcfa0e6fa9236de68c2773fc9402, MotorProtocol.cpp / arm_motor_bus.cpp.
 //! One owner, seven-joint command batches. No action retries or cached feedback.
 
+use crate::journal::{Journal, TraceData};
 use crossbeam_channel::{Receiver as EventReceiver, Sender, bounded, unbounded};
 use serde::{Deserialize, Serialize};
 use serialport::{
@@ -268,10 +269,16 @@ impl Calibration {
     }
 
     fn feedback(self, mut f: Feedback) -> Feedback {
-        f.q = (self.gain * f.q as f32 + self.offset) as f64;
-        f.dq = (self.gain * f.dq as f32) as f64;
-        f.tau = (self.gain * f.tau as f32) as f64;
+        [f.q, f.dq, f.tau] = self.feedback_motion([f.q, f.dq, f.tau]);
         f
+    }
+
+    fn feedback_motion(self, [q, dq, tau]: [f64; 3]) -> [f64; 3] {
+        [
+            (self.gain * q as f32 + self.offset) as f64,
+            (self.gain * dq as f32) as f64,
+            (self.gain * tau as f32) as f64,
+        ]
     }
 }
 
@@ -368,6 +375,16 @@ fn encode(id: u8, s: Setpoint) -> Result<[u8; COMMAND_LEN], String> {
     Ok(packet)
 }
 
+fn decode_motion(id: u8, t: i16, v: i16, q: i32) -> [f64; 3] {
+    // IDs outside this seven-joint bus use the SDK's fallback reduction.
+    let r = if id < 7 { ratio(id) } else { 38.0 / 3.0 };
+    [
+        ((2.0 * PI * q as f64 / 32768.0 / r) as f32) as f64,
+        (((v as f32 / 64.0 * 2.0) as f64 * PI / r) as f32) as f64,
+        (((t as f32 / 2560.0) as f64 * r) as f32) as f64,
+    ]
+}
+
 fn decode(frame: &[u8]) -> Option<Feedback> {
     if frame.len() != FEEDBACK_LEN || frame[..2] != [0xfc, 0xee] {
         return None;
@@ -376,17 +393,15 @@ fn decode(frame: &[u8]) -> Option<Feedback> {
         return None;
     }
     let id = frame[2] & 0x0f;
-    // IDs outside this seven-joint bus are still valid frames; never apply a
-    // joint calibration to them. SDK's fallback reduction is 38/3.
-    let r = if id < 7 { ratio(id) } else { 38.0 / 3.0 };
     let t = i16::from_le_bytes(frame[6..8].try_into().ok()?);
     let v = i16::from_le_bytes(frame[8..10].try_into().ok()?);
     let q = i32::from_le_bytes(frame[10..14].try_into().ok()?);
+    let [q, dq, tau] = decode_motion(id, t, v, q);
     Some(Feedback {
         id,
-        q: ((2.0 * PI * q as f64 / 32768.0 / r) as f32) as f64,
-        dq: (((v as f32 / 64.0 * 2.0) as f64 * PI / r) as f32) as f64,
-        tau: (((t as f32 / 2560.0) as f64 * r) as f32) as f64,
+        q,
+        dq,
+        tau,
         temperature: (frame[3] as i8) as f64,
         voltage: frame[5] as f64 / 2.0,
         error: u32::from_le_bytes(frame[14..18].try_into().ok()?),
@@ -568,7 +583,16 @@ impl Bus {
 
     /// Writes one seven-joint command batch. It never reads feedback and can
     /// be called from a dedicated I/O thread while another path drains frames.
+    #[cfg(test)]
     pub fn write_all(&mut self, setpoints: &[Setpoint; 7]) -> Result<(), String> {
+        self.write_all_recorded(setpoints, None)
+    }
+
+    fn write_all_recorded(
+        &mut self,
+        setpoints: &[Setpoint; 7],
+        recording: Option<(&Journal, Instant, u64)>,
+    ) -> Result<(), String> {
         if self.incomplete_write {
             return Err("previous command was partially written; reconnect serial port".into());
         }
@@ -582,6 +606,16 @@ impl Bus {
             // The official SDK keeps this gap after every packet, including
             // the last one, before the adapter turns around to receive.
             std::thread::sleep(Duration::from_micros(200));
+        }
+        if let Some((journal, started, seq)) = recording {
+            sample_transmit(
+                journal,
+                started,
+                setpoints,
+                seq,
+                &packets,
+                &self.calibration,
+            );
         }
         Ok(())
     }
@@ -677,11 +711,56 @@ fn stopped_setpoints() -> [Setpoint; 7] {
     })
 }
 
+#[derive(Clone, Copy)]
+struct PublishedSetpoints {
+    values: [Setpoint; 7],
+    seq: u64,
+}
+
+fn sample_transmit(
+    journal: &Journal,
+    started: Instant,
+    values: &[Setpoint; 7],
+    seq: u64,
+    packets: &[[u8; COMMAND_LEN]; 7],
+    calibration: &[Calibration; 7],
+) {
+    let write_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
+    // Read the fields actually sent, after calibration, f32 narrowing and
+    // integer rounding. Reuse the feedback conversion into joint coordinates.
+    // Disabled/clear packets describe their raw fields, not an active target.
+    let wire: [[f64; 3]; 7] = std::array::from_fn(|i| {
+        let packet = &packets[i];
+        calibration[i].feedback_motion(decode_motion(
+            packet[2] & 0x0f,
+            i16::from_le_bytes(packet[4..6].try_into().unwrap()),
+            i16::from_le_bytes(packet[6..8].try_into().unwrap()),
+            i32::from_le_bytes(packet[8..12].try_into().unwrap()),
+        ))
+    });
+    journal.sample(
+        started,
+        TraceData::Transmit {
+            seq,
+            mode: std::array::from_fn(|i| (packets[i][2] >> 4) & 0x07),
+            q_ref: std::array::from_fn(|i| values[i].q),
+            dq_ref: std::array::from_fn(|i| values[i].dq),
+            tau_ff: std::array::from_fn(|i| values[i].tau),
+            q_wire: std::array::from_fn(|i| wire[i][0]),
+            dq_wire: std::array::from_fn(|i| wire[i][1]),
+            tau_wire: std::array::from_fn(|i| wire[i][2]),
+            kp: std::array::from_fn(|i| values[i].kp),
+            kd: std::array::from_fn(|i| values[i].kd),
+            write_us,
+        },
+    );
+}
+
 /// Owns the serial bus on a dedicated thread. The control loop only publishes
 /// the latest setpoints and drains timestamped feedback, so a slow feedback
 /// frame cannot lengthen the command cycle.
 pub struct BusHandle {
-    setpoints: watch::Sender<[Setpoint; 7]>,
+    setpoints: watch::Sender<PublishedSetpoints>,
     command: Sender<BusCommand>,
     events: EventReceiver<BusEvent>,
     stats: Arc<Mutex<BusStats>>,
@@ -691,11 +770,21 @@ pub struct BusHandle {
 }
 
 impl BusHandle {
-    pub fn open(port: &str, side: &str, baud: u32, timeout: Duration) -> Result<Self, String> {
-        Self::start(Bus::open(port, side, baud, timeout)?)
+    pub fn open_recorded(
+        port: &str,
+        side: &str,
+        baud: u32,
+        timeout: Duration,
+        journal: Journal,
+    ) -> Result<Self, String> {
+        Self::start_recorded(Bus::open(port, side, baud, timeout)?, Some(journal))
     }
 
-    fn start(mut bus: Bus) -> Result<Self, String> {
+    #[cfg(test)]
+    fn start(bus: Bus) -> Result<Self, String> {
+        Self::start_recorded(bus, None)
+    }
+    fn start_recorded(mut bus: Bus, journal: Option<Journal>) -> Result<Self, String> {
         let reader_port = bus
             .port
             .try_clone()
@@ -708,7 +797,10 @@ impl BusHandle {
             stats: BusStats::default(),
             incomplete_write: false,
         };
-        let (setpoint_tx, mut setpoint_rx) = watch::channel(stopped_setpoints());
+        let (setpoint_tx, mut setpoint_rx) = watch::channel(PublishedSetpoints {
+            values: stopped_setpoints(),
+            seq: 0,
+        });
         let (command_tx, command_rx) = bounded::<BusCommand>(1);
         let (event_tx, event_rx) = unbounded();
         let writer_events = event_tx.clone();
@@ -718,6 +810,7 @@ impl BusHandle {
         let worker_stop = stop.clone();
         let reader_stats = stats.clone();
         let writer_stats = stats;
+        let writer_journal = journal.clone();
         let join = thread::Builder::new()
             .name("arm-serial-tx".into())
             .spawn(move || {
@@ -732,15 +825,25 @@ impl BusHandle {
                     if let Ok(command) = command_rx.try_recv() {
                         match command {
                             BusCommand::Disable(reply) => {
-                                let result = bus.write_all(&stopped_setpoints());
+                                let started = Instant::now();
+                                let result = bus.write_all_recorded(
+                                    &stopped_setpoints(),
+                                    writer_journal.as_ref().map(|journal| (journal, started, 0)),
+                                );
                                 let _ = reply.send(result);
                                 disabled = true;
                             }
                             BusCommand::Write(setpoints, reply) => {
                                 let started = Instant::now();
-                                let result = bus.write_all(&setpoints);
+                                let result = bus.write_all_recorded(
+                                    &setpoints,
+                                    writer_journal.as_ref().map(|journal| (journal, started, 0)),
+                                );
                                 if result.is_ok() {
-                                    last = *setpoints;
+                                    last = PublishedSetpoints {
+                                        values: *setpoints,
+                                        seq: 0,
+                                    };
                                     next_write = started + WRITE_PERIOD;
                                     if let Ok(mut shared) = writer_stats.lock() {
                                         shared.transmit.record(
@@ -761,7 +864,12 @@ impl BusHandle {
                         }
                         if Instant::now() >= next_write {
                             let started = Instant::now();
-                            if let Err(error) = bus.write_all(&last) {
+                            if let Err(error) = bus.write_all_recorded(
+                                &last.values,
+                                writer_journal
+                                    .as_ref()
+                                    .map(|journal| (journal, started, last.seq)),
+                            ) {
                                 let _ = writer_events.send(BusEvent::Error(error));
                                 break;
                             }
@@ -795,7 +903,24 @@ impl BusHandle {
                     match reader.read_available() {
                         Ok(frames) => {
                             for frame in frames {
-                                let _ = event_tx.send(BusEvent::Feedback(frame, Instant::now()));
+                                let at = Instant::now();
+                                if let Some(journal) = journal.as_ref() {
+                                    journal.sample(
+                                        at,
+                                        TraceData::Feedback {
+                                            joint: frame.id,
+                                            q: frame.q,
+                                            dq: frame.dq,
+                                            tau: frame.tau,
+                                            temperature: frame.temperature,
+                                            voltage: frame.voltage,
+                                            error: frame.error,
+                                            mode: frame.mode,
+                                            timeout: frame.timeout,
+                                        },
+                                    );
+                                }
+                                let _ = event_tx.send(BusEvent::Feedback(frame, at));
                             }
                         }
                         Err(error) => {
@@ -827,9 +952,16 @@ impl BusHandle {
         })
     }
 
+    #[cfg(test)]
     pub fn send(&self, setpoints: [Setpoint; 7]) -> Result<(), String> {
+        self.send_with_sequence(setpoints, 0)
+    }
+    pub fn send_with_sequence(&self, setpoints: [Setpoint; 7], seq: u64) -> Result<(), String> {
         self.setpoints
-            .send(setpoints)
+            .send(PublishedSetpoints {
+                values: setpoints,
+                seq,
+            })
             .map_err(|_| "serial I/O thread is closed".into())
     }
 
@@ -1355,6 +1487,487 @@ mod tests {
             },
             wire,
         )
+    }
+
+    fn wait_for_protocol(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !ready() {
+            assert!(Instant::now() < deadline, "offline protocol test timed out");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn finish_trace(journal: &Journal, id: &str) -> crate::journal::TraceRecording {
+        journal.trace_stop().unwrap();
+        wait_for_protocol(|| journal.trace_list(1).unwrap()[0].status == "complete");
+        let recording = journal.trace_read(id).unwrap();
+        assert_eq!(recording.trace.errors, 0);
+        assert_eq!(recording.trace.pending, 0);
+        assert_eq!(recording.trace.accepted, recording.samples.len() as u64);
+        assert_eq!(recording.trace.written, recording.trace.accepted);
+        assert!(journal.shutdown(Duration::from_secs(2)));
+        recording
+    }
+
+    fn assert_source_time(at_us: u64, source: Instant, before: Instant, after: Instant) {
+        assert!(
+            source_time_matches(at_us, source, before, after),
+            "source timestamp was not retained"
+        );
+    }
+
+    fn source_time_matches(at_us: u64, source: Instant, before: Instant, after: Instant) -> bool {
+        let earliest = source.duration_since(after).as_micros() as u64;
+        let latest = source.duration_since(before).as_micros() as u64;
+        (earliest..=latest).contains(&at_us)
+    }
+
+    fn trace_number_matches(actual: f64, expected: f64) -> bool {
+        (actual - expected).abs() <= 4.0 * f64::EPSILON * expected.abs().max(1.0)
+    }
+
+    fn assert_trace_numbers<const N: usize>(actual: [f64; N], expected: [f64; N]) {
+        // Persisted JSON can round-trip with a few f64 ULPs of parser error.
+        // This allowance is far smaller than either f32 or any wire LSB.
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert!(
+                trace_number_matches(actual, expected),
+                "trace value {actual} differs from {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn offline_trace_links_published_sequences_wire_values_and_every_feedback_frame() {
+        for side in ["right", "left"] {
+            let directory = tempfile::tempdir().unwrap();
+            let journal = Journal::start(directory.path().join("events.db")).unwrap();
+            let before = Instant::now();
+            let trace = journal
+                .trace_start(20_000, side, Some("fake-port"))
+                .unwrap();
+            let after = Instant::now();
+            let calibration = calibrations(side).unwrap();
+            let g = golden();
+            let base = unhex(g["feedback"][0]["packet"].as_str().unwrap());
+            let duplicate = feedback_for_id(&base, 2);
+            let mut changed = duplicate.clone();
+            changed[10..14].copy_from_slice(&12345i32.to_le_bytes());
+            let crc = crc32(&changed[2..22]);
+            changed[22..26].copy_from_slice(&crc.to_le_bytes());
+            let frames = [
+                duplicate.clone(),
+                duplicate,
+                changed,
+                feedback_for_id(&base, 6),
+            ];
+            let mut corrupt = frames[0].clone();
+            corrupt[22] ^= 1;
+            let mut input = vec![0x55, 0xaa];
+            input.extend(corrupt);
+            input.extend(frames.iter().flatten());
+            let (mut bus, wire) = fake_bus(Wire {
+                write_chunk: 3,
+                // Split a frame across reads; one read also contains repeated IDs.
+                after_tx: VecDeque::from([input[..19].to_vec(), input[19..].to_vec()]),
+                ..Wire::default()
+            });
+            bus.calibration = calibration;
+            bus.budget = MAX_TRANSACTION;
+            let handle = BusHandle::start_recorded(bus, Some(journal.clone())).unwrap();
+            let first = std::array::from_fn(|i| Setpoint {
+                mode: DriveMode::Servo,
+                q: 0.123456789 + i as f64 * 0.07,
+                dq: if i == 0 { 0.0007 } else { -0.005 * i as f64 },
+                tau: 0.1234567 * (i + 1) as f64,
+                kp: 60.0,
+                kd: 1.0,
+            });
+            let second = first.map(|s| Setpoint {
+                q: s.q + 0.00003,
+                ..s
+            });
+            let encoded = |values: [Setpoint; 7]| -> Vec<u8> {
+                values
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, s)| encode(i as u8, calibration[i].command(*s)).unwrap())
+                    .collect()
+            };
+            let first_bytes = encoded(first);
+            let second_bytes = encoded(second);
+            handle.send_with_sequence(first, 71).unwrap();
+            wait_for_protocol(|| {
+                wire.lock()
+                    .unwrap()
+                    .written
+                    .as_chunks::<{ 7 * COMMAND_LEN }>()
+                    .0
+                    .iter()
+                    .filter(|batch| batch.as_slice() == first_bytes.as_slice())
+                    .count()
+                    >= 2
+            });
+            handle.send_with_sequence(second, 72).unwrap();
+            wait_for_protocol(|| {
+                wire.lock()
+                    .unwrap()
+                    .written
+                    .as_chunks::<{ 7 * COMMAND_LEN }>()
+                    .0
+                    .iter()
+                    .any(|batch| batch == second_bytes.as_slice())
+            });
+            let mut feedback = Vec::new();
+            wait_for_protocol(|| {
+                let (received, error) = handle.drain();
+                assert!(error.is_none(), "{error:?}");
+                feedback.extend(received);
+                feedback.len() == frames.len()
+            });
+            let clear = [Setpoint {
+                mode: DriveMode::ClearFault,
+                q: 5.0,
+                ..first[0]
+            }; 7];
+            handle.write_blocking(clear).unwrap();
+            handle.disable().unwrap();
+            let stopped_len = wire.lock().unwrap().written.len();
+            handle.send_with_sequence(first, 999).unwrap();
+            thread::sleep(WRITE_PERIOD * 2);
+            assert_eq!(wire.lock().unwrap().written.len(), stopped_len);
+            drop(handle);
+
+            let recording = finish_trace(&journal, &trace.id);
+            let written = wire.lock().unwrap().written.clone();
+            assert_eq!(written.len() % (7 * COMMAND_LEN), 0);
+            let batches = written.as_chunks::<{ 7 * COMMAND_LEN }>().0;
+            assert_eq!(
+                recording.samples.len() as u64 + recording.trace.dropped,
+                (batches.len() + frames.len()) as u64
+            );
+            let transmits: Vec<_> = recording
+                .samples
+                .iter()
+                .filter(|s| matches!(s.data, TraceData::Transmit { .. }))
+                .collect();
+            let mut remaining_batches = batches.iter();
+            for sample in &transmits {
+                let TraceData::Transmit {
+                    seq,
+                    mode,
+                    q_ref,
+                    dq_ref,
+                    tau_ff,
+                    q_wire,
+                    dq_wire,
+                    tau_wire,
+                    kp,
+                    kd,
+                    write_us,
+                } = sample.data
+                else {
+                    unreachable!()
+                };
+                let values = match seq {
+                    71 => first,
+                    72 => second,
+                    0 if q_ref[0] == clear[0].q => clear,
+                    0 => stopped_setpoints(),
+                    _ => panic!("unpublished transmit sequence {seq}"),
+                };
+                let expected_bytes = encoded(values);
+                let batch = remaining_batches
+                    .by_ref()
+                    .find(|batch| batch.as_slice() == expected_bytes.as_slice())
+                    .expect("captured TX is not an ordered subsequence of written batches");
+                assert_trace_numbers(q_ref, values.map(|s| s.q));
+                assert_trace_numbers(dq_ref, values.map(|s| s.dq));
+                assert_trace_numbers(tau_ff, values.map(|s| s.tau));
+                assert_eq!(kp, values.map(|s| s.kp));
+                assert_eq!(kd, values.map(|s| s.kd));
+                assert!(write_us > 0);
+                for (i, packet) in batch.as_chunks::<COMMAND_LEN>().0.iter().enumerate() {
+                    assert_eq!(mode[i], (packet[2] >> 4) & 0x07);
+                    // Feed the actual command fields through the independently
+                    // golden-tested feedback path, with its different offsets/CRC.
+                    let mut reply = [0u8; FEEDBACK_LEN];
+                    reply[..2].copy_from_slice(&[0xfc, 0xee]);
+                    reply[2] = packet[2];
+                    reply[6..14].copy_from_slice(&packet[4..12]);
+                    let crc = crc32(&reply[2..22]);
+                    reply[22..26].copy_from_slice(&crc.to_le_bytes());
+                    let decoded = calibration[i].feedback(decode(&reply).unwrap());
+                    assert_trace_numbers(
+                        [q_wire[i], dq_wire[i], tau_wire[i]],
+                        [decoded.q, decoded.dq, decoded.tau],
+                    );
+                }
+                if seq == 71 || seq == 72 {
+                    assert_eq!(dq_wire[0], 0.0);
+                    assert_ne!(dq_ref[0], dq_wire[0]);
+                    assert_ne!(q_ref, q_wire);
+                }
+            }
+            if recording.trace.dropped == 0 {
+                assert_eq!(transmits.len(), batches.len());
+                assert!(
+                    transmits
+                        .iter()
+                        .filter(|s| matches!(s.data, TraceData::Transmit { seq: 71, .. }))
+                        .count()
+                        >= 2
+                );
+                assert!(
+                    transmits
+                        .iter()
+                        .any(|s| matches!(s.data, TraceData::Transmit { seq: 72, .. }))
+                );
+            }
+            let captured: Vec<_> = recording
+                .samples
+                .iter()
+                .filter(|s| matches!(s.data, TraceData::Feedback { .. }))
+                .collect();
+            if recording.trace.dropped == 0 {
+                assert_eq!(captured.len(), frames.len());
+            }
+            let mut remaining_feedback = feedback.iter().zip(&frames);
+            for sample in captured {
+                let TraceData::Feedback {
+                    joint,
+                    q,
+                    dq,
+                    tau,
+                    temperature,
+                    voltage,
+                    error,
+                    mode,
+                    timeout,
+                } = sample.data
+                else {
+                    unreachable!()
+                };
+                let ((event, at), frame) = remaining_feedback
+                    .by_ref()
+                    .find(|((event, at), _)| {
+                        joint == event.id
+                            && trace_number_matches(q, event.q)
+                            && source_time_matches(sample.at_us, *at, before, after)
+                    })
+                    .expect("captured feedback is not an ordered subsequence of decoded frames");
+                let expected = calibration[event.id as usize].feedback(decode(frame).unwrap());
+                assert_eq!(
+                    (joint, error, mode, timeout),
+                    (expected.id, expected.error, expected.mode, expected.timeout)
+                );
+                assert_trace_numbers(
+                    [q, dq, tau, temperature, voltage],
+                    [
+                        expected.q,
+                        expected.dq,
+                        expected.tau,
+                        expected.temperature,
+                        expected.voltage,
+                    ],
+                );
+                assert_eq!(event.q, expected.q);
+                assert_source_time(sample.at_us, *at, before, after);
+            }
+        }
+    }
+
+    #[test]
+    fn offline_trace_wire_lsb_staircase_and_float32_rounding_use_encoded_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = Journal::start(directory.path().join("events.db")).unwrap();
+        let before = Instant::now();
+        let trace = journal
+            .trace_start(20_000, "right", Some("fake-port"))
+            .unwrap();
+        let after = Instant::now();
+        let (mut bus, wire) = fake_bus(Wire {
+            write_chunk: COMMAND_LEN,
+            ..Wire::default()
+        });
+        bus.calibration = [Calibration {
+            gain: 1.0,
+            offset: 0.0,
+        }; 7];
+        bus.budget = MAX_TRANSACTION;
+        let position_lsb: [f64; 7] = std::array::from_fn(|i| 2.0 * PI / 32768.0 / ratio(i as u8));
+        let velocity_lsb: [f64; 7] = std::array::from_fn(|i| 2.0 * PI / 64.0 / ratio(i as u8));
+        let torque_lsb: [f64; 7] = std::array::from_fn(|i| ratio(i as u8) / 2560.0);
+        let fractions = [0.0, 0.2, 0.4, 0.6, 0.8, 1.2];
+        let mut sources = Vec::new();
+        let mut values_by_sequence = Vec::new();
+        for (seq, fraction) in fractions.into_iter().enumerate() {
+            let values = std::array::from_fn(|i| Setpoint {
+                mode: DriveMode::Servo,
+                q: position_lsb[i] * fraction,
+                dq: position_lsb[i] * 0.2 / WRITE_PERIOD.as_secs_f64(),
+                tau: torque_lsb[i] * 0.51,
+                kp: 60.0,
+                kd: 1.0,
+            });
+            let started = Instant::now();
+            if seq == 0 {
+                // Delayed submission must keep the source Instant, not write,
+                // queue-consumption, serialization or SQLite completion time.
+                thread::sleep(Duration::from_millis(20));
+            }
+            bus.write_all_recorded(&values, Some((&journal, started, seq as u64)))
+                .unwrap();
+            sources.push(started);
+            values_by_sequence.push(values);
+        }
+        for (n, delta) in [-1e-10, 1e-10].into_iter().enumerate() {
+            let values = std::array::from_fn(|i| Setpoint {
+                mode: DriveMode::Servo,
+                q: position_lsb[i] * (0.5 + delta),
+                dq: velocity_lsb[i] * (0.5 + delta),
+                tau: torque_lsb[i] * (0.5 + delta),
+                kp: 60.0,
+                kd: 1.0,
+            });
+            let started = Instant::now();
+            bus.write_all_recorded(&values, Some((&journal, started, (n + 6) as u64)))
+                .unwrap();
+            sources.push(started);
+            values_by_sequence.push(values);
+        }
+        let negative = std::array::from_fn(|i| Setpoint {
+            mode: DriveMode::Servo,
+            q: -position_lsb[i] * 0.6,
+            dq: -velocity_lsb[i] * 0.6,
+            tau: -torque_lsb[i] * 0.6,
+            kp: 60.0,
+            kd: 1.0,
+        });
+        let started = Instant::now();
+        bus.write_all_recorded(&negative, Some((&journal, started, 8)))
+            .unwrap();
+        sources.push(started);
+        values_by_sequence.push(negative);
+        let recording = finish_trace(&journal, &trace.id);
+        assert_eq!(
+            recording.samples.len() as u64 + recording.trace.dropped,
+            sources.len() as u64
+        );
+        let written = wire.lock().unwrap().written.clone();
+        let batches = written.as_chunks::<{ 7 * COMMAND_LEN }>().0;
+        assert_eq!(batches.len(), sources.len());
+        // Check every actual batch even if the bounded recorder dropped it.
+        for (n, batch) in batches.iter().enumerate() {
+            for packet in batch.as_chunks::<COMMAND_LEN>().0 {
+                if n < 6 {
+                    assert_eq!(
+                        i32::from_le_bytes(packet[8..12].try_into().unwrap()),
+                        [0, 0, 0, 1, 1, 1][n]
+                    );
+                    assert_eq!(i16::from_le_bytes(packet[6..8].try_into().unwrap()), 0);
+                    assert_eq!(i16::from_le_bytes(packet[4..6].try_into().unwrap()), 1);
+                } else if n == 8 {
+                    assert_eq!(i32::from_le_bytes(packet[8..12].try_into().unwrap()), -1);
+                    assert_eq!(i16::from_le_bytes(packet[6..8].try_into().unwrap()), -1);
+                    assert_eq!(i16::from_le_bytes(packet[4..6].try_into().unwrap()), -1);
+                }
+            }
+        }
+        let mut previous_seq = None;
+        for sample in &recording.samples {
+            let TraceData::Transmit {
+                seq,
+                mode,
+                q_ref,
+                dq_ref,
+                tau_ff,
+                q_wire,
+                dq_wire,
+                tau_wire,
+                ..
+            } = sample.data
+            else {
+                unreachable!()
+            };
+            let n = usize::try_from(seq).unwrap();
+            assert!(n < batches.len() && previous_seq.is_none_or(|prev| seq > prev));
+            previous_seq = Some(seq);
+            assert_source_time(sample.at_us, sources[n], before, after);
+            assert_eq!(mode, [1; 7]);
+            assert_trace_numbers(q_ref, values_by_sequence[n].map(|s| s.q));
+            assert_trace_numbers(dq_ref, values_by_sequence[n].map(|s| s.dq));
+            assert_trace_numbers(tau_ff, values_by_sequence[n].map(|s| s.tau));
+            for (i, packet) in batches[n].as_chunks::<COMMAND_LEN>().0.iter().enumerate() {
+                let p = i32::from_le_bytes(packet[8..12].try_into().unwrap());
+                let v = i16::from_le_bytes(packet[6..8].try_into().unwrap());
+                let t = i16::from_le_bytes(packet[4..6].try_into().unwrap());
+                assert_trace_numbers(
+                    [q_wire[i], dq_wire[i], tau_wire[i]],
+                    [
+                        (p as f64 * position_lsb[i]) as f32 as f64,
+                        (v as f64 * velocity_lsb[i]) as f32 as f64,
+                        (t as f64 * torque_lsb[i]) as f32 as f64,
+                    ],
+                );
+            }
+        }
+        // Opposite sides of a half-LSB boundary collapse to the same f32.
+        // A pre-encoding f64 estimate would incorrectly show different steps.
+        for i in 0..7 {
+            let a = values_by_sequence[6][i];
+            let b = values_by_sequence[7][i];
+            assert!(a.q < position_lsb[i] * 0.5 && b.q > position_lsb[i] * 0.5);
+            assert!(a.dq < velocity_lsb[i] * 0.5 && b.dq > velocity_lsb[i] * 0.5);
+            assert!(a.tau < torque_lsb[i] * 0.5 && b.tau > torque_lsb[i] * 0.5);
+            assert_eq!(a.q as f32, b.q as f32);
+            assert_eq!(a.dq as f32, b.dq as f32);
+            assert_eq!(a.tau as f32, b.tau as f32);
+        }
+        assert_eq!(
+            &written[6 * 7 * COMMAND_LEN..7 * 7 * COMMAND_LEN],
+            &written[7 * 7 * COMMAND_LEN..8 * 7 * COMMAND_LEN]
+        );
+    }
+
+    #[test]
+    fn offline_trace_does_not_report_rejected_or_partially_written_batches() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = Journal::start(directory.path().join("events.db")).unwrap();
+        let trace = journal
+            .trace_start(20_000, "right", Some("fake-port"))
+            .unwrap();
+        let (mut bus, wire) = fake_bus(Wire {
+            write_chunk: 5,
+            fail_after: Some(5),
+            fail_kind: Some(io::ErrorKind::BrokenPipe),
+            ..Wire::default()
+        });
+        let mut invalid = stopped_setpoints();
+        invalid[6] = Setpoint {
+            mode: DriveMode::Servo,
+            q: f64::NAN,
+            ..stop()
+        };
+        assert!(
+            bus.write_all_recorded(&invalid, Some((&journal, Instant::now(), 81)))
+                .is_err()
+        );
+        assert!(wire.lock().unwrap().written.is_empty());
+        assert!(
+            bus.write_all_recorded(&stopped_setpoints(), Some((&journal, Instant::now(), 82)))
+                .is_err()
+        );
+        assert_eq!(wire.lock().unwrap().written.len(), 5);
+        assert!(
+            bus.write_all_recorded(&stopped_setpoints(), Some((&journal, Instant::now(), 83)))
+                .unwrap_err()
+                .contains("reconnect")
+        );
+        assert_eq!(wire.lock().unwrap().written.len(), 5);
+        let recording = finish_trace(&journal, &trace.id);
+        assert!(recording.samples.is_empty());
+        assert_eq!(recording.trace.dropped, 0);
     }
 
     #[test]

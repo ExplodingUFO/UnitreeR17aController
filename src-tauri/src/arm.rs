@@ -1,7 +1,11 @@
 use crate::{
-    journal::{Journal, JournalStats},
-    kinematics::{self, Frame, Kinematics, LocalTarget, MotionLimits, Pose, StepInput},
+    journal::{Journal, JournalStats, TraceData},
+    kinematics::{
+        self, CartesianPath, Frame, Kinematics, LocalTarget, MotionLimits, Pose, SmoothingState,
+        StepInput,
+    },
     protocol::{BusHandle, DriveMode, Feedback, Setpoint},
+    trajectory::{self, JOINT_ACCELERATION, JOINT_JERK, JOINT_SPEED},
 };
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use serde::{Deserialize, Serialize};
@@ -24,8 +28,6 @@ const CONTROL_PERIOD: Duration = Duration::from_millis(10);
 // Position error is what creates holding torque; do not clamp it so tightly
 // that a load drags the commanded reference down with the measured joint.
 const MAX_TRACKING_ERROR: f64 = 0.60;
-const JOINT_SPEED: f64 = 0.20;
-const JOINT_ACCELERATION: f64 = 0.60;
 const LINEAR_SPEED: f64 = 0.015;
 const ANGULAR_SPEED: f64 = 0.15;
 // The official motion demo uses these gains for loaded joint movement.
@@ -439,6 +441,11 @@ struct Core {
     feedback: [Option<Observation>; 7],
     reference: [f64; 7],
     velocity: [f64; 7],
+    acceleration: [f64; 7],
+    jerk: [f64; 7],
+    control_seq: u64,
+    control_at: Instant,
+    stop_path: Option<CartesianPath>,
     tcp: Option<Pose>,
     enabled: bool,
     close_requested: bool,
@@ -481,6 +488,11 @@ impl Core {
             feedback: std::array::from_fn(|_| None),
             reference: [0.0; 7],
             velocity: [0.0; 7],
+            acceleration: [0.0; 7],
+            jerk: [0.0; 7],
+            control_seq: 0,
+            control_at: Instant::now(),
+            stop_path: None,
             tcp: None,
             enabled: false,
             close_requested: false,
@@ -549,14 +561,17 @@ impl Core {
     fn end_motion(&mut self, status: &str, code: &str, message: &str) {
         if let Some((id, _)) = self.enable_request.take() {
             self.enabled = false;
-            self.velocity = [0.0; 7];
+            self.reset_derivatives();
             self.record(&id, status, code, message);
         }
         if let Some(motion) = self.motion.take() {
+            self.stop_path = Self::motion_path(&motion);
             self.record(&motion.request_id, status, code, message);
         }
         self.generation += 1;
-        self.stopping = self.enabled && self.velocity.iter().any(|v| v.abs() > 1e-6);
+        self.stopping = self.enabled
+            && (self.velocity.iter().any(|v| v.abs() > 1e-12)
+                || self.acceleration.iter().any(|a| a.abs() > 1e-12));
         self.phase();
         self.dirty = true;
     }
@@ -572,7 +587,7 @@ impl Core {
             self.generation += 1;
         }
         self.enabled = false;
-        self.velocity = [0.0; 7];
+        self.reset_derivatives();
         self.stopping = false;
         self.error = Some(ApiError::new(code, message.clone()));
         self.phase = Phase::Fault;
@@ -763,8 +778,14 @@ impl Core {
                 let model = Kinematics::load(&side).map_err(|e| ApiError::new("model_error", e))?;
                 // The first FTDI reply after opening can arrive after the
                 // adapter's latency timer; 20 ms also bounds a failed probe.
-                let bus = BusHandle::open(&port, &side, 6_000_000, Duration::from_millis(20))
-                    .map_err(|e| ApiError::new("connect_failed", e))?;
+                let bus = BusHandle::open_recorded(
+                    &port,
+                    &side,
+                    6_000_000,
+                    Duration::from_millis(20),
+                    self.journal.clone(),
+                )
+                .map_err(|e| ApiError::new("connect_failed", e))?;
                 if self.side != side || self.tcp.is_none() {
                     // Link7 itself is a usable jog reference on a bare flange.
                     // A user-supplied tool transform replaces it explicitly.
@@ -782,7 +803,7 @@ impl Core {
                 self.error = None;
                 self.motion = None;
                 self.enable_request = None;
-                self.velocity = [0.0; 7];
+                self.reset_derivatives();
                 self.connected_at = Some(now);
                 self.phase = Phase::Connecting;
                 self.generation += 1;
@@ -811,7 +832,7 @@ impl Core {
                 }
                 self.reference = self.measured(now)?;
                 self.check_positions(&self.reference)?;
-                self.velocity = [0.0; 7];
+                self.reset_derivatives();
                 self.enable_request = Some((id.into(), now));
                 self.stopping = false;
                 self.phase = Phase::Enabling;
@@ -821,7 +842,7 @@ impl Core {
                 self.require_release(allow_release)?;
                 self.end_motion("cancelled", "disabled", "设备已失能");
                 self.enabled = false;
-                self.velocity = [0.0; 7];
+                self.reset_derivatives();
                 self.stopping = false;
                 self.phase();
             }
@@ -950,7 +971,7 @@ impl Core {
     fn disconnect(&mut self) {
         self.end_motion("cancelled", "disconnected", "设备连接已断开");
         self.enabled = false;
-        self.velocity = [0.0; 7];
+        self.reset_derivatives();
         self.stopping = false;
         self.send_disable();
         self.bus = None;
@@ -1011,7 +1032,7 @@ impl Core {
             return Err(ApiError::new("invalid_pose", "收纳轨迹时长无效"));
         }
         self.reference = anchor;
-        self.velocity = [0.0; 7];
+        self.reset_derivatives();
         self.motion = Some(Motion {
             request_id: id.into(),
             space: Space::Joint,
@@ -1068,7 +1089,7 @@ impl Core {
             return Err(ApiError::new("speed_limit", "速度超出当前限制"));
         }
         self.reference = anchor;
-        self.velocity = [0.0; 7];
+        self.reset_derivatives();
         let mut target = anchor;
         let mut initial_pose = None;
         let mut target_pose = None;
@@ -1142,26 +1163,119 @@ impl Core {
         }
         Ok(())
     }
-    // Constrain the velocity that will actually be transmitted, then integrate once.
+    fn reset_derivatives(&mut self) {
+        self.velocity = [0.0; 7];
+        self.acceleration = [0.0; 7];
+        self.jerk = [0.0; 7];
+        self.stop_path = None;
+    }
+    fn motion_path(motion: &Motion) -> Option<CartesianPath> {
+        (motion.space == Space::Cartesian).then(|| CartesianPath {
+            origin: motion.initial_pose.unwrap(),
+            axis: motion.axis,
+            frame: motion.frame,
+        })
+    }
+    // Constrain the controller velocity before integrating its reference once.
+    // The serial sender may coalesce updates; capture its timing separately.
     // Absolute-time waypoints alone do not bound derivatives under scheduler jitter.
     fn commit_joint_velocity(&mut self, desired: [f64; 7], dt: f64) -> Result<(), ApiError> {
-        let mut velocity = [0.0; 7];
-        let mut reference = self.reference;
-        for i in 0..7 {
-            let low = (-JOINT_SPEED).max(self.velocity[i] - JOINT_ACCELERATION * dt);
-            let high = JOINT_SPEED.min(self.velocity[i] + JOINT_ACCELERATION * dt);
-            if !desired[i].is_finite() || low > high {
-                return Err(ApiError::new("joint_dynamics", "关节动态约束无法满足"));
-            }
-            velocity[i] = desired[i].clamp(low, high);
-            reference[i] += velocity[i] * dt;
-        }
+        let window = trajectory::velocity_window(
+            self.velocity,
+            self.acceleration,
+            desired,
+            [JOINT_SPEED; 7],
+            [JOINT_ACCELERATION; 7],
+            [JOINT_JERK; 7],
+            dt,
+        )
+        .map_err(|e| ApiError::new("joint_dynamics", e))?;
+        let velocity = std::array::from_fn(|i| desired[i].clamp(window.low[i], window.high[i]));
+        let (reference, acceleration) =
+            trajectory::integrate(self.reference, self.velocity, velocity, dt);
         self.check_positions(&reference)?;
+        self.jerk = std::array::from_fn(|i| (acceleration[i] - self.acceleration[i]) / dt);
         self.reference = reference;
         self.velocity = velocity;
+        self.acceleration = acceleration;
         Ok(())
     }
+    fn commit_cartesian(
+        &mut self,
+        target: LocalTarget,
+        path: Option<CartesianPath>,
+        measured: [f64; 7],
+        dt: f64,
+        stopping: bool,
+    ) -> Result<(), String> {
+        let candidate = self
+            .model
+            .as_ref()
+            .ok_or("missing model")?
+            .step(StepInput {
+                reference: self.reference,
+                measured,
+                previous_velocity: self.velocity,
+                target,
+                dt,
+                tcp: self.tcp.ok_or("missing TCP")?,
+                limits: MotionLimits {
+                    joint_velocity: [JOINT_SPEED; 7],
+                    joint_acceleration: [JOINT_ACCELERATION; 7],
+                    max_reference_error: MAX_TRACKING_ERROR,
+                    max_joint_step: 0.01,
+                    linear_speed: LINEAR_SPEED,
+                    angular_speed: ANGULAR_SPEED,
+                },
+                smoothing: Some(SmoothingState {
+                    acceleration: self.acceleration,
+                    jerk: [JOINT_JERK; 7],
+                    path,
+                    stopping,
+                }),
+            })?;
+        self.jerk = std::array::from_fn(|i| (candidate.ddq[i] - self.acceleration[i]) / dt);
+        self.reference = candidate.q;
+        self.velocity = candidate.dq;
+        self.acceleration = candidate.ddq;
+        Ok(())
+    }
+    fn decelerate(&mut self, measured: [f64; 7], dt: f64) -> Result<(), ApiError> {
+        let near_rest = self.velocity.iter().all(|v| v.abs() < 1e-6)
+            && self.acceleration.iter().all(|a| a.abs() < 1e-4);
+        if let Some(path) = self.stop_path
+            && !near_rest
+        {
+            match self.commit_cartesian(
+                LocalTarget::Velocity {
+                    twist: [0.0; 6],
+                    frame: Frame::Base,
+                },
+                Some(path),
+                measured,
+                dt,
+                true,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    // Stopping remains possible if the selected Cartesian path
+                    // becomes infeasible. Do not keep an old motion alive.
+                    self.journal
+                        .log("warn", "control", "stop_path", &error, None);
+                    self.stop_path = None;
+                }
+            }
+        }
+        self.commit_joint_velocity([0.0; 7], dt)
+    }
+    fn at_rest(&self) -> bool {
+        self.velocity.iter().all(|v| v.abs() < 1e-12)
+            && self.acceleration.iter().all(|a| a.abs() < 1e-12)
+    }
     fn advance(&mut self, now: Instant, dt: f64) {
+        self.control_seq = self.control_seq.wrapping_add(1);
+        self.control_at = now;
+        self.jerk = [0.0; 7];
         self.settle_transitions(now);
         if !self.enabled {
             return;
@@ -1202,12 +1316,13 @@ impl Core {
             self.end_motion("cancelled", "input_expired", "连续输入已过期");
         }
         if self.stopping {
-            if let Err(e) = self.commit_joint_velocity([0.0; 7], dt) {
+            if let Err(e) = self.decelerate(measured, dt) {
                 self.fault(&e.code, e.message);
                 return;
             }
-            if self.velocity.iter().all(|v| v.abs() < 1e-12) {
+            if self.at_rest() {
                 self.stopping = false;
+                self.stop_path = None;
                 self.phase();
                 self.dirty = true;
             }
@@ -1220,6 +1335,9 @@ impl Core {
         let mode = motion.mode;
         if matches!(mode, MotionMode::Return { .. }) && elapsed > motion.duration + 3.0 {
             self.end_motion("failed", "target_timeout", "收纳到位超时，已停止返回");
+            if let Err(e) = self.decelerate(measured, dt) {
+                self.fault(&e.code, e.message);
+            }
             return;
         }
         let t = if mode.timed() {
@@ -1252,11 +1370,12 @@ impl Core {
         let at_target =
             mode.timed() && t >= 1.0 && within_target(&measured) && within_target(&self.reference);
         if at_target {
-            if let Err(e) = self.commit_joint_velocity([0.0; 7], dt) {
+            self.stop_path = Self::motion_path(motion);
+            if let Err(e) = self.decelerate(measured, dt) {
                 self.fault(&e.code, e.message);
                 return;
             }
-            if self.velocity.iter().all(|v| v.abs() < 1e-12) {
+            if self.at_rest() {
                 if let MotionMode::Return { disconnect_after } = mode {
                     let slow = self.feedback.iter().all(|sample| {
                         sample.as_ref().is_some_and(|sample| {
@@ -1287,12 +1406,14 @@ impl Core {
                         self.record(&id, "completed", "parked", "收纳到位，连接已断开");
                     } else {
                         self.generation += 1;
+                        self.stop_path = None;
                         self.record(&id, "completed", "returned", "已返回收纳位");
                         self.phase();
                     }
                     return;
                 }
                 let id = self.motion.take().unwrap().request_id;
+                self.stop_path = None;
                 self.generation += 1;
                 self.record(&id, "completed", "completed", "动作已完成");
                 self.phase();
@@ -1322,7 +1443,6 @@ impl Core {
                 return;
             }
         } else {
-            let tcp = *self.tcp.as_ref().unwrap();
             let target = if motion.mode.timed() {
                 let mut delta = [0.0; 6];
                 delta[motion.axis] = motion.direction * motion.amount * smooth;
@@ -1334,6 +1454,9 @@ impl Core {
                     Ok(target) => LocalTarget::Pose(target),
                     Err(e) => {
                         self.end_motion("failed", "kinematics", &e);
+                        if let Err(e) = self.decelerate(measured, dt) {
+                            self.fault(&e.code, e.message);
+                        }
                         return;
                     }
                 }
@@ -1345,29 +1468,13 @@ impl Core {
                     frame: motion.frame,
                 }
             };
-            let limits = MotionLimits {
-                joint_velocity: [JOINT_SPEED; 7],
-                joint_acceleration: [JOINT_ACCELERATION; 7],
-                max_reference_error: MAX_TRACKING_ERROR,
-                max_joint_step: 0.01,
-                linear_speed: LINEAR_SPEED,
-                angular_speed: ANGULAR_SPEED,
-            };
-            match self.model.as_ref().unwrap().step(StepInput {
-                reference: self.reference,
-                measured,
-                previous_velocity: self.velocity,
-                target,
-                dt: dt.max(0.0001),
-                tcp,
-                limits,
-            }) {
-                Ok(candidate) => {
-                    self.reference = candidate.q;
-                    self.velocity = candidate.dq;
-                }
+            match self.commit_cartesian(target, Self::motion_path(motion), measured, dt, false) {
+                Ok(()) => {}
                 Err(e) => {
                     self.end_motion("failed", "kinematics", &e);
+                    if let Err(e) = self.decelerate(measured, dt) {
+                        self.fault(&e.code, e.message);
+                    }
                     return;
                 }
             }
@@ -1409,6 +1516,45 @@ impl Core {
             kd: if servo { SERVO_KD } else { 0.0 },
         });
         let clearing = self.clear_pending.iter().any(|pending| *pending);
+        let motion = self.motion.as_ref();
+        self.journal.sample(
+            self.control_at,
+            TraceData::Control {
+                seq: self.control_seq,
+                generation: self.generation,
+                enabled: self.enabled,
+                stopping: self.stopping,
+                motion: motion.map_or(0, |m| match (m.space, m.mode) {
+                    (_, MotionMode::Return { .. }) => 5,
+                    (Space::Joint, MotionMode::Continuous) => 1,
+                    (Space::Joint, MotionMode::Step) => 2,
+                    (Space::Cartesian, MotionMode::Continuous) => 3,
+                    (Space::Cartesian, MotionMode::Step) => 4,
+                }),
+                axis: motion
+                    .filter(|m| !matches!(m.mode, MotionMode::Return { .. }))
+                    .map(|m| m.axis as u8),
+                q_ref: self.reference,
+                dq_ref: self.velocity,
+                ddq_ref: self.acceleration,
+                jerk_ref: self.jerk,
+                tau_ff: std::array::from_fn(|i| setpoints[i].tau),
+                q: std::array::from_fn(|i| self.feedback[i].as_ref().map(|s| s.value.q)),
+                dq: std::array::from_fn(|i| self.feedback[i].as_ref().map(|s| s.value.dq)),
+                tau: std::array::from_fn(|i| self.feedback[i].as_ref().map(|s| s.value.tau)),
+                voltage: std::array::from_fn(|i| {
+                    self.feedback[i].as_ref().map(|s| s.value.voltage)
+                }),
+                age_us: std::array::from_fn(|i| {
+                    self.feedback[i].as_ref().map(|s| {
+                        self.control_at
+                            .saturating_duration_since(s.at)
+                            .as_micros()
+                            .min(u64::MAX as u128) as u64
+                    })
+                }),
+            },
+        );
         let Some(bus) = self.bus.as_ref() else {
             return;
         };
@@ -1417,7 +1563,7 @@ impl Core {
         } else {
             Ok(())
         };
-        let send_result = bus.send(setpoints);
+        let send_result = bus.send_with_sequence(setpoints, self.control_seq);
         let (values, read_error) = bus.drain();
         let stats = bus.stats();
         if let Err(e) = clear_result {
@@ -2284,6 +2430,201 @@ mod tests {
         }
         assert!(completed);
     }
+
+    #[test]
+    fn every_joint_jog_keeps_steady_low_speed_and_jerk_bounded_through_stop() {
+        for axis in 0..7 {
+            for speed in [0.001, 0.05, JOINT_SPEED] {
+                for direction in [-1, 1] {
+                    let mut now = Instant::now();
+                    let (mut core, _directory) = observed_core(now);
+                    core.enabled = true;
+                    core.port = Some("memory-only".into());
+                    core.begin(
+                        "jog",
+                        Space::Joint,
+                        axis,
+                        direction,
+                        speed,
+                        Frame::Base,
+                        false,
+                        0.0,
+                        None,
+                        0,
+                        now,
+                    )
+                    .unwrap();
+                    for tick in 0..600 {
+                        let dt = [0.040, 0.002, 0.007, 0.003][tick % 4];
+                        now += Duration::from_secs_f64(dt);
+                        follow_reference(&mut core, now);
+                        if tick == 180 {
+                            core.apply("stop", Operation::Stop, now, now).unwrap();
+                        }
+                        let q = core.reference;
+                        let v = core.velocity;
+                        let a = core.acceleration;
+                        core.advance(now, dt);
+                        assert_integrated_dynamics(&core, q, v, dt);
+                        for (i, previous_a) in a.into_iter().enumerate() {
+                            assert!(
+                                (core.acceleration[i] - previous_a).abs() <= JOINT_JERK * dt + 1e-9,
+                                "axis={axis} speed={speed} tick={tick} joint={i}"
+                            );
+                            if i != axis {
+                                assert_eq!(core.velocity[i], 0.0);
+                            }
+                        }
+                        assert!(core.velocity[axis] * direction as f64 >= -1e-10);
+                        if (100..180).contains(&tick) {
+                            assert!((core.velocity[axis] - direction as f64 * speed).abs() < 1e-9);
+                            assert!(core.acceleration[axis].abs() < 1e-9);
+                        }
+                        if tick >= 180 && !core.stopping {
+                            break;
+                        }
+                    }
+                    assert!(core.motion.is_none() && !core.stopping && core.at_rest());
+                    assert!(core.enabled && core.port.is_some());
+                    assert!(core.results.iter().any(|r| r.request_id == "jog"
+                        && r.status == "cancelled"
+                        && r.code == "stopped"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_joint_step_reaches_rest_with_bounded_jerk_under_jitter() {
+        for axis in 0..7 {
+            for speed in [0.001, 0.05, JOINT_SPEED] {
+                let mut now = Instant::now();
+                let (mut core, _directory) = observed_core(now);
+                core.enabled = true;
+                core.begin(
+                    "step",
+                    Space::Joint,
+                    axis,
+                    -1,
+                    speed,
+                    Frame::Base,
+                    true,
+                    0.02,
+                    None,
+                    0,
+                    now,
+                )
+                .unwrap();
+                for tick in 0..4000 {
+                    let dt = [0.040, 0.002, 0.007, 0.003][tick % 4];
+                    now += Duration::from_secs_f64(dt);
+                    follow_reference(&mut core, now);
+                    let q = core.reference;
+                    let v = core.velocity;
+                    let a = core.acceleration;
+                    core.advance(now, dt);
+                    assert_integrated_dynamics(&core, q, v, dt);
+                    for (i, previous_a) in a.into_iter().enumerate() {
+                        assert!(
+                            (core.acceleration[i] - previous_a).abs() <= JOINT_JERK * dt + 1e-9,
+                            "axis={axis} speed={speed} tick={tick}"
+                        );
+                    }
+                    if core.motion.is_none() {
+                        break;
+                    }
+                }
+                assert!(
+                    core.motion.is_none() && core.at_rest(),
+                    "axis={axis} speed={speed}"
+                );
+                assert_eq!(core.results.front().unwrap().code, "completed");
+                assert!(core.enabled);
+            }
+        }
+    }
+
+    #[test]
+    fn cartesian_jogs_and_steps_preserve_offset_tcp_and_jerk_at_low_speed() {
+        for frame in [Frame::Base, Frame::Tool] {
+            for axis in 0..6 {
+                for step in [false, true] {
+                    let mut now = Instant::now();
+                    let (mut core, _directory) = observed_core(now);
+                    let q = [1.5576, -0.0350, 0.0102, -0.0217, 1.6217, 0.0088, 0.1133];
+                    for (i, value) in q.into_iter().enumerate() {
+                        let mut f = core.feedback[i].as_ref().unwrap().value.clone();
+                        f.q = value;
+                        core.accept_feedback(f, now);
+                    }
+                    core.reference = q;
+                    core.enabled = true;
+                    core.tcp = Some(Pose {
+                        translation: [0.0, 0.0, 0.1],
+                        rotation: [0.0, 0.0, 0.0, 1.0],
+                    });
+                    core.port = Some("memory-only".into());
+                    let speed = if axis < 3 { 0.0005 } else { 0.005 };
+                    let amount = if axis < 3 { 0.002 } else { 0.03 };
+                    core.begin(
+                        "cartesian",
+                        Space::Cartesian,
+                        axis,
+                        1,
+                        speed,
+                        frame,
+                        step,
+                        amount,
+                        None,
+                        0,
+                        now,
+                    )
+                    .unwrap();
+                    let path = Core::motion_path(core.motion.as_ref().unwrap()).unwrap();
+                    for tick in 0..2200 {
+                        let dt = [0.040, 0.002, 0.007, 0.003][tick % 4];
+                        now += Duration::from_secs_f64(dt);
+                        follow_reference(&mut core, now);
+                        if !step && tick == 180 {
+                            core.apply("stop", Operation::Stop, now, now).unwrap();
+                        }
+                        let old_q = core.reference;
+                        let old_v = core.velocity;
+                        let old_a = core.acceleration;
+                        core.advance(now, dt);
+                        assert_integrated_dynamics(&core, old_q, old_v, dt);
+                        for (i, previous_a) in old_a.into_iter().enumerate() {
+                            assert!(
+                                (core.acceleration[i] - previous_a).abs() <= JOINT_JERK * dt + 1e-8,
+                                "{frame:?} axis={axis} step={step} tick={tick}"
+                            );
+                        }
+                        path.check(
+                            &core
+                                .model
+                                .as_ref()
+                                .unwrap()
+                                .fk(&core.reference, core.tcp.as_ref().unwrap())
+                                .unwrap(),
+                        )
+                        .unwrap();
+                        if core.motion.is_none() && !core.stopping {
+                            break;
+                        }
+                    }
+                    assert!(
+                        core.motion.is_none() && !core.stopping && core.at_rest(),
+                        "{frame:?} axis={axis} step={step}"
+                    );
+                    assert_eq!(
+                        core.results.front().unwrap().code,
+                        if step { "completed" } else { "stopped" }
+                    );
+                    assert!(core.enabled && core.port.is_some());
+                }
+            }
+        }
+    }
     #[test]
     fn cartesian_step_decelerates_before_reporting_completed() {
         let mut now = Instant::now();
@@ -2322,7 +2663,7 @@ mod tests {
         assert_integrated_dynamics(&core, q, dq, 0.002);
         assert!(core.motion.is_some());
         assert!(core.velocity[0] > 0.0);
-        for _ in 0..50 {
+        for _ in 0..300 {
             now += Duration::from_millis(2);
             follow_reference(&mut core, now);
             let q = core.reference;
@@ -2346,10 +2687,10 @@ mod tests {
         core.begin(
             "cartesian",
             Space::Cartesian,
-            0,
+            5,
             1,
             0.005,
-            Frame::Base,
+            Frame::Tool,
             true,
             0.001,
             None,
@@ -2365,7 +2706,9 @@ mod tests {
             .unwrap();
         core.motion.as_mut().unwrap().target_pose = Some(pose);
         core.motion.as_mut().unwrap().duration = 0.1;
-        core.reference[0] += 0.03;
+        // J7 turns about the Link7 tool-Z axis without leaving the selected
+        // TCP rotation path; the reference is still outside pose tolerance.
+        core.reference[6] += 0.03;
         core.advance(now + Duration::from_millis(110), 0.002);
         assert!(core.motion.is_some());
         assert!(

@@ -1,12 +1,13 @@
 use crate::{
     arm::{ApiError, ArmHandle, CommandRequest, ControlRequest},
-    journal::{Journal, LogRecord},
+    journal::{Journal, LogRecord, TraceSummary},
     protocol,
 };
 use axum::{
     Json, Router,
     extract::{
-        DefaultBodyLimit, Query, State, WebSocketUpgrade,
+        DefaultBodyLimit, Path, Query, State, WebSocketUpgrade,
+        rejection::{JsonRejection, QueryRejection},
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, Method, StatusCode, header},
@@ -104,13 +105,17 @@ async fn launch_at(
                 .collect::<Vec<_>>(),
         )
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        .expose_headers([header::CONTENT_DISPOSITION]);
     let router = Router::new()
         .route("/v1/ports", get(ports))
         .route("/v1/state", get(snapshot))
         .route("/v1/control", post(control))
         .route("/v1/commands", post(command))
         .route("/v1/logs", get(logs))
+        .route("/v1/traces", post(trace_start).get(traces))
+        .route("/v1/traces/stop", post(trace_stop))
+        .route("/v1/traces/{id}", get(trace_read))
         .route("/v1/events", get(events))
         .with_state(state.clone())
         .layer(DefaultBodyLimit::max(16 * 1024))
@@ -179,9 +184,15 @@ impl IntoResponse for ApiError {
             "unauthorized" => StatusCode::UNAUTHORIZED,
             "forbidden_origin" => StatusCode::FORBIDDEN,
             "queue_full" | "too_many_connections" => StatusCode::TOO_MANY_REQUESTS,
-            "closing" | "journal_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
+            "closing" | "journal_unavailable" | "trace_unavailable" => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             "timeout" => StatusCode::GATEWAY_TIMEOUT,
-            "owned" | "not_owner" | "stale_context" | "motion_busy" => StatusCode::CONFLICT,
+            "owned" | "not_owner" | "stale_context" | "motion_busy" | "trace_active" => {
+                StatusCode::CONFLICT
+            }
+            "trace_capacity" => StatusCode::TOO_MANY_REQUESTS,
+            "trace_not_found" => StatusCode::NOT_FOUND,
             _ => StatusCode::BAD_REQUEST,
         };
         (status, Json(self)).into_response()
@@ -229,6 +240,130 @@ async fn logs(
         .map(Json)
         .map_err(|_| ApiError::new("journal_unavailable", "日志暂不可读"))
 }
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TraceStartRequest {
+    duration_ms: Option<u64>,
+}
+
+fn trace_error(code: String) -> ApiError {
+    let message = match code.as_str() {
+        "invalid_trace_duration" => "采样时长应为 1000–20000 毫秒",
+        "invalid_trace_context" => "采样上下文无效",
+        "trace_active" => "已有采样正在记录",
+        "trace_capacity" => "采样写入积压，请稍后重试",
+        "trace_not_found" => "采样不存在或已清理",
+        "closing" => "应用正在关闭",
+        _ => "采样暂不可读写",
+    };
+    ApiError::new(&code, message)
+}
+
+async fn trace_start(
+    State(state): State<ApiState>,
+    request: Result<Json<TraceStartRequest>, JsonRejection>,
+) -> Result<Json<TraceSummary>, ApiError> {
+    let Json(request) =
+        request.map_err(|_| ApiError::new("invalid_trace_request", "采样请求 JSON 无效"))?;
+    let duration_ms = request
+        .duration_ms
+        .unwrap_or(crate::trace::DEFAULT_DURATION_MS);
+    if !(1000..=20_000).contains(&duration_ms) {
+        return Err(trace_error("invalid_trace_duration".into()));
+    }
+    // Merely observe an existing connection. This never acquires a lease, sends
+    // a control/command request, enables motors, or opens a serial device.
+    let snapshot = state.arm.snapshot();
+    if snapshot.port.is_none()
+        || matches!(
+            snapshot.phase,
+            crate::arm::Phase::Disconnected
+                | crate::arm::Phase::Connecting
+                | crate::arm::Phase::Closing
+        )
+    {
+        return Err(ApiError::new(
+            "not_connected",
+            "请先连接机械臂，再开始短时采样",
+        ));
+    }
+    tokio::task::spawn_blocking(move || {
+        state
+            .journal
+            .trace_start(duration_ms, &snapshot.side, snapshot.port.as_deref())
+    })
+    .await
+    .map_err(|_| trace_error("trace_unavailable".into()))?
+    .map(Json)
+    .map_err(trace_error)
+}
+
+#[derive(Default, Deserialize)]
+struct TraceListQuery {
+    limit: Option<u32>,
+}
+
+async fn traces(
+    State(state): State<ApiState>,
+    query: Result<Query<TraceListQuery>, QueryRejection>,
+) -> Result<Json<Vec<TraceSummary>>, ApiError> {
+    let Query(query) =
+        query.map_err(|_| ApiError::new("invalid_trace_request", "采样查询参数无效"))?;
+    let limit = query.limit.unwrap_or(20).clamp(1, 10);
+    tokio::task::spawn_blocking(move || state.journal.trace_list(limit))
+        .await
+        .map_err(|_| trace_error("trace_unavailable".into()))?
+        .map(Json)
+        .map_err(trace_error)
+}
+
+async fn trace_stop(State(state): State<ApiState>) -> Result<Json<Option<TraceSummary>>, ApiError> {
+    tokio::task::spawn_blocking(move || state.journal.trace_stop())
+        .await
+        .map_err(|_| trace_error("trace_unavailable".into()))?
+        .map(Json)
+        .map_err(trace_error)
+}
+
+#[derive(Default, Deserialize)]
+struct TraceReadQuery {
+    download: Option<bool>,
+    attachment: Option<bool>,
+}
+
+async fn trace_read(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    query: Result<Query<TraceReadQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(query) =
+        query.map_err(|_| ApiError::new("invalid_trace_request", "采样查询参数无效"))?;
+    let download = query.download.unwrap_or(false) || query.attachment.unwrap_or(false);
+    // Encoding a full capture is also blocking CPU work; keep it off Tokio threads.
+    let (id, body) = tokio::task::spawn_blocking(move || {
+        let recording = state.journal.trace_read(&id)?;
+        let body = serde_json::to_vec(&recording).map_err(|_| "trace_unavailable".to_owned())?;
+        Ok::<_, String>((recording.trace.id, body))
+    })
+    .await
+    .map_err(|_| trace_error("trace_unavailable".into()))?
+    .map_err(trace_error)?;
+    let mut response = ([(header::CONTENT_TYPE, "application/json")], body).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    if download {
+        response.headers_mut().insert(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"trace-{id}.json\"")
+                .parse()
+                .map_err(|_| trace_error("trace_unavailable".into()))?,
+        );
+    }
+    Ok(response)
+}
+
 async fn events(State(state): State<ApiState>, ws: WebSocketUpgrade) -> Result<Response, ApiError> {
     let permit = state
         .sockets
@@ -445,5 +580,220 @@ mod tests {
         arm.shutdown(Duration::from_millis(500));
         server.shutdown().await;
         journal.shutdown(Duration::from_secs(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trace_http_auth_download_and_offline_observation_do_not_issue_commands() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = Journal::start(directory.path().join("events.db")).unwrap();
+        let arm = ArmHandle::spawn(journal.clone()).unwrap();
+        let token = "trace-http-secret";
+        let server = launch_at(
+            arm.clone(),
+            journal.clone(),
+            token.into(),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await
+        .unwrap();
+        let base = server.base_url();
+        let client = reqwest::Client::new();
+        let missing = uuid::Uuid::new_v4().to_string();
+        for (method, path) in [
+            (Method::POST, "/v1/traces".to_owned()),
+            (Method::GET, "/v1/traces?limit=20".to_owned()),
+            (Method::POST, "/v1/traces/stop".to_owned()),
+            (Method::GET, format!("/v1/traces/{missing}?download=true")),
+        ] {
+            let response = client
+                .request(method.clone(), format!("{base}{path}"))
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response.json::<serde_json::Value>().await.unwrap()["code"],
+                "unauthorized"
+            );
+            let response = client
+                .request(method, format!("{base}{path}"))
+                .bearer_auth(token)
+                .header(header::ORIGIN, "https://unrelated.example")
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        let before = serde_json::to_value(arm.snapshot()).unwrap();
+        let response = client
+            .post(format!("{base}/v1/traces"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["code"],
+            "not_connected"
+        );
+        for body in [
+            serde_json::json!({"duration_ms":999}),
+            serde_json::json!({"duration_ms":20_001}),
+            serde_json::json!({"duration_ms":-1}),
+            serde_json::json!({"duration_ms":"1000"}),
+            serde_json::json!({"lease_id":"must-not-be-recorded"}),
+        ] {
+            let response = client
+                .post(format!("{base}/v1/traces"))
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let error = response.json::<serde_json::Value>().await.unwrap();
+            assert!(error["code"].is_string());
+            assert!(error["message"].is_string());
+        }
+        // Seed observation through the journal without any device connection. The
+        // endpoints must stop/read it while disconnected and without a motion lease.
+        let trace = journal
+            .trace_start(20_000, "left", Some("offline-fixture"))
+            .unwrap();
+        journal.sample(
+            std::time::Instant::now(),
+            crate::journal::TraceData::Feedback {
+                joint: 0,
+                q: 0.1,
+                dq: 0.2,
+                tau: 0.3,
+                temperature: 30.0,
+                voltage: 48.0,
+                error: 0,
+                mode: 1,
+                timeout: false,
+            },
+        );
+        let list: serde_json::Value = client
+            .get(format!("{base}/v1/traces?limit=20"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(list[0]["id"], trace.id);
+        let stop = client
+            .post(format!("{base}/v1/traces/stop"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stop.status(), StatusCode::OK);
+        assert_eq!(
+            stop.json::<serde_json::Value>().await.unwrap()["id"],
+            trace.id
+        );
+        let stop: serde_json::Value = client
+            .post(format!("{base}/v1/traces/stop"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(stop.is_null());
+        for _ in 0..100 {
+            if journal.trace_list(1).unwrap()[0].status == "complete" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for query in ["", "?download=true", "?attachment=true"] {
+            let response = client
+                .get(format!("{base}/v1/traces/{}{query}", trace.id))
+                .bearer_auth(token)
+                .header(header::ORIGIN, "http://localhost:1420")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            if !query.is_empty() {
+                assert_eq!(
+                    response.headers()[header::CONTENT_DISPOSITION],
+                    format!("attachment; filename=\"trace-{}.json\"", trace.id)
+                );
+            }
+            let text = response.text().await.unwrap();
+            assert!(!text.contains(token));
+            assert!(!text.contains("lease"));
+            assert!(!text.contains("request_id"));
+            let recording: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(recording["trace"]["status"], "complete");
+            assert_eq!(
+                recording["trace"]["accepted"],
+                recording["trace"]["written"]
+            );
+            let written = recording["trace"]["written"].as_u64().unwrap();
+            assert!(written >= 1);
+            assert_eq!(recording["trace"]["pending"], 0);
+            assert_eq!(
+                recording["samples"].as_array().unwrap().len() as u64,
+                written
+            );
+            assert!(
+                recording["samples"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|sample| sample["source"] == "feedback" && sample["q"] == 0.1)
+            );
+        }
+        let not_found = client
+            .get(format!("{base}/v1/traces/{missing}"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            not_found.json::<serde_json::Value>().await.unwrap()["code"],
+            "trace_not_found"
+        );
+        let invalid = client
+            .get(format!("{base}/v1/traces?limit=bad"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            invalid.json::<serde_json::Value>().await.unwrap()["code"],
+            "invalid_trace_request"
+        );
+        let after = serde_json::to_value(arm.snapshot()).unwrap();
+        for key in [
+            "generation",
+            "phase",
+            "side",
+            "port",
+            "enabled",
+            "owner",
+            "action",
+            "last_result",
+            "results",
+        ] {
+            assert_eq!(before[key], after[key], "observation changed {key}");
+        }
+        assert!(arm.shutdown(Duration::from_millis(500)));
+        server.shutdown().await;
+        assert!(journal.shutdown(Duration::from_secs(2)));
     }
 }

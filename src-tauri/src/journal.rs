@@ -1,12 +1,16 @@
-//! Bounded structured event journal. Never pass credentials or per-frame telemetry here.
-//! `recent` performs disk I/O: HTTP callers must use `server`'s spawn_blocking boundary.
-use crossbeam_channel::{Receiver, Sender, bounded};
+//! Bounded event journal with an independent short-capture worker.
+//! `log` accepts summaries, never credentials or per-frame telemetry; use `sample` for frames.
+//! Queue admission tries a mutex once; contention and overflow count as drops.
+//! Disk readers must run within `server`'s spawn_blocking boundary.
+use crate::trace::Recorder;
+pub use crate::trace::{TraceData, TraceRecording, TraceSummary};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::VecDeque,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
@@ -24,7 +28,7 @@ pub struct JournalStats {
     pub pending: u64,
     /// Successfully committed events in this process, including subsequently pruned events.
     pub written: u64,
-    /// Queue overflow, calls after close, and accepted events abandoned at shutdown.
+    /// Queue contention, poisoning, overflow, calls after close, and shutdown abandonment.
     pub dropped: u64,
     /// Failed background database operations (not the number of affected records).
     pub errors: u64,
@@ -42,8 +46,8 @@ pub struct LogRecord {
     pub request_id: Option<String>,
 }
 
-#[derive(Default)]
 struct State {
+    queue: Mutex<VecDeque<LogRecord>>,
     // One atomic admission gate orders close against producers already in flight.
     gate: AtomicUsize,
     pending: AtomicU64,
@@ -55,10 +59,34 @@ struct State {
     done: AtomicBool,
 }
 
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            queue: Mutex::new(VecDeque::with_capacity(CAPACITY)),
+            gate: AtomicUsize::new(0),
+            pending: AtomicU64::new(0),
+            written: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            healthy: AtomicBool::new(false),
+            abort: AtomicBool::new(false),
+            done: AtomicBool::new(false),
+        }
+    }
+}
+
+struct Admission<'a>(&'a AtomicUsize);
+
+impl Drop for Admission<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 struct Shared {
     path: PathBuf,
-    tx: Sender<LogRecord>,
     state: Arc<State>,
+    traces: Recorder,
 }
 
 impl Drop for Shared {
@@ -76,19 +104,25 @@ impl Journal {
     /// Starts the worker only. Opening the directory, database and schema is asynchronous;
     /// a path failure is reflected in stats and retried, rather than failing the controller.
     pub fn start(path: PathBuf) -> Result<Self, String> {
-        let (tx, rx) = bounded(CAPACITY);
+        let traces = Recorder::start(&path)?;
         let state = Arc::new(State::default());
         let worker_state = state.clone();
         let worker_path = path.clone();
         thread::Builder::new()
             .name("event-journal".into())
-            .spawn(move || writer(&worker_path, rx, worker_state))
+            .spawn(move || writer(&worker_path, worker_state))
             .map_err(|e| format!("start journal writer: {e}"))?;
-        Ok(Self(Arc::new(Shared { path, tx, state })))
+        Ok(Self(Arc::new(Shared {
+            path,
+            state,
+            traces,
+        })))
     }
 
     /// Bounded in-memory work only; fields are truncated at UTF-8 boundaries.
     /// Callers supply event summaries and request IDs, never tokens or lease IDs.
+    /// String allocation is bounded; queue admission tries its mutex once and drops
+    /// on contention, poisoning, or overflow without a queue wakeup or database work.
     pub fn log(
         &self,
         level: &str,
@@ -99,9 +133,9 @@ impl Journal {
     ) {
         let s = &self.0.state;
         let previous = s.gate.fetch_add(1, Ordering::SeqCst);
+        let _admission = Admission(&s.gate);
         if previous & CLOSED != 0 {
             s.dropped.fetch_add(1, Ordering::Relaxed);
-            s.gate.fetch_sub(1, Ordering::SeqCst);
             return;
         }
         let record = LogRecord {
@@ -117,13 +151,18 @@ impl Journal {
             message: capped(message, 2048),
             request_id: request_id.map(|s| capped(s, 128)),
         };
-        // Account before publication, so a fast consumer cannot underflow pending.
-        s.pending.fetch_add(1, Ordering::Relaxed);
-        if self.0.tx.try_send(record).is_err() {
-            s.pending.fetch_sub(1, Ordering::Relaxed);
+        let Ok(mut queue) = s.queue.try_lock() else {
             s.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        if queue.len() >= CAPACITY {
+            s.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
         }
-        s.gate.fetch_sub(1, Ordering::SeqCst);
+        // Account before publication, so a fast consumer cannot underflow pending.
+        // The queue retains its preallocated capacity; only the strings above allocate.
+        s.pending.fetch_add(1, Ordering::Relaxed);
+        queue.push_back(record);
     }
 
     /// Independent atomic samples, not a transactionally consistent snapshot.
@@ -137,6 +176,36 @@ impl Journal {
             healthy: s.healthy.load(Ordering::Acquire)
                 && s.gate.load(Ordering::SeqCst) & CLOSED == 0,
         }
+    }
+
+    /// Observation only. HTTP supplies the 10000ms default; Rust callers supply
+    /// 1000..=20000 milliseconds explicitly.
+    pub fn trace_start(
+        &self,
+        duration_ms: u64,
+        side: &str,
+        port: Option<&str>,
+    ) -> Result<TraceSummary, String> {
+        self.0.traces.trace_start(duration_ms, side, port)
+    }
+
+    pub fn trace_stop(&self) -> Result<Option<TraceSummary>, String> {
+        self.0.traces.trace_stop()
+    }
+
+    /// Blocking read: HTTP callers must use spawn_blocking.
+    pub fn trace_list(&self, limit: u32) -> Result<Vec<TraceSummary>, String> {
+        self.0.traces.trace_list(limit)
+    }
+
+    /// Blocking read: HTTP callers must use spawn_blocking.
+    pub fn trace_read(&self, id: &str) -> Result<TraceRecording, String> {
+        self.0.traces.trace_read(id)
+    }
+
+    /// Fixed-size observation submission. Never waits for a lock, disk or queue space.
+    pub fn sample(&self, at: Instant, data: TraceData) {
+        self.0.traces.sample(at, data);
     }
 
     /// Blocking read, including open and SQLite busy waits; use spawn_blocking.
@@ -171,22 +240,24 @@ impl Journal {
             .map_err(|e| e.to_string())
     }
 
-    /// Application-close coordination only. True means every accepted event was committed
-    /// and the worker exited. False means the deadline expired or events were abandoned.
+    /// Application-close coordination only. True means every accepted event/sample
+    /// was committed and both workers exited. False means a timeout or abandoned data.
     /// A blocked OS/SQLite call can outlive this return; no forced cancellation or join.
     pub fn shutdown(&self, timeout: Duration) -> bool {
         let s = &self.0.state;
+        self.0.traces.request_shutdown();
         s.gate.fetch_or(CLOSED, Ordering::SeqCst);
         let start = Instant::now();
-        while !s.done.load(Ordering::Acquire) {
+        while !s.done.load(Ordering::Acquire) || !self.0.traces.done() {
             let remaining = timeout.saturating_sub(start.elapsed());
             if remaining.is_zero() {
                 s.abort.store(true, Ordering::Release);
+                self.0.traces.abort();
                 return false;
             }
             thread::sleep(remaining.min(Duration::from_millis(1)));
         }
-        !s.abort.load(Ordering::Acquire)
+        !s.abort.load(Ordering::Acquire) && self.0.traces.clean()
     }
 }
 
@@ -263,7 +334,7 @@ fn backoff(s: &State, delay: Duration) {
     }
 }
 
-fn writer(path: &Path, rx: Receiver<LogRecord>, state: Arc<State>) {
+fn writer(path: &Path, state: Arc<State>) {
     let s = &*state;
     let mut conn = None;
     let mut batch = Vec::with_capacity(BATCH_SIZE);
@@ -271,14 +342,15 @@ fn writer(path: &Path, rx: Receiver<LogRecord>, state: Arc<State>) {
     let mut checkpoint_at = Instant::now();
     loop {
         if s.abort.load(Ordering::Acquire) {
-            let count = batch.len() as u64;
+            let mut count = batch.len() as u64;
             batch.clear();
+            {
+                let mut queue = s.queue.lock().unwrap_or_else(|p| p.into_inner());
+                count += queue.len() as u64;
+                queue.clear();
+            }
             s.dropped.fetch_add(count, Ordering::Relaxed);
             s.pending.fetch_sub(count, Ordering::Relaxed);
-            for _ in rx.try_iter() {
-                s.dropped.fetch_add(1, Ordering::Relaxed);
-                s.pending.fetch_sub(1, Ordering::Relaxed);
-            }
             // Producers admitted just before close can still publish a final event.
             if s.gate.load(Ordering::SeqCst) == CLOSED && s.pending.load(Ordering::Relaxed) == 0 {
                 break;
@@ -300,15 +372,15 @@ fn writer(path: &Path, rx: Receiver<LogRecord>, state: Arc<State>) {
                 }
             }
         }
-        if batch.is_empty()
-            && let Ok(record) = rx.recv_timeout(POLL)
         {
-            batch.push(record);
-        }
-        while batch.len() < BATCH_SIZE {
-            match rx.try_recv() {
-                Ok(record) => batch.push(record),
-                Err(_) => break,
+            // Only the writer waits for this lock. No SQL, allocation, or sleeping
+            // occurs while draining into the preallocated batch.
+            let mut queue = s.queue.lock().unwrap_or_else(|p| p.into_inner());
+            while batch.len() < BATCH_SIZE {
+                let Some(record) = queue.pop_front() else {
+                    break;
+                };
+                batch.push(record);
             }
         }
         if !batch.is_empty() {
@@ -329,6 +401,9 @@ fn writer(path: &Path, rx: Receiver<LogRecord>, state: Arc<State>) {
                     continue;
                 }
             }
+        } else {
+            // Polling avoids producer-side notification and its hidden wakeup locks.
+            thread::sleep(POLL);
         }
         let closing =
             s.gate.load(Ordering::SeqCst) == CLOSED && s.pending.load(Ordering::Relaxed) == 0;
@@ -372,26 +447,76 @@ mod tests {
         }
     }
 
+    // Single-producer fixtures retry only rejected calls to keep their expected
+    // payloads deterministic. Return every attempt so drops remain fully accounted.
+    fn log_until_queued(journal: &Journal, mut emit: impl FnMut()) -> u64 {
+        let mut attempts = 0;
+        wait_for(|| {
+            let dropped = journal.stats().dropped;
+            emit();
+            attempts += 1;
+            journal.stats().dropped == dropped
+        });
+        attempts
+    }
+
+    #[test]
+    fn queue_contention_drops_without_waiting_and_calls_after_close_still_count() {
+        let dir = tempdir().unwrap();
+        let journal = Journal::start(dir.path().join("events.db")).unwrap();
+        // Hold the writer's queue mutex until the producer has returned.
+        let queue = journal.0.state.queue.lock().unwrap();
+        let worker = journal.clone();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let producer = thread::spawn(move || {
+            for _ in 0..100 {
+                worker.log("info", "app", "contended", "rejected summary", None);
+            }
+            completed_tx.send(()).unwrap();
+        });
+        let completed = completed_rx.recv_timeout(Duration::from_secs(1));
+        drop(queue);
+        producer.join().unwrap();
+        completed.expect("event producer waited for the queue mutex");
+        let stats = journal.stats();
+        assert_eq!(stats.written, 0);
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.dropped, 100);
+        assert_eq!(stats.written + stats.dropped + stats.pending, 100);
+        assert_eq!(journal.0.state.gate.load(Ordering::SeqCst), 0);
+        assert!(journal.shutdown(Duration::from_secs(2)));
+        let queue = journal.0.state.queue.lock().unwrap();
+        journal.log("info", "app", "late", "after close", None);
+        let stats = journal.stats();
+        assert_eq!(stats.written, 0);
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.dropped, 101);
+        assert_eq!(stats.written + stats.dropped + stats.pending, 101);
+        assert_eq!(journal.0.state.gate.load(Ordering::SeqCst), CLOSED);
+        assert!(queue.is_empty());
+    }
+
     #[test]
     fn persisted_query_order_limit_and_reopen() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nested/events.sqlite3");
         let journal = Journal::start(path.clone()).unwrap();
+        let mut submitted = 0;
         for i in 0..600 {
-            journal.log(
-                "info",
-                "control",
-                "accepted",
-                &format!("event {i}"),
-                Some("request-1"),
-            );
+            submitted += log_until_queued(&journal, || {
+                journal.log(
+                    "info",
+                    "control",
+                    "accepted",
+                    &format!("event {i}"),
+                    Some("request-1"),
+                );
+            });
         }
         assert!(journal.shutdown(Duration::from_secs(8)));
         let stats = journal.stats();
-        assert_eq!(
-            (stats.written, stats.pending, stats.dropped, stats.errors),
-            (600, 0, 0, 0)
-        );
+        assert_eq!((stats.written, stats.pending, stats.errors), (600, 0, 0));
+        assert_eq!(stats.written + stats.dropped + stats.pending, submitted);
         let records = journal.recent(u32::MAX).unwrap();
         assert_eq!(records.len(), 500);
         assert_eq!(records[0].message, "event 599");
@@ -400,8 +525,12 @@ mod tests {
         assert_eq!(records[0].request_id.as_deref(), Some("request-1"));
         assert!(records[0].ts_ms > 0);
         let reopened = Journal::start(path).unwrap();
-        reopened.log("info", "app", "started", "new session", None);
+        let submitted = log_until_queued(&reopened, || {
+            reopened.log("info", "app", "started", "new session", None);
+        });
         assert!(reopened.shutdown(Duration::from_secs(8)));
+        let stats = reopened.stats();
+        assert_eq!(stats.written + stats.dropped + stats.pending, submitted);
         assert_eq!(reopened.recent(1).unwrap()[0].message, "new session");
         assert!(reopened.recent(0).unwrap().is_empty());
     }
@@ -413,6 +542,7 @@ mod tests {
         std::fs::write(&blocker, "not a directory").unwrap();
         let journal = Journal::start(blocker.join("events.db")).unwrap();
         wait_for(|| journal.stats().errors > 0);
+        let capacity = journal.0.state.queue.lock().unwrap().capacity();
         let start = Instant::now();
         for _ in 0..20_000 {
             journal.log("warn", "app", "offline", "summary", None);
@@ -422,7 +552,8 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(2));
         let stats = journal.stats();
         assert_eq!(stats.pending, CAPACITY as u64);
-        assert_eq!(stats.pending + stats.dropped, 20_000);
+        assert_eq!(stats.written + stats.dropped + stats.pending, 20_000);
+        assert_eq!(journal.0.state.queue.lock().unwrap().capacity(), capacity);
         assert!(!stats.healthy);
         std::fs::remove_file(&blocker).unwrap();
         wait_for(|| journal.stats().pending == 0 && journal.stats().healthy);
@@ -436,7 +567,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("events.db");
         let journal = Journal::start(path.clone()).unwrap();
-        journal.log("info", "app", "start", "before lock", None);
+        let initial_attempts = log_until_queued(&journal, || {
+            journal.log("info", "app", "start", "before lock", None);
+        });
         wait_for(|| journal.stats().written == 1);
         let locker = Connection::open(&path).unwrap();
         locker.execute_batch("BEGIN IMMEDIATE").unwrap();
@@ -453,7 +586,10 @@ mod tests {
         wait_for(|| journal.0.state.done.load(Ordering::Acquire));
         let stats = journal.stats();
         assert_eq!(stats.pending, 0);
-        assert_eq!(stats.written + stats.dropped, 10_002);
+        assert_eq!(
+            stats.written + stats.dropped + stats.pending,
+            initial_attempts + 10_001
+        );
         assert_eq!(journal.recent(500).unwrap().len(), 1);
         locker.execute_batch("ROLLBACK").unwrap();
         let second = Journal::start(path).unwrap();
@@ -468,15 +604,21 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("events.db");
         let journal = Journal::start(path.clone()).unwrap();
-        journal.log("info", "app", "start", "initial", None);
+        let mut submitted = log_until_queued(&journal, || {
+            journal.log("info", "app", "start", "initial", None);
+        });
         wait_for(|| journal.stats().written == 1);
         let locker = Connection::open(path).unwrap();
         locker.execute_batch("BEGIN IMMEDIATE").unwrap();
         for i in 0..200 {
-            journal.log("info", "control", "accepted", &format!("event {i}"), None);
+            submitted += log_until_queued(&journal, || {
+                journal.log("info", "control", "accepted", &format!("event {i}"), None);
+            });
         }
         wait_for(|| journal.stats().errors > 0);
         assert_eq!(journal.stats().pending, 200);
+        let stats = journal.stats();
+        assert_eq!(stats.written + stats.dropped + stats.pending, submitted);
         assert_eq!(journal.recent(500).unwrap().len(), 1);
         locker.execute_batch("ROLLBACK").unwrap();
         wait_for(|| journal.stats().written == 201 && journal.stats().pending == 0);
@@ -485,7 +627,9 @@ mod tests {
         assert_eq!(records.len(), 201);
         let unique: std::collections::HashSet<_> = records.iter().map(|r| &r.message).collect();
         assert_eq!(unique.len(), 201);
-        assert_eq!(journal.stats().dropped, 0);
+        let stats = journal.stats();
+        assert_eq!(stats.dropped, submitted - 201);
+        assert_eq!(stats.written + stats.dropped + stats.pending, submitted);
     }
 
     #[test]
@@ -509,7 +653,7 @@ mod tests {
         wait_for(|| journal.0.state.done.load(Ordering::Acquire));
         let stats = journal.stats();
         assert_eq!(stats.pending, 0);
-        assert_eq!(stats.written + stats.dropped, 12_000);
+        assert_eq!(stats.written + stats.dropped + stats.pending, 12_000);
     }
 
     #[test]
@@ -525,8 +669,12 @@ mod tests {
         .unwrap();
         drop(seed);
         let journal = Journal::start(path.clone()).unwrap();
-        journal.log("info", "app", "event", &"界".repeat(3000), None);
+        let submitted = log_until_queued(&journal, || {
+            journal.log("info", "app", "event", &"界".repeat(3000), None);
+        });
         assert!(journal.shutdown(Duration::from_secs(8)));
+        let stats = journal.stats();
+        assert_eq!(stats.written + stats.dropped + stats.pending, submitted);
         let conn = Connection::open(path).unwrap();
         let count: i64 = conn
             .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
