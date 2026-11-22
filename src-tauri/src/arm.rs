@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::trajectory::{JOINT_ACCELERATION, JOINT_JERK, JOINT_SPEED};
 use crate::{
     calibration::{
         self, Choice, Collector, Leg, Point, Report as CalibrationReport,
@@ -5,12 +7,12 @@ use crate::{
     },
     journal::{Journal, JournalStats, TraceData},
     kinematics::{
-        self, CartesianPath, Frame, Kinematics, LocalTarget, MotionLimits, Pose, SmoothingState,
-        StepInput,
+        self, CartesianPath, CartesianPlanning, Frame, HoldPose, Kinematics, LocalTarget,
+        MotionLimits, Pose, SmoothingState, StepInput,
     },
     protocol::{BusError, BusHandle, DriveMode, Feedback, SentReference, Setpoint},
     reference::{CartesianGuard, MAX_REFERENCE_AGE, Reference},
-    trajectory::{self, JOINT_ACCELERATION, JOINT_JERK, JOINT_SPEED},
+    trajectory::{self, MotionTuning},
     tuning::ServoTuning,
 };
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
@@ -34,8 +36,6 @@ const CONTROL_PERIOD: Duration = Duration::from_millis(10);
 // Position error is what creates holding torque; do not clamp it so tightly
 // that a load drags the commanded reference down with the measured joint.
 const MAX_TRACKING_ERROR: f64 = 0.60;
-const LINEAR_SPEED: f64 = 0.015;
-const ANGULAR_SPEED: f64 = 0.15;
 // The official motion demo uses these gains for loaded joint movement.
 const SERVO_KP: f64 = 60.0;
 // The official R1-7A teleoperation stack uses kd=10 with gravity feedforward.
@@ -133,6 +133,7 @@ pub struct Snapshot {
     pub servo_tuning: ServoTuning,
     pub servo_tuning_revision: u64,
     pub calibration: Option<CalibrationStatus>,
+    pub motion_tuning: MotionTuning,
     #[serde(skip)]
     pub(crate) calibration_report: Option<Arc<CalibrationReport>>,
     #[serde(skip)]
@@ -196,6 +197,9 @@ pub enum Operation {
     ConfigureServo {
         config: Box<ServoTuning>,
     },
+    ConfigureMotion {
+        config: MotionTuning,
+    },
     CalibrateStart {
         #[serde(default)]
         settings: CalibrationSettings,
@@ -247,6 +251,7 @@ impl Operation {
             Self::ClearFault => "clear_fault",
             Self::ConfigureTcp { .. } => "configure_tcp",
             Self::ConfigureServo { .. } => "configure_servo",
+            Self::ConfigureMotion { .. } => "configure_motion",
             Self::CalibrateStart { .. } => "calibrate_start",
             Self::CalibrateApply { .. } => "calibrate_apply",
             Self::JogStart { .. } => "jog_start",
@@ -469,6 +474,7 @@ impl MotionMode {
 }
 struct Motion {
     calibration: bool,
+    finishing: Option<HoldPose>,
     request_id: String,
     space: Space,
     axis: usize,
@@ -482,6 +488,7 @@ struct Motion {
     initial: [f64; 7],
     target: [f64; 7],
     initial_pose: Option<Pose>,
+    path_origin: Option<Pose>,
     target_pose: Option<Pose>,
     deadline: Option<Instant>,
     input_seq: u64,
@@ -519,6 +526,7 @@ impl CalibrationLeg {
     }
 }
 struct CalibrationRun {
+    original_motion: MotionTuning,
     report: CalibrationReport,
     queue: Vec<CalibrationPlan>,
     legs: Vec<CalibrationLeg>,
@@ -592,6 +600,7 @@ struct Core {
     reference_epoch: Arc<AtomicU64>,
     reference_version: u64,
     servo_tuning: ServoTuning,
+    motion_tuning: MotionTuning,
     servo_tuning_revision: u64,
     side: String,
     port: Option<String>,
@@ -648,6 +657,7 @@ impl Core {
             reference_epoch: Arc::new(AtomicU64::new(0)),
             reference_version: 0,
             servo_tuning: ServoTuning::default(),
+            motion_tuning: MotionTuning::default(),
             servo_tuning_revision: 1,
             side: "right".into(),
             port: None,
@@ -1139,6 +1149,16 @@ impl Core {
                     Some(id),
                 );
             }
+            Operation::ConfigureMotion { config } => {
+                config
+                    .validate()
+                    .map_err(|e| ApiError::new("invalid_motion", e))?;
+                if self.motion.is_some() || self.stopping || self.enable_request.is_some() {
+                    return Err(ApiError::new("motion_busy", "请先结束当前动作"));
+                }
+                self.motion_tuning = config;
+                self.bump_generation();
+            }
             Operation::CalibrateStart { settings } => self.begin_calibration(id, settings, now)?,
             Operation::CalibrateApply { calibration_id } => {
                 self.apply_calibration(&calibration_id, now)?
@@ -1175,16 +1195,8 @@ impl Core {
                 speed,
                 frame,
             } => {
-                if !amount.is_finite()
-                    || amount <= 0.0
-                    || amount
-                        > if space == Space::Cartesian && axis < 3 {
-                            0.05
-                        } else {
-                            0.35
-                        }
-                {
-                    return Err(ApiError::new("invalid_step", "步长超出局部范围"));
+                if !amount.is_finite() || amount <= 0.0 {
+                    return Err(ApiError::new("invalid_step", "步长必须为正数"));
                 }
                 self.begin(
                     id, space, axis, direction, speed, frame, true, amount, None, 0, now,
@@ -1252,6 +1264,13 @@ impl Core {
         }
         calibration::validate(&settings, &self.servo_tuning)
             .map_err(|e| ApiError::new("invalid_calibration", e))?;
+        let original_motion = self.motion_tuning;
+        let calibration_motion = settings.cartesian.as_ref().map(|program| program.motion);
+        if let Some(config) = calibration_motion {
+            config
+                .validate()
+                .map_err(|e| ApiError::new("invalid_motion", e))?;
+        }
         let axes = settings
             .axis
             .map_or_else(|| (0..7).collect::<Vec<_>>(), |axis| vec![axis]);
@@ -1297,6 +1316,7 @@ impl Core {
                 .collect()
         };
         self.calibration = Some(CalibrationRun {
+            original_motion,
             report: CalibrationReport {
                 id: uuid::Uuid::new_v4().to_string(),
                 request_id: id.into(),
@@ -1343,6 +1363,9 @@ impl Core {
         });
         self.calibration_result = None;
         self.calibration_apply_revision = None;
+        if let Some(config) = calibration_motion {
+            self.motion_tuning = config;
+        }
         self.phase();
         self.dirty = true;
         Ok(())
@@ -1403,6 +1426,17 @@ impl Core {
     }
     fn finish_calibration(&mut self, mut run: CalibrationRun) {
         let axis = run.axis();
+        self.motion_tuning = run.original_motion;
+        if let Some(trial) = run.report.trials.get_mut(run.trial) {
+            if trial.space == "cartesian" && trial.metrics_by_joint.is_none() {
+                trial.metrics_by_joint =
+                    Some(run.collectors.iter().map(Collector::finish).collect());
+            } else if trial.metrics.is_none()
+                && let Some(axis) = trial.axis
+            {
+                trial.metrics = run.collectors[axis].finish();
+            }
+        }
         run.report.sample_count = run.points.len();
         run.report.curves = Arc::new(run.points);
         let report = run.report;
@@ -1821,6 +1855,14 @@ impl Core {
                             0,
                             now,
                         )
+                        .map(|()| {
+                            let motion = self.motion.as_mut().unwrap();
+                            motion.path_origin = Some(origin);
+                            let mut delta = [0.0; 6];
+                            delta[axis] = offset;
+                            motion.target_pose =
+                                Some(kinematics::offset_pose(&origin, delta, Frame::Base).unwrap());
+                        })
                     }
                 };
                 match started {
@@ -1988,8 +2030,8 @@ impl Core {
         now: Instant,
     ) -> Result<(), ApiError> {
         let anchor = self.motion_anchor(now)?;
-        if !speed.is_finite() || speed <= 0.0 || speed > JOINT_SPEED {
-            return Err(ApiError::new("speed_limit", "收纳速度超出当前限制"));
+        if !speed.is_finite() || speed <= 0.0 {
+            return Err(ApiError::new("speed_limit", "收纳速度必须为正数"));
         }
         if target.iter().any(|q| !q.is_finite()) {
             return Err(ApiError::new("invalid_pose", "收纳位参数无效"));
@@ -1997,17 +2039,17 @@ impl Core {
         let distance = (0..7)
             .map(|i| (target[i] - anchor[i]).abs())
             .fold(0.0, f64::max);
-        if distance > std::f64::consts::TAU {
-            return Err(ApiError::new("invalid_pose", "收纳位与当前位置相差过大"));
-        }
-        // Quintic interpolation: zero velocity and acceleration at both ends.
-        // Peak |ds/dt|=1.875/T, peak |d²s/dt²|=10/sqrt(3)/T²,
-        // peak |d³s/dt³|=60/T³. Short returns need the jerk bound too:
-        // otherwise the downstream limiter lags the curve and can overshoot.
-        let duration = (1.875 * distance / speed)
-            .max((10.0 / 3.0_f64.sqrt() * distance / JOINT_ACCELERATION).sqrt())
-            .max((60.0 * distance / JOINT_JERK).cbrt())
-            .max(0.2);
+        let speed = speed.min(
+            self.joint_speeds()
+                .into_iter()
+                .fold(f64::INFINITY, f64::min),
+        );
+        let duration = trajectory::segment_duration(
+            distance,
+            speed,
+            self.motion_tuning.acceleration,
+            self.motion_tuning.jerk,
+        );
         if !duration.is_finite() {
             return Err(ApiError::new("invalid_pose", "收纳轨迹时长无效"));
         }
@@ -2015,6 +2057,7 @@ impl Core {
         self.reset_derivatives();
         self.motion = Some(Motion {
             calibration: false,
+            finishing: None,
             request_id: id.into(),
             space: Space::Joint,
             axis: 0,
@@ -2028,6 +2071,7 @@ impl Core {
             initial: anchor,
             target,
             initial_pose: None,
+            path_origin: None,
             target_pose: None,
             deadline: None,
             input_seq: 0,
@@ -2059,16 +2103,11 @@ impl Core {
         {
             return Err(ApiError::new("invalid_motion", "点动参数无效"));
         }
-        let limit = if space == Space::Joint {
-            JOINT_SPEED
-        } else if axis < 3 {
-            LINEAR_SPEED
+        let speed = if space == Space::Joint {
+            speed.min(self.joint_speeds()[axis])
         } else {
-            ANGULAR_SPEED
+            speed
         };
-        if speed > limit {
-            return Err(ApiError::new("speed_limit", "速度超出当前限制"));
-        }
         self.reference = anchor;
         self.reset_derivatives();
         let mut target = anchor;
@@ -2101,17 +2140,42 @@ impl Core {
             initial_pose = Some(pose);
         }
         let duration = if step {
-            let duration = (1.5 * amount / speed).max(0.10);
             if space == Space::Joint {
-                duration.max((6.0 * amount / JOINT_ACCELERATION).sqrt())
+                trajectory::segment_duration(
+                    amount,
+                    speed,
+                    self.motion_tuning.acceleration,
+                    self.motion_tuning.jerk,
+                )
             } else {
-                duration
+                let displacement = self
+                    .model
+                    .as_ref()
+                    .unwrap()
+                    .local_displacement(
+                        &anchor,
+                        self.tcp.as_ref().unwrap(),
+                        target_pose.as_ref().unwrap(),
+                    )
+                    .map_err(|e| ApiError::new("kinematics", e))?;
+                let distance = displacement.into_iter().map(f64::abs).fold(0.0, f64::max);
+                let joint_speed = self
+                    .joint_speeds()
+                    .into_iter()
+                    .fold(f64::INFINITY, f64::min);
+                (1.5 * amount / speed).max(trajectory::segment_duration(
+                    distance,
+                    joint_speed,
+                    self.motion_tuning.acceleration,
+                    self.motion_tuning.jerk,
+                ))
             }
         } else {
             0.0
         };
         self.motion = Some(Motion {
             calibration: false,
+            finishing: None,
             request_id: id.into(),
             space,
             axis,
@@ -2129,6 +2193,7 @@ impl Core {
             initial: anchor,
             target,
             initial_pose,
+            path_origin: None,
             target_pose,
             deadline,
             input_seq,
@@ -2154,7 +2219,7 @@ impl Core {
     }
     fn motion_path(motion: &Motion) -> Option<CartesianPath> {
         (motion.space == Space::Cartesian).then(|| CartesianPath {
-            origin: motion.initial_pose.unwrap(),
+            origin: motion.path_origin.or(motion.initial_pose).unwrap(),
             axis: motion.axis,
             frame: motion.frame,
         })
@@ -2162,14 +2227,23 @@ impl Core {
     // Constrain the controller velocity before integrating its reference once.
     // The serial sender may coalesce updates; capture its timing separately.
     // Absolute-time waypoints alone do not bound derivatives under scheduler jitter.
+    fn joint_speeds(&self) -> [f64; 7] {
+        self.motion_tuning.speed_limits(
+            self.model
+                .as_ref()
+                .map_or([self.motion_tuning.joint_speed; 7], |model| {
+                    model.speed_limits()
+                }),
+        )
+    }
     fn commit_joint_velocity(&mut self, desired: [f64; 7], dt: f64) -> Result<(), ApiError> {
         let window = trajectory::velocity_window(
             self.velocity,
             self.acceleration,
             desired,
-            [JOINT_SPEED; 7],
-            [JOINT_ACCELERATION; 7],
-            [JOINT_JERK; 7],
+            self.joint_speeds(),
+            [self.motion_tuning.acceleration; 7],
+            [self.motion_tuning.jerk; 7],
             dt,
         )
         .map_err(|e| ApiError::new("joint_dynamics", e))?;
@@ -2191,11 +2265,50 @@ impl Core {
         dt: f64,
         stopping: bool,
     ) -> Result<(), String> {
+        let model = self.model.as_ref().ok_or("missing model")?;
+        let tcp = self.tcp.ok_or("missing TCP")?;
+        let joint_velocity = self.joint_speeds();
+        let (mut linear_speed, mut angular_speed) =
+            model.cartesian_speed_limits(&self.reference, &tcp, joint_velocity)?;
+        if let Some(motion) = &self.motion
+            && motion.space == Space::Cartesian
+        {
+            if motion.axis < 3 {
+                linear_speed = linear_speed.min(motion.speed);
+            } else {
+                angular_speed = angular_speed.min(motion.speed);
+            }
+        }
+        // Keep translation and orientation objectives dimensionally balanced.
+        // A low translation request must not make orientation hundreds of
+        // times less important merely because model angular speed is high.
+        let length = model.reach_radius(&tcp);
+        let task_rate = (linear_speed / length).min(angular_speed);
+        linear_speed = task_rate * length;
+        angular_speed = task_rate;
+        let planning = if let Some(run) = &self.calibration
+            && let Some(program) = &run.report.settings.cartesian
+        {
+            let origin = model.fk(&program.origin, &program.tcp)?;
+            let current = model.fk(&self.reference, &tcp)?;
+            Some(CartesianPlanning {
+                origin: run.report.center_reference,
+                guide: path.filter(|p| p.axis < 3).and_then(|p| {
+                    program.guide_at(
+                        p.axis,
+                        current.translation[p.axis] - origin.translation[p.axis],
+                    )
+                }),
+            })
+        } else {
+            None
+        };
         let candidate = self
             .model
             .as_ref()
             .ok_or("missing model")?
             .step(StepInput {
+                planning,
                 reference: self.reference,
                 measured,
                 previous_velocity: self.velocity,
@@ -2203,16 +2316,21 @@ impl Core {
                 dt,
                 tcp: self.tcp.ok_or("missing TCP")?,
                 limits: MotionLimits {
-                    joint_velocity: [JOINT_SPEED; 7],
-                    joint_acceleration: [JOINT_ACCELERATION; 7],
+                    joint_velocity,
+                    joint_acceleration: [self.motion_tuning.acceleration; 7],
                     max_reference_error: MAX_TRACKING_ERROR,
-                    max_joint_step: 0.01,
-                    linear_speed: LINEAR_SPEED,
-                    angular_speed: ANGULAR_SPEED,
+                    max_joint_step: joint_velocity.into_iter().fold(0.0, f64::max) * dt,
+                    linear_speed,
+                    angular_speed,
                 },
                 smoothing: Some(SmoothingState {
+                    hold: if stopping {
+                        self.motion.as_ref().and_then(|m| m.finishing)
+                    } else {
+                        None
+                    },
                     acceleration: self.acceleration,
-                    jerk: [JOINT_JERK; 7],
+                    jerk: [self.motion_tuning.jerk; 7],
                     path,
                     stopping,
                 }),
@@ -2224,10 +2342,8 @@ impl Core {
         Ok(())
     }
     fn decelerate(&mut self, measured: [f64; 7], dt: f64) -> Result<(), ApiError> {
-        let near_rest = self.velocity.iter().all(|v| v.abs() < 1e-6)
-            && self.acceleration.iter().all(|a| a.abs() < 1e-4);
         if let Some(path) = self.stop_path
-            && !near_rest
+            && !self.can_finish_stop(dt)
         {
             match self.commit_cartesian(
                 LocalTarget::Velocity {
@@ -2255,6 +2371,17 @@ impl Core {
         self.velocity.iter().all(|v| v.abs() < 1e-12)
             && self.acceleration.iter().all(|a| a.abs() < 1e-12)
     }
+    fn can_finish_stop(&self, dt: f64) -> bool {
+        // Hand off once zero velocity, then zero acceleration, fit the configured
+        // derivatives. This avoids an absolute near-zero velocity threshold.
+        let jerk_step = self.motion_tuning.jerk * dt;
+        (0..7).all(|i| {
+            let acceleration = -self.velocity[i] / dt;
+            acceleration.abs() <= self.motion_tuning.acceleration
+                && (acceleration - self.acceleration[i]).abs() <= jerk_step
+                && acceleration.abs() <= jerk_step
+        })
+    }
     fn advance(&mut self, now: Instant, dt: f64) {
         self.flush_calibration_report();
         self.advance_motion(now, dt);
@@ -2275,7 +2402,7 @@ impl Core {
                 return;
             }
         };
-        if dt > MAX_REFERENCE_AGE.as_secs_f64() || !dt.is_finite() {
+        if dt <= 0.0 || !dt.is_finite() {
             self.fault("control_timeout", "控制周期超时");
             return;
         }
@@ -2348,7 +2475,7 @@ impl Core {
         } else {
             0.0
         };
-        let smooth = if matches!(mode, MotionMode::Return { .. }) {
+        let smooth = if motion.space == Space::Joint {
             t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
         } else {
             t * t * (3.0 - 2.0 * t)
@@ -2386,8 +2513,42 @@ impl Core {
             && t >= 1.0
             && within_target(&self.reference)
             && (!needs_measured_position || within_target(&measured));
-        if at_target {
-            self.stop_path = Self::motion_path(motion);
+        // A Cartesian pose controller finishes its position trajectory before
+        // handing off to zero-velocity hold. Switching modes merely on entering
+        // the pose tolerance can send a slow jerk ramp past the goal repeatedly.
+        let pose_finish = motion.space == Space::Cartesian && matches!(mode, MotionMode::Step);
+        let finishing = motion.finishing;
+        let arrival_path = Self::motion_path(motion);
+        if at_target || finishing.is_some() {
+            if pose_finish && (!at_target || !self.can_finish_stop(dt)) {
+                let arrival = finishing.unwrap_or_else(|| {
+                    let velocity = self
+                        .velocity
+                        .iter()
+                        .map(|v| v.abs())
+                        .fold(f64::EPSILON, f64::max);
+                    let jerk = self.motion_tuning.jerk;
+                    HoldPose {
+                        joints: self.reference,
+                        // Keep the arrival bandwidth fixed as velocity decays.
+                        bandwidth: (jerk / velocity).sqrt(),
+                    }
+                });
+                self.motion.as_mut().unwrap().finishing = Some(arrival);
+                let goal = self
+                    .model
+                    .as_ref()
+                    .unwrap()
+                    .fk(&arrival.joints, self.tcp.as_ref().unwrap())
+                    .unwrap();
+                if let Err(error) =
+                    self.commit_cartesian(LocalTarget::Pose(goal), None, measured, dt, true)
+                {
+                    self.end_motion("failed", "kinematics", &error);
+                }
+                return;
+            }
+            self.stop_path = arrival_path;
             if let Err(e) = self.decelerate(measured, dt) {
                 self.fault(&e.code, e.message);
                 return;
@@ -2452,7 +2613,6 @@ impl Core {
             };
             if let Err(e) = self.commit_joint_velocity(desired_velocity, dt) {
                 self.fault(&e.code, e.message);
-                return;
             }
         } else {
             let target = if motion.mode.timed() {
@@ -2487,16 +2647,8 @@ impl Core {
                     if let Err(e) = self.decelerate(measured, dt) {
                         self.fault(&e.code, e.message);
                     }
-                    return;
                 }
             }
-        }
-        if self
-            .motion
-            .as_ref()
-            .is_some_and(|m| !m.calibration && m.mode.timed() && elapsed > m.duration + 3.0)
-        {
-            self.end_motion("failed", "target_timeout", "目标到达超时");
         }
     }
     fn outgoing_reference(&self) -> Reference {
@@ -2508,6 +2660,7 @@ impl Core {
             self.generation,
             self.reference_version,
         );
+        reference.joint_velocity = self.joint_speeds();
         reference.servo_tuning = self.servo_tuning;
         reference.tuning_revision = self.servo_tuning_revision;
         reference.stopping = self.stopping || self.stop_path.is_some();
@@ -2535,14 +2688,6 @@ impl Core {
                 tcp,
                 path,
                 goal: motion.and_then(|m| m.target_pose),
-                linear_speed: LINEAR_SPEED,
-                angular_speed: ANGULAR_SPEED,
-                measured: std::array::from_fn(|i| {
-                    self.feedback[i]
-                        .as_ref()
-                        .map_or(self.reference[i], |s| s.value.q)
-                }),
-                max_reference_error: MAX_TRACKING_ERROR,
             });
         }
         reference
@@ -2560,6 +2705,21 @@ impl Core {
             || self.reference_version != epoch
             || self.reference_epoch.load(Ordering::Acquire) != epoch
         {
+            return;
+        }
+        if matches!(
+            reason,
+            crate::reference::SampleStatus::Stale
+                | crate::reference::SampleStatus::Future
+                | crate::reference::SampleStatus::Constraint
+        ) {
+            self.journal.log(
+                "debug",
+                "control",
+                "send_hold",
+                &format!("发送暂缓：{reason:?}"),
+                None,
+            );
             return;
         }
         self.end_motion("failed", "send_reference", "发送参考无法对齐，动作已停止");
@@ -2994,6 +3154,7 @@ impl Core {
                 timeouts: self.communication.timeouts,
             },
             servo_tuning: self.servo_tuning,
+            motion_tuning: self.motion_tuning,
             servo_tuning_revision: self.servo_tuning_revision,
             calibration: self
                 .calibration
@@ -3333,7 +3494,7 @@ mod tests {
             source.generation,
             source.epoch,
             held,
-            crate::reference::SampleStatus::Constraint,
+            crate::reference::SampleStatus::Invalid,
         );
         core.settle_transitions(now + Duration::from_millis(10));
         assert!(core.enable_request.is_none() && !core.enabled);
@@ -3360,7 +3521,7 @@ mod tests {
             reference.generation,
             reference.epoch,
             held,
-            crate::reference::SampleStatus::Constraint,
+            crate::reference::SampleStatus::Invalid,
         );
         assert!(core.motion.is_none() && !core.stopping && core.enabled);
         assert!(core.port.is_some());
@@ -3716,15 +3877,13 @@ mod tests {
                         core.advance(at, at.duration_since(last_control).as_secs_f64());
                         last_control = at;
                         assert!(core.error.is_none(), "{:?}", core.error);
-                        path.check(
-                            &core
-                                .model
-                                .as_ref()
-                                .unwrap()
-                                .fk(&core.reference, core.tcp.as_ref().unwrap())
-                                .unwrap(),
-                        )
-                        .unwrap();
+                        let pose = core
+                            .model
+                            .as_ref()
+                            .unwrap()
+                            .fk(&core.reference, core.tcp.as_ref().unwrap())
+                            .unwrap();
+                        path.check(&pose).unwrap();
                         references.push(core.outgoing_reference());
                         if core.motion.is_none() {
                             break;
@@ -4310,16 +4469,42 @@ mod tests {
     }
     #[test]
     fn previewed_cartesian_calibration_executes_before_and_after_and_records_every_joint() {
+        run_previewed_calibration(
+            [0.3, 0.7, 1.1, 0.9, -0.4, 0.2, -0.3],
+            Pose {
+                translation: [0.025, -0.015, 0.1],
+                rotation: [
+                    0.09879603932153468,
+                    -0.148194058982302,
+                    0.19759207864306935,
+                    0.9639684818261637,
+                ],
+            },
+        );
+    }
+    #[test]
+    fn captured_pose_executes_its_full_automatic_calibration_range() {
+        run_previewed_calibration(
+            [
+                1.0485035052359992,
+                0.3369648851818667,
+                -0.024104830439799833,
+                0.5221767742481414,
+                1.683944156955803,
+                0.07362801043445026,
+                0.34971860713891384,
+            ],
+            Pose {
+                translation: [0.0; 3],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            },
+        );
+    }
+    fn run_previewed_calibration(initial: [f64; 7], tcp: Pose) {
         let origin = Instant::now();
         let (mut core, _dir, sent) = calibration_fixture(origin);
-        core.reference = [0.3, 0.7, 1.1, 0.9, -0.4, 0.2, -0.3];
-        core.tcp.as_mut().unwrap().translation = [0.025, -0.015, 0.1];
-        core.tcp.as_mut().unwrap().rotation = [
-            0.09879603932153468,
-            -0.148194058982302,
-            0.19759207864306935,
-            0.9639684818261637,
-        ];
+        core.reference = initial;
+        core.tcp = Some(tcp);
         calibration_tick(&mut core, &sent, origin, origin, false);
         let preview = crate::calibration_path::preview(
             core.model.as_ref().unwrap(),
@@ -4337,6 +4522,8 @@ mod tests {
             .fk(&program.origin, &program.tcp)
             .unwrap();
         let baseline = core.servo_tuning;
+        let original_motion = core.motion_tuning;
+        let (lower, upper) = core.model.as_ref().unwrap().position_limits();
         calibration_request(
             &mut core,
             "cartesian-program",
@@ -4350,6 +4537,16 @@ mod tests {
             let now = origin + Duration::from_millis(tick * 10);
             calibration_tick(&mut core, &sent, now, origin, false);
             assert!(core.error.is_none(), "{:?}", core.error);
+            for axis in 0..7 {
+                assert!(
+                    core.reference[axis] >= lower[axis].min(initial[axis]) - 1e-6
+                        && core.reference[axis] <= upper[axis].max(initial[axis]) + 1e-6,
+                    "axis {axis} q={} range {}..{} tick={tick}",
+                    core.reference[axis],
+                    lower[axis],
+                    upper[axis]
+                );
+            }
             if let Some(run) = &core.calibration {
                 assert!(!run.cancelled, "{}", run.report.message);
                 if run.cartesian()
@@ -4371,13 +4568,34 @@ mod tests {
                         high[stage][i] = high[stage][i].max(d);
                     }
                     let e = kinematics::pose_error(&center, &pose);
-                    assert!(e[3..].iter().all(|x| x.abs() < 0.003));
+                    // Full model travel includes derivative-limited turns near
+                    // reach boundaries. Use the API's existing one-degree pose
+                    // tolerance; small local-path tests check finer accuracy.
+                    assert!(
+                        e[3..].iter().map(|x| x * x).sum::<f64>().sqrt()
+                            <= std::f64::consts::PI / 180.0,
+                        "tick={tick} stage={} leg={} error={e:?} q={:?}",
+                        run.queue[run.trial].phase,
+                        run.leg,
+                        core.reference
+                    );
                 }
             } else {
                 break;
             }
         }
-        assert!(core.calibration.is_none(), "programme did not finish");
+        assert!(
+            core.calibration.is_none(),
+            "programme did not finish: phase={:?}, calibration={:?}, motion={:?}, reference={:?}",
+            core.phase,
+            core.calibration
+                .as_ref()
+                .map(|r| (r.queue[r.trial].phase.as_str(), r.leg, r.trial)),
+            core.motion
+                .as_ref()
+                .map(|m| (m.axis, m.duration, m.target_pose)),
+            core.reference
+        );
         let status = core.calibration_result.as_ref().unwrap();
         assert_eq!(
             status.state,
@@ -4432,6 +4650,7 @@ mod tests {
                 .all(|p| full.trials.get(p.trial).is_some())
         );
         assert_eq!(core.servo_tuning, baseline);
+        assert_eq!(core.motion_tuning, original_motion);
         assert!((0..7).all(|i| (core.reference[i] - program.origin[i]).abs() < 0.02));
         let json = serde_json::to_value(core.snapshot(Instant::now())).unwrap();
         assert!(json.get("calibration_report").is_none());
@@ -4572,6 +4791,258 @@ mod tests {
             assert!(core.at_rest());
             assert_eq!(core.servo_tuning, baseline);
             assert_eq!(core.calibration_result.as_ref().unwrap().state, "cancelled");
+            let report = core.last_calibration_report.as_ref().unwrap();
+            assert!(report.sample_count > 0);
+            assert!(
+                report.trials[0].metrics.is_some(),
+                "a stopped measurement must retain the observations already collected"
+            );
+        }
+    }
+    #[test]
+    fn temporary_sender_hold_keeps_calibration_and_the_motion_context() {
+        let origin = Instant::now();
+        let (mut core, _dir, sent) = calibration_fixture(origin);
+        calibration_request(
+            &mut core,
+            "hold-calibration",
+            Operation::CalibrateStart {
+                settings: calibration_settings(),
+            },
+            origin,
+        );
+        for tick in 1..60 {
+            calibration_tick(
+                &mut core,
+                &sent,
+                origin + Duration::from_millis(tick * 10),
+                origin,
+                false,
+            );
+        }
+        let epoch = core.reference_version;
+        let generation = core.generation;
+        let action = core.motion.as_ref().unwrap().request_id.clone();
+        for reason in [
+            crate::reference::SampleStatus::Stale,
+            crate::reference::SampleStatus::Future,
+        ] {
+            core.reject_send_reference(generation, epoch, core.reference, reason);
+            assert!(!core.calibration.as_ref().unwrap().cancelled);
+            assert_eq!(core.motion.as_ref().unwrap().request_id, action);
+            assert_eq!(core.reference_version, epoch);
+        }
+        calibration_tick(
+            &mut core,
+            &sent,
+            origin + Duration::from_millis(600),
+            origin,
+            false,
+        );
+        assert!(core.error.is_none());
+        assert!(core.calibration.is_some());
+    }
+    #[test]
+    fn accepted_preview_keeps_an_actual_anchor_just_outside_the_nominal_model_range() {
+        let origin = Instant::now();
+        let (mut core, _dir, sent) = calibration_fixture(origin);
+        let mut preview_origin = core.reference;
+        preview_origin[1] = 0.005;
+        core.reference[1] = -0.004;
+        calibration_tick(&mut core, &sent, origin, origin, false);
+        let program = serde_json::from_value(serde_json::json!({
+            "side":core.side,"origin":preview_origin,"tcp":core.tcp,
+            "amplitude":0.02,"speed":0.01,
+            "segments":[{"axis":2,"offset":0.02},{"axis":2,"offset":0}]
+        }))
+        .unwrap();
+        calibration_request(
+            &mut core,
+            "near-limit-preview",
+            Operation::CalibrateStart {
+                settings: CalibrationSettings {
+                    cartesian: Some(program),
+                    ..CalibrationSettings::default()
+                },
+            },
+            origin,
+        );
+        assert!(core.calibration.is_some(), "accepted preview must start");
+        for tick in 1..100 {
+            calibration_tick(
+                &mut core,
+                &sent,
+                origin + Duration::from_millis(tick * 10),
+                origin,
+                false,
+            );
+            assert!(core.error.is_none(), "{:?}", core.error);
+            assert!(
+                core.calibration.as_ref().is_some_and(|run| !run.cancelled),
+                "{:?}",
+                core.calibration_result
+                    .as_ref()
+                    .map(|s| s.report.as_ref().map(|r| r.message.as_str()))
+            );
+        }
+    }
+    #[test]
+    fn stopping_a_cartesian_measurement_retains_seven_axis_metrics_and_curves() {
+        let origin = Instant::now();
+        let (mut core, _dir, sent) = calibration_fixture(origin);
+        let program = serde_json::from_value(serde_json::json!({
+            "side":core.side,"origin":core.reference,"tcp":core.tcp,
+            "amplitude":0.15,"speed":0.04,
+            "segments":[{"axis":2,"offset":0.15},{"axis":2,"offset":0}]
+        }))
+        .unwrap();
+        calibration_request(
+            &mut core,
+            "partial-cartesian",
+            Operation::CalibrateStart {
+                settings: CalibrationSettings {
+                    cartesian: Some(program),
+                    ..CalibrationSettings::default()
+                },
+            },
+            origin,
+        );
+        for tick in 1..200 {
+            calibration_tick(
+                &mut core,
+                &sent,
+                origin + Duration::from_millis(tick * 10),
+                origin,
+                false,
+            );
+        }
+        assert!(core.calibration.as_ref().is_some_and(|run| !run.cancelled));
+        calibration_request(
+            &mut core,
+            "cancel",
+            Operation::Stop,
+            origin + Duration::from_secs(2),
+        );
+        for tick in 200..500 {
+            calibration_tick(
+                &mut core,
+                &sent,
+                origin + Duration::from_millis(tick * 10),
+                origin,
+                false,
+            );
+            if core.calibration.is_none() {
+                break;
+            }
+        }
+        let report = core.last_calibration_report.as_ref().unwrap();
+        assert_eq!(report.outcome, "cancelled");
+        assert!(report.curves.len() > 20);
+        let metrics = report.trials[0].metrics_by_joint.as_ref().unwrap();
+        assert_eq!(metrics.len(), 7);
+        assert!(metrics.iter().all(Option::is_some));
+    }
+    #[test]
+    fn motion_preferences_replace_the_old_jog_and_step_software_caps() {
+        let now = Instant::now();
+        for (space, axis, speed, amount) in [
+            (Space::Joint, 0, 0.4, 0.5),
+            (Space::Cartesian, 0, 0.04, 0.15),
+            (Space::Cartesian, 5, 0.4, 0.5),
+        ] {
+            let (mut core, _dir) = observed_core(now);
+            core.enabled = true;
+            core.tcp = Some(Pose::identity());
+            core.apply(
+                "motion",
+                Operation::ConfigureMotion {
+                    config: MotionTuning {
+                        joint_speed: 0.7,
+                        acceleration: 0.8,
+                        jerk: 8.0,
+                    },
+                },
+                now,
+                now,
+            )
+            .unwrap();
+            core.begin(
+                "larger-step",
+                space,
+                axis,
+                1,
+                speed,
+                Frame::Base,
+                true,
+                amount,
+                None,
+                0,
+                now,
+            )
+            .unwrap();
+            assert_eq!(core.motion.as_ref().unwrap().speed, speed);
+            assert_eq!(core.motion.as_ref().unwrap().amount, amount);
+            assert_eq!(core.outgoing_reference().joint_velocity, [0.7; 7]);
+        }
+    }
+    #[test]
+    fn slow_jerk_joint_and_cartesian_steps_finish_after_the_former_wall_clock_deadline() {
+        for (space, axis, amount, speed) in [
+            (Space::Joint, 0, 0.5, 0.4),
+            (Space::Cartesian, 0, 0.01, 0.04),
+        ] {
+            let origin = Instant::now();
+            let (mut core, _dir) = observed_core(origin);
+            core.reference = [0.3, 0.7, 1.1, 0.9, -0.4, 0.2, -0.3];
+            follow_reference(&mut core, origin);
+            core.enabled = true;
+            core.tcp = Some(Pose {
+                translation: [0.0, 0.0, 0.1],
+                ..Pose::identity()
+            });
+            core.motion_tuning = MotionTuning {
+                joint_speed: 1.0,
+                acceleration: 0.8,
+                jerk: 0.01,
+            };
+            core.begin(
+                "slow-jerk",
+                space,
+                axis,
+                1,
+                speed,
+                Frame::Base,
+                true,
+                amount,
+                None,
+                0,
+                origin,
+            )
+            .unwrap();
+            let mut elapsed = 0.0;
+            for tick in 1..10000 {
+                elapsed = tick as f64 * 0.01;
+                let now = origin + Duration::from_millis(tick * 10);
+                follow_reference(&mut core, now);
+                let previous_acceleration = core.acceleration;
+                core.advance(now, 0.01);
+                assert!(core.error.is_none(), "{space:?}: {:?}", core.error);
+                for (i, a) in previous_acceleration.into_iter().enumerate() {
+                    assert!((core.acceleration[i] - a).abs() <= 0.01 * 0.01 + 1e-8);
+                }
+                if core.motion.is_none() {
+                    break;
+                }
+            }
+            assert!(
+                elapsed > 1.5 * amount / speed + 3.0,
+                "fixture must exceed the former timeout"
+            );
+            assert!(
+                core.motion.is_none() && core.at_rest(),
+                "{space:?} did not complete"
+            );
+            assert_eq!(core.results.front().unwrap().code, "completed");
         }
     }
     #[test]
@@ -5152,7 +5623,7 @@ mod tests {
         core.port = Some("memory-only".into());
         core.begin_return("return", core.reference, 0.1, true, now)
             .unwrap();
-        for _ in 0..39 {
+        while core.motion.as_ref().unwrap().settled_since.is_none() {
             now += Duration::from_millis(10);
             follow_reference(&mut core, now);
             core.advance(now, 0.01);
@@ -5236,7 +5707,7 @@ mod tests {
                 .code,
             "invalid_pose"
         );
-        for speed in [0.0, -0.1, 0.21, f64::NAN] {
+        for speed in [0.0, -0.1, f64::NAN] {
             assert_eq!(
                 core.begin_return("bad", initial, speed, true, now)
                     .unwrap_err()
@@ -5317,7 +5788,9 @@ mod tests {
                             }
                         }
                         assert!(core.velocity[axis] * direction as f64 >= -1e-10);
-                        if (100..180).contains(&tick) {
+                        // Allow the configured acceleration and jerk to bring
+                        // the new 1 rad/s preference up to constant speed.
+                        if (160..180).contains(&tick) {
                             assert!((core.velocity[axis] - direction as f64 * speed).abs() < 1e-9);
                             assert!(core.acceleration[axis].abs() < 1e-9);
                         }
@@ -5387,12 +5860,98 @@ mod tests {
 
     #[test]
     fn cartesian_jogs_and_steps_preserve_offset_tcp_and_jerk_at_low_speed() {
+        run_cartesian_motion_checks(
+            [1.5576, -0.0350, 0.0102, -0.0217, 1.6217, 0.0088, 0.1133],
+            0.0005,
+            0.005,
+            6.0,
+            [0.0, 0.0, 0.1],
+            &[false, true],
+        );
+    }
+    #[test]
+    fn cartesian_jogs_above_the_former_caps_preserve_offset_tcp_through_stop() {
+        run_cartesian_motion_checks(
+            [0.3, 0.7, 1.1, 0.9, -0.4, 0.2, -0.3],
+            0.04,
+            0.4,
+            6.0,
+            [0.0, 0.0, 0.1],
+            &[false],
+        );
+    }
+    #[test]
+    fn gentle_jerk_stops_keep_the_offset_tcp_center_at_higher_jog_speeds() {
+        let origin = Instant::now();
+        let (mut core, _dir) = observed_core(origin);
+        core.reference = [0.3, 0.7, 1.1, 0.9, -0.4, 0.2, -0.3];
+        follow_reference(&mut core, origin);
+        core.enabled = true;
+        core.port = Some("offline-stop".into());
+        core.motion_tuning.jerk = 0.6;
+        core.tcp = Some(Pose {
+            translation: [0.025, -0.015, 0.1],
+            ..Pose::identity()
+        });
+        core.begin(
+            "rotation",
+            Space::Cartesian,
+            4,
+            1,
+            0.7,
+            Frame::Base,
+            false,
+            0.0,
+            None,
+            0,
+            origin,
+        )
+        .unwrap();
+        let path = Core::motion_path(core.motion.as_ref().unwrap()).unwrap();
+        let mut stopped = false;
+        for tick in 1..2000 {
+            let now = origin + Duration::from_millis(tick * 10);
+            follow_reference(&mut core, now);
+            if tick == 200 {
+                core.apply("stop", Operation::Stop, now, now).unwrap();
+            }
+            let q = core.reference;
+            let v = core.velocity;
+            let a = core.acceleration;
+            core.advance(now, 0.01);
+            assert_integrated_dynamics(&core, q, v, 0.01);
+            for (i, previous) in a.into_iter().enumerate() {
+                assert!((core.acceleration[i] - previous).abs() <= 0.6 * 0.01 + 1e-8);
+            }
+            if tick >= 200 && core.at_rest() && !core.stopping {
+                stopped = true;
+                break;
+            }
+        }
+        assert!(stopped, "jerk-limited rotation must finish stopping");
+        let pose = core
+            .model
+            .as_ref()
+            .unwrap()
+            .fk(&core.reference, core.tcp.as_ref().unwrap())
+            .unwrap();
+        path.check(&pose).unwrap();
+        assert_eq!(core.results.front().unwrap().code, "stopped");
+        assert!(core.enabled && core.port.is_some());
+    }
+    fn run_cartesian_motion_checks(
+        q: [f64; 7],
+        linear_speed: f64,
+        angular_speed: f64,
+        jerk: f64,
+        tcp_offset: [f64; 3],
+        steps: &[bool],
+    ) {
         for frame in [Frame::Base, Frame::Tool] {
             for axis in 0..6 {
-                for step in [false, true] {
+                for &step in steps {
                     let mut now = Instant::now();
                     let (mut core, _directory) = observed_core(now);
-                    let q = [1.5576, -0.0350, 0.0102, -0.0217, 1.6217, 0.0088, 0.1133];
                     for (i, value) in q.into_iter().enumerate() {
                         let mut f = core.feedback[i].as_ref().unwrap().value.clone();
                         f.q = value;
@@ -5400,12 +5959,17 @@ mod tests {
                     }
                     core.reference = q;
                     core.enabled = true;
+                    core.motion_tuning.jerk = jerk;
                     core.tcp = Some(Pose {
-                        translation: [0.0, 0.0, 0.1],
+                        translation: tcp_offset,
                         rotation: [0.0, 0.0, 0.0, 1.0],
                     });
                     core.port = Some("memory-only".into());
-                    let speed = if axis < 3 { 0.0005 } else { 0.005 };
+                    let speed = if axis < 3 {
+                        linear_speed
+                    } else {
+                        angular_speed
+                    };
                     let amount = if axis < 3 { 0.002 } else { 0.03 };
                     core.begin(
                         "cartesian",
@@ -5436,19 +6000,22 @@ mod tests {
                         assert_integrated_dynamics(&core, old_q, old_v, dt);
                         for (i, previous_a) in old_a.into_iter().enumerate() {
                             assert!(
-                                (core.acceleration[i] - previous_a).abs() <= JOINT_JERK * dt + 1e-8,
+                                (core.acceleration[i] - previous_a).abs() <= jerk * dt + 1e-8,
                                 "{frame:?} axis={axis} step={step} tick={tick}"
                             );
                         }
-                        path.check(
-                            &core
-                                .model
-                                .as_ref()
-                                .unwrap()
-                                .fk(&core.reference, core.tcp.as_ref().unwrap())
-                                .unwrap(),
-                        )
-                        .unwrap();
+                        let pose = core
+                            .model
+                            .as_ref()
+                            .unwrap()
+                            .fk(&core.reference, core.tcp.as_ref().unwrap())
+                            .unwrap();
+                        path.check(&pose).unwrap_or_else(|error| {
+                            panic!(
+                                "{frame:?} axis={axis} tick={tick} stopping={}: {error}",
+                                core.stopping
+                            )
+                        });
                         if core.motion.is_none() && !core.stopping {
                             break;
                         }
@@ -5504,7 +6071,7 @@ mod tests {
         assert_integrated_dynamics(&core, q, dq, 0.002);
         assert!(core.motion.is_some());
         assert!(core.velocity[0] > 0.0);
-        for _ in 0..300 {
+        for _ in 0..3000 {
             now += Duration::from_millis(2);
             follow_reference(&mut core, now);
             let q = core.reference;
@@ -5515,7 +6082,13 @@ mod tests {
                 break;
             }
         }
-        assert!(core.motion.is_none());
+        assert!(
+            core.motion.is_none(),
+            "remaining v={:?} a={:?} q={:?}",
+            core.velocity,
+            core.acceleration,
+            core.reference
+        );
         assert!(core.velocity.iter().all(|v| v.abs() < 1e-12));
         assert_eq!(core.results.front().unwrap().code, "completed");
     }

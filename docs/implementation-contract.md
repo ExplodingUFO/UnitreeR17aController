@@ -129,6 +129,7 @@
 | `clear_fault`    | 无                                                    | 该请求 `completed/cleared`，`error:null`、`enabled:false`               |
 | `configure_tcp`  | `tcp:Pose`                                            | 请求被接受，`tcp_configured:true`，`tcp_transform` 与归一化后的输入一致 |
 | `configure_servo` | `config:ServoTuning`（完整七轴配置） | `accepted/configure_servo`，快照配置及版本更新；不产生独立 completed |
+| `configure_motion` | `config:MotionTuning` | `accepted/configure_motion`，快照运动设置与 generation 更新 |
 | `calibrate_start` | `settings:CalibrationSettings` | 接受后跟踪 `calibration`；结束返回 completed、cancelled 或 failed，code 为 calibration_done |
 | `calibrate_apply` | `calibration_id:string` | `accepted/calibrate_apply`，配置及版本与推荐一致 |
 | `jog_start`      | `space,axis,direction,speed,frame?,ttl_ms?,input_seq` | 请求被接受且 `action.request_id` 等于本次 `request_id`                  |
@@ -145,11 +146,11 @@
 
 ### 5.3 坐标、单位与范围
 
-| 点动类型 | `space` / `axis`                | `speed` 单位与上限 | `amount` 单位与上限 |
+| 点动类型 | `space` / `axis`                | `speed` 单位 | `amount` 单位 |
 | -------- | ------------------------------- | ------------------ | ------------------- |
-| 关节     | `joint`，0..6 对应 J1..J7       | rad/s，≤ 0.20      | rad，≤ 0.35         |
-| 末端平移 | `cartesian`，0..2 对应 X/Y/Z    | m/s，≤ 0.015       | m，≤ 0.05           |
-| 末端旋转 | `cartesian`，3..5 对应 Rx/Ry/Rz | rad/s，≤ 0.15      | rad，≤ 0.35         |
+| 关节     | `joint`，0..6 对应 J1..J7       | rad/s | rad |
+| 末端平移 | `cartesian`，0..2 对应 X/Y/Z    | m/s | m |
+| 末端旋转 | `cartesian`，3..5 对应 Rx/Ry/Rz | rad/s | rad |
 
 `speed`、`amount` 必须为正数，方向由 `direction:-1|1` 指定。`frame` 默认 `base`：`base` 沿固定基座轴运动，`tool` 沿当前 TCP 轴运动。关节点动建议传 `base`，该字段不影响关节轴。
 
@@ -245,7 +246,7 @@ J1 正向连续点动，速度 0.1 rad/s：
 
 ### 5.6 收纳返回与断开
 
-先在桌面记录有支撑的收纳姿态，或由调用方保存实测七轴位置，再提交 `return_to_pose`。`joints` 按 J1..J7 排列，单位 rad；`speed` 为正且不超过 0.20 rad/s。各轴相对当前参考位置的行程不得超过 2π rad。请求需要控制权、已使能状态、完整新鲜反馈，且没有其他动作。
+先在桌面记录有支撑的收纳姿态，或由调用方保存实测七轴位置，再提交 `return_to_pose`。`joints` 按 J1..J7 排列，单位 rad；`speed` 为有限正数，执行时受当前运动设置与模型关节速度约束。请求需要控制权、已使能状态、完整新鲜反馈，且没有其他动作。
 
 七轴按共同的五次多项式生成返回目标，起止速度和加速度为零；控制参考再经过关节速度、加速度和 jerk 限制，按实际控制间隔积分。回程是关节插值，不提供碰撞规划。界面按左右臂与串口保存收纳位，没有预置角度。
 
@@ -270,9 +271,13 @@ J1 正向连续点动，速度 0.1 rad/s：
 
 ### 5.7 参考导数与停止
 
-关节、末端点动与收纳返回共用离散参考限制：关节速度不超过 0.20 rad/s，加速度不超过 0.60 rad/s²，jerk 的当前离线默认值为 6 rad/s³。控制器保留原有 Euler 积分，先求满足导数窗口的最终速度，再按实际周期积分 `q_ref`；`ddq_ref` 和 `jerk_ref` 分别从相邻速度和加速度求得。
+关节、末端点动与收纳返回共用 `MotionTuning`：`joint_speed` 默认 1 rad/s、`acceleration` 默认 0.60 rad/s²、`jerk` 默认 6 rad/s³，均为有限正数。关节速度取设置与 URDF 各轴速度的较小值。控制器先求满足导数窗口的最终速度，再按实际周期积分 `q_ref`；`ddq_ref` 和 `jerk_ref` 分别从相邻速度和加速度求得。
 
-末端求解把动态窗口直接纳入 Jacobian 的有界二次规划，避免逐轴独立平滑改变所选 TCP 路径。候选继续受参考偏差与单步增量限制，经 FK 检查路径偏差和速度；路径模型阈值为 50 μm、0.002 rad。全局 TCP 速度上限预留 10% 目标余量，接近上限时目标为 13.5 mm/s、0.135 rad/s；低于这两个阈值的请求不因该余量额外缩放。最终 FK 仍检查 15 mm/s、0.15 rad/s 的硬上限。模型阈值用于筛选参考候选，机械臂实际精度仍待测。
+末端求解把导数窗口直接纳入 Jacobian 的有界二次规划，路径修正用于保持所选 TCP 的运动方向和旋转中心。速度按请求、当前姿态和有效关节速度求解；不另设固定的 15 mm/s、0.15 rad/s 上限，也不通过微小 FK 残差结束动作。
+
+空闲时可提交 `{"kind":"configure_motion","config":{"joint_speed":1,"acceleration":0.6,"jerk":6}}`，公共命令字段与其他请求相同。配置需要控制权，接受后更新 generation；当前值见 `Snapshot.motion_tuning`。校准使用预览中的 `program.motion`，结束或取消后恢复开始前的运动设置。
+
+关节步长与收纳使用起止速度、加速度为零的五次轨迹，时长同时考虑速度、加速度与 jerk。末端步长通过当前 Jacobian 估计关节位移，用于安排导数受限的参考时长；执行仍由同一局部求解器推进。预计时长不是普通步长的失败期限，到位并完成减速后才报告完成。
 
 停止权限、租约与 generation 校验、原请求的 cancelled 结果保持原有语义。正常停止按 jerk 限制减速，可能需要更长时间；`action:null` 后仍须等待 `stopping` 结束。停止求解惩罚关节速度本身，使冗余方向的速度也减至零，连续性由导数硬约束维持。笛卡尔路径无法满足制动约束时，写入 `control/stop_path` 警告并转为受限关节制动。故障、失能和关闭继续优先处理。
 
@@ -284,19 +289,17 @@ J1 正向连续点动，速度 0.1 rad/s：
 
 发送线程在本批次主机起点选取最新源参考，以其来源时间计算 `age`，要求 `0 ≤ age ≤ 50 ms`。先按 `dq + ddq*age` 取样速度，在关节速度上限或首次速度零点封顶；已零速的停止参考不会自行启动。首次伺服取样按该段速度积分位置，未触边界时为 `q + dq*age + 0.5*ddq*age²`。
 
-有上一成功整批伺服目标时，位置按 `q_previous + 0.5*(dq_previous + dq_sample)*Δt_tx` 连续积分，使用两次主机批次起点的实际间隔。新控制参考只更新取样速度，不重新锚定发送位置，避免控制器离散积分与外推交接时的位置回跳。与源参考投影位置的偏离不得超过 0.01 rad。本次不修改控制器 Euler 积分或 jerk 限制。
+有上一成功整批伺服目标时，位置按 `q_previous + 0.5*(dq_previous + dq_sample)*Δt_tx` 连续积分，使用两次主机批次起点的实际间隔。新控制参考只更新取样速度，不重新锚定发送位置，避免控制器离散积分与外推交接时的位置回跳。
 
 新点动、固定步长和收纳回程从最近成功发送的静止目标建立起点，避免多次动作积累控制参考与发送位置的残差。该目标必须属于当前 generation/epoch、年龄不超过 50 ms、七轴指令速度均为零；未确认时返回 `motion_busy`，不排队启动下一段。目标仍需满足相对实测的 0.6 rad 偏差限制。此交接读取单值内存快照，不访问日志或数据库。
 
-取样沿用动作的不可变 TCP、路径起点与方向，不随新源参考重设路径。候选经 FK 复核路径、全局 TCP 速度上限及相对实测偏差。首次取样以源参考为速度检查起点，后续以最近成功批次的目标和实际发送间隔检查 TCP 速度。
-
-上一成功伺服目标保留位置、速度和批次主机起点。相对该目标的关节位移同时受 0.01 rad 与 `JOINT_SPEED × 实际发送间隔` 约束，即 `|Δq| ≤ min(0.01 rad, 0.20 rad/s × Δt)`；两端速度同向时，位置不得反向变化。越过位移预算或方向检查失败均为 `constraint`，按下述规则保持或拒绝。
+发送端按当前有效关节速度对预测速度限幅，保留 TCP 和动作目标，不再次进行路径、实测跟随或固定关节增量检查。轨迹生成与发送积分的细小残差不会产生运动失败。
 
 关节目标越界时限制在目标或本次积分起点，并将对应速度置零；末端目标越界时保持上一成功伺服位置（无历史则保持源位置），整组速度置零。取消后的减速不再追逐旧目标。
 
 源参考携带 generation、epoch 与有效截止时间；运动期间截止时间取输入有效期与租约到期时间的较早者。取样前及写入前复查 epoch 和有效期，写入前同时检查优先命令；失效候选不提交。已开始写入的七轴批次仍使用原有 20 ms 整批预算，不在批次中途插入其它报文；这不是实际线上 TX 或电机确认的时限保证。
 
-参考过旧、来自未来、无效或不满足约束时，若有上一成功写完整批的七轴伺服目标，就保持其位置、将速度置零；同一 epoch 的拒绝原因保持到上下文更新。控制器只处理 generation 与 epoch 仍匹配的拒绝，将当前动作记为 `failed/send_reference`，同步保持目标并清零导数，保留控制权；已使能时继续保持使能。
+参考过旧或时间暂时未对齐时，若有上一成功整批伺服目标，就保持位置并将速度置零；新参考到达后恢复取样，不结束当前校准或点动。非有限输入与动作有效期到期仍结束动作。迟到的旧 generation/epoch 事件不会影响新的动作。
 
 使能确认中的匹配拒绝同样有效：结束 `enable_request`，记录 `failed/send_reference`，维持原有 `enabled=false`，同次新鲜反馈不能再将其置为 Ready。迟到拒绝不能取消新动作。首次无效且没有成功伺服历史时走 I/O 错误处理。已换代或到期而在写前跳过的批次不产生 `transmit` 样本。
 
@@ -359,17 +362,20 @@ J1 正向连续点动，速度 0.1 rad/s：
 
 | 字段 | 默认 | 范围与单位 |
 | --- | --- | --- |
-| `amplitude` | 0.05 | 单向 20..100 mm，API 使用 m；默认正负各 50 mm |
-| `speed` | 0.01 | 5..13.5 mm/s，API 使用 m/s |
+| `amplitude` | null | 自动计算各方向连续可达行程；指定时为有限正数，单位 m，按实际可达范围截取 |
+| `speed` | 0.01 | 有限正数，单位 m/s；运动设置与模型决定实际可执行速度 |
 | `axes` | [0,1,2] | 基座 X/Y/Z；重复值合并 |
+| `motion` | 1 / 0.6 / 6 | joint_speed / acceleration / jerk，分别为 rad/s、rad/s²、rad/s³ |
 
 预览使用当前指令保持位置和当前 TCP，沿各方向生成正向、反向、回原位片段。保持 TCP 姿态，连续求解关节构型；不足整段时保留可达行程。返回 `program` 与 `points`：
 
-- `program`：side、origin（七轴 rad）、tcp（Link7→TCP）、amplitude、speed、joint_excursion（默认 16°，目标 ±8°）、segments。
+- `program`：side、origin（七轴 rad）、tcp（Link7→TCP）、amplitude、speed、joint_excursion（默认 16°，目标 ±8°）、motion、auto_range、segments、guide。
+- `guide[]`：axis、offset（基座 m）、joints（七轴 rad），为执行提供预览中的连续关节构型参考，随 program 原样提交；旧报告可以缺省。
+- `ranges[]`：axis、negative、positive，单位 m；表示从当前姿态出发、保持 TCP 方向时，各基座方向的连续可达范围。它不是所有可能关节构型的全局工作空间。
 - `segments[]`：axis（0..2）、offset（相对原始 TCP 的绝对带符号偏移，m）。其他分量仍以原位为准。
 - `points[]`：joints（七轴 rad）、tcp（基座坐标 XYZ，m）、segment、space、axis。space 为 cartesian、joint 或 joint_return；points 同时包含末端路线、冗余自由度回原位和全部关节试验。
 
-前端使用 points 显示路线、计划姿态及整臂包络，实际行程以生成结果为准。预览在工作线程计算，不占用控制周期；生成预览不改变参数或使能状态。
+前端使用 points 按阶段显示彩色路线、方向、关键姿态与连杆扫掠，可切换视角和播放。范围盒可单独打开。预览在工作线程计算，不占用控制周期；生成预览不改变参数或使能状态。
 
 **确认启动**：把收到的 `program` 原样放入 `settings.cartesian`，提交普通命令：
 
@@ -405,8 +411,8 @@ Kp/Kd 保持起始值。推荐只涉及平滑摩擦与速度前馈，末端前�
 | 字段 | 默认 | 范围 |
 | --- | --- | --- |
 | `axis` | null，七轴 | 0..6 指定单轴；末端程序测试七轴 |
-| `excursion` | 0.2792526803190927（16°） | rad，1°..30°，目标取一半；末端程序采用 program.joint_excursion |
-| `speed` | 0.03490658503988659（2°/s） | rad/s，0.005..0.08，第二档两倍 |
+| `excursion` | 0.2792526803190927（16°） | 有限正数，rad，目标取一半；末端程序采用 program.joint_excursion |
+| `speed` | 0.03490658503988659（2°/s） | 有限正数，rad/s，第二档两倍 |
 | `max_friction` | 0.2 | Nm，0..2，Fc 取一半及全部，0 跳过摩擦候选 |
 | `cartesian` | null | 已预览的 CartesianProgram |
 
@@ -509,6 +515,7 @@ Kp/Kd 保持起始值。推荐只涉及平滑摩擦与速度前馈，末端前�
 | `tcp_configured`          | boolean                        | 是否有可用的 TCP；连接后默认 Link7 法兰为 true     |
 | `servo_tuning` | `ServoTuning` | 当前完整伺服配置，见 5.9；连接/断开恢复基线 |
 | `servo_tuning_revision` | u64 | 当前配置版本；应用及连接/断开重置时更新，不跨进程保存 |
+| `motion_tuning` | `MotionTuning` | 当前关节速度、加速度与 jerk 设置，见 5.7 |
 | `feedback_age_ms`         | u64 或 null                    | 已有反馈中最大的接收年龄                           |
 | `action`                  | object 或 null                 | 当前动作：`request_id,space,mode,axis,progress`    |
 | `calibration` | `CalibrationStatus` 或 null | 当前校准或最近一次结果，见 5.10 |
@@ -721,8 +728,8 @@ Authorization: Bearer <token>
 | `bounded`       | 关节目标使候选限幅，或末端目标越界后保持位置。             |
 | `stale`         | 源年龄超过 50 ms。                                         |
 | `future`        | 取样时刻早于源时刻，或不晚于上一成功伺服批次起点。         |
-| `invalid`       | 数值非有限、源速度/加速度超限或取样参数无效。              |
-| `constraint`    | 路径、TCP 速度、相对实测偏差或相邻成功目标增量检查未通过。 |
+| `invalid`       | 数值非有限或取样参数无效。                                |
+| `constraint`    | 目标 FK 无法计算；旧采样也使用此值记录路径检查失败。       |
 | `expired`       | 已到输入或租约的有效截止时间。                             |
 
 完整三类样本示例见 [OpenAPI](openapi.json) 的 `TraceSample` 和读取响应。事件日志与短时采样仍使用单次 `try_lock`、竞争即丢弃和独立 SQLite writer，不等待队列或磁盘。
@@ -889,7 +896,7 @@ Tauri 仅向主窗口提供三个命令：
 
 ### trajectory.rs
 
-提供 `velocity_window`、`integrate` 和七变量盒约束的 `bounded_quadratic`。动态窗口由前一速度、加速度、目标、限制与实际 `dt` 计算；关节与末端求解使用相同的导数约束。当前常量为 `JOINT_SPEED=0.20`、`JOINT_ACCELERATION=0.60`、`JOINT_JERK=6.0`，单位分别为 rad/s、rad/s²、rad/s³。数值输入显式传入，可独立进行离线测试。
+提供 `MotionTuning`、`velocity_window`、`integrate` 和七变量盒约束的 `bounded_quadratic`。动态窗口由前一速度、加速度、目标、限制与实际 `dt` 计算；关节与末端求解使用相同导数约束。默认值为 1 rad/s、0.60 rad/s²、6 rad/s³；模型各轴额定速度单独读取，数值输入显式传入，可独立测试。
 
 ### journal.rs
 

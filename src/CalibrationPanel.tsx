@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import {
   api,
   ApiError,
+  DEFAULT_MOTION_TUNING,
   parseCalibrationReport,
   sameServoTuning,
   type CalibrationMetrics,
@@ -14,7 +15,16 @@ import {
   type View,
   hasFreshFeedback,
 } from "./api";
-import RobotScene, { type PreviewEnvelope } from "./RobotScene";
+import RobotScene, {
+  stagePoints,
+  type PreviewEnvelope,
+  type PreviewStage,
+} from "./RobotScene";
+import {
+  MotionTuningFields,
+  toMotionDraft,
+  readMotionDraft,
+} from "./ServoPanel";
 import CalibrationChart, {
   calibrationTrialLabel,
   calibrationTrials,
@@ -159,10 +169,12 @@ function ReportDetails({
   report,
   local,
   applied,
+  onCurves,
 }: {
   report: CalibrationReport;
   local: boolean;
   applied: boolean;
+  onCurves: () => void;
 }) {
   const axes = measuredAxes(report);
   const cartesianBefore = report.trials.find(
@@ -172,6 +184,23 @@ function ReportDetails({
     (trial) => trial.phase === "cartesian_after",
   );
   const hasCartesian = !!cartesianBefore || !!cartesianAfter;
+  const recordedCount = report.sample_count || report.curves?.length || 0;
+  const recordedDuration = report.curves?.length
+    ? Math.max(...report.curves.map((point) => point.t_ms)) / 1000
+    : null;
+  const beforeMetrics = cartesianBefore?.metrics_by_joint;
+  const afterMetrics = cartesianAfter?.metrics_by_joint;
+  const cartesianAxes = Array.from({ length: 7 }, (_, axis) => axis).filter(
+    (axis) => beforeMetrics?.[axis] || afterMetrics?.[axis],
+  );
+  const pairedCartesian =
+    !!beforeMetrics?.some(Boolean) && !!afterMetrics?.some(Boolean);
+  const hasJointStatistics = report.trials.some(
+    (trial) =>
+      trial.space !== "cartesian" &&
+      !trial.phase.startsWith("cartesian_") &&
+      trial.metrics,
+  );
   const deltas = report.baseline.joints.flatMap((before, axis) =>
     (["coulomb", "velocity_ff"] as const).flatMap((key) => {
       const after = report.recommended?.joints[axis][key];
@@ -220,54 +249,77 @@ function ReportDetails({
               : "已恢复起始参数。"
             : "各轮测量已保留，可查看每轴的变化与曲线。"}
       </p>
-      <section className="calibration-deltas" aria-label="参数变化">
-        <div className="calibration-deltas-heading">
-          <h4>{applied ? "已应用的参数变化" : "推荐参数变化"}</h4>
-          <b>
-            {kdUnchanged
-              ? "Kp / Kd 保持原值"
-              : "Kp 保持原值 · Kd 见历史参数明细"}
-          </b>
+      {recordedCount > 0 && (
+        <div className="calibration-recorded">
+          <span>
+            <b>{recordedCount.toLocaleString()} 点</b>
+            {recordedDuration != null && (
+              <small>已录制 {recordedDuration.toFixed(3)} s</small>
+            )}
+            {!pairedCartesian && hasCartesian && (
+              <small>末端动作 · 已采集部分</small>
+            )}
+          </span>
+          <button onClick={onCurves}>查看曲线</button>
         </div>
-        {deltas.length ? (
-          <div className="calibration-delta-list">
-            {deltas.map(({ axis, key, before, after }) => (
-              <div key={`${axis}:${key}`}>
-                <span>
-                  J{axis + 1} ·{" "}
-                  {key === "coulomb" ? "摩擦补偿 Fc" : "速度前馈 FF"}
-                </span>
-                <strong>
-                  {before} <span>→</span> {after}
-                  {key === "coulomb" ? " N·m" : ""}
-                </strong>
+      )}
+      {(!["failed", "cancelled"].includes(report.outcome) ||
+        report.recommended) && (
+        <>
+          <section className="calibration-deltas" aria-label="参数变化">
+            <div className="calibration-deltas-heading">
+              <h4>{applied ? "已应用的参数变化" : "推荐参数变化"}</h4>
+              <b>
+                {kdUnchanged
+                  ? "Kp / Kd 保持原值"
+                  : "Kp 保持原值 · Kd 见历史参数明细"}
+              </b>
+            </div>
+            {deltas.length ? (
+              <div className="calibration-delta-list">
+                {deltas.map(({ axis, key, before, after }) => (
+                  <div key={`${axis}:${key}`}>
+                    <span>
+                      J{axis + 1} ·{" "}
+                      {key === "coulomb" ? "摩擦补偿 Fc" : "速度前馈 FF"}
+                    </span>
+                    <strong>
+                      {before} <span>→</span> {after}
+                      {key === "coulomb" ? " N·m" : ""}
+                    </strong>
+                  </div>
+                ))}
               </div>
-            ))}
-          </div>
-        ) : (
-          <p>Fc 与速度前馈保持原值。</p>
-        )}
-        {report.recommended &&
-          report.baseline.friction_enabled !==
-            report.recommended.friction_enabled && (
-            <small>
-              摩擦补偿：{report.baseline.friction_enabled ? "开启" : "关闭"} →{" "}
-              {report.recommended.friction_enabled ? "开启" : "关闭"}
-            </small>
-          )}
-        {!!report.recommended && (
-          <small>
-            {applied
-              ? "已采用本次推荐参数。"
-              : "测试结束已恢复起始参数；点击“应用推荐”后生效。"}
-          </small>
-        )}
-      </section>
-      {hasCartesian && (
+            ) : (
+              <p>Fc 与速度前馈保持原值。</p>
+            )}
+            {report.recommended &&
+              report.baseline.friction_enabled !==
+                report.recommended.friction_enabled && (
+                <small>
+                  摩擦补偿：{report.baseline.friction_enabled ? "开启" : "关闭"}{" "}
+                  → {report.recommended.friction_enabled ? "开启" : "关闭"}
+                </small>
+              )}
+            {!!report.recommended && (
+              <small>
+                {applied
+                  ? "已采用本次推荐参数。"
+                  : "测试结束已恢复起始参数；点击“应用推荐”后生效。"}
+              </small>
+            )}
+          </section>
+        </>
+      )}
+      {hasCartesian && cartesianAxes.length > 0 && (
         <>
           <h4 className="calibration-section-label">
-            末端动作前后对照{" "}
-            <small>同一条路径 · 七轴实测响应 · 调整前 → 调整后</small>
+            {pairedCartesian ? "末端动作前后对照" : "末端动作已录统计"}{" "}
+            <small>
+              {pairedCartesian
+                ? "同一条路径 · 七轴实测响应 · 调整前 → 调整后"
+                : "已采集的关节响应"}
+            </small>
           </h4>
           <div className="calibration-table-scroll">
             <table
@@ -283,24 +335,51 @@ function ReportDetails({
                 </tr>
               </thead>
               <tbody>
-                {Array.from({ length: 7 }, (_, axis) => (
+                {cartesianAxes.map((axis) => (
                   <tr key={axis}>
                     <th>J{axis + 1}</th>
-                    <MetricComparison
-                      before={cartesianBefore?.metrics_by_joint?.[axis]}
-                      after={cartesianAfter?.metrics_by_joint?.[axis]}
-                      field="tracking_rms"
-                    />
-                    <MetricComparison
-                      before={cartesianBefore?.metrics_by_joint?.[axis]}
-                      after={cartesianAfter?.metrics_by_joint?.[axis]}
-                      field="velocity_rms"
-                    />
-                    <MetricComparison
-                      before={cartesianBefore?.metrics_by_joint?.[axis]}
-                      after={cartesianAfter?.metrics_by_joint?.[axis]}
-                      field="tracking_peak"
-                    />
+                    {pairedCartesian ? (
+                      <MetricComparison
+                        before={cartesianBefore?.metrics_by_joint?.[axis]}
+                        after={cartesianAfter?.metrics_by_joint?.[axis]}
+                        field="tracking_rms"
+                      />
+                    ) : (
+                      <td>
+                        {degrees(
+                          (afterMetrics?.[axis] ?? beforeMetrics?.[axis])
+                            ?.tracking_rms,
+                        )}
+                      </td>
+                    )}
+                    {pairedCartesian ? (
+                      <MetricComparison
+                        before={cartesianBefore?.metrics_by_joint?.[axis]}
+                        after={cartesianAfter?.metrics_by_joint?.[axis]}
+                        field="velocity_rms"
+                      />
+                    ) : (
+                      <td>
+                        {degrees(
+                          (afterMetrics?.[axis] ?? beforeMetrics?.[axis])
+                            ?.velocity_rms,
+                        )}
+                      </td>
+                    )}
+                    {pairedCartesian ? (
+                      <MetricComparison
+                        before={cartesianBefore?.metrics_by_joint?.[axis]}
+                        after={cartesianAfter?.metrics_by_joint?.[axis]}
+                        field="tracking_peak"
+                      />
+                    ) : (
+                      <td>
+                        {degrees(
+                          (afterMetrics?.[axis] ?? beforeMetrics?.[axis])
+                            ?.tracking_peak,
+                        )}
+                      </td>
+                    )}
                   </tr>
                 ))}
               </tbody>
@@ -308,7 +387,7 @@ function ReportDetails({
           </div>
         </>
       )}
-      {!hasCartesian && axes.length > 0 && (
+      {!hasCartesian && hasJointStatistics && axes.length > 0 && (
         <div className="calibration-table-scroll">
           <table
             className="calibration-table calibration-axis-results"
@@ -357,7 +436,7 @@ function ReportDetails({
           </table>
         </div>
       )}
-      {report.trials.length > 0 ? (
+      {hasJointStatistics ? (
         <details className="calibration-round-details" open={!hasCartesian}>
           <summary>
             关节候选测量 <small>基线与各轮参数比较</small>
@@ -443,7 +522,11 @@ function ReportDetails({
           </div>
         </details>
       ) : (
-        <p className="calibration-note">此报告没有完整测量轮次。</p>
+        <p className="calibration-note">
+          {recordedCount > 0
+            ? "本次未完成对照测量，可查看已录制曲线。"
+            : "此报告没有完整测量轮次。"}
+        </p>
       )}
       <details className="calibration-parameters">
         <summary>参数明细</summary>
@@ -504,35 +587,59 @@ export default function CalibrationPanel({
     status = s.calibration;
   const connection = `${view.baseUrl}:${view.connectionEpoch ?? 0}:${s.side}:${s.port ?? ""}:${["disconnected", "connecting", "closing"].includes(s.phase) ? "detached" : "attached"}`;
   const [page, setPage] = useState<Page>("settings");
+  const [autoRange, setAutoRange] = useState(true);
   const [amplitudeText, setAmplitudeText] = useState("50");
-  const amplitude = Number(amplitudeText);
+  const [speedText, setSpeedText] = useState("10");
+  const [motionDraft, setMotionDraft] = useState(() =>
+    toMotionDraft(s.motion_tuning ?? DEFAULT_MOTION_TUNING),
+  );
+  const [motionEdited, setMotionEdited] = useState(false);
+  const appliedMotionKey = JSON.stringify(
+    s.motion_tuning ?? DEFAULT_MOTION_TUNING,
+  );
+  useEffect(() => {
+    if (!motionEdited)
+      setMotionDraft(toMotionDraft(s.motion_tuning ?? DEFAULT_MOTION_TUNING));
+  }, [appliedMotionKey, motionEdited]);
+  const motion = readMotionDraft(motionDraft);
+  const amplitude = autoRange ? null : Number(amplitudeText);
   const amplitudeValid =
-    amplitudeText.trim() !== "" &&
-    Number.isFinite(amplitude) &&
-    amplitude >= 20 &&
-    amplitude <= 100;
+    autoRange ||
+    (amplitudeText.trim() !== "" &&
+      Number.isFinite(amplitude) &&
+      amplitude! > 0);
+  const speed = Number(speedText);
+  const speedValid =
+    speedText.trim() !== "" && Number.isFinite(speed) && speed > 0;
   const tcpGeometry = s.tcp_transform
     ? [...s.tcp_transform.translation, ...s.tcp_transform.rotation]
         .map((value) => Math.round(value * 1e7))
         .join(":")
     : "unset";
   const previewContext = `${connection}:${tcpGeometry}`;
+  const previewSettings = JSON.stringify({ amplitude, speed, motion });
   const previewContextRef = useRef(previewContext);
   previewContextRef.current = previewContext;
   const [generated, setGenerated] = useState<{
     data: CalibrationPreview;
     context: string;
-    amplitude: number;
+    settings: string;
   } | null>(null);
   const preview =
-    generated?.context === previewContext && generated.amplitude === amplitude
+    generated?.context === previewContext &&
+    generated.settings === previewSettings
       ? generated.data
       : null;
   const [previewBusy, setPreviewBusy] = useState(false);
   const previewRequest = useRef<AbortController | null>(null);
-  const [previewProgress, setPreviewProgress] = useState(0);
+  const [previewProgress, setPreviewProgress] = useState(0.25);
   const [previewPlaying, setPreviewPlaying] = useState(false);
+  const [previewStage, setPreviewStage] = useState<PreviewStage>("cartesian:0");
   const [envelope, setEnvelope] = useState<PreviewEnvelope | null>(null);
+  const selectedPoints = useMemo(
+    () => (preview ? stagePoints(preview, previewStage) : []),
+    [preview, previewStage],
+  );
   const tcpExtents = useMemo(() => {
     const points = preview?.points.filter(
       (point) => point.space === "cartesian",
@@ -545,6 +652,60 @@ export default function CalibrationPanel({
       return [Math.min(...values), Math.max(...values)];
     });
   }, [preview]);
+  function chooseStage(stage: PreviewStage, data = preview) {
+    setPreviewPlaying(false);
+    if (!data) {
+      setPreviewStage(stage);
+      return;
+    }
+    const candidates: PreviewStage[] = [
+      stage,
+      "cartesian:0",
+      "cartesian:1",
+      "cartesian:2",
+      ...Array.from(
+        { length: 7 },
+        (_, axis) => `joint:${axis}` as PreviewStage,
+      ),
+      "return",
+      "xyz",
+    ];
+    const visibleStage =
+      candidates.find((candidate) => {
+        const points = stagePoints(data, candidate);
+        const first = points[0];
+        return (
+          first &&
+          points.some(
+            (point) =>
+              point.tcp.some(
+                (value, axis) => Math.abs(value - first.tcp[axis]) > 1e-9,
+              ) ||
+              point.joints.some(
+                (value, axis) => Math.abs(value - first.joints[axis]) > 1e-9,
+              ),
+          )
+        );
+      }) ??
+      candidates.find((candidate) => stagePoints(data, candidate).length) ??
+      stage;
+    setPreviewStage(visibleStage);
+    const points = stagePoints(data, visibleStage);
+    // Start paused at a distinct real pose, instead of covering the measured arm.
+    let selected = 0,
+      displacement = -1;
+    points.forEach((point, index) => {
+      const delta = point.joints.reduce(
+        (sum, q, axis) => sum + (q - data.program.origin[axis]) ** 2,
+        0,
+      );
+      if (delta > displacement) {
+        selected = index;
+        displacement = delta;
+      }
+    });
+    setPreviewProgress(points.length > 1 ? selected / (points.length - 1) : 0);
+  }
   const [pending, setPendingState] = useState<Pending | null>(null);
   const pendingRef = useRef<Pending | null>(null);
   const [run, setRunState] = useState<Run | null>(null);
@@ -628,7 +789,7 @@ export default function CalibrationPanel({
     setPreviewBusy(false);
     setPreviewPlaying(false);
     setPreviewProgress(0);
-  }, [previewContext, s.action?.request_id]);
+  }, [previewContext, previewSettings, s.action?.request_id]);
   useEffect(() => {
     if (open) return;
     previewRequest.current?.abort();
@@ -895,7 +1056,8 @@ export default function CalibrationPanel({
     const frame = requestAnimationFrame(() => {
       if (
         lastFocus.current?.isConnected &&
-        lastFocus.current.getClientRects().length
+        lastFocus.current.getClientRects().length &&
+        !lastFocus.current.closest("details:not([open])")
       )
         lastFocus.current.focus();
       else dialog.current?.focus();
@@ -928,7 +1090,12 @@ export default function CalibrationPanel({
         dialog.current?.querySelectorAll<HTMLElement>(
           'button:not(:disabled), input:not(:disabled), select:not(:disabled), summary, a[href], [tabindex="0"]',
         ) ?? [],
-      ).filter((element) => element.getClientRects().length);
+      ).filter(
+        (element) =>
+          element.getClientRects().length &&
+          (element.tagName === "SUMMARY" ||
+            !element.closest("details:not([open])")),
+      );
       const first = controls[0],
         last = controls.at(-1);
       if (
@@ -973,8 +1140,12 @@ export default function CalibrationPanel({
       : busy
         ? "等待当前动作完成"
         : !amplitudeValid
-          ? "幅度范围为 ±20–100 mm"
-          : "";
+          ? "请输入大于 0 的单侧行程"
+          : !speedValid
+            ? "请输入大于 0 的末端速度"
+            : !motion
+              ? "运动偏好须为正数"
+              : "";
   // The current report and servo config are sufficient; TCP/pose changes do not invalidate tuning.
   const applyReason =
     local || reportId !== status?.report?.id
@@ -1015,7 +1186,12 @@ export default function CalibrationPanel({
     setFeedback(null);
     try {
       const data = await api.previewCalibration(
-        { amplitude: amplitude / 1000, speed: 0.01, axes: [0, 1, 2] },
+        {
+          amplitude: amplitude == null ? null : amplitude / 1000,
+          speed: speed / 1000,
+          axes: [0, 1, 2],
+          motion: motion!,
+        },
         controller.signal,
       );
       if (
@@ -1024,7 +1200,12 @@ export default function CalibrationPanel({
         previewContextRef.current !== previewContext
       )
         return;
-      setGenerated({ data, context: previewContext, amplitude });
+      setGenerated({
+        data,
+        context: previewContext,
+        settings: previewSettings,
+      });
+      chooseStage("cartesian:0", data);
     } catch (error) {
       if (!controller.signal.aborted && alive.current)
         setFeedback({
@@ -1263,37 +1444,71 @@ export default function CalibrationPanel({
                 <small>XYZ 末端动作 + J1–J7 关节试验</small>
                 <h3>先预览，再开始</h3>
                 <p>以当前姿态为原位，比较摩擦补偿与速度前馈。</p>
-                <label className="calibration-amplitude">
-                  <span>末端单侧幅度</span>
-                  <span>
-                    <b>±</b>
+                <div className="calibration-range-settings">
+                  <label className="calibration-range-mode">
+                    <span>末端行程</span>
+                    <select
+                      aria-label="末端行程模式"
+                      value={autoRange ? "auto" : "manual"}
+                      disabled={busy}
+                      onChange={(event) =>
+                        setAutoRange(event.target.value === "auto")
+                      }
+                    >
+                      <option value="auto">自动可达行程</option>
+                      <option value="manual">指定行程</option>
+                    </select>
+                  </label>
+                  {!autoRange && (
+                    <label className="calibration-amplitude">
+                      <span>单侧行程 · mm</span>
+                      <span>
+                        <b>±</b>
+                        <input
+                          type="number"
+                          aria-label="末端单侧幅度 mm"
+                          min={0}
+                          step="any"
+                          value={amplitudeText}
+                          disabled={busy}
+                          aria-invalid={!amplitudeValid}
+                          onChange={(event) =>
+                            setAmplitudeText(event.target.value)
+                          }
+                        />
+                        <b>mm</b>
+                      </span>
+                      {!amplitudeValid && <small>输入大于 0 的行程</small>}
+                    </label>
+                  )}
+                  <label className="calibration-speed">
+                    <span>
+                      末端速度 <small>mm/s</small>
+                    </span>
                     <input
                       type="number"
-                      aria-label="末端单侧幅度 mm"
-                      min={20}
-                      max={100}
-                      step={5}
-                      value={amplitudeText}
+                      aria-label="校准末端速度 mm/s"
+                      min={0}
+                      step="any"
+                      value={speedText}
                       disabled={busy}
-                      onChange={(event) => {
-                        previewRequest.current?.abort();
-                        setPreviewBusy(false);
-                        setGenerated(null);
-                        setEnvelope(null);
-                        setPreviewPlaying(false);
-                        setPreviewProgress(0);
-                        setFeedback(null);
-                        setAmplitudeText(event.target.value);
+                      aria-invalid={!speedValid}
+                      onChange={(event) => setSpeedText(event.target.value)}
+                    />
+                  </label>
+                  <details className="motion-preferences calibration-motion">
+                    <summary>运动偏好</summary>
+                    <MotionTuningFields
+                      draft={motionDraft}
+                      disabled={busy}
+                      onChange={(value) => {
+                        setMotionEdited(true);
+                        setMotionDraft(value);
                       }}
                     />
-                    <b>mm</b>
-                  </span>
-                  <small>
-                    {amplitudeValid
-                      ? `总行程 ${amplitude * 2} mm · 速度 10 mm/s`
-                      : "输入 20–100 mm"}
-                  </small>
-                </label>
+                    <small>用于本次预览与执行</small>
+                  </details>
+                </div>
                 <ol className="calibration-plan">
                   <li>
                     <b>末端动作 · 调整前</b>
@@ -1332,6 +1547,7 @@ export default function CalibrationPanel({
                       }
                       preview={preview}
                       previewProgress={previewProgress}
+                      previewStage={previewStage}
                       onPreviewEnvelope={setEnvelope}
                     />
                   )}
@@ -1348,6 +1564,47 @@ export default function CalibrationPanel({
                 </div>
                 {preview ? (
                   <>
+                    <nav
+                      className="calibration-preview-stages"
+                      aria-label="预览阶段"
+                    >
+                      {(
+                        [
+                          "xyz",
+                          "cartesian:0",
+                          "cartesian:1",
+                          "cartesian:2",
+                          ...Array.from(
+                            { length: 7 },
+                            (_, axis) => `joint:${axis}`,
+                          ),
+                          "return",
+                        ] as PreviewStage[]
+                      ).map((stage) => {
+                        const axis = Number(stage.split(":")[1]);
+                        return (
+                          <button
+                            key={stage}
+                            aria-pressed={previewStage === stage}
+                            disabled={!stagePoints(preview, stage).length}
+                            className={
+                              stage.startsWith("cartesian:")
+                                ? `axis-${"xyz"[axis]}`
+                                : ""
+                            }
+                            onClick={() => chooseStage(stage)}
+                          >
+                            {stage === "xyz"
+                              ? "XYZ"
+                              : stage === "return"
+                                ? "归位"
+                                : stage.startsWith("cartesian:")
+                                  ? "XYZ"[axis]
+                                  : `J${axis + 1}`}
+                          </button>
+                        );
+                      })}
+                    </nav>
                     <div className="calibration-preview-scrub">
                       <button
                         aria-label={previewPlaying ? "暂停预览" : "播放预览"}
@@ -1373,14 +1630,15 @@ export default function CalibrationPanel({
                       <output>
                         {(() => {
                           const point =
-                            preview.points[
+                            selectedPoints[
                               Math.min(
-                                preview.points.length - 1,
+                                selectedPoints.length - 1,
                                 Math.floor(
-                                  previewProgress * (preview.points.length - 1),
+                                  previewProgress * (selectedPoints.length - 1),
                                 ),
                               )
                             ];
+                          if (!point) return "无路径";
                           return point.space === "cartesian"
                             ? `末端 ${"XYZ"[point.axis] ?? ""}`
                             : point.space === "joint_return"
@@ -1392,28 +1650,32 @@ export default function CalibrationPanel({
                     <div className="calibration-preview-extents">
                       <div>
                         <b>
-                          TCP 实际往返 <small>相对原位 · mm</small>
+                          {preview.ranges?.length
+                            ? "模型可达行程"
+                            : "TCP 实际行程"}{" "}
+                          <small>相对原位 · mm</small>
                         </b>
                         <div>
-                          {tcpExtents?.map(([min, max], axis) => (
+                          {(preview.ranges?.length
+                            ? preview.ranges
+                            : tcpExtents?.map(([negative, positive], axis) => ({
+                                axis,
+                                negative: negative / 1000,
+                                positive: positive / 1000,
+                              }))
+                          )?.map(({ axis, negative, positive }) => (
                             <span key={axis}>
-                              <i>{"XYZ"[axis]}</i>
-                              {min.toFixed(0)} → {max.toFixed(0)}
+                              <i className={`axis-${"xyz"[axis]}`}>
+                                {"XYZ"[axis]}
+                              </i>
+                              {(negative * 1000).toFixed(1)} →{" "}
+                              {(positive * 1000).toFixed(1)}
                             </span>
                           ))}
                         </div>
                       </div>
-                      <div>
-                        <b>
-                          全臂包络 <small>全部试验姿态 · mm</small>
-                        </b>
-                        <strong>
-                          {envelope
-                            ? envelope.size
-                                .map((value) => (value * 1000).toFixed(0))
-                                .join(" × ")
-                            : "计算模型范围…"}
-                        </strong>
+                      <details>
+                        <summary>全臂范围 · mm</summary>
                         <small>
                           {envelope
                             ? envelope.min
@@ -1422,15 +1684,17 @@ export default function CalibrationPanel({
                                     `${"XYZ"[axis]} ${(value * 1000).toFixed(0)}…${(envelope.max[axis] * 1000).toFixed(0)}`,
                                 )
                                 .join(" · ")
-                            : ""}
+                            : "计算中…"}
                         </small>
-                      </div>
+                      </details>
                     </div>
                   </>
                 ) : (
                   <p className="calibration-preview-hint">
-                    预览包含末端 ±{amplitudeValid ? amplitude : "—"} mm 与七轴
-                    ±8°；不发送运动指令。
+                    {autoRange
+                      ? "按当前姿态计算 XYZ 可达行程"
+                      : `末端单侧 ${amplitudeValid ? amplitude : "—"} mm`}{" "}
+                    · 含七轴试验
                   </p>
                 )}
               </div>
@@ -1558,6 +1822,7 @@ export default function CalibrationPanel({
                         report={report}
                         local={local}
                         applied={appliedReport === report.id}
+                        onCurves={() => setPage("curves")}
                       />
                     ) : (
                       <CalibrationChart

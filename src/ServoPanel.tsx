@@ -4,10 +4,79 @@ import {
   createServoTuning,
   sameServoTuning,
   SERVO_TUNING_RANGES,
+  DEFAULT_MOTION_TUNING,
+  type MotionTuning,
   type JointTuning,
   type ServoTuning,
   type View,
 } from "./api";
+
+export type MotionDraft = Record<keyof MotionTuning, string>;
+const motionFields = [
+  ["joint_speed", "关节速度", "rad/s"],
+  ["acceleration", "加速度", "rad/s²"],
+  ["jerk", "加加速度", "rad/s³"],
+] as const;
+export function toMotionDraft(config: MotionTuning): MotionDraft {
+  return {
+    joint_speed: String(config.joint_speed),
+    acceleration: String(config.acceleration),
+    jerk: String(config.jerk),
+  };
+}
+export function readMotionDraft(draft: MotionDraft): MotionTuning | null {
+  if (
+    motionFields.some(
+      ([key]) =>
+        !draft[key].trim() ||
+        !Number.isFinite(Number(draft[key])) ||
+        Number(draft[key]) <= 0,
+    )
+  )
+    return null;
+  return {
+    joint_speed: Number(draft.joint_speed),
+    acceleration: Number(draft.acceleration),
+    jerk: Number(draft.jerk),
+  };
+}
+export function MotionTuningFields({
+  draft,
+  disabled = false,
+  onChange,
+}: {
+  draft: MotionDraft;
+  disabled?: boolean;
+  onChange: (draft: MotionDraft) => void;
+}) {
+  return (
+    <div className="motion-preference-fields">
+      {motionFields.map(([key, label, unit]) => (
+        <label key={key}>
+          <span>
+            {label} <small>{unit}</small>
+          </span>
+          <input
+            type="number"
+            aria-label={`运动偏好 ${label} ${unit}`}
+            min={0}
+            step="any"
+            value={draft[key]}
+            disabled={disabled}
+            aria-invalid={
+              !draft[key].trim() ||
+              !Number.isFinite(Number(draft[key])) ||
+              Number(draft[key]) <= 0
+            }
+            onChange={(event) =>
+              onChange({ ...draft, [key]: event.target.value })
+            }
+          />
+        </label>
+      ))}
+    </div>
+  );
+}
 
 const fields: {
   key: keyof JointTuning;
@@ -139,6 +208,44 @@ export default function ServoPanel({
   const alive = useRef(true);
   const config = readDraft(draft);
   const dirty = !config || !sameServoTuning(config, applied);
+  const appliedMotion = s.motion_tuning ?? DEFAULT_MOTION_TUNING;
+  const motionKey = JSON.stringify(appliedMotion);
+  const motionPrevious = useRef({ connectionKey, motionKey });
+  const [motionDraft, setMotionDraft] = useState(() =>
+    toMotionDraft(appliedMotion),
+  );
+  const [motionPending, setMotionPending] = useState<string | null>(null);
+  const motionConfig = readMotionDraft(motionDraft);
+  const motionDirty =
+    !motionConfig || JSON.stringify(motionConfig) !== motionKey;
+  useEffect(() => {
+    const before = motionPrevious.current;
+    motionPrevious.current = { connectionKey, motionKey };
+    setMotionDraft((current) =>
+      before.connectionKey !== connectionKey ||
+      JSON.stringify(readMotionDraft(current)) === before.motionKey
+        ? toMotionDraft(appliedMotion)
+        : current,
+    );
+    if (before.connectionKey !== connectionKey) setMotionPending(null);
+  }, [connectionKey, motionKey]);
+  useEffect(() => {
+    if (!motionPending) return;
+    const result =
+      s.results?.find((item) => item.request_id === motionPending) ??
+      (s.last_result?.request_id === motionPending ? s.last_result : null);
+    if (!result) return;
+    if (["rejected", "failed", "cancelled"].includes(result.status)) {
+      setError(result.message || "运动偏好未应用");
+      setMotionPending(null);
+    } else if (
+      ["accepted", "completed"].includes(result.status) &&
+      !motionDirty
+    ) {
+      setCopyFeedback("运动偏好已应用");
+      setMotionPending(null);
+    }
+  }, [s, motionPending, motionDirty]);
 
   useEffect(() => {
     const before = previous.current;
@@ -166,9 +273,20 @@ export default function ServoPanel({
   useEffect(() => {
     if (!open) return;
     const previous = document.activeElement;
-    const field = lastField.current?.isConnected
-      ? lastField.current
-      : dialog.current?.querySelector<HTMLInputElement>('input[type="number"]');
+    const field =
+      lastField.current?.isConnected &&
+      lastField.current.getClientRects().length &&
+      !lastField.current.closest("details:not([open])")
+        ? lastField.current
+        : Array.from(
+            dialog.current?.querySelectorAll<HTMLInputElement>(
+              'input[type="number"]',
+            ) ?? [],
+          ).find(
+            (input) =>
+              input.getClientRects().length &&
+              !input.closest("details:not([open])"),
+          );
     (field ?? dialog.current)?.focus();
     return () => {
       if (previous instanceof HTMLElement && previous.isConnected)
@@ -271,6 +389,32 @@ export default function ServoPanel({
       });
     }
   }
+  async function applyMotion() {
+    if (
+      !motionConfig ||
+      !motionDirty ||
+      applyReason ||
+      motionPending ||
+      pending
+    )
+      return;
+    const requestId = crypto.randomUUID();
+    setMotionPending(requestId);
+    edited();
+    try {
+      await api.command(
+        "configure_motion",
+        { config: motionConfig },
+        requestId,
+        s.generation,
+      );
+    } catch (error) {
+      if (alive.current) {
+        setError(error instanceof Error ? error.message : "运动偏好未确认");
+        setMotionPending(null);
+      }
+    }
+  }
 
   return (
     <div
@@ -287,8 +431,13 @@ export default function ServoPanel({
         } else if (event.key === "Tab") {
           const controls = Array.from(
             dialog.current?.querySelectorAll<HTMLElement>(
-              "button:not(:disabled), input:not(:disabled), textarea:not(:disabled)",
+              "button:not(:disabled), input:not(:disabled), textarea:not(:disabled), summary",
             ) ?? [],
+          ).filter(
+            (element) =>
+              element.getClientRects().length &&
+              (element.tagName === "SUMMARY" ||
+                !element.closest("details:not([open])")),
           );
           const first = controls[0];
           const last = controls[controls.length - 1];
@@ -360,6 +509,42 @@ export default function ServoPanel({
           </button>
         </div>
         <div className="servo-body">
+          <details className="motion-preferences servo-motion">
+            <summary>
+              运动偏好 <small>速度 / 加速度 / 加加速度</small>
+            </summary>
+            <MotionTuningFields
+              draft={motionDraft}
+              disabled={!!motionPending || pending}
+              onChange={(value) => {
+                edited();
+                setMotionDraft(value);
+              }}
+            />
+            <div className="motion-preference-actions">
+              <small>
+                {motionConfig ? "用于点动与轨迹规划" : "请输入大于 0 的数值"}
+              </small>
+              <button
+                disabled={!motionDirty || !!motionPending}
+                onClick={() => setMotionDraft(toMotionDraft(appliedMotion))}
+              >
+                重置
+              </button>
+              <button
+                disabled={
+                  !motionDirty ||
+                  !motionConfig ||
+                  !!applyReason ||
+                  !!motionPending ||
+                  pending
+                }
+                onClick={() => void applyMotion()}
+              >
+                {motionPending ? "等待确认…" : "应用运动偏好"}
+              </button>
+            </div>
+          </details>
           <div className="servo-table-wrap">
             <table className="servo-table" aria-label="七轴伺服参数草稿">
               <thead>

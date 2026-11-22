@@ -3094,3 +3094,329 @@ summary:focus-visible {
     flex: 1;
   }
 }
+
+/* Calibration preview: keep the actual paths readable at the compact viewport. */
+.scene-toolbar .source-badge {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.scene-views {
+  display: flex;
+  flex-shrink: 0;
+  gap: 2px;
+  pointer-events: auto;
+}
+.scene-views button {
+  height: 25px;
+  padding: 0 6px;
+  font-size: 10px;
+}
+.scene-views button[aria-pressed="true"] {
+  color: var(--color-focus);
+  border-color: var(--color-focus);
+}
+.scene-distance-labels {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+.scene-distance-labels span {
+  position: absolute;
+  top: 0;
+  left: 0;
+  padding: 2px 5px;
+  font:
+    10px/17px ui-monospace,
+    monospace;
+  white-space: nowrap;
+  border-radius: 3px;
+  background: #101820de;
+  border: 1px solid #ffffff20;
+  box-shadow: 0 1px 3px #0003;
+}
+.scene-scale {
+  position: absolute;
+  bottom: 10px;
+  right: 12px;
+  padding-bottom: 4px;
+  border: solid #a6b9c8;
+  border-width: 0 1px 2px;
+  color: #c1d0db;
+  font:
+    10px/12px ui-monospace,
+    monospace;
+  text-align: center;
+  pointer-events: none;
+}
+.scene-preview-legend {
+  inset: auto 8px 34px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px 10px;
+  font-size: 9px;
+}
+.scene-preview-legend span::before {
+  width: 9px;
+}
+.scene-preview-legend [data-kind="planned"]::before {
+  background: #7ceaff;
+  border: 0;
+  height: 6px;
+}
+.scene-preview-legend [data-kind="sweep"]::before {
+  background: #829ba6;
+  height: 6px;
+  opacity: 0.65;
+}
+.scene-preview-legend label {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: auto;
+  pointer-events: auto;
+}
+.scene-preview-legend input {
+  width: 12px;
+  height: 12px;
+  accent-color: var(--color-focus);
+  margin: 0;
+}
+.scene-axes {
+  gap: 6px;
+}
+.scene-axes > span {
+  font-size: 9px;
+}
+.calibration-intro {
+  min-height: 0;
+  max-height: 100%;
+  overflow-y: auto;
+  padding-right: 3px;
+  scrollbar-width: thin;
+}
+.calibration-range-settings {
+  display: grid;
+  gap: 9px;
+  margin: 12px 0;
+}
+.calibration-range-mode,
+.calibration-speed {
+  display: grid;
+  gap: 5px;
+  font-size: 11px;
+}
+.calibration-range-mode > span,
+.calibration-speed > span {
+  color: var(--color-muted);
+}
+.calibration-range-mode select {
+  width: 100%;
+  min-width: 0;
+  height: 30px;
+  font-size: 11px;
+}
+.calibration-speed {
+  grid-template-columns: minmax(0, 1fr) 78px;
+  align-items: center;
+}
+.calibration-speed input {
+  width: 100%;
+  height: 30px;
+}
+.calibration-speed small {
+  font-size: 9px;
+}
+.calibration-amplitude {
+  margin: 0;
+  gap: 4px;
+}
+.calibration-amplitude input {
+  width: 92px;
+  height: 30px;
+  font-size: 15px;
+}
+.motion-preferences {
+  border: 1px solid var(--color-rule);
+  border-radius: 4px;
+}
+.motion-preferences summary {
+  cursor: pointer;
+  padding: 8px;
+  font-size: 11px;
+}
+.motion-preferences summary small {
+  margin-left: 8px;
+  color: var(--color-muted);
+}
+.motion-preferences > small {
+  display: block;
+  margin: 7px 8px;
+  font-size: 10px;
+  color: var(--color-muted);
+}
+.motion-preference-fields {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  padding: 4px 8px 8px;
+}
+.motion-preference-fields label {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  font-size: 11px;
+}
+.motion-preference-fields small {
+  font-size: 9px;
+  color: var(--color-muted);
+}
+.motion-preference-fields input {
+  width: 100%;
+  min-width: 0;
+  height: 30px;
+}
+.motion-preference-fields input[aria-invalid="true"],
+.calibration-range-settings input[aria-invalid="true"] {
+  border-color: var(--color-danger);
+}
+.calibration-motion .motion-preference-fields {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
+}
+.calibration-motion .motion-preference-fields label {
+  grid-template-columns: minmax(0, 1fr) 72px;
+  align-items: center;
+}
+.servo-motion {
+  max-width: 1120px;
+  margin: 0 auto 12px;
+}
+.motion-preference-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 8px 8px;
+}
+.motion-preference-actions small {
+  margin-right: auto;
+  color: var(--color-muted);
+  font-size: 10px;
+}
+.motion-preference-actions button {
+  height: 27px;
+  font-size: 11px;
+}
+.calibration-preview-stages {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-top: 7px;
+}
+.calibration-preview-stages button {
+  height: 25px;
+  min-width: 27px;
+  padding: 0 5px;
+  font-size: 10px;
+}
+.calibration-preview-stages button[aria-pressed="true"] {
+  border-color: var(--color-focus);
+  background: var(--color-selected);
+}
+.calibration-preview-scrub {
+  margin-block: 5px 7px;
+}
+.calibration-preview-extents {
+  grid-template-columns: minmax(0, 1fr) 94px;
+  gap: 8px;
+  font-size: 10px;
+}
+.calibration-preview-extents > div > div {
+  display: flex;
+  gap: 4px 10px;
+  margin-top: 5px;
+}
+.calibration-preview-extents details {
+  border-top: 1px solid var(--color-rule);
+  padding-top: 8px;
+}
+.calibration-preview-extents summary {
+  cursor: pointer;
+  font-size: 9px;
+  color: var(--color-muted);
+}
+.calibration-preview-extents details > small {
+  display: block;
+  margin-top: 5px;
+  font-size: 9px;
+  line-height: 1.6;
+  color: var(--color-muted);
+}
+.calibration-preview-extents i {
+  color: inherit;
+}
+.calibration-recorded {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  margin: 12px 0;
+  border: 1px solid var(--color-rule);
+  border-radius: 4px;
+}
+.calibration-recorded > span {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  align-items: baseline;
+}
+.calibration-recorded b {
+  font-size: 18px;
+  font-weight: 500;
+}
+.calibration-recorded small {
+  color: var(--color-muted);
+  font-size: 11px;
+}
+.calibration-recorded button {
+  flex-shrink: 0;
+}
+@media (max-height: 640px) {
+  .calibration-plan {
+    gap: 5px;
+  }
+  .calibration-range-settings {
+    margin-block: 8px;
+    gap: 6px;
+  }
+  .calibration-preview-extents b small {
+    display: inline;
+  }
+  .calibration-intro > h3 {
+    font-size: 18px;
+  }
+  .calibration-preview-scene {
+    min-height: 200px;
+  }
+}
+@media (max-width: 600px) {
+  .calibration-intro {
+    max-height: none;
+    overflow: visible;
+  }
+  .scene-preview-legend {
+    gap: 4px 7px;
+  }
+}
+.scene-preview-legend [data-kind="elbow"]::before {
+  background: #ffd070;
+  height: 3px;
+}
+.scene-preview-legend [data-kind="wrist"]::before {
+  background: #d4a0ff;
+  height: 3px;
+}

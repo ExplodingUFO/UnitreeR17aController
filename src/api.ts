@@ -48,6 +48,16 @@ export interface ServoTuning {
     JointTuning,
   ];
 }
+export interface MotionTuning {
+  joint_speed: number;
+  acceleration: number;
+  jerk: number;
+}
+export const DEFAULT_MOTION_TUNING: MotionTuning = {
+  joint_speed: 1,
+  acceleration: 0.6,
+  jerk: 6,
+};
 export interface CalibrationSettings {
   axis: number | null;
   excursion: number;
@@ -56,9 +66,10 @@ export interface CalibrationSettings {
   cartesian?: CartesianProgram | null;
 }
 export interface CalibrationPreviewRequest {
-  amplitude: number;
+  amplitude?: number | null;
   speed: number;
   axes: number[];
+  motion: MotionTuning;
 }
 export interface CartesianProgram {
   side: Side;
@@ -68,6 +79,9 @@ export interface CartesianProgram {
   speed: number;
   joint_excursion: number;
   segments: { axis: number; offset: number }[];
+  guide?: { axis: number; offset: number; joints: JointPositions }[];
+  motion?: MotionTuning;
+  auto_range?: boolean;
 }
 export interface PreviewPoint {
   joints: JointPositions;
@@ -79,6 +93,7 @@ export interface PreviewPoint {
 export interface CalibrationPreview {
   program: CartesianProgram;
   points: PreviewPoint[];
+  ranges?: { axis: number; negative: number; positive: number }[];
 }
 export interface CalibrationMetrics {
   windows: number;
@@ -353,6 +368,7 @@ export interface Snapshot {
   tcp_configured: boolean;
   servo_tuning: ServoTuning;
   servo_tuning_revision: number;
+  motion_tuning?: MotionTuning;
   feedback_age_ms: number | null;
   action: Action | null;
   calibration?: CalibrationStatus | null;
@@ -457,6 +473,7 @@ export type Operation =
   | ({ kind: "return_to_pose" } & ReturnToPoseArguments)
   | { kind: "configure_tcp"; tcp: Pose }
   | { kind: "configure_servo"; config: ServoTuning }
+  | { kind: "configure_motion"; config: MotionTuning }
   | { kind: "calibrate_start"; settings?: Partial<CalibrationSettings> }
   | { kind: "calibrate_apply"; calibration_id: string }
   | ({
@@ -491,6 +508,7 @@ export const emptySnapshot: Snapshot = {
   tcp_configured: false,
   servo_tuning: createServoTuning(),
   servo_tuning_revision: 0,
+  motion_tuning: { ...DEFAULT_MOTION_TUNING },
   feedback_age_ms: null,
   action: null,
   calibration: null,

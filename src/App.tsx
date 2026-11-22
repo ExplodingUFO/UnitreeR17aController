@@ -393,10 +393,15 @@ export default function App() {
     return () => window.removeEventListener("hashchange", changed);
   }, []);
   const beginMotion = (axis: number, direction: number) => {
-    setPressed(`${axis}:${direction}`);
-    api.clearError();
     const angular = space === "joint" || axis >= 3;
     const speed = angular ? angularSpeed / DEG : linearSpeed / 1000;
+    if (!Number.isFinite(speed) || speed <= 0) {
+      pointer.current = null;
+      api.fail(new Error("请输入大于 0 的速度"));
+      return;
+    }
+    setPressed(`${axis}:${direction}`);
+    api.clearError();
     const params = { space, axis, direction, speed, frame };
     if (mode === "continuous") {
       void api.startJog(params).catch((e) => {
@@ -825,9 +830,6 @@ export default function App() {
                   onClick={() =>
                     changeControls(() => {
                       setSpace(value);
-                      setAngularSpeed((speed) =>
-                        Math.min(speed, (value === "joint" ? 0.2 : 0.15) * DEG),
-                      );
                     })
                   }
                 >
@@ -913,18 +915,10 @@ export default function App() {
                 <input
                   aria-label="线速度 mm/s"
                   type="number"
-                  min="0.1"
-                  max="15"
-                  step="1"
+                  min="0"
+                  step="any"
                   value={linearSpeed}
-                  onChange={(e) =>
-                    setLinearSpeed(
-                      Math.max(
-                        0.1,
-                        Math.min(15, Number(e.target.value) || 0.1),
-                      ),
-                    )
-                  }
+                  onChange={(e) => setLinearSpeed(Number(e.target.value))}
                 />
               </label>
             )}
@@ -935,21 +929,10 @@ export default function App() {
               <input
                 aria-label="角速度 度每秒"
                 type="number"
-                min="0.1"
-                max={space === "joint" ? 0.2 * DEG : 0.15 * DEG}
-                step="1"
+                min="0"
+                step="any"
                 value={angularSpeed}
-                onChange={(e) =>
-                  setAngularSpeed(
-                    Math.max(
-                      0.1,
-                      Math.min(
-                        space === "joint" ? 0.2 * DEG : 0.15 * DEG,
-                        Number(e.target.value) || 0.1,
-                      ),
-                    ),
-                  )
-                }
+                onChange={(e) => setAngularSpeed(Number(e.target.value))}
               />
             </label>
             {mode === "step" && (

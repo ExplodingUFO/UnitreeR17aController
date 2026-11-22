@@ -45,7 +45,7 @@ src-tauri/target/release/bundle/macos/R1-7a Controller.app
 
 基线关闭摩擦补偿，每轴 `kd=10`、`velocity_ff=1`，摩擦系数为零。先连接再配置；应用需要当前控制权，运动、减速停止、使能确认或故障期间拒绝。参数只在当前连接的内存中生效，每次连接或断开恢复基线，不自动持久化。速度前馈权重仅改变报文速度字段，位置轨迹、TCP 路径及停止/收纳时序仍使用原始轨迹速度。完整参数范围与确认方式见[伺服调试配置](docs/implementation-contract.md#59-伺服调试配置)。
 
-控制页点击“校准”，设置末端单向幅度并生成轨迹预览。默认沿基座 X、Y、Z 各往返 ±50 mm，总跨度 100 mm；关节试验为逐轴 ±8°。3D 同时显示 TCP 路线、计划姿态与整臂经过的包络，可拖动查看或播放姿态，确认后点击开始。可达范围不足的方向按实际生成的行程显示。
+控制页点击“校准”生成轨迹预览。默认根据当前姿态、TCP 和模型关节范围，分别计算基座 X、Y、Z 正反方向的连续可达行程；也可指定单向幅度和测试速度。3D 按阶段显示彩色 TCP 路线、方向、关键姿态和肘腕扫过区域，可切换俯视、正视、侧视或播放动作。查看各方向的实际行程后确认开始。关节试验为逐轴 ±8°。
 
 程序先记录末端三向往返，再通过逐轴运动比较 Fc=0.1/0.2 Nm 的平滑摩擦和速度前馈候选，最后重复同一组末端运动。Kp/Kd 保持原值，这项校准调整的是摩擦补偿与速度前馈。结果直接列出改了哪些关节、参数的原值与推荐值，并显示同一末端路线下七轴位置和速度跟随的变化。正常完成回原位、恢复起始参数，点击“应用推荐”才采用结果。停止则取消后续动作、减速并恢复参数。
 
@@ -75,11 +75,9 @@ cargo run --manifest-path src-tauri/Cargo.toml --example analyze_trace -- /path/
 
 输出包括来源间隔、参考速度/加速度/jerk 峰值、新鲜反馈的逐轴跟随 RMS、编码值与参考的最大差异、发送序号重复/跳过及完整性计数。新增 `tuning` 汇总配置版本与逐轴补偿限幅次数；速度编码差异优先比较 `tuning.dq_feedforward`，旧文件回退到 `dq_ref`，速度前馈权重为零不会被误算成编码误差。采集静止保持、低速与常用速度点动、停止等场景的操作顺序见[采样与验收流程](docs/implementation-contract.md#93-采样与验收流程)。
 
-串口发送保持原始 10 ms 网格，跳过错过的槽位，不补发。发送端将速度对齐到当前发送时刻，再按相邻成功批次的实际间隔连续积分位置，避免切换控制参考时回跳；源参考年龄不超过 50 ms。发送前复核关节增量、路径、TCP 速度、目标和上下文有效期。采样 JSON 的 `transmit.q_ref/dq_ref` 是对齐后的理想目标，`q_wire/dq_wire` 是报文编码后转回关节单位的值，详见[接口说明](docs/implementation-contract.md#58-发送时间对齐)。
+串口发送保持原始 10 ms 网格，跳过错过的槽位，不补发。发送端将速度对齐到当前发送时刻，再按相邻成功批次的实际间隔连续积分位置，避免切换控制参考时回跳。源参考超过 50 ms 时保持最近成功目标，新参考到达后继续，不因此结束整个动作。发送端保留目标与上下文有效期处理，移除了重复的路径残差拒绝。采样 JSON 的 `transmit.q_ref/dq_ref` 是对齐后的理想目标，`q_wire/dq_wire` 是报文编码后转回关节单位的值，详见[接口说明](docs/implementation-contract.md#58-发送时间对齐)。
 
-关节、末端点动与收纳返回的控制参考保留原有 Euler 积分和 jerk 限制，当前离线默认值为 6 rad/s³，关节速度与加速度上限仍为 0.20 rad/s、0.60 rad/s²。正常停止按这些约束减速，可能需要更长时间；故障、失能和关闭继续优先处理。参考导数限制用于控制器参考序列，实际发送节拍与物理 jerk 以采样和测量为准。
-
-末端接近全局速度上限时预留 10% 目标余量，即平移 13.5 mm/s、旋转 0.135 rad/s；低于这两个阈值的请求不因该余量额外缩放。最终 FK 仍检查 15 mm/s、0.15 rad/s 的硬上限。50 μm、0.002 rad 为模型候选的路径偏差检查阈值。
+关节、末端点动与收纳共用可编辑的运动设置：关节速度默认 1 rad/s，加速度 0.60 rad/s²，jerk 6 rad/s³。速度同时受模型各轴速度约束，末端速度按请求和当前 Jacobian 求解，不另设 15 mm/s 或 100 mm 行程上限。这些默认值是软件运动设置，可在参数弹窗调整。正常停止按导数约束减速；参考导数与实测运动分别记录。
 
 ## 开发与测试
 
@@ -92,7 +90,7 @@ cargo run --manifest-path src-tauri/Cargo.toml --example analyze_trace -- /path/
 ```bash
 npm run format:check
 npm run build
-cargo test --manifest-path src-tauri/Cargo.toml --all-targets --locked -- --test-threads=1
+cargo test --release --manifest-path src-tauri/Cargo.toml --all-targets --locked -- --test-threads=1
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
 cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 ```

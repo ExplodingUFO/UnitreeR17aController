@@ -834,12 +834,7 @@ impl PublishedSetpoints {
                     && r.valid_until.is_none_or(|until| at < until)
             })
     }
-    fn prepare(
-        &self,
-        at: Instant,
-        committed: Option<Committed>,
-        latched: Option<SampleStatus>,
-    ) -> Result<Prepared, String> {
+    fn prepare(&self, at: Instant, committed: Option<Committed>) -> Result<Prepared, String> {
         if self.values.iter().all(|s| s.mode != DriveMode::Servo) {
             return Ok(Prepared::direct(self.values));
         }
@@ -847,11 +842,7 @@ impl PublishedSetpoints {
             return Ok(Prepared::direct(self.values));
         };
         let previous = committed.and_then(|c| c.servo());
-        let sample = if let Some(reason) = latched {
-            Err(reason)
-        } else {
-            reference.sample(at, previous)
-        };
+        let sample = reference.sample(at, previous);
         let (mut values, q, dq, gravity, timing, rejection) = match sample {
             Ok(sample) => (
                 self.values,
@@ -1120,12 +1111,7 @@ impl BusHandle {
                         if !last.is_current(&reference_epoch, started) {
                             next_write = next_deadline(next_write, started, started);
                         } else {
-                            let latched = last.reference.as_ref().and_then(|r| {
-                                rejected
-                                    .filter(|(epoch, _)| *epoch == r.epoch)
-                                    .map(|(_, reason)| reason)
-                            });
-                            let prepared = match last.prepare(started, committed, latched) {
+                            let prepared = match last.prepare(started, committed) {
                                 Ok(prepared) => prepared,
                                 Err(error) => {
                                     sent_tx.send_replace(None);
@@ -1189,6 +1175,8 @@ impl BusHandle {
                                         });
                                     }
                                     rejected = Some((source.epoch, reason));
+                                } else {
+                                    rejected = None;
                                 }
                                 if let Ok(mut shared) = writer_stats.lock() {
                                     shared
@@ -1436,7 +1424,7 @@ mod tests {
             reference: Some(reference),
         };
         let prepared = published
-            .prepare(now + Duration::from_millis(20), None, None)
+            .prepare(now + Duration::from_millis(20), None)
             .unwrap();
         for side in ["left", "right"] {
             let calibration = calibrations(side).unwrap();
@@ -1456,7 +1444,7 @@ mod tests {
             values: stopped_setpoints(),
             ..published
         }
-        .prepare(now + Duration::from_secs(1), None, None)
+        .prepare(now + Duration::from_secs(1), None)
         .unwrap();
         assert!(direct.tuning.is_none());
         assert_eq!(direct.values.map(|v| v.mode), [DriveMode::Disabled; 7]);
@@ -1489,7 +1477,7 @@ mod tests {
             reference: Some(reference),
         };
         let at = now + Duration::from_millis(20);
-        let first = published.prepare(at, None, None).unwrap();
+        let first = published.prepare(at, None).unwrap();
         assert_eq!(first.values.map(|s| s.dq), [0.0; 7]);
         assert_eq!(first.motion_velocity, [0.05; 7]);
         assert_eq!(first.values.map(|s| s.q), [0.501; 7]);
@@ -1505,11 +1493,11 @@ mod tests {
             gravity: first.gravity,
         };
         let next = published
-            .prepare(now + Duration::from_millis(30), Some(committed), None)
+            .prepare(now + Duration::from_millis(30), Some(committed))
             .unwrap();
         assert_trace_numbers(next.values.map(|s| s.q), [0.5015; 7]);
         let held = published
-            .prepare(now + Duration::from_millis(60), Some(committed), None)
+            .prepare(now + Duration::from_millis(60), Some(committed))
             .unwrap();
         assert_eq!(held.rejection, Some(SampleStatus::Stale));
         assert_eq!(held.values.map(|s| s.q), [0.501; 7]);
@@ -1627,6 +1615,7 @@ mod tests {
                         }
                         let step = model
                             .step(StepInput {
+                                planning: None,
                                 reference: q,
                                 measured: q,
                                 previous_velocity: dq,
@@ -1642,6 +1631,7 @@ mod tests {
                                     angular_speed: 0.15,
                                 },
                                 smoothing: Some(SmoothingState {
+                                    hold: None,
                                     acceleration: ddq,
                                     jerk: [JOINT_JERK; 7],
                                     path: Some(path),
@@ -1658,10 +1648,6 @@ mod tests {
                             tcp,
                             path,
                             goal: None,
-                            linear_speed: 0.015,
-                            angular_speed: 0.15,
-                            measured: q,
-                            max_reference_error: 0.60,
                         });
                         let values = std::array::from_fn(|i| Setpoint {
                             mode: DriveMode::Servo,
@@ -1677,7 +1663,7 @@ mod tests {
                             seq: tick,
                             reference: Some(reference.clone()),
                         }
-                        .prepare(at, baseline, None)
+                        .prepare(at, baseline)
                         .unwrap();
                         reference.servo_tuning.friction_enabled = true;
                         for (i, joint) in reference.servo_tuning.joints.iter_mut().enumerate() {
@@ -1691,7 +1677,7 @@ mod tests {
                             seq: tick,
                             reference: Some(reference),
                         }
-                        .prepare(at, tuned, None)
+                        .prepare(at, tuned)
                         .unwrap();
                         assert!(normal.rejection.is_none() && actual.rejection.is_none());
                         assert_eq!(actual.values.map(|s| s.q), normal.values.map(|s| s.q));
@@ -1744,9 +1730,7 @@ mod tests {
                         seq: 151,
                         reference: Some(idle),
                     };
-                    let rest = rest
-                        .prepare(held.at + WRITE_PERIOD, Some(held), None)
-                        .unwrap();
+                    let rest = rest.prepare(held.at + WRITE_PERIOD, Some(held)).unwrap();
                     assert_eq!(rest.motion_velocity, [0.0; 7]);
                     assert_eq!(rest.tuning.unwrap().friction_applied, [0.0; 7]);
                     assert_eq!(rest.values.map(|s| s.tau), [0.3; 7]);
@@ -1811,7 +1795,7 @@ mod tests {
         };
         assert!(published.is_current(&epoch, now));
         let prepared = published
-            .prepare(now + Duration::from_millis(10), None, None)
+            .prepare(now + Duration::from_millis(10), None)
             .unwrap();
         assert!(prepared.values[0].q > 0.5);
         epoch.fetch_add(1, Ordering::AcqRel);
@@ -1835,7 +1819,7 @@ mod tests {
             reference: Some(Reference::joint(now, [0.5; 7], [0.05; 7], [0.0; 7], 1, 0)),
         };
         let prepared = published
-            .prepare(now + Duration::from_millis(20), None, None)
+            .prepare(now + Duration::from_millis(20), None)
             .unwrap();
         assert_eq!(prepared.values.map(|s| s.q), [0.501; 7]);
         assert_eq!(prepared.values.map(|s| s.dq), [0.05; 7]);
@@ -1849,7 +1833,7 @@ mod tests {
             reference: published.reference,
         };
         let direct = disabled
-            .prepare(now + Duration::from_secs(1), None, None)
+            .prepare(now + Duration::from_secs(1), None)
             .unwrap();
         assert!(direct.values.iter().all(|s| s.mode == DriveMode::Disabled));
         assert!(direct.timing.is_none());
@@ -1872,27 +1856,38 @@ mod tests {
             reference: Some(Reference::joint(now, [0.5; 7], [0.1; 7], [0.0; 7], 1, 0)),
         };
         let at = now + Duration::from_millis(60);
-        assert!(published.prepare(at, None, None).is_err());
+        assert!(published.prepare(at, None).is_err());
         let committed = Committed::direct(
             now + Duration::from_millis(10),
             values.map(|s| Setpoint { q: 0.501, ..s }),
         );
-        let held = published.prepare(at, Some(committed), None).unwrap();
+        let held = published.prepare(at, Some(committed)).unwrap();
         assert_eq!(held.values.map(|s| s.q), [0.501; 7]);
         assert_eq!(held.values.map(|s| s.dq), [0.0; 7]);
         assert_eq!(held.timing.unwrap().status, SampleStatus::Stale);
         let later = published
-            .prepare(
-                at + Duration::from_secs(1),
-                Some(committed),
-                Some(SampleStatus::Stale),
-            )
+            .prepare(at + Duration::from_secs(1), Some(committed))
             .unwrap();
         assert_eq!(later.values.map(|s| s.q), [0.501; 7]);
+        let mut fresh = published.clone();
+        fresh.reference.as_mut().unwrap().at = at;
+        let resumed = fresh
+            .prepare(
+                at + WRITE_PERIOD,
+                Some(Committed {
+                    at,
+                    values: held.values,
+                    motion_velocity: [0.0; 7],
+                    gravity: held.gravity,
+                }),
+            )
+            .unwrap();
+        assert!(resumed.rejection.is_none());
+        assert!(resumed.values[0].q > held.values[0].q);
         // An initial disabled target is not an observed servo position.
         assert!(
             published
-                .prepare(at, Some(Committed::direct(now, stopped_setpoints())), None)
+                .prepare(at, Some(Committed::direct(now, stopped_setpoints())))
                 .is_err()
         );
     }

@@ -1,30 +1,34 @@
 //! Offline geometry for the complete calibration programme. Samples are actual
 //! joint configurations and FK TCP positions, not a Cartesian bounding box.
 use crate::kinematics::{
-    Frame, Kinematics, LocalTarget, MotionLimits, Pose, StepInput, offset_pose, pose_error,
+    ContinuationBounds, Frame, JointGuide, Kinematics, Pose, offset_pose, pose_error,
 };
+use crate::trajectory::MotionTuning;
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
 const END_TOLERANCE: f64 = 1e-6;
 const PATH_TOLERANCE: f64 = 0.00002;
 const ORIENTATION_TOLERANCE: f64 = 0.0002;
-const MIN_DIRECTION: f64 = 0.0001;
 const JOINT_SAMPLE_STEP: f64 = 0.01;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct PreviewRequest {
-    pub amplitude: f64,
+    /// None selects the complete locally reachable range in each direction.
+    pub amplitude: Option<f64>,
     pub speed: f64,
     pub axes: Vec<usize>,
+    pub motion: MotionTuning,
 }
 
 impl Default for PreviewRequest {
     fn default() -> Self {
         Self {
-            amplitude: 0.05,
+            amplitude: None,
             speed: 0.01,
             axes: vec![0, 1, 2],
+            motion: MotionTuning::default(),
         }
     }
 }
@@ -47,7 +51,48 @@ pub struct CartesianProgram {
     /// Full joint excursion in radians; each joint visits +/- half of this.
     #[serde(default = "default_joint_excursion")]
     pub joint_excursion: f64,
+    #[serde(default)]
+    pub motion: MotionTuning,
+    #[serde(default)]
+    pub auto_range: bool,
     pub segments: Vec<CartesianSegment>,
+    #[serde(default)]
+    pub guide: Vec<BranchPoint>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct BranchPoint {
+    pub axis: usize,
+    pub offset: f64,
+    pub joints: [f64; 7],
+}
+
+impl CartesianProgram {
+    /// Interpolate the preview branch at actual signed TCP progress. Only a
+    /// handful of knots per ray cross the API; no IK runs in this lookup.
+    pub fn guide_at(&self, axis: usize, offset: f64) -> Option<JointGuide> {
+        let first = self.guide.partition_point(|point| point.axis < axis);
+        let end = self.guide.partition_point(|point| point.axis <= axis);
+        let points = &self.guide[first..end];
+        if points.len() < 2 {
+            return None;
+        }
+        let next = points
+            .partition_point(|point| point.offset <= offset)
+            .clamp(1, points.len() - 1);
+        let a = &points[next - 1];
+        let b = &points[next];
+        let distance = b.offset - a.offset;
+        if distance <= 0.0 {
+            return None;
+        }
+        let fraction = ((offset - a.offset) / distance).clamp(0.0, 1.0);
+        Some(JointGuide {
+            axis,
+            position: std::array::from_fn(|i| a.joints[i] + (b.joints[i] - a.joints[i]) * fraction),
+            tangent: std::array::from_fn(|i| (b.joints[i] - a.joints[i]) / distance),
+        })
+    }
 }
 
 fn default_joint_excursion() -> f64 {
@@ -71,6 +116,16 @@ pub struct PreviewPoint {
 pub struct CalibrationPreview {
     pub program: CartesianProgram,
     pub points: Vec<PreviewPoint>,
+    #[serde(default)]
+    pub ranges: Vec<AxisRange>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AxisRange {
+    pub axis: usize,
+    /// Signed displacements from the original TCP in base metres.
+    pub negative: f64,
+    pub positive: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -92,16 +147,21 @@ pub fn preview(
     if !matches!(side, "right" | "left") {
         return Err("side must be right or left".into());
     }
-    if !request.amplitude.is_finite() || !(0.02..=0.10).contains(&request.amplitude) {
-        return Err("末端单向幅度为 20–100 mm".into());
+    if request
+        .amplitude
+        .is_some_and(|value| !value.is_finite() || value <= 0.0)
+    {
+        return Err("末端单向幅度必须为有限正数".into());
     }
-    if !request.speed.is_finite() || !(0.005..=0.0135).contains(&request.speed) {
-        return Err("末端测试速度为 5–13.5 mm/s".into());
+    if !request.speed.is_finite() || request.speed <= 0.0 {
+        return Err("末端测试速度必须为有限正数".into());
     }
+    request.motion.validate()?;
     if request.axes.iter().any(|axis| *axis >= 3) {
         return Err("末端测试方向为基座 X、Y、Z".into());
     }
     let origin_pose = model.fk(&origin, &tcp)?;
+    let bounds = model.continuation_bounds(&origin)?;
     let start = Sample {
         joints: origin,
         tcp: origin_pose.translation,
@@ -110,119 +170,256 @@ pub fn preview(
         side: side.into(),
         origin,
         tcp,
-        amplitude: request.amplitude,
+        amplitude: request.amplitude.unwrap_or(0.0),
         speed: request.speed,
         joint_excursion: default_joint_excursion(),
+        motion: request.motion,
+        auto_range: request.amplitude.is_none(),
         segments: Vec::new(),
+        guide: Vec::new(),
     };
     let mut points = Vec::new();
-    let mut current = start;
+    let mut ranges = Vec::with_capacity(3);
+    // The sphere only bounds the search. Every accepted point is solved from
+    // its neighbour with the selected TCP orientation held fixed.
+    let search_distance = 2.0 * model.reach_radius(&tcp);
+    if !search_distance.is_finite() || search_distance <= 0.0 {
+        return Err("invalid model geometry extent".into());
+    }
     for axis in 0..3 {
+        let positive = trace(
+            model,
+            tcp,
+            origin_pose,
+            start,
+            axis,
+            search_distance,
+            bounds,
+        );
+        let negative = trace(
+            model,
+            tcp,
+            origin_pose,
+            start,
+            axis,
+            -search_distance,
+            bounds,
+        );
+        let range = AxisRange {
+            axis,
+            negative: negative.last().unwrap().tcp[axis] - start.tcp[axis],
+            positive: positive.last().unwrap().tcp[axis] - start.tcp[axis],
+        };
+        if program.auto_range {
+            program.amplitude = program.amplitude.max(range.positive).max(-range.negative);
+        }
+        ranges.push(range);
         if !request.axes.contains(&axis) {
             continue;
         }
-        let axis_start = current;
-        let segment_start = program.segments.len();
-        let point_start = points.len();
-        for target in [program.amplitude, -program.amplitude] {
-            let samples = trace(model, &program, origin_pose, current, axis, target);
-            let endpoint = *samples.last().unwrap();
-            let offset = endpoint.tcp[axis] - start.tcp[axis];
-            if target.signum() * offset >= MIN_DIRECTION {
-                append_cartesian(&mut program, &mut points, axis, offset, &samples);
-                current = endpoint;
+        let positive = clip_trace(
+            model,
+            tcp,
+            origin_pose,
+            axis,
+            positive,
+            request.amplitude,
+            bounds,
+        );
+        let negative = clip_trace(
+            model,
+            tcp,
+            origin_pose,
+            axis,
+            negative,
+            request.amplitude,
+            bounds,
+        );
+        // Eight intervals per direction, sharing the origin, keep the complete
+        // programme well below the command API's 16 KiB body limit.
+        let mut knots = Vec::new();
+        for samples in [&negative, &positive] {
+            for index in branch_indices(samples, axis) {
+                let sample = samples[index];
+                knots.push(BranchPoint {
+                    axis,
+                    offset: sample.tcp[axis] - start.tcp[axis],
+                    joints: sample.joints,
+                });
             }
         }
-        if program.segments.len() == segment_start {
+        knots.sort_by(|a, b| a.offset.total_cmp(&b.offset));
+        knots.dedup_by(|a, b| a.offset == b.offset);
+        program.guide.extend(knots);
+        if positive.len() == 1 && negative.len() == 1 {
             continue;
         }
-        let returning = trace(model, &program, origin_pose, current, axis, 0.0);
-        let endpoint = *returning.last().unwrap();
-        if (endpoint.tcp[axis] - start.tcp[axis]).abs() <= END_TOLERANCE {
-            append_cartesian(&mut program, &mut points, axis, 0.0, &returning);
-            current = endpoint;
-        } else {
-            // An axis that cannot complete its return is omitted as a whole.
-            // Other axes and joint trials still get their own usable preview.
-            program.segments.truncate(segment_start);
-            points.truncate(point_start);
-            current = axis_start;
+        if positive.len() > 1 {
+            let offset = positive.last().unwrap().tcp[axis] - start.tcp[axis];
+            append_cartesian(&mut program, &mut points, axis, offset, &positive);
         }
+        if negative.len() > 1 {
+            // Reverse the accepted positive branch through the exact starting
+            // configuration, then continue out along the negative branch.
+            let mut crossing: Vec<_> = positive.iter().rev().copied().collect();
+            crossing.extend_from_slice(&negative[1..]);
+            let offset = negative.last().unwrap().tcp[axis] - start.tcp[axis];
+            append_cartesian(&mut program, &mut points, axis, offset, &crossing);
+        }
+        let outward = if negative.len() > 1 {
+            &negative
+        } else {
+            &positive
+        };
+        let returning: Vec<_> = outward.iter().rev().copied().collect();
+        append_cartesian(&mut program, &mut points, axis, 0.0, &returning);
     }
-    append_joint_return(model, &program, current, &mut points)?;
+    append_joint_return(model, &program, start, &mut points)?;
     append_joint_trials(model, &program, start, &mut points)?;
-    Ok(CalibrationPreview { program, points })
+    Ok(CalibrationPreview {
+        program,
+        points,
+        ranges,
+    })
+}
+
+/// Spend the small wire budget where the branch bends, rather than where
+/// numerical boundary subdivision happened to produce the most samples.
+fn branch_indices(samples: &[Sample], axis: usize) -> Vec<usize> {
+    if samples.len() == 1 {
+        return vec![0];
+    }
+    let mut indices = vec![0, samples.len() - 1];
+    while indices.len() < 9 {
+        let mut best = None;
+        let mut maximum = 0.0;
+        for (interval, pair) in indices.windows(2).enumerate() {
+            let (a, b) = (samples[pair[0]], samples[pair[1]]);
+            let distance = b.tcp[axis] - a.tcp[axis];
+            if distance.abs() < f64::EPSILON {
+                continue;
+            }
+            for (index, sample) in samples.iter().enumerate().take(pair[1]).skip(pair[0] + 1) {
+                let fraction = (sample.tcp[axis] - a.tcp[axis]) / distance;
+                let error: f64 = (0..7)
+                    .map(|i| {
+                        (sample.joints[i] - a.joints[i] - (b.joints[i] - a.joints[i]) * fraction)
+                            .powi(2)
+                    })
+                    .sum();
+                if error > maximum {
+                    maximum = error;
+                    best = Some((interval + 1, index));
+                }
+            }
+        }
+        let Some((interval, index)) = best else {
+            break;
+        };
+        indices.insert(interval, index);
+    }
+    indices
 }
 
 fn trace(
     model: &Kinematics,
-    program: &CartesianProgram,
+    tcp: Pose,
     origin_pose: Pose,
     start: Sample,
     axis: usize,
     target_offset: f64,
+    bounds: ContinuationBounds,
 ) -> Vec<Sample> {
     let mut samples = vec![start];
-    // These bounds keep the offline IK local. Reset derivatives and measured
-    // joints on each step: the preview is geometry, not simulated servo motion.
-    let limits = MotionLimits {
-        joint_velocity: [0.2; 7],
-        joint_acceleration: [2.0; 7],
-        max_reference_error: 0.1,
-        max_joint_step: JOINT_SAMPLE_STEP,
-        linear_speed: program.speed,
-        angular_speed: 0.15,
-    };
-    // A finite budget also handles directions whose projection vanishes at a
-    // reach boundary. Only accepted actual FK samples survive a clipped leg.
-    for _ in 0..2000 {
+    let length = model.reach_radius(&tcp);
+    let nominal_step = length / 128.0;
+    let resolution = length * 1e-8;
+    // Monotone displacement bounded by model extent, with adaptive subdivision
+    // at a continuation boundary. No operating speed or fixed travel budget.
+    loop {
         let previous = *samples.last().unwrap();
         let distance = previous.tcp[axis] - origin_pose.translation[axis];
         let remaining = target_offset - distance;
-        if remaining.abs() <= END_TOLERANCE {
+        let tolerance = resolution.min(target_offset.abs() * 1e-6);
+        if remaining.abs() <= tolerance {
             break;
         }
-        let mut delta = [0.0; 6];
-        delta[axis] = distance + remaining.clamp(-0.002, 0.002);
-        let Ok(target) = offset_pose(&origin_pose, delta, Frame::Base) else {
-            break;
-        };
-        let Ok(candidate) = model.step(StepInput {
-            reference: previous.joints,
-            measured: previous.joints,
-            previous_velocity: [0.0; 7],
-            target: LocalTarget::Pose(target),
-            dt: 0.1,
-            tcp: program.tcp,
-            limits,
-            smoothing: None,
-        }) else {
-            break;
-        };
-        let Ok(pose) = model.fk(&candidate.q, &program.tcp) else {
-            break;
-        };
-        let error = pose_error(&origin_pose, &pose);
-        let projection = error[axis];
-        let transverse = (0..3)
-            .filter(|component| *component != axis)
-            .map(|component| error[component].powi(2))
-            .sum::<f64>()
-            .sqrt();
-        let rotation = error[3..].iter().map(|v| v * v).sum::<f64>().sqrt();
-        if !projection.is_finite()
-            || remaining.signum() * (projection - distance) < 1e-8
-            || projection.abs() > program.amplitude
-            || transverse > PATH_TOLERANCE
-            || rotation > ORIENTATION_TOLERANCE
-        {
-            break;
+        let mut step = nominal_step.min(remaining.abs());
+        let mut accepted = None;
+        // Permit even very small requested amplitudes; resolution only governs
+        // subdivision after a failed solve, not validation of the request.
+        loop {
+            let mut delta = [0.0; 6];
+            delta[axis] = distance + remaining.signum() * step;
+            let target = offset_pose(&origin_pose, delta, Frame::Base).unwrap();
+            if let Ok(joints) =
+                model.continue_pose(&previous.joints, &tcp, &target, JOINT_SAMPLE_STEP, bounds)
+                && let Ok(pose) = model.fk(&joints, &tcp)
+            {
+                let error = pose_error(&origin_pose, &pose);
+                let progress = remaining.signum() * (error[axis] - distance);
+                let transverse = (0..3)
+                    .filter(|component| *component != axis)
+                    .map(|component| error[component].powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                let rotation = error[3..].iter().map(|v| v * v).sum::<f64>().sqrt();
+                if progress > 0.0
+                    && progress >= resolution.min(remaining.abs()) * (1.0 - 1e-5)
+                    && progress <= step + tolerance
+                    && progress <= remaining.abs()
+                    && transverse <= PATH_TOLERANCE
+                    && rotation <= ORIENTATION_TOLERANCE
+                {
+                    accepted = Some(Sample {
+                        joints,
+                        tcp: pose.translation,
+                    });
+                    break;
+                }
+            }
+            step *= 0.5;
+            if step < resolution {
+                break;
+            }
         }
-        samples.push(Sample {
-            joints: candidate.q,
-            tcp: pose.translation,
-        });
+        match accepted {
+            Some(sample) => samples.push(sample),
+            None => break,
+        }
     }
+    samples
+}
+
+fn clip_trace(
+    model: &Kinematics,
+    tcp: Pose,
+    origin: Pose,
+    axis: usize,
+    mut samples: Vec<Sample>,
+    amplitude: Option<f64>,
+    bounds: ContinuationBounds,
+) -> Vec<Sample> {
+    let Some(amplitude) = amplitude else {
+        return samples;
+    };
+    let endpoint = samples.last().unwrap().tcp[axis] - origin.translation[axis];
+    if endpoint.abs() <= amplitude {
+        return samples;
+    }
+    let keep = samples
+        .partition_point(|sample| (sample.tcp[axis] - origin.translation[axis]).abs() < amplitude);
+    samples.truncate(keep.max(1));
+    let finishing = trace(
+        model,
+        tcp,
+        origin,
+        *samples.last().unwrap(),
+        axis,
+        endpoint.signum() * amplitude,
+        bounds,
+    );
+    samples.extend_from_slice(&finishing[1..]);
     samples
 }
 
@@ -325,6 +522,7 @@ mod tests {
     fn check_samples(model: &Kinematics, preview: &CalibrationPreview) {
         let program = &preview.program;
         let original = model.fk(&program.origin, &program.tcp).unwrap();
+        let bounds = model.continuation_bounds(&program.origin).unwrap();
         assert!(!preview.points.is_empty());
         for point in &preview.points {
             let pose = model.fk(&point.joints, &program.tcp).unwrap();
@@ -338,6 +536,10 @@ mod tests {
             );
             match point.space.as_str() {
                 "cartesian" => {
+                    for axis in 0..7 {
+                        assert!(point.joints[axis] >= bounds.lower[axis] - 1e-12);
+                        assert!(point.joints[axis] <= bounds.upper[axis] + 1e-12);
+                    }
                     assert!(point.segment < program.segments.len());
                     assert_eq!(point.axis, program.segments[point.segment].axis);
                     let error = pose_error(&original, &pose);
@@ -425,23 +627,245 @@ mod tests {
     }
 
     #[test]
+    fn auto_ranges_extend_beyond_100mm_and_manual_travel_clips_only_to_geometry() {
+        let model = Kinematics::load("right").unwrap();
+        let automatic =
+            preview(&model, "right", origin(), tool(), PreviewRequest::default()).unwrap();
+        check_samples(&model, &automatic);
+        assert!(automatic.program.auto_range);
+        assert_eq!(automatic.ranges.len(), 3);
+        assert!(
+            automatic
+                .ranges
+                .iter()
+                .any(|range| range.positive > 0.1 || range.negative < -0.1)
+        );
+        let maximum = automatic
+            .ranges
+            .iter()
+            .map(|range| range.positive.max(-range.negative))
+            .fold(0.0, f64::max);
+        assert_eq!(automatic.program.amplitude, maximum);
+        for amplitude in [1e-6, 0.001, 0.15, f64::MAX] {
+            let manual = preview(
+                &model,
+                "right",
+                origin(),
+                tool(),
+                PreviewRequest {
+                    amplitude: Some(amplitude),
+                    ..PreviewRequest::default()
+                },
+            )
+            .unwrap();
+            check_samples(&model, &manual);
+            assert!(!manual.program.auto_range);
+            assert_eq!(manual.program.amplitude, amplitude);
+            assert_eq!(manual.ranges, automatic.ranges);
+            for segment in manual
+                .program
+                .segments
+                .iter()
+                .filter(|segment| segment.offset != 0.0)
+            {
+                let range = &manual.ranges[segment.axis];
+                let available = if segment.offset > 0.0 {
+                    range.positive
+                } else {
+                    -range.negative
+                };
+                assert!((segment.offset.abs() - amplitude.min(available)).abs() < END_TOLERANCE);
+            }
+            if amplitude <= 0.15 {
+                assert_eq!(manual.program.segments.len(), 9);
+            } else {
+                assert_eq!(manual.points, automatic.points);
+                assert_eq!(manual.program.segments, automatic.program.segments);
+            }
+        }
+    }
+
+    #[test]
+    fn operating_speed_and_motion_preferences_do_not_change_reach_or_samples() {
+        let model = Kinematics::load("right").unwrap();
+        let baseline =
+            preview(&model, "right", origin(), tool(), PreviewRequest::default()).unwrap();
+        for speed in [1e-12, 0.001, 0.2, 1000.0, f64::MAX] {
+            let motion = MotionTuning {
+                joint_speed: speed,
+                acceleration: speed,
+                jerk: speed,
+            };
+            let result = preview(
+                &model,
+                "right",
+                origin(),
+                tool(),
+                PreviewRequest {
+                    speed,
+                    motion,
+                    ..PreviewRequest::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(result.ranges, baseline.ranges);
+            assert_eq!(result.program.segments, baseline.program.segments);
+            assert_eq!(result.points, baseline.points);
+            assert_eq!(result.program.speed, speed);
+            assert_eq!(result.program.motion, motion);
+        }
+    }
+
+    #[test]
+    fn two_origins_and_tcps_use_actual_fk_and_fixed_orientation_continuation() {
+        let origins = [
+            origin(),
+            [1.5576, -0.0350, 0.0102, -0.0217, 1.6217, 0.0088, 0.1133],
+        ];
+        for side in ["right", "left"] {
+            let model = Kinematics::load(side).unwrap();
+            let mut ranges = Vec::new();
+            for origin in origins {
+                let flange = preview(
+                    &model,
+                    side,
+                    origin,
+                    Pose::identity(),
+                    PreviewRequest::default(),
+                )
+                .unwrap();
+                let tool =
+                    preview(&model, side, origin, tool(), PreviewRequest::default()).unwrap();
+                check_samples(&model, &flange);
+                check_samples(&model, &tool);
+                assert_ne!(flange.points[0].tcp, tool.points[0].tcp);
+                // Holding orientation fixes the TCP-to-flange displacement in
+                // base axes: straight translation travel is therefore invariant
+                // under a rigid TCP offset, up to continuation resolution.
+                for (a, b) in flange.ranges.iter().zip(&tool.ranges) {
+                    assert!((a.positive - b.positive).abs() < END_TOLERANCE);
+                    assert!((a.negative - b.negative).abs() < END_TOLERANCE);
+                }
+                ranges.push(flange.ranges);
+            }
+            assert!(
+                ranges[0]
+                    .iter()
+                    .zip(&ranges[1])
+                    .any(|(a, b)| (a.positive - b.positive).abs() > 0.01
+                        || (a.negative - b.negative).abs() > 0.01)
+            );
+        }
+    }
+
+    #[test]
+    fn captured_origin_ranges_respect_all_model_position_limits_and_are_directional() {
+        let model = Kinematics::load("right").unwrap();
+        // center_reference from calibration-4a3ca783-4d2d-49e2-867b-7e2b6d549d94.
+        let origin = [
+            1.0485126779344875,
+            0.33696024505486105,
+            -0.024104458715885565,
+            0.5221739002599245,
+            1.6839417312898655,
+            0.07363282576166262,
+            0.3497202195213932,
+        ];
+        let result = preview(
+            &model,
+            "right",
+            origin,
+            Pose::identity(),
+            PreviewRequest::default(),
+        )
+        .unwrap();
+        check_samples(&model, &result);
+        let (lower, upper) = model.position_limits();
+        for point in &result.points {
+            assert!((0..7).all(
+                |i| point.joints[i] >= lower[i] - 1e-12 && point.joints[i] <= upper[i] + 1e-12
+            ));
+        }
+        assert_eq!(result.ranges.len(), 3);
+        assert!(result.program.amplitude > 0.1);
+        assert!(
+            result
+                .ranges
+                .iter()
+                .any(|range| (range.positive + range.negative).abs() > 0.01)
+        );
+        assert!(
+            result
+                .ranges
+                .windows(2)
+                .all(|pair| (pair[0].positive - pair[1].positive).abs() > 1e-4
+                    || (pair[0].negative - pair[1].negative).abs() > 1e-4)
+        );
+        for axis in 0..3 {
+            assert!(
+                result
+                    .program
+                    .segments
+                    .iter()
+                    .any(|segment| segment.axis == axis && segment.offset != 0.0)
+            );
+        }
+    }
+
+    #[test]
+    fn nominally_outside_origins_allow_return_toward_the_model_without_extending_outward() {
+        let model = Kinematics::load("right").unwrap();
+        let (lower, upper) = model.position_limits();
+        let mut outside = origin();
+        outside[5] = lower[5] - 0.2;
+        outside[6] = upper[6] + 0.3;
+        let result = preview(&model, "right", outside, tool(), PreviewRequest::default()).unwrap();
+        check_samples(&model, &result);
+        assert!(
+            result
+                .program
+                .segments
+                .iter()
+                .any(|segment| segment.offset != 0.0)
+        );
+        for point in result
+            .points
+            .iter()
+            .filter(|point| point.space == "cartesian")
+        {
+            assert!(point.joints[5] >= outside[5] - 1e-12);
+            assert!(point.joints[6] <= outside[6] + 1e-12);
+        }
+    }
+
+    #[test]
     fn default_request_and_program_envelope_round_trip() {
         let request: PreviewRequest = serde_json::from_str("{}").unwrap();
         assert_eq!(request, PreviewRequest::default());
         let partial: PreviewRequest = serde_json::from_str(r#"{"speed":0.005}"#).unwrap();
-        assert_eq!(partial.amplitude, 0.05);
+        assert_eq!(partial.amplitude, None);
         assert_eq!(partial.axes, vec![0, 1, 2]);
         let model = Kinematics::load("right").unwrap();
         let result = preview(&model, "right", origin(), tool(), request).unwrap();
         assert_eq!(result.program.joint_excursion, 16.0_f64.to_radians());
         let mut value = serde_json::to_value(&result.program).unwrap();
         value.as_object_mut().unwrap().remove("joint_excursion");
+        value.as_object_mut().unwrap().remove("motion");
+        value.as_object_mut().unwrap().remove("auto_range");
         let restored: CartesianProgram = serde_json::from_value(value).unwrap();
         assert_same_program(&restored, &result.program);
+        assert_eq!(restored.motion, MotionTuning::default());
+        assert!(!restored.auto_range);
         let encoded = serde_json::to_string(&result).unwrap();
         let decoded: CalibrationPreview = serde_json::from_str(&encoded).unwrap();
         assert_same_program(&decoded.program, &result.program);
         assert_eq!(decoded.points.len(), result.points.len());
+        assert_eq!(decoded.program.motion, result.program.motion);
+        assert_eq!(decoded.program.auto_range, result.program.auto_range);
+        let mut legacy = serde_json::to_value(&result).unwrap();
+        legacy.as_object_mut().unwrap().remove("ranges");
+        let legacy: CalibrationPreview = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.ranges.is_empty());
         for (actual, expected) in decoded.points.iter().zip(&result.points) {
             assert_eq!(actual.space, expected.space);
             assert_eq!(actual.axis, expected.axis);
@@ -452,7 +876,51 @@ mod tests {
     }
 
     #[test]
-    fn redundant_ik_drift_and_the_full_joint_return_are_in_the_preview() {
+    fn branch_guides_fit_the_command_body_and_interpolate_the_preview_knots() {
+        let model = Kinematics::load("right").unwrap();
+        let captured = [
+            1.0485035052359992,
+            0.3369648851818667,
+            -0.024104830439799833,
+            0.5221767742481414,
+            1.683944156955803,
+            0.07362801043445026,
+            0.34971860713891384,
+        ];
+        for (origin, tcp) in [(captured, Pose::identity()), (origin(), tool())] {
+            let started = std::time::Instant::now();
+            let result = preview(&model, "right", origin, tcp, PreviewRequest::default()).unwrap();
+            let elapsed = started.elapsed();
+            assert!(result.program.guide.len() <= 51);
+            for knot in &result.program.guide {
+                let guide = result.program.guide_at(knot.axis, knot.offset).unwrap();
+                assert_eq!(guide.axis, knot.axis);
+                assert_close(&guide.position, &knot.joints);
+                assert!(guide.tangent.iter().all(|value| value.is_finite()));
+            }
+            let request = serde_json::json!({
+                "request_id": "12345678-1234-1234-1234-123456789012",
+                "client_id": "12345678-1234-1234-1234-123456789012",
+                "lease_id": "12345678-1234-1234-1234-123456789012",
+                "generation": 123456789, "kind": "calibrate_start",
+                "settings": { "axis": 1, "excursion": 0.2, "speed": 0.02,
+                    "max_friction": 0.1, "cartesian": result.program }
+            });
+            let size = serde_json::to_vec(&request).unwrap().len();
+            assert!(size < 16 * 1024, "command body contains {size} bytes");
+            eprintln!(
+                "preview timing tcp={:?}: {elapsed:?}, guide knots={}, request bytes={size}",
+                tcp.translation,
+                request["settings"]["cartesian"]["guide"]
+                    .as_array()
+                    .unwrap()
+                    .len()
+            );
+        }
+    }
+
+    #[test]
+    fn reversible_continuation_returns_to_the_exact_starting_configuration() {
         let model = Kinematics::load("right").unwrap();
         let result = preview(&model, "right", origin(), tool(), PreviewRequest::default()).unwrap();
         check_samples(&model, &result);
@@ -466,13 +934,7 @@ mod tests {
             .iter()
             .filter(|point| point.space == "joint_return")
             .collect();
-        assert!(
-            last_cartesian
-                .joints
-                .iter()
-                .zip(origin())
-                .any(|(a, b)| (a - b).abs() > 1e-7)
-        );
+        assert_eq!(last_cartesian.joints, origin());
         assert!(returning.len() >= 2);
         assert_eq!(returning[0].joints, last_cartesian.joints);
         assert_eq!(returning.last().unwrap().joints, origin());
@@ -491,8 +953,17 @@ mod tests {
         for side in ["right", "left"] {
             let model = Kinematics::load(side).unwrap();
             for tcp in [Pose::identity(), tool()] {
-                let result =
-                    preview(&model, side, origin(), tcp, PreviewRequest::default()).unwrap();
+                let result = preview(
+                    &model,
+                    side,
+                    origin(),
+                    tcp,
+                    PreviewRequest {
+                        amplitude: Some(0.05),
+                        ..PreviewRequest::default()
+                    },
+                )
+                .unwrap();
                 check_samples(&model, &result);
                 assert_eq!(result.program.segments.len(), 9, "{side}, {tcp:?}");
                 for axis in 0..3 {
@@ -577,7 +1048,7 @@ mod tests {
                 [0.0; 7],
                 Pose::identity(),
                 PreviewRequest {
-                    amplitude: 0.10,
+                    amplitude: Some(0.10),
                     ..PreviewRequest::default()
                 },
             )
@@ -615,9 +1086,10 @@ mod tests {
             origin(),
             tool(),
             PreviewRequest {
-                amplitude: 0.02,
+                amplitude: Some(0.02),
                 speed: 0.0135,
                 axes: vec![2, 0, 2],
+                ..PreviewRequest::default()
             },
         )
         .unwrap();
@@ -642,14 +1114,7 @@ mod tests {
     #[test]
     fn invalid_requests_fail_before_geometry() {
         let model = Kinematics::load("right").unwrap();
-        for value in [
-            f64::NAN,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            0.0,
-            0.01999,
-            0.10001,
-        ] {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -0.001] {
             assert!(
                 preview(
                     &model,
@@ -657,21 +1122,14 @@ mod tests {
                     origin(),
                     tool(),
                     PreviewRequest {
-                        amplitude: value,
+                        amplitude: Some(value),
                         ..PreviewRequest::default()
                     }
                 )
                 .is_err()
             );
         }
-        for value in [
-            f64::NAN,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            0.0,
-            0.00499,
-            0.01351,
-        ] {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -0.001] {
             assert!(
                 preview(
                     &model,

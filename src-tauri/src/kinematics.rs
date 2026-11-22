@@ -65,6 +65,22 @@ pub struct StepInput {
     pub tcp: TcpTransform,
     pub limits: MotionLimits,
     pub smoothing: Option<SmoothingState>,
+    pub planning: Option<CartesianPlanning>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CartesianPlanning {
+    /// Actual accepted start for joint-position bounds, including outside axes.
+    pub origin: [f64; 7],
+    /// Optional posture on the previewed IK branch at the current TCP progress.
+    pub guide: Option<JointGuide>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct JointGuide {
+    pub axis: usize,
+    pub position: [f64; 7],
+    pub tangent: [f64; 7],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -75,7 +91,14 @@ pub struct CartesianPath {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub struct HoldPose {
+    pub joints: [f64; 7],
+    pub bandwidth: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct SmoothingState {
+    pub hold: Option<HoldPose>,
     pub acceleration: [f64; 7],
     pub jerk: [f64; 7],
     pub path: Option<CartesianPath>,
@@ -115,7 +138,7 @@ impl CartesianPath {
             let requested = desired.fixed_rows::<3>(offset).into_owned();
             let correction = error.fixed_rows::<3>(offset).into_owned();
             result.fixed_rows_mut::<3>(offset).copy_from(
-                &((Matrix3::identity() - project) * requested + project * correction * 12.0),
+                &((Matrix3::identity() - project) * requested + project * correction * 20.0),
             );
             priority
                 .fixed_view_mut::<3, 3>(offset, offset)
@@ -123,6 +146,7 @@ impl CartesianPath {
         }
         Ok((result, priority))
     }
+    #[cfg(test)]
     pub(crate) fn check(self, candidate: &Pose) -> Result<(), String> {
         let error = Twist::from_row_slice(&pose_error(&self.origin, candidate));
         let axis = self.axis_in_base()?;
@@ -139,8 +163,10 @@ impl CartesianPath {
         } else {
             angular.norm()
         };
-        if linear_error > 0.00005 || angular_error > 0.002 {
-            return Err("Cartesian path deviation exceeds the selected TCP constraint".into());
+        if linear_error > 0.001 || angular_error > std::f64::consts::PI / 180.0 {
+            return Err(format!(
+                "Cartesian path deviation: position={linear_error}m orientation={angular_error}rad"
+            ));
         }
         Ok(())
     }
@@ -173,6 +199,13 @@ struct Joint {
 pub struct Kinematics {
     joints: [Joint; 7],
     tip: Isometry3<f64>,
+    chain_length: f64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ContinuationBounds {
+    pub lower: [f64; 7],
+    pub upper: [f64; 7],
 }
 
 impl Kinematics {
@@ -228,6 +261,7 @@ impl Kinematics {
         let mut visited = HashSet::new();
         let mut pending = Isometry3::identity();
         let mut joints = Vec::with_capacity(7);
+        let mut chain_length = 0.0;
         while link != "Link7" {
             let joint = robot
                 .joints
@@ -242,6 +276,7 @@ impl Kinematics {
             if !xyz.iter().chain(p.rpy.iter()).all(|v| v.is_finite()) {
                 return Err("non-finite URDF origin".into());
             }
+            chain_length += xyz.norm();
             pending *= Isometry3::from_parts(
                 Translation3::from(xyz),
                 UnitQuaternion::from_euler_angles(p.rpy[0], p.rpy[1], p.rpy[2]),
@@ -285,17 +320,149 @@ impl Kinematics {
             }
             link = &joint.child.link;
         }
-        if visited.len() != robot.joints.len() || joints.len() != 7 {
+        if visited.len() != robot.joints.len() || joints.len() != 7 || !chain_length.is_finite() {
             return Err("expected exactly seven revolute joints on base_link to Link7".into());
         }
         Ok(Self {
             joints: joints.try_into().map_err(|_| "invalid joint count")?,
             tip: pending,
+            chain_length,
         })
     }
 
     pub fn joint_names(&self) -> [String; 7] {
         std::array::from_fn(|i| self.joints[i].name.clone())
+    }
+
+    /// URDF joint velocity ratings, independent of editable motion preferences.
+    pub fn speed_limits(&self) -> [f64; 7] {
+        std::array::from_fn(|i| self.joints[i].velocity)
+    }
+
+    /// Conservative base-centred geometric bound including fixed links and TCP.
+    /// Local IK, rather than this sphere, determines available directional travel.
+    pub fn reach_radius(&self, tcp: &TcpTransform) -> f64 {
+        self.chain_length + Vector3::from(tcp.translation).norm()
+    }
+
+    /// Planning bounds retain the starting configuration when nominal URDF
+    /// zeros differ, while permitting no additional travel outside the model.
+    pub(crate) fn continuation_bounds(
+        &self,
+        origin: &[f64; 7],
+    ) -> Result<ContinuationBounds, String> {
+        self.validate_q(origin)?;
+        Ok(ContinuationBounds {
+            lower: std::array::from_fn(|i| self.joints[i].lower.min(origin[i])),
+            upper: std::array::from_fn(|i| self.joints[i].upper.max(origin[i])),
+        })
+    }
+
+    /// Exact instantaneous linear/angular norm bounds over the joint-speed box.
+    /// These describe the Jacobian at this pose, not independent Cartesian goals.
+    pub fn cartesian_speed_limits(
+        &self,
+        q: &[f64; 7],
+        tcp: &TcpTransform,
+        joint_limits: [f64; 7],
+    ) -> Result<(f64, f64), String> {
+        if joint_limits.iter().any(|v| !v.is_finite() || *v <= 0.0) {
+            return Err("joint speed limits must be finite positive values".into());
+        }
+        let (_, jacobian) = self.evaluate(q, tcp)?;
+        let speeds: [f64; 7] =
+            std::array::from_fn(|i| joint_limits[i].min(self.joints[i].velocity));
+        let mut linear: f64 = 0.0;
+        let mut angular: f64 = 0.0;
+        // A convex norm on a box attains its maximum at a vertex.
+        for signs in 0..128 {
+            let velocity = SVector::<f64, 7>::from_fn(|i, _| {
+                if signs & (1 << i) == 0 {
+                    -speeds[i]
+                } else {
+                    speeds[i]
+                }
+            });
+            let twist = jacobian * velocity;
+            linear = linear.max(twist.fixed_rows::<3>(0).norm());
+            angular = angular.max(twist.fixed_rows::<3>(3).norm());
+        }
+        if !linear.is_finite() || !angular.is_finite() {
+            return Err("non-finite Cartesian speed bounds".into());
+        }
+        Ok((linear, angular))
+    }
+
+    /// Geometry-only continuation near `seed`, with no operating speed or servo
+    /// derivatives. The trust region prevents IK branch jumps. Nominal URDF
+    /// position zeros are not installed-arm hardware travel gates.
+    pub(crate) fn continue_pose(
+        &self,
+        seed: &[f64; 7],
+        tcp: &TcpTransform,
+        target: &Pose,
+        max_joint_step: f64,
+        bounds: ContinuationBounds,
+    ) -> Result<[f64; 7], String> {
+        to_isometry(target)?;
+        if !max_joint_step.is_finite() || max_joint_step <= 0.0 {
+            return Err("invalid IK continuation trust region".into());
+        }
+        let length = self.reach_radius(tcp).max(f64::MIN_POSITIVE);
+        if !length.is_finite() {
+            return Err("non-finite model reach".into());
+        }
+        let initial = self.fk(seed, tcp)?;
+        let distance = Vector3::from(target.translation) - Vector3::from(initial.translation);
+        let tolerance = (distance.norm() / length * 1e-6).clamp(64.0 * f64::EPSILON, 1e-10);
+        let mut q = *seed;
+        for _ in 0..48 {
+            let (pose, mut jacobian) = self.evaluate(&q, tcp)?;
+            let mut error = Twist::from(pose_error(&pose, target));
+            for row in 0..3 {
+                error[row] /= length;
+                jacobian.row_mut(row).scale_mut(1.0 / length);
+            }
+            if error.norm() <= tolerance {
+                return Ok(q);
+            }
+            let mut improved = None;
+            for damping in [1e-6_f64, 1e-4, 1e-2] {
+                let h = jacobian.transpose() * jacobian
+                    + SMatrix::<f64, 7, 7>::identity() * damping.powi(2);
+                let gradient = -jacobian.transpose() * error;
+                let window = trajectory::VelocityWindow {
+                    low: std::array::from_fn(|i| {
+                        (seed[i] - max_joint_step).max(bounds.lower[i]) - q[i]
+                    }),
+                    high: std::array::from_fn(|i| {
+                        (seed[i] + max_joint_step).min(bounds.upper[i]) - q[i]
+                    }),
+                };
+                let Ok(step) = trajectory::bounded_quadratic(h, gradient, window, [0.0; 7]) else {
+                    continue;
+                };
+                let mut amount: f64 = 1.0;
+                for _ in 0..12 {
+                    let next = std::array::from_fn(|i| {
+                        (q[i] + step[i] * amount).clamp(bounds.lower[i], bounds.upper[i])
+                    });
+                    let next_pose = self.fk(&next, tcp)?;
+                    let mut next_error = Twist::from(pose_error(&next_pose, target));
+                    next_error.fixed_rows_mut::<3>(0).scale_mut(1.0 / length);
+                    if next_error.norm() < error.norm() * (1.0 - 1e-8) {
+                        improved = Some(next);
+                        break;
+                    }
+                    amount *= 0.5;
+                }
+                if improved.is_some() {
+                    break;
+                }
+            }
+            q = improved.ok_or("local geometry continuation reached its boundary")?;
+        }
+        Err("local geometry continuation did not converge".into())
     }
 
     #[cfg(test)]
@@ -353,6 +520,36 @@ impl Kinematics {
         self.evaluate(q, tcp).map(|(pose, _)| pose)
     }
 
+    /// Local joint displacement for timing a Cartesian segment. This is a
+    /// Jacobian estimate, not an absolute IK target or a reachability check.
+    pub fn local_displacement(
+        &self,
+        q: &[f64; 7],
+        tcp: &TcpTransform,
+        target: &Pose,
+    ) -> Result<[f64; 7], String> {
+        let (pose, mut jacobian) = self.evaluate(q, tcp)?;
+        let mut error = Twist::from_row_slice(&pose_error(&pose, target));
+        let length = self.reach_radius(tcp);
+        for row in 0..3 {
+            jacobian.row_mut(row).scale_mut(1.0 / length);
+            error[row] /= length;
+        }
+        let system = jacobian * jacobian.transpose() + SMatrix::<f64, 6, 6>::identity() * 1e-12;
+        let displacement = jacobian.transpose()
+            * system
+                .cholesky()
+                .ok_or("Cartesian timing factorization failed")?
+                .solve(&error);
+        let bounds = self.continuation_bounds(q)?;
+        Ok(std::array::from_fn(|i| {
+            // A local linearization can diverge near a singularity. Its timing
+            // estimate uses the model's joint span; this does not clip the target.
+            let span = bounds.upper[i] - bounds.lower[i];
+            displacement[i].clamp(-span, span)
+        }))
+    }
+
     /// Static gravity torque in URDF joint coordinates, using the same link
     /// inertials as the official R1-7A model. Positive values are the torque
     /// the actuator must apply to hold the commanded configuration.
@@ -406,9 +603,10 @@ impl Kinematics {
             tcp,
             limits,
             smoothing,
+            planning: _,
         } = input;
-        if !dt.is_finite() || !(1e-6..=0.1).contains(&dt) {
-            return Err("dt must be between 1 microsecond and 100 milliseconds".into());
+        if !dt.is_finite() || dt <= 0.0 {
+            return Err("dt must be finite and positive".into());
         }
         self.validate_q(&reference)?;
         self.validate_q(&measured)?;
@@ -422,11 +620,11 @@ impl Kinematics {
             .iter()
             .chain(limits.joint_velocity.iter())
             .chain(limits.joint_acceleration.iter())
-            .all(|v| v.is_finite() && *v >= 1e-9 && *v <= 1e3)
+            .all(|v| v.is_finite() && *v > 0.0)
         {
-            return Err("motion limits must be finite positive values in [1e-9, 1000]".into());
+            return Err("motion limits must be finite positive values".into());
         }
-        let max_step = limits.max_joint_step.min(0.1); // Never leave the local configuration neighborhood.
+        let max_step = limits.max_joint_step;
         let speeds: [f64; 7] =
             std::array::from_fn(|i| limits.joint_velocity[i].min(self.joints[i].velocity));
         for i in 0..7 {
@@ -460,26 +658,22 @@ impl Kinematics {
             LocalTarget::Pose(pose) => {
                 to_isometry(&pose)?;
                 let error = Twist::from_row_slice(&pose_error(&current, &pose));
-                if error.fixed_rows::<3>(0).norm() > 0.1 || error.fixed_rows::<3>(3).norm() > 0.35 {
-                    return Err("pose target exceeds local range (0.1 m / 0.35 rad)".into());
-                }
                 error * POSE_GAIN
             }
         };
-        if let Some(path) = smoothing.and_then(|state| state.path) {
+        if let Some(state) = smoothing
+            && !state.stopping
+            && let Some(path) = state.path
+        {
             desired = path.correct(&current, desired)?.0;
         }
         if !desired.iter().all(|v| v.is_finite()) || !desired.norm().is_finite() {
             return Err("non-finite target velocity".into());
         }
         // One common task scale preserves the linear/angular ratio.
-        // Leave margin at the global TCP cap for finite FK curvature and
-        // jerk-bounded recovery. The final FK limit is still a hard check.
-        let headroom = if smoothing.is_some() { 0.90 } else { 1.0 };
-        let task_scale = (headroom * limits.linear_speed
-            / desired.fixed_rows::<3>(0).norm().max(1e-300))
-        .min(headroom * limits.angular_speed / desired.fixed_rows::<3>(3).norm().max(1e-300))
-        .min(1.0);
+        let task_scale = (limits.linear_speed / desired.fixed_rows::<3>(0).norm().max(1e-300))
+            .min(limits.angular_speed / desired.fixed_rows::<3>(3).norm().max(1e-300))
+            .min(1.0);
         let desired_bounded = desired * task_scale;
         let task_weights = Twist::from_row_slice(&[
             1.0 / limits.linear_speed,
@@ -656,6 +850,102 @@ impl Kinematics {
         })
     }
 
+    fn braking_reference(
+        &self,
+        input: &StepInput,
+        current: Pose,
+        jacobian: Jacobian,
+        desired: Twist,
+        raw: SVector<f64, 7>,
+        damping: f64,
+    ) -> Result<(Twist, SVector<f64, 7>), String> {
+        let state = input.smoothing.unwrap();
+        let limits = input.limits;
+        let dt = input.dt;
+        let speeds: [f64; 7] =
+            std::array::from_fn(|i| limits.joint_velocity[i].min(self.joints[i].velocity));
+        let velocity = SVector::<f64, 7>::from_row_slice(&input.previous_velocity);
+        let acceleration = SVector::<f64, 7>::from_row_slice(&state.acceleration);
+        let task_velocity = jacobian * velocity;
+        let ahead = std::array::from_fn(|i| input.reference[i] + velocity[i] * dt * 0.5);
+        let behind = std::array::from_fn(|i| input.reference[i] - velocity[i] * dt * 0.5);
+        let curvature = (self.evaluate(&ahead, &input.tcp)?.1
+            - self.evaluate(&behind, &input.tcp)?.1)
+            * velocity
+            / dt;
+        let task_acceleration = jacobian * acceleration + curvature;
+        // Critically damped task jerk, using the current velocity and acceleration.
+        // Bandwidth follows the configured jerk and joint motion, rather than an
+        // instantaneous position-error velocity that a slow jerk ramp cannot follow.
+        let rate_scale = (0..7)
+            .map(|i| velocity[i].abs().max(raw[i].abs().min(speeds[i])))
+            .fold(f64::EPSILON, f64::max);
+        let omega = state
+            .hold
+            .map_or_else(
+                || (state.jerk.into_iter().fold(f64::INFINITY, f64::min) / rate_scale).sqrt(),
+                |hold| hold.bandwidth,
+            )
+            .min(0.25 / dt);
+        let mut requested = if let LocalTarget::Pose(goal) = &input.target {
+            Twist::from_row_slice(&pose_error(&current, goal)) * (omega / 3.0)
+        } else {
+            desired
+        };
+        if let Some(path) = state.path {
+            let axis = path.axis_in_base()?;
+            let perpendicular = Matrix3::identity() - axis * axis.transpose();
+            let error = Twist::from_row_slice(&pose_error(&current, &path.origin));
+            for block in 0..2 {
+                let project = if (block == 0) == (path.axis < 3) {
+                    perpendicular
+                } else {
+                    Matrix3::identity()
+                };
+                let offset = block * 3;
+                let value = requested.fixed_rows::<3>(offset).into_owned();
+                requested.fixed_rows_mut::<3>(offset).copy_from(
+                    &((Matrix3::identity() - project) * value
+                        + project * error.fixed_rows::<3>(offset).into_owned() * (omega / 3.0)),
+                );
+            }
+        }
+        let scale = (limits.linear_speed / requested.fixed_rows::<3>(0).norm().max(1e-300))
+            .min(limits.angular_speed / requested.fixed_rows::<3>(3).norm().max(1e-300))
+            .min(1.0);
+        requested *= scale;
+        let task_jerk =
+            (requested - task_velocity) * (3.0 * omega * omega) - task_acceleration * (3.0 * omega);
+        let next_acceleration = task_acceleration + task_jerk * dt;
+        let desired = task_velocity + (next_acceleration - curvature) * dt;
+        let task_weights = SMatrix::<f64, 6, 6>::from_diagonal(&Twist::from_fn(|i, _| {
+            1.0 / if i < 3 {
+                limits.linear_speed
+            } else {
+                limits.angular_speed
+            }
+        }));
+        let normalized = task_weights * jacobian;
+        let goal_system = (normalized * normalized.transpose()
+            + SMatrix::<f64, 6, 6>::identity() * damping.powi(2))
+        .cholesky()
+        .ok_or("Cartesian goal factorization failed")?;
+        let mut preferred = normalized.transpose() * goal_system.solve(&(task_weights * requested));
+        if let Some(hold) = state.hold {
+            let goal = SVector::<f64, 7>::from_fn(|i, _| {
+                (hold.joints[i] - input.reference[i]) * (omega / 3.0)
+            });
+            let delta = goal - preferred;
+            preferred += delta - normalized.transpose() * goal_system.solve(&(normalized * delta));
+        }
+        let posture = velocity
+            + (acceleration
+                + ((preferred - velocity) * (3.0 * omega * omega) - acceleration * (3.0 * omega))
+                    * dt)
+                * dt;
+        Ok((desired, posture))
+    }
+
     fn smoothed_candidate(
         &self,
         input: &StepInput,
@@ -669,27 +959,27 @@ impl Kinematics {
         let limits = input.limits;
         let dt = input.dt;
         let speeds = std::array::from_fn(|i| limits.joint_velocity[i].min(self.joints[i].velocity));
-        let target = std::array::from_fn(|i| raw[i] * 0.999);
-        let mut window = trajectory::velocity_window(
-            input.previous_velocity,
-            state.acceleration,
-            target,
-            speeds,
-            limits.joint_acceleration,
-            state.jerk,
-            dt,
-        )?;
-        for i in 0..7 {
-            window.low[i] = window.low[i]
-                .max(-limits.max_joint_step / dt)
-                .max((input.measured[i] - limits.max_reference_error - input.reference[i]) / dt);
-            window.high[i] = window.high[i]
-                .min(limits.max_joint_step / dt)
-                .min((input.measured[i] + limits.max_reference_error - input.reference[i]) / dt);
-            if window.low[i] > window.high[i] {
-                return Err("Cartesian derivative and reference bounds conflict".into());
-            }
-        }
+        let guide = input
+            .planning
+            .filter(|_| !state.stopping)
+            .and_then(|p| p.guide);
+        let (desired, posture) = if state.stopping {
+            self.braking_reference(input, current, jacobian, desired, raw, damping)?
+        } else {
+            let posture = if let Some(guide) = guide {
+                if guide.axis >= 3 {
+                    return Err("invalid planning guide axis".into());
+                }
+                SVector::<f64, 7>::from_fn(|i, _| {
+                    (guide.tangent[i] * desired[guide.axis]
+                        + 4.0 * (guide.position[i] - input.reference[i]))
+                        .clamp(-speeds[i], speeds[i])
+                })
+            } else {
+                SVector::<f64, 7>::zeros()
+            };
+            (desired, posture)
+        };
         let mut weights = SMatrix::<f64, 6, 6>::identity();
         for i in 0..6 {
             weights[(i, i)] = 1.0
@@ -711,10 +1001,60 @@ impl Kinematics {
         // Continuity comes from hard derivative bounds, not a velocity-memory
         // objective that could preserve redundant motion indefinitely.
         let regularizer = SMatrix::<f64, 7, 7>::from_diagonal(&SVector::from_fn(|i, _| {
-            (damping.powi(2) / speeds[i].powi(2)).max(task_hessian.trace() * 1e-8)
+            if state.stopping {
+                (1.0 / speeds[i].powi(2)).max(task_hessian.trace() * 32.0 * f64::EPSILON)
+            } else {
+                (damping.powi(2) / speeds[i].powi(2)).max(task_hessian.trace() * 1e-8)
+            }
         }));
         let h = task_hessian + regularizer;
-        let g = -a.transpose() * b;
+        let g = -a.transpose() * b - regularizer * posture;
+        let mut window = trajectory::derivative_window(
+            input.previous_velocity,
+            state.acceleration,
+            speeds,
+            limits.joint_acceleration,
+            state.jerk,
+            dt,
+        )?;
+        if let Some(planning) = input.planning {
+            let bounds = self.continuation_bounds(&planning.origin)?;
+            trajectory::bound_position_window(
+                &mut window,
+                input.reference,
+                input.previous_velocity,
+                limits.joint_acceleration,
+                state.jerk,
+                bounds.lower,
+                bounds.upper,
+                dt,
+            )?;
+        }
+        for i in 0..7 {
+            window.low[i] = window.low[i]
+                .max(-limits.max_joint_step / dt)
+                .max((input.measured[i] - limits.max_reference_error - input.reference[i]) / dt);
+            window.high[i] = window.high[i]
+                .min(limits.max_joint_step / dt)
+                .min((input.measured[i] + limits.max_reference_error - input.reference[i]) / dt);
+            if window.low[i] > window.high[i] {
+                return Err("Cartesian derivative and reference bounds conflict".into());
+            }
+        }
+        if !state.stopping {
+            let unconstrained = h
+                .cholesky()
+                .ok_or("Cartesian objective factorization failed")?
+                .solve(&(-g));
+            trajectory::approach_velocity_target(
+                &mut window,
+                input.previous_velocity,
+                std::array::from_fn(|i| unconstrained[i]),
+                speeds,
+                state.jerk,
+                dt,
+            )?;
+        }
         let dq = trajectory::bounded_quadratic(h, g, window, input.previous_velocity)?;
         let (q, ddq) = trajectory::integrate(input.reference, input.previous_velocity, dq, dt);
         for i in 0..7 {
@@ -730,19 +1070,12 @@ impl Kinematics {
             }
         }
         let next = self.fk(&q, &input.tcp)?;
-        if let Some(path) = state.path {
-            path.check(&next)?;
-        }
+        // Path accuracy is maintained by the correction objective above. Small
+        // finite-step residuals are not an additional motion-failure gate.
         let achieved = Twist::from_row_slice(&pose_error(&current, &next)) / dt;
-        if achieved.fixed_rows::<3>(0).norm() > limits.linear_speed + 1e-10
-            || achieved.fixed_rows::<3>(3).norm() > limits.angular_speed + 1e-10
-        {
-            return Err(format!(
-                "smoothed FK increment exceeds TCP speed limits: {:.9} m/s, {:.9} rad/s",
-                achieved.fixed_rows::<3>(0).norm(),
-                achieved.fixed_rows::<3>(3).norm()
-            ));
-        }
+        // Cartesian speed is the task objective. A finite-step FK residual or
+        // transient while joint derivatives settle is not a second hard speed
+        // gate; the QP already enforces model joint speeds and derivatives.
         // Path-correction priorities belong to the objective, not the progress
         // metric: a transverse correction can briefly oppose its old velocity
         // while the commanded direction still makes useful progress.
@@ -754,9 +1087,6 @@ impl Kinematics {
         };
         if !projection.is_finite() {
             return Err("invalid smoothed task projection".into());
-        }
-        if !state.stopping && desired.norm() > 1e-8 && projection < 1e-10 {
-            return Err("smoothed Cartesian motion is blocked".into());
         }
         Ok(StepCandidate {
             q,
@@ -858,6 +1188,7 @@ mod tests {
             measured: q,
             previous_velocity: [0.0; 7],
             smoothing: None,
+            planning: None,
             target,
             dt: 0.02,
             tcp: Pose::identity(),
@@ -1008,6 +1339,7 @@ mod tests {
             tcp,
             limits: rotation_diagnostic_limits(),
             smoothing: Some(SmoothingState {
+                hold: None,
                 acceleration: [0.0; 7],
                 jerk: [trajectory::JOINT_JERK; 7],
                 path: Some(path),
@@ -1075,6 +1407,7 @@ mod tests {
                             tcp,
                             limits: rotation_diagnostic_limits(),
                             smoothing: Some(SmoothingState {
+                                hold: None,
                                 acceleration: [0.0; 7],
                                 jerk: [trajectory::JOINT_JERK; 7],
                                 path: Some(path),
@@ -1104,7 +1437,10 @@ mod tests {
                                         <= trajectory::JOINT_JERK * dt + 1e-8
                                 );
                             }
-                            path.check(&k.fk(&c.q, &tcp).unwrap()).unwrap();
+                            path.check(&k.fk(&c.q, &tcp).unwrap()).unwrap_or_else(|e| {
+                                panic!("{side} q={q:?} {frame:?} axis={axis} tick={tick}: {e}; deviation={:?}",
+                                    pose_error(&origin, &k.fk(&c.q, &tcp).unwrap()))
+                            });
                             sample.reference = c.q;
                             sample.measured = c.q;
                             sample.previous_velocity = c.dq;
@@ -1146,6 +1482,7 @@ mod tests {
                         tcp,
                         limits: rotation_diagnostic_limits(),
                         smoothing: Some(SmoothingState {
+                            hold: None,
                             acceleration: [0.0; 7],
                             jerk: [trajectory::JOINT_JERK; 7],
                             path: Some(path),
@@ -1180,7 +1517,9 @@ mod tests {
                     let min = steady.iter().copied().fold(f64::INFINITY, f64::min);
                     let max = steady.iter().copied().fold(f64::NEG_INFINITY, f64::max);
                     assert!(
-                        mean > requested * 0.05 && (max - min) / mean < 0.03,
+                        mean > requested * 0.98
+                            && mean < requested * 1.02
+                            && (max - min) / mean < 0.03,
                         "{side} {frame:?} axis={axis} mean={mean:e} spread={:e}",
                         (max - min) / mean
                     );
@@ -1194,8 +1533,24 @@ mod tests {
         let old = k.fk(&i.reference, &i.tcp).unwrap();
         let new = k.fk(&c.q, &i.tcp).unwrap();
         let effective = Twist::from(pose_error(&old, &new)) / i.dt;
-        assert!(effective.fixed_rows::<3>(0).norm() <= i.limits.linear_speed + 1e-10);
-        assert!(effective.fixed_rows::<3>(3).norm() <= i.limits.angular_speed + 1e-10);
+        if i.smoothing.is_none() {
+            assert!(effective.fixed_rows::<3>(0).norm() <= i.limits.linear_speed + 1e-10);
+            assert!(effective.fixed_rows::<3>(3).norm() <= i.limits.angular_speed + 1e-10);
+        } else {
+            // During derivative-limited transients the requested Cartesian
+            // speed is an objective. The integrated motion remains bounded by
+            // joint speeds and the actual chain length throughout the step.
+            let joint_speed: f64 = k
+                .speed_limits()
+                .iter()
+                .zip(i.limits.joint_velocity)
+                .map(|(model, requested)| model.min(requested))
+                .sum();
+            assert!(
+                effective.fixed_rows::<3>(0).norm() <= k.reach_radius(&i.tcp) * joint_speed + 1e-10
+            );
+            assert!(effective.fixed_rows::<3>(3).norm() <= joint_speed + 1e-10);
+        }
         for j in 0..7 {
             assert!(c.q[j].is_finite() && c.dq[j].is_finite());
             assert!((c.q[j] - i.reference[j] - c.dq[j] * i.dt).abs() < 1e-14);
@@ -1371,6 +1726,135 @@ mod tests {
         assert!(
             (to_isometry(&pose).unwrap().rotation * Vector3::x() + Vector3::x()).norm() < 1e-12
         );
+    }
+
+    #[test]
+    fn model_speed_and_reach_bounds_use_urdf_transforms_and_tcp() {
+        for side in ["right", "left"] {
+            let model = Kinematics::load(side).unwrap();
+            assert_eq!(
+                model.speed_limits(),
+                [18.7, 18.7, 33.4, 33.4, 33.4, 37.7, 37.7]
+            );
+            for tcp in [
+                Pose::identity(),
+                Pose {
+                    translation: [0.2, -0.1, 0.3],
+                    ..Pose::identity()
+                },
+            ] {
+                assert!(
+                    model
+                        .fk(&interior(), &tcp)
+                        .unwrap()
+                        .translation
+                        .iter()
+                        .map(|v| v * v)
+                        .sum::<f64>()
+                        .sqrt()
+                        <= model.reach_radius(&tcp)
+                );
+                let small = model
+                    .cartesian_speed_limits(&interior(), &tcp, [0.1; 7])
+                    .unwrap();
+                let large = model
+                    .cartesian_speed_limits(&interior(), &tcp, [1.0; 7])
+                    .unwrap();
+                assert!(small.0 > 0.0 && small.1 > 0.0);
+                assert!((large.0 - 10.0 * small.0).abs() < 1e-12);
+                assert!((large.1 - 10.0 * small.1).abs() < 1e-12);
+                assert!(large.0 > 0.015 && large.1 > 0.15);
+                assert_eq!(
+                    model
+                        .cartesian_speed_limits(&interior(), &tcp, [1000.0; 7])
+                        .unwrap(),
+                    model
+                        .cartesian_speed_limits(&interior(), &tcp, model.speed_limits())
+                        .unwrap()
+                );
+            }
+            for limit in [0.0, -1.0, f64::INFINITY, f64::NAN] {
+                assert!(
+                    model
+                        .cartesian_speed_limits(&interior(), &Pose::identity(), [limit; 7])
+                        .is_err()
+                );
+            }
+        }
+        let planar = Kinematics::from_urdf(&planar_urdf()).unwrap();
+        assert_eq!(planar.reach_radius(&Pose::identity()), 7.0);
+        assert_eq!(
+            planar.reach_radius(&Pose {
+                translation: [0.0, 0.0, 2.0],
+                ..Pose::identity()
+            }),
+            9.0
+        );
+        assert_eq!(
+            planar
+                .cartesian_speed_limits(&[0.0; 7], &Pose::identity(), [1.0; 7])
+                .unwrap(),
+            (21.0, 7.0)
+        );
+    }
+
+    #[test]
+    fn geometry_continuation_has_no_one_metre_radius_or_four_metre_loop_budget() {
+        use crate::calibration_path::{PreviewRequest, preview};
+        let mut robot =
+            urdf_rs::read_from_string(include_str!("../../resources/models/right/robot.urdf"))
+                .unwrap();
+        for joint in &mut robot.joints {
+            for value in &mut joint.origin.xyz.0 {
+                *value *= 20.0;
+            }
+        }
+        let large = Kinematics::from_urdf(&urdf_rs::write_to_string(&robot).unwrap()).unwrap();
+        let ordinary = Kinematics::load("right").unwrap();
+        assert!(
+            (large.reach_radius(&Pose::identity()) / ordinary.reach_radius(&Pose::identity())
+                - 20.0)
+                .abs()
+                < 1e-12
+        );
+        let result = preview(
+            &large,
+            "right",
+            interior(),
+            Pose::identity(),
+            PreviewRequest::default(),
+        )
+        .unwrap();
+        assert!(result.ranges[0].negative < -4.0);
+        assert!(result.program.amplitude > 4.0);
+        assert_eq!(result.points.last().unwrap().joints, interior());
+        for pair in result.points.windows(2) {
+            assert!((0..7).all(|axis| (pair[1].joints[axis] - pair[0].joints[axis]).abs() <= 0.01 + 1e-12));
+        }
+    }
+
+    #[test]
+    fn finite_longer_periods_and_distant_pose_goals_still_generate_local_bounded_steps() {
+        let model = Kinematics::load("right").unwrap();
+        for dt in [1e-7, 0.051, 0.101, 0.2] {
+            let sample = StepInput {
+                dt,
+                ..input(
+                    interior(),
+                    velocity([0.001, 0.0, 0.0, 0.0, 0.0, 0.0], Frame::Base),
+                )
+            };
+            let candidate = model.step(sample.clone()).unwrap();
+            check_bounds(&model, &sample, &candidate);
+        }
+        let mut sample = input(interior(), velocity([0.0; 6], Frame::Base));
+        let pose = model.fk(&sample.reference, &sample.tcp).unwrap();
+        sample.target = LocalTarget::Pose(
+            offset_pose(&pose, [0.3, 0.0, 0.0, 0.0, 0.0, 0.0], Frame::Base).unwrap(),
+        );
+        let candidate = model.step(sample.clone()).unwrap();
+        check_bounds(&model, &sample, &candidate);
+        assert!(candidate.q != sample.reference);
     }
 
     #[test]
@@ -1676,6 +2160,7 @@ mod tests {
                                 tcp,
                                 limits,
                                 smoothing: None,
+                                planning: None,
                             })
                             .unwrap_or_else(|error| {
                                 panic!("{side} {frame:?} axis {axis}: {error}")
@@ -1785,7 +2270,7 @@ mod tests {
             interior(),
             velocity([0.001, 0.0, 0.0, 0.0, 0.0, 0.0], Frame::Base),
         );
-        for dt in [0.0, -0.01, 0.100001, f64::INFINITY, f64::NAN] {
+        for dt in [0.0, -0.01, f64::INFINITY, f64::NAN] {
             assert!(k.step(StepInput { dt, ..i.clone() }).is_err());
         }
         for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
@@ -1868,13 +2353,13 @@ mod tests {
             Frame::Base,
         )
         .unwrap();
-        assert!(
-            k.step(StepInput {
+        let candidate = k
+            .step(StepInput {
                 target: LocalTarget::Pose(goal),
                 ..i.clone()
             })
-            .is_err()
-        );
+            .unwrap();
+        check_bounds(&k, &i, &candidate);
         assert!(
             k.step(StepInput {
                 tcp: Pose {

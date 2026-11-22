@@ -160,17 +160,13 @@ fn guard(
     model: &Arc<Kinematics>,
     tcp: Pose,
     path: CartesianPath,
-    measured: [f64; 7],
+    _measured: [f64; 7],
 ) -> CartesianGuard {
     CartesianGuard {
         model: model.clone(),
         tcp,
         path,
         goal: None,
-        linear_speed: LINEAR_CAP,
-        angular_speed: ANGULAR_CAP,
-        measured,
-        max_reference_error: 0.60,
     }
 }
 
@@ -213,6 +209,7 @@ fn cartesian_send_samples_preserve_all_axes_frames_and_offset_tcp_through_brakin
                                     };
                             }
                             let input = StepInput {
+                                planning: None,
                                 reference: q,
                                 measured: q,
                                 previous_velocity: dq,
@@ -221,6 +218,7 @@ fn cartesian_send_samples_preserve_all_axes_frames_and_offset_tcp_through_brakin
                                 tcp,
                                 limits: limits(),
                                 smoothing: Some(SmoothingState {
+                                    hold: None,
                                     acceleration: ddq,
                                     jerk: [JOINT_JERK; 7],
                                     path: Some(path),
@@ -285,35 +283,48 @@ fn cartesian_send_samples_preserve_all_axes_frames_and_offset_tcp_through_brakin
                                 assert!(sample.dq[joint].abs() <= JOINT_SPEED + 1e-10);
                                 assert!(wire_dq[joint].abs() <= JOINT_SPEED + velocity_error);
                             }
-                            if let Some((previous_us, _, previous_pose, previous_wire_pose)) =
-                                previous
+                            if let Some((
+                                previous_us,
+                                previous_sample,
+                                previous_pose,
+                                previous_wire_pose,
+                            )) = previous
                             {
                                 let dt = (send.at_us - previous_us) as f64 * 1e-6;
                                 let delta = pose_error(&previous_pose, &pose);
+                                let travel = (0..7)
+                                    .map(|i| (sample.q[i] - previous_sample.q[i]).abs())
+                                    .sum::<f64>();
+                                for i in 0..7 {
+                                    assert!(
+                                        (sample.q[i] - previous_sample.q[i]).abs()
+                                            <= JOINT_SPEED * dt + 1e-10
+                                    );
+                                }
                                 assert!(
-                                    norm(&delta[..3]) <= LINEAR_CAP * dt + 1e-10,
-                                    "{side} sample linear TCP cap"
+                                    norm(&delta[..3]) <= model.reach_radius(&tcp) * travel + 1e-10,
+                                    "{side} sampled translation exceeds the model's geometric bound"
                                 );
                                 assert!(
-                                    norm(&delta[3..]) <= ANGULAR_CAP * dt + 1e-10,
-                                    "{side} sample angular TCP cap"
+                                    norm(&delta[3..]) <= travel + 1e-10,
+                                    "{side} sampled rotation exceeds total joint travel"
                                 );
                                 let wire_delta = pose_error(&previous_wire_pose, &wire_pose);
                                 let before_rounding =
                                     pose_error(&previous_pose, &previous_wire_pose);
                                 let after_rounding = pose_error(&pose, &wire_pose);
-                                // Only the known endpoint rounding can extend a wire
-                                // increment beyond the strict unquantized TCP cap.
+                                // Encoding can add only the measured endpoint
+                                // rounding to the unquantized geometric increment.
                                 assert!(
                                     norm(&wire_delta[..3])
-                                        <= LINEAR_CAP * dt
+                                        <= norm(&delta[..3])
                                             + norm(&before_rounding[..3])
                                             + norm(&after_rounding[..3])
                                             + 1e-10
                                 );
                                 assert!(
                                     norm(&wire_delta[3..])
-                                        <= ANGULAR_CAP * dt
+                                        <= norm(&delta[3..])
                                             + norm(&before_rounding[3..])
                                             + norm(&after_rounding[3..])
                                             + 1e-10

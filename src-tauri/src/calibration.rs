@@ -31,20 +31,16 @@ fn validate_settings(settings: &Settings) -> Result<(), String> {
     if settings.axis.is_some_and(|axis| axis >= 7) {
         return Err("校准关节必须为 0..6".into());
     }
-    for (name, value, min, max) in [
-        // Include standard degree conversion and the published rounded limits.
-        (
-            "excursion",
-            settings.excursion,
-            1.0f64.to_radians(),
-            30.0f64.to_radians(),
-        ),
-        ("speed", settings.speed, 0.005, 0.08),
-        ("max_friction", settings.max_friction, 0.0, 2.0),
-    ] {
-        if !value.is_finite() || !(min..=max).contains(&value) {
-            return Err(format!("校准 {name} 无效或超限"));
+    for (name, value) in [("excursion", settings.excursion), ("speed", settings.speed)] {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(format!("校准 {name} 必须为正数"));
         }
+    }
+    if !settings.max_friction.is_finite()
+        || settings.max_friction < 0.0
+        || settings.max_friction > 2.0
+    {
+        return Err("摩擦试验参数无效".into());
     }
     Ok(())
 }
@@ -54,9 +50,9 @@ pub fn validate(settings: &Settings, baseline: &ServoTuning) -> Result<(), Strin
     if let Some(path) = &settings.cartesian
         && (path.origin.iter().any(|v| !v.is_finite())
             || !path.amplitude.is_finite()
-            || !(0.02..=0.1).contains(&path.amplitude)
+            || path.amplitude < 0.0
             || !path.speed.is_finite()
-            || !(0.005..=0.0135).contains(&path.speed)
+            || path.speed <= 0.0
             || path.segments.iter().any(|s| {
                 s.axis > 2 || !s.offset.is_finite() || s.offset.abs() > path.amplitude + 1e-9
             }))

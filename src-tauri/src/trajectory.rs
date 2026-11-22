@@ -1,10 +1,55 @@
 //! Discrete command derivatives. Limits apply to the velocity actually integrated,
 //! including unequal control intervals; no filtering is applied to measured joints.
 use nalgebra::{SMatrix, SVector};
+use serde::{Deserialize, Serialize};
 
 pub const JOINT_JERK: f64 = 6.0;
 pub const JOINT_ACCELERATION: f64 = 0.60;
-pub const JOINT_SPEED: f64 = 0.20;
+pub const JOINT_SPEED: f64 = 1.0;
+
+/// Editable motion preferences. Hardware/model velocity ratings come from URDF.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct MotionTuning {
+    pub joint_speed: f64,
+    pub acceleration: f64,
+    pub jerk: f64,
+}
+
+impl Default for MotionTuning {
+    fn default() -> Self {
+        Self {
+            joint_speed: JOINT_SPEED,
+            acceleration: JOINT_ACCELERATION,
+            jerk: JOINT_JERK,
+        }
+    }
+}
+
+impl MotionTuning {
+    pub fn validate(&self) -> Result<(), String> {
+        if [self.joint_speed, self.acceleration, self.jerk]
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+        {
+            return Err("motion preferences must be finite positive values".into());
+        }
+        Ok(())
+    }
+
+    pub fn speed_limits(&self, model_limits: [f64; 7]) -> [f64; 7] {
+        model_limits.map(|limit| self.joint_speed.min(limit))
+    }
+}
+
+/// Quintic position profile with zero endpoint velocity and acceleration.
+/// Peak normalized derivatives are 1.875, 10/sqrt(3), and 60.
+pub fn segment_duration(distance: f64, speed: f64, acceleration: f64, jerk: f64) -> f64 {
+    (1.875 * distance / speed)
+        .max((10.0 / 3.0_f64.sqrt() * distance / acceleration).sqrt())
+        .max((60.0 * distance / jerk).cbrt())
+        .max(f64::EPSILON)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct VelocityWindow {
@@ -29,7 +74,22 @@ pub fn velocity_window(
     jerk: [f64; 7],
     dt: f64,
 ) -> Result<VelocityWindow, String> {
-    if !dt.is_finite() || !(0.0001..=0.05).contains(&dt) {
+    let mut window = derivative_window(velocity, acceleration, speed, max_acceleration, jerk, dt)?;
+    approach_velocity_target(&mut window, velocity, target, speed, jerk, dt)?;
+    Ok(window)
+}
+
+/// Hard derivative envelope without a soft constant-velocity goal. Position
+/// braking can require slowing past that goal while retaining all derivatives.
+pub fn derivative_window(
+    velocity: [f64; 7],
+    acceleration: [f64; 7],
+    speed: [f64; 7],
+    max_acceleration: [f64; 7],
+    jerk: [f64; 7],
+    dt: f64,
+) -> Result<VelocityWindow, String> {
+    if !dt.is_finite() || dt <= 0.0 {
         return Err("invalid trajectory period".into());
     }
     let mut low = [0.0; 7];
@@ -38,7 +98,6 @@ pub fn velocity_window(
         if [
             velocity[i],
             acceleration[i],
-            target[i],
             speed[i],
             max_acceleration[i],
             jerk[i],
@@ -62,6 +121,23 @@ pub fn velocity_window(
         if low[i] > high[i] {
             return Err("trajectory state cannot satisfy derivative limits".into());
         }
+    }
+    Ok(VelocityWindow { low, high })
+}
+
+/// Apply goal convergence only after all hard feasible windows are intersected.
+pub fn approach_velocity_target(
+    window: &mut VelocityWindow,
+    velocity: [f64; 7],
+    target: [f64; 7],
+    speed: [f64; 7],
+    jerk: [f64; 7],
+    dt: f64,
+) -> Result<(), String> {
+    if target.iter().any(|value| !value.is_finite()) {
+        return Err("invalid target velocity".into());
+    }
+    for i in 0..7 {
         // Approach a constant velocity with zero acceleration. A newly changed
         // goal may make that envelope temporarily infeasible; global hard limits
         // still apply while acceleration is brought back toward the new goal.
@@ -69,18 +145,96 @@ pub fn velocity_window(
         let difference = target - velocity[i];
         if difference >= 0.0 {
             let cap = velocity[i] + brake_acceleration(difference, jerk[i], dt) * dt;
-            if cap >= low[i] - 1e-12 {
-                high[i] = high[i].min(cap.max(low[i]));
+            if cap >= window.low[i] - 1e-12 {
+                window.high[i] = window.high[i].min(cap.max(window.low[i]));
             }
         }
         if difference <= 0.0 {
             let cap = velocity[i] - brake_acceleration(-difference, jerk[i], dt) * dt;
-            if cap <= high[i] + 1e-12 {
-                low[i] = low[i].max(cap.min(high[i]));
+            if cap <= window.high[i] + 1e-12 {
+                window.low[i] = window.low[i].max(cap.min(window.high[i]));
             }
         }
     }
-    Ok(VelocityWindow { low, high })
+    Ok(())
+}
+
+/// Maximum additional outward displacement while applying maximum braking jerk,
+/// then acceleration. Negative initial velocity can first move into the range;
+/// only a subsequent outward maximum contributes to the position envelope.
+fn stopping_distance(velocity: f64, acceleration: f64, limit: f64, jerk: f64) -> f64 {
+    let discriminant = acceleration * acceleration + 2.0 * jerk * velocity;
+    if discriminant <= 0.0 {
+        return 0.0;
+    }
+    let stop = (acceleration + discriminant.sqrt()) / jerk;
+    if stop <= 0.0 {
+        return 0.0;
+    }
+    let ramp = ((acceleration + limit) / jerk).max(0.0);
+    let time = stop.min(ramp);
+    let distance = velocity * time + acceleration * time * time / 2.0 - jerk * time.powi(3) / 6.0;
+    let remaining_velocity = (velocity + acceleration * time - jerk * time * time / 2.0).max(0.0);
+    (distance
+        + if stop > ramp {
+            remaining_velocity.powi(2) / (2.0 * limit)
+        } else {
+            0.0
+        })
+    .max(0.0)
+}
+
+/// Intersect derivative-feasible velocities with joint-position viability. The
+/// root includes the current integrated step and the remaining jerk-limited
+/// braking travel; approaching a model endpoint slows the QP before contact.
+#[allow(clippy::too_many_arguments)]
+pub fn bound_position_window(
+    window: &mut VelocityWindow,
+    position: [f64; 7],
+    previous_velocity: [f64; 7],
+    acceleration: [f64; 7],
+    jerk: [f64; 7],
+    lower: [f64; 7],
+    upper: [f64; 7],
+    dt: f64,
+) -> Result<(), String> {
+    for i in 0..7 {
+        let outward = |velocity: f64, sign: f64| {
+            let a = (velocity - previous_velocity[i]) / dt;
+            sign * velocity * dt
+                + stopping_distance(sign * velocity, sign * a, acceleration[i], jerk[i])
+        };
+        for (sign, distance) in [
+            (1.0, upper[i] - position[i]),
+            (-1.0, position[i] - lower[i]),
+        ] {
+            let (mut safe, mut unsafe_value) = if sign > 0.0 {
+                (window.low[i], window.high[i])
+            } else {
+                (window.high[i], window.low[i])
+            };
+            if outward(unsafe_value, sign) <= distance {
+                continue;
+            }
+            if outward(safe, sign) > distance + 1e-12 {
+                return Err("joint position and derivative envelopes are infeasible".into());
+            }
+            for _ in 0..40 {
+                let middle = (safe + unsafe_value) * 0.5;
+                if outward(middle, sign) <= distance {
+                    safe = middle;
+                } else {
+                    unsafe_value = middle;
+                }
+            }
+            if sign > 0.0 {
+                window.high[i] = safe;
+            } else {
+                window.low[i] = safe;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn integrate(
@@ -206,6 +360,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn position_envelopes_brake_before_both_limits_without_breaking_discrete_derivatives() {
+        let mut q = [0.0; 7];
+        let mut v = [0.0; 7];
+        let mut a = [0.0; 7];
+        for target in [1.0_f64, 0.0, -1.0, 0.0, 1.0] {
+            for tick in 0..1200 {
+                let dt = [0.01, 0.04, 0.002, 0.007, 0.003][tick % 5];
+                let mut window =
+                    velocity_window(v, a, [target; 7], [1.0; 7], [0.6; 7], [6.0; 7], dt).unwrap();
+                bound_position_window(
+                    &mut window,
+                    q,
+                    v,
+                    [0.6; 7],
+                    [6.0; 7],
+                    [-0.01; 7],
+                    [0.01; 7],
+                    dt,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("goal={target} tick={tick} q={q:?} v={v:?} a={a:?}: {error}")
+                });
+                let next = std::array::from_fn(|i| target.clamp(window.low[i], window.high[i]));
+                let (position, acceleration) = integrate(q, v, next, dt);
+                for i in 0..7 {
+                    assert!(position[i] >= -0.01 - 1e-12 && position[i] <= 0.01 + 1e-12);
+                    assert!(acceleration[i].abs() <= 0.6 + 1e-10);
+                    assert!((acceleration[i] - a[i]).abs() <= 6.0 * dt + 1e-9);
+                }
+                q = position;
+                v = next;
+                a = acceleration;
+            }
+            if target != 0.0 {
+                assert!((q[0] - target.signum() * 0.01).abs() < 1e-7);
+            }
+            assert!(v[0].abs() < 1e-7);
+        }
+    }
+
+    #[test]
     fn changing_velocity_goals_keep_jerk_bounded_at_low_speed_and_at_the_cap() {
         let mut v = [0.0; 7];
         let mut a = [0.0; 7];
@@ -275,7 +470,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_periods_limits_and_nonfinite_state() {
-        for dt in [0.0, -0.01, 0.051, f64::NAN] {
+        for dt in [0.0, -0.01, f64::INFINITY, f64::NAN] {
             assert!(
                 velocity_window(
                     [0.0; 7], [0.0; 7], [0.0; 7], [0.2; 7], [0.6; 7], [6.0; 7], dt
@@ -297,6 +492,60 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn preferences_are_positive_editable_values_and_model_velocities_cap_them() {
+        assert_eq!(MotionTuning::default().joint_speed, 1.0);
+        let restored: MotionTuning = serde_json::from_str("{}").unwrap();
+        assert_eq!(restored, MotionTuning::default());
+        for speed in [1e-12, 0.001, 5.0, 10000.0] {
+            let tuning = MotionTuning {
+                joint_speed: speed,
+                ..restored
+            };
+            tuning.validate().unwrap();
+            assert_eq!(tuning.speed_limits([18.7; 7]), [speed.min(18.7); 7]);
+        }
+        for value in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                MotionTuning {
+                    joint_speed: value,
+                    ..restored
+                }
+                .validate()
+                .is_err()
+            );
+            assert!(
+                MotionTuning {
+                    acceleration: value,
+                    ..restored
+                }
+                .validate()
+                .is_err()
+            );
+            assert!(
+                MotionTuning {
+                    jerk: value,
+                    ..restored
+                }
+                .validate()
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn positive_periods_have_no_control_frequency_gate() {
+        for dt in [1e-6, 0.051, 0.2, 1.0] {
+            let window = velocity_window(
+                [0.0; 7], [0.0; 7], [0.1; 7], [1.0; 7], [0.6; 7], [6.0; 7], dt,
+            )
+            .unwrap();
+            let next = 0.1_f64.clamp(window.low[0], window.high[0]);
+            assert!(next.abs() <= 1.0);
+            assert!((next / dt).abs() <= 0.6 + 1e-12);
+        }
     }
     #[test]
     fn start_stop_and_reverse_obey_final_discrete_derivatives_with_jitter() {

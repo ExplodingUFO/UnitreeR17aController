@@ -4,7 +4,7 @@
   "info": {
     "title": "R1-7a Controller 本机 API",
     "version": "0.1.0",
-    "description": "对应当前桌面软件。应用从 127.0.0.1:8177 提供 HTTP 与 WebSocket，随桌面启停。token 从桌面“接口”面板取得，每次启动变化。POST /v1/commands 的 202 仅代表入队，执行结果从 Snapshot.results 按 request_id 读取。字段范围表示有效业务输入；业务校验可在入队后返回 rejected。所有量采用 m、rad、s，显式 _ms 字段采用 ms，_us 字段采用 μs。UTF-8 字节上限使用 x-utf8-max-bytes 表示。示例数值为协议示例。 短时采样沿用 Bearer/Origin 校验，无需运动租约。关节参考速度/加速度/jerk 上限为 0.20 rad/s、0.60 rad/s²、6 rad/s³，jerk 为离线默认值；实际串口发送可重复或合并参考，物理 jerk 尚未验证。 伺服调试提供逐轴阻尼/速度前馈权重和可开关平滑摩擦，完整配置见 ServoTuning；仅当前连接内存生效，连接/断开恢复基线，算法尚未真机验证。",
+    "description": "对应当前桌面软件。应用从 127.0.0.1:8177 提供 HTTP 与 WebSocket，随桌面启停。token 从桌面“接口”面板取得，每次启动变化。POST /v1/commands 的 202 仅代表入队，执行结果从 Snapshot.results 按 request_id 读取。字段范围表示有效业务输入；业务校验可在入队后返回 rejected。所有量采用 m、rad、s，显式 _ms 字段采用 ms，_us 字段采用 μs。UTF-8 字节上限使用 x-utf8-max-bytes 表示。示例数值为协议示例。 短时采样沿用 Bearer/Origin 校验，无需运动租约。关节速度/加速度/jerk 由MotionTuning配置，默认为1 rad/s、0.60 rad/s²、6 rad/s³；实际串口发送可重复或合并参考，物理 jerk 尚未验证。 伺服调试提供逐轴阻尼/速度前馈权重和可开关平滑摩擦，完整配置见 ServoTuning；仅当前连接内存生效，连接/断开恢复基线，算法尚未真机验证。",
     "license": {
       "name": "BSD-3-Clause",
       "url": "https://opensource.org/license/bsd-3-clause"
@@ -276,7 +276,12 @@
                     ]
                   },
                   "servo_tuning_revision": 1,
-                  "calibration": null
+                  "calibration": null,
+                  "motion_tuning": {
+                    "joint_speed": 1.0,
+                    "acceleration": 0.6,
+                    "jerk": 6.0
+                  }
                 }
               }
             }
@@ -731,6 +736,21 @@
                     "generation": 4,
                     "kind": "calibrate_apply",
                     "calibration_id": "33333333-3333-4333-8333-333333333333"
+                  }
+                },
+                "configure_motion": {
+                  "summary": "应用运动设置",
+                  "value": {
+                    "request_id": "req-motion-001",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 4,
+                    "kind": "configure_motion",
+                    "config": {
+                      "joint_speed": 1.0,
+                      "acceleration": 0.6,
+                      "jerk": 6.0
+                    }
                   }
                 }
               }
@@ -1200,7 +1220,12 @@
                   ]
                 },
                 "servo_tuning_revision": 1,
-                "calibration": null
+                "calibration": null,
+                "motion_tuning": {
+                  "joint_speed": 1.0,
+                  "acceleration": 0.6,
+                  "jerk": 6.0
+                }
               }
             }
           },
@@ -2818,7 +2843,7 @@
           "speed": {
             "type": "number",
             "exclusiveMinimum": 0,
-            "description": "必须为正数；关节/旋转用 rad/s，平移用 m/s。"
+            "description": "有限正数；关节/旋转rad/s，平移m/s。执行由当前MotionTuning与模型逐轴速度求解。"
           },
           "frame": {
             "type": "string",
@@ -2845,9 +2870,6 @@
               "axis": {
                 "minimum": 0,
                 "maximum": 6
-              },
-              "speed": {
-                "maximum": 0.2
               }
             }
           },
@@ -2859,9 +2881,6 @@
               "axis": {
                 "minimum": 0,
                 "maximum": 2
-              },
-              "speed": {
-                "maximum": 0.015
               }
             }
           },
@@ -2873,9 +2892,6 @@
               "axis": {
                 "minimum": 3,
                 "maximum": 5
-              },
-              "speed": {
-                "maximum": 0.15
               }
             }
           }
@@ -3498,7 +3514,7 @@
             "$ref": "#/components/schemas/MotionArguments"
           }
         ],
-        "description": "开始单轴连续点动。本请求 request_id 同时作为 action_id；推荐 ttl_ms=350，每 100 ms 更新一次。 控制参考共用速度/加速度/jerk 约束。末端以有界 Jacobian 求解保持所选 TCP 路径，模型偏差阈值 50 μm、0.002 rad；全局 TCP 上限预留 10% 目标余量，近上限目标为 0.0135 m/s、0.135 rad/s，低于该阈值的请求不因这一余量额外缩放。最终 FK 仍检查 0.015 m/s、0.15 rad/s 硬上限；模型阈值不表示硬件精度。",
+        "description": "开始单轴连续点动。本请求 request_id 同时作为 action_id；推荐 ttl_ms=350，每 100 ms 更新一次。 关节与末端共用MotionTuning导数约束，TCP路径修正进入求解目标，不以微小FK残差拒绝动作。",
         "examples": [
           {
             "request_id": "req-jog-001",
@@ -3592,39 +3608,9 @@
           },
           {
             "$ref": "#/components/schemas/MotionArguments"
-          },
-          {
-            "if": {
-              "properties": {
-                "space": {
-                  "const": "cartesian"
-                },
-                "axis": {
-                  "maximum": 2
-                }
-              },
-              "required": [
-                "space",
-                "axis"
-              ]
-            },
-            "then": {
-              "properties": {
-                "amount": {
-                  "maximum": 0.05
-                }
-              }
-            },
-            "else": {
-              "properties": {
-                "amount": {
-                  "maximum": 0.35
-                }
-              }
-            }
           }
         ],
-        "description": "执行一次固定步长动作，不排运动队列。以 completed/completed 为完成标志，progress=1 不是完成确认。 控制参考共用速度/加速度/jerk 约束。末端以有界 Jacobian 求解保持所选 TCP 路径，模型偏差阈值 50 μm、0.002 rad；全局 TCP 上限预留 10% 目标余量，近上限目标为 0.0135 m/s、0.135 rad/s，低于该阈值的请求不因这一余量额外缩放。最终 FK 仍检查 0.015 m/s、0.15 rad/s 硬上限；模型阈值不表示硬件精度。",
+        "description": "执行一次固定步长动作，不排运动队列。以 completed/completed 为完成标志，progress=1 不是完成确认。 关节与末端共用MotionTuning导数约束，TCP路径修正进入求解目标，不以微小FK残差拒绝动作。 参考时长考虑当前运动设置；普通步长不因超过预计用时3秒而失败，到位并完成减速后报告完成。",
         "examples": [
           {
             "request_id": "req-step-001",
@@ -3713,6 +3699,9 @@
           },
           {
             "$ref": "#/components/schemas/CalibrateApplyCommand"
+          },
+          {
+            "$ref": "#/components/schemas/ConfigureMotionCommand"
           }
         ],
         "discriminator": {
@@ -3731,7 +3720,8 @@
             "return_to_pose": "#/components/schemas/ReturnToPoseCommand",
             "configure_servo": "#/components/schemas/ConfigureServoCommand",
             "calibrate_start": "#/components/schemas/CalibrateStartCommand",
-            "calibrate_apply": "#/components/schemas/CalibrateApplyCommand"
+            "calibrate_apply": "#/components/schemas/CalibrateApplyCommand",
+            "configure_motion": "#/components/schemas/ConfigureMotionCommand"
           }
         },
         "description": "全部操作参数与公共字段位于同一层。范围表示有效业务输入；HTTP 202 后仍可能异步 rejected。未知 JSON 字段当前会被忽略。",
@@ -3945,6 +3935,18 @@
             "generation": 4,
             "kind": "calibrate_apply",
             "calibration_id": "33333333-3333-4333-8333-333333333333"
+          },
+          {
+            "request_id": "req-motion-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 4,
+            "kind": "configure_motion",
+            "config": {
+              "joint_speed": 1.0,
+              "acceleration": 0.6,
+              "jerk": 6.0
+            }
           }
         ]
       },
@@ -4468,6 +4470,11 @@
                 "type": "null"
               }
             ]
+          },
+          "motion_tuning": {
+            "joint_speed": 1.0,
+            "acceleration": 0.6,
+            "jerk": 6.0
           }
         },
         "required": [
@@ -4491,7 +4498,8 @@
           "communication",
           "servo_tuning",
           "servo_tuning_revision",
-          "calibration"
+          "calibration",
+          "motion_tuning"
         ],
         "description": "完整状态；所有键均存在，可选值用 null。tcp 是实测关节计算的基座 → TCP；未设置 TCP 或反馈无效时为 null。",
         "examples": [
@@ -4664,7 +4672,12 @@
               ]
             },
             "servo_tuning_revision": 1,
-            "calibration": null
+            "calibration": null,
+            "motion_tuning": {
+              "joint_speed": 1.0,
+              "acceleration": 0.6,
+              "jerk": 6.0
+            }
           }
         ]
       },
@@ -4855,7 +4868,12 @@
                 ]
               },
               "servo_tuning_revision": 1,
-              "calibration": null
+              "calibration": null,
+              "motion_tuning": {
+                "joint_speed": 1.0,
+                "acceleration": 0.6,
+                "jerk": 6.0
+              }
             }
           }
         ]
@@ -4990,13 +5008,12 @@
                 },
                 "minItems": 7,
                 "maxItems": 7,
-                "description": "J1..J7 的已记录收纳位，单位 rad。各轴相对当前参考的行程不得超过 2π rad。示例不作为默认收纳位。"
+                "description": "J1..J7已记录收纳位，rad；示例不作为默认收纳位。"
               },
               "speed": {
                 "type": "number",
                 "exclusiveMinimum": 0,
-                "maximum": 0.2,
-                "description": "最大关节速度，rad/s。"
+                "description": "有限正数rad/s，执行受MotionTuning与模型各轴速度约束。"
               },
               "disconnect_after": {
                 "type": "boolean",
@@ -6304,17 +6321,15 @@
           },
           "excursion": {
             "type": "number",
-            "minimum": 0.017453292519943295,
-            "maximum": 0.5235987755982988,
-            "description": "关节允许偏移参数，rad，1°..30°，目标一半；cartesian程序采用program.joint_excursion。",
-            "default": 0.2792526803190927
+            "description": "完整关节偏移范围rad，目标一半；cartesian程序采用program.joint_excursion。",
+            "default": 0.2792526803190927,
+            "exclusiveMinimum": 0
           },
           "speed": {
             "type": "number",
-            "minimum": 0.005,
-            "maximum": 0.08,
             "description": "关节慢档rad/s，默认2°/s，快档两倍。",
-            "default": 0.03490658503988659
+            "default": 0.03490658503988659,
+            "exclusiveMinimum": 0
           },
           "max_friction": {
             "type": "number",
@@ -7246,18 +7261,19 @@
         "type": "object",
         "properties": {
           "amplitude": {
-            "type": "number",
-            "minimum": 0.02,
-            "maximum": 0.1,
-            "default": 0.05,
-            "description": "基座各方向的单向幅度，m；默认正负各50mm。"
+            "type": [
+              "number",
+              "null"
+            ],
+            "exclusiveMinimum": 0,
+            "default": null,
+            "description": "null或省略时计算各方向连续可达行程；正数为指定单向幅度m，不设固定100mm上限。"
           },
           "speed": {
             "type": "number",
-            "minimum": 0.005,
-            "maximum": 0.0135,
+            "exclusiveMinimum": 0,
             "default": 0.01,
-            "description": "末端峰值速度，m/s。"
+            "description": "请求末端峰值速度m/s；实际执行由运动设置与模型求解。"
           },
           "axes": {
             "type": "array",
@@ -7272,6 +7288,9 @@
               2
             ],
             "description": "基座XYZ索引；重复值合并。"
+          },
+          "motion": {
+            "$ref": "#/components/schemas/MotionTuning"
           }
         },
         "required": [],
@@ -7299,8 +7318,6 @@
           },
           "offset": {
             "type": "number",
-            "minimum": -0.1,
-            "maximum": 0.1,
             "description": "相对原始TCP的绝对带符号偏移，m；实际值不超过program.amplitude。"
           }
         },
@@ -7334,20 +7351,18 @@
           },
           "amplitude": {
             "type": "number",
-            "minimum": 0.02,
-            "maximum": 0.1
+            "minimum": 0,
+            "description": "m，自动模式为各方向最大绝对行程；指定模式为请求幅度。"
           },
           "speed": {
             "type": "number",
-            "minimum": 0.005,
-            "maximum": 0.0135
+            "exclusiveMinimum": 0
           },
           "joint_excursion": {
             "type": "number",
-            "minimum": 0.017453292519943295,
-            "maximum": 0.5235987755982988,
             "default": 0.2792526803190927,
-            "description": "完整关节偏移范围，rad，目标为正负一半；预览默认16°，目标±8°。"
+            "description": "完整关节偏移范围，rad，目标为正负一半；预览默认16°，目标±8°。",
+            "exclusiveMinimum": 0
           },
           "segments": {
             "type": "array",
@@ -7355,6 +7370,22 @@
               "$ref": "#/components/schemas/CartesianSegment"
             },
             "description": "每轴按正向、反向、原位排列。可达不足时缩短实际偏移；无可达末端方向时为空，仍可预览关节程序。"
+          },
+          "motion": {
+            "$ref": "#/components/schemas/MotionTuning"
+          },
+          "auto_range": {
+            "type": "boolean",
+            "default": false,
+            "description": "是否按模型自动选择各方向行程。"
+          },
+          "guide": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CalibrationBranchPoint"
+            },
+            "default": [],
+            "description": "执行时沿预览的连续关节分支跟随；旧程序可省略。"
           }
         },
         "required": [
@@ -7495,13 +7526,20 @@
             "items": {
               "$ref": "#/components/schemas/CalibrationPreviewPoint"
             }
+          },
+          "ranges": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CalibrationAxisRange"
+            },
+            "default": []
           }
         },
         "required": [
           "program",
           "points"
         ],
-        "description": "整个测试的几何预览，前端显示TCP路线、计划姿态及整臂包络；不触发运动。",
+        "description": "整个测试的几何预览。显示分阶段TCP路线、关键姿态及连杆扫掠；不触发运动。",
         "examples": [
           {
             "program": {
@@ -7631,6 +7669,127 @@
             ]
           }
         ]
+      },
+      "MotionTuning": {
+        "type": "object",
+        "properties": {
+          "joint_speed": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "default": 1.0,
+            "description": "关节操作速度，rad/s；执行值同时受URDF逐轴速度约束。"
+          },
+          "acceleration": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "default": 0.6,
+            "description": "关节参考加速度，rad/s²。"
+          },
+          "jerk": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "default": 6.0,
+            "description": "关节参考jerk，rad/s³。"
+          }
+        },
+        "description": "可编辑运动设置；省略字段使用默认值，不表示硬件额定能力。",
+        "examples": [
+          {
+            "joint_speed": 1.0,
+            "acceleration": 0.6,
+            "jerk": 6.0
+          }
+        ]
+      },
+      "ConfigureMotionCommand": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CommandEnvelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "const": "configure_motion",
+                "type": "string"
+              },
+              "config": {
+                "$ref": "#/components/schemas/MotionTuning"
+              }
+            },
+            "required": [
+              "kind",
+              "config"
+            ]
+          }
+        ],
+        "description": "空闲时应用运动设置，需要控制权。更新generation，结果accepted/configure_motion。",
+        "examples": [
+          {
+            "request_id": "req-motion-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 4,
+            "kind": "configure_motion",
+            "config": {
+              "joint_speed": 1.0,
+              "acceleration": 0.6,
+              "jerk": 6.0
+            }
+          }
+        ]
+      },
+      "CalibrationAxisRange": {
+        "type": "object",
+        "properties": {
+          "axis": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2
+          },
+          "negative": {
+            "type": "number",
+            "maximum": 0
+          },
+          "positive": {
+            "type": "number",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "axis",
+          "negative",
+          "positive"
+        ],
+        "description": "当前姿态与TCP的局部连续可达范围，偏移以基座m表示。不是所有构型的全局工作空间。"
+      },
+      "CalibrationBranchPoint": {
+        "type": "object",
+        "properties": {
+          "axis": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2
+          },
+          "offset": {
+            "type": "number",
+            "description": "相对原始TCP的基座轴偏移，m。"
+          },
+          "joints": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7
+          }
+        },
+        "required": [
+          "axis",
+          "offset",
+          "joints"
+        ],
+        "description": "预览的连续关节构型参考点；按axis和offset排序。随program原样提交。"
       }
     },
     "responses": {
