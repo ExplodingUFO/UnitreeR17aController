@@ -33,6 +33,8 @@
 | `POST /v1/traces`       | `{duration_ms?:number\|null}` | `200 TraceSummary`                 | 开始短时采样             |
 | `POST /v1/traces/stop`  | 无                            | `200 TraceSummary\|null`           | 结束当前采样             |
 | `GET /v1/traces/{id}`   | 可选 `download/attachment`    | `200 TraceRecording`               | 读取或下载采样 JSON      |
+| `GET /v1/calibrations?limit=20` | 可选条数 | `200 CalibrationReport[]` | 查询最近校准报告 |
+| `GET /v1/calibrations/{id}` | 报告 ID | `200 CalibrationReport` | 读取完整校准报告 |
 
 普通 HTTP 返回值直接使用表中的结构，没有统一的 `data` 包装。只有 WebSocket 状态消息使用 `{type:"state",data:Snapshot}`。
 
@@ -126,6 +128,8 @@
 | `clear_fault`    | 无                                                    | 该请求 `completed/cleared`，`error:null`、`enabled:false`               |
 | `configure_tcp`  | `tcp:Pose`                                            | 请求被接受，`tcp_configured:true`，`tcp_transform` 与归一化后的输入一致 |
 | `configure_servo` | `config:ServoTuning`（完整七轴配置） | `accepted/configure_servo`，快照配置及版本更新；不产生独立 completed |
+| `calibrate_start` | `settings:CalibrationSettings` | 接受后跟踪 `calibration`；结束返回 completed、cancelled 或 failed，code 为 calibration_done |
+| `calibrate_apply` | `calibration_id:string` | `accepted/calibrate_apply`，配置及版本与推荐一致 |
 | `jog_start`      | `space,axis,direction,speed,frame?,ttl_ms?,input_seq` | 请求被接受且 `action.request_id` 等于本次 `request_id`                  |
 | `jog_update`     | `action_id,input_seq,ttl_ms?`                         | 成功更新不产生 `accepted` 记录；按当前动作与后续状态判断                |
 | `step`           | `space,axis,direction,amount,speed,frame?`            | 该请求 `completed/completed`                                            |
@@ -342,6 +346,73 @@ J1 正向连续点动，速度 0.1 rad/s：
 
 参数标定与减抖效果尚未真机验证；候选方案和证据见[补偿方案调查](research/motion-compensation-repositories-2026-11-21.md)。
 
+### 5.10 低速稳定性校准
+
+先连接、取得控制权并使能，等待七轴静止及成功发送的静止目标。`calibrate_start` 是主动运动命令。一次只测试一个关节，其他关节保持参考；测试中拒绝其他运动、TCP 与伺服配置变更。
+
+```json
+{
+  "request_id": "req-calibration-001",
+  "client_id": "example-service",
+  "lease_id": "11111111-1111-4111-8111-111111111111",
+  "generation": 5,
+  "kind": "calibrate_start",
+  "settings": {
+    "axis": 1,
+    "excursion": 0.10471975511965977,
+    "speed": 0.017453292519943295,
+    "max_friction": 0.1
+  }
+}
+```
+
+| 字段 | 单位与范围 | 含义 |
+| --- | --- | --- |
+| `axis` | 0..6 | J1..J7，本例为 J2 |
+| `excursion` | rad，1°..10° | 相对起始位置允许的偏移；目标取参考中心 ±半个此值，最后回到中心 |
+| `speed` | rad/s，0.005..0.04 | 低档峰值速度上限；第二档为两倍；小位移的实际峰值由导数约束降低 |
+| `max_friction` | Nm，0..2 | 选定轴的库仑摩擦及摩擦输出试验上限；0 跳过摩擦候选 |
+
+每组配置执行两档速度的六段往返。全部 Kp/Kd 保持起始值，候选分别试验选定轴的半上限/全上限 Coulomb 系数，以及起始速度前馈的 75%；不同时搜索二者。关闭摩擦但其他轴留有非零系数时拒绝启动，避免打开全局开关改变其他轴的有效行为。
+
+比较使用新到达的位置反馈与已成功写完整批的参考，按 100 ms 窗计算速度跟随误差，不对微秒级回包间隔直接差分。窗口中断、长缺口、起停及数据不足不生成推荐。至少 12 个窗口、2 秒有效运动才形成统计。候选须改善主要速度指标且位置与其他轴偏移不过度恶化，再重测基线与候选。算法判据和模拟测试见[试用测试](low-speed-calibration-test-plan.md)；这些阈值不是机械精度声明。
+
+HTTP 返回 `202 queued` 后，读取匹配请求的结果和 `Snapshot.calibration`。配置切换和片段结束会更新 `generation`；运行由后端推进，调用方只需继续续期控制权，不发送逐片段命令或 `jog_update`。`calibration` 包含：
+
+| 字段 | 含义 |
+| --- | --- |
+| `id` / `request_id` | 报告 ID / 原始启动请求 ID |
+| `state` | running、stopping、completed、cancelled、failed |
+| `stage` | baseline、candidate、baseline_check、validation、restoring、done |
+| `axis` | 选定关节 |
+| `trial_index/trial_count` | 从 0 开始的配置进度；是否复测由实测决定，总数可调整 |
+| `leg_index/leg_count` | 当前配置的片段进度；每组 6 段 |
+| `progress` | 0..1；结束为 1，成功与否看 state/report |
+| `report` | 执行时为 null；结束后含配置、统计、结论与推荐 |
+
+报告 `outcome` 为 improved、unchanged、insufficient、cancelled 或 failed。`recommended` 是完整 `ServoTuning` 或 null；`improvement` 是重复对照中较小的相对改善比例或 null。`trials[]` 保存阶段、实际配置与 `metrics`：窗口数 windows、有效毫秒 valid_ms、速度误差 RMS velocity_rms（rad/s）、位置误差 RMS/峰值 tracking_rms/tracking_peak（rad）及其他轴相对初始实测的最大偏移 other_peak（rad）。
+
+正常完成先恢复起始配置，仍保持使能。停止、释放/失去控制权会取消剩余测试，按现有停止过程减速并恢复配置；失能、断开、故障或关闭不会自动重新使能。桌面停止可取消外部程序发起的校准。关闭弹窗仅隐藏窗口，Esc 请求停止并关闭。
+
+有推荐时，以最新 `generation` 提交：
+
+```json
+{
+  "request_id": "req-calibration-use-001",
+  "client_id": "example-service",
+  "lease_id": "11111111-1111-4111-8111-111111111111",
+  "generation": 20,
+  "kind": "calibrate_apply",
+  "calibration_id": "33333333-3333-4333-8333-333333333333"
+}
+```
+
+仅当前连接中最近完成、复测通过的结果可应用，且需仍使能、静止、新鲜反馈、原始配置版本和相同 TCP，并位于本轮姿态范围。重新连接、参数修改、TCP 修改（即使改回原值）或已应用均使旧结果失效。calibration_unavailable 表示没有对应推荐；stale_calibration 表示上下文改变；calibration_range 表示姿态越界；calibration_storage_busy 表示上一报告尚待接纳，稍后可手动启动。
+
+报告在后台序列化并写入现有 events.sqlite3，保留最近 100 份。生产者只尝试一次队列锁，未接纳报告由控制器保留并补投；关闭时在控制结束后交接补投，再刷新数据库。`GET /v1/calibrations` 默认 20，limit 限制到 1..100，按创建时间与 ID 降序返回；单份不存在返回 `404 calibration_not_found`。读取走 spawn_blocking。报告不含令牌或控制权凭据，也不改变事件日志统计。
+
+历史报告可以下载、对照，重启后没有直接应用资格。首版保存逐轮窗口统计与配置，需要完整 control/transmit/feedback 时使用已有短时采样。IMU 共振识别和输入整形见[设计方案](calibration-analysis-plan.md)。
+
 ## 6. 命令输出与执行结果
 
 提交成功立即返回：
@@ -397,6 +468,7 @@ J1 正向连续点动，速度 0.1 rad/s：
 | `servo_tuning_revision` | u64 | 当前配置版本；应用及连接/断开重置时更新，不跨进程保存 |
 | `feedback_age_ms`         | u64 或 null                    | 已有反馈中最大的接收年龄                           |
 | `action`                  | object 或 null                 | 当前动作：`request_id,space,mode,axis,progress`    |
+| `calibration` | `CalibrationStatus` 或 null | 当前校准或最近一次结果，见 5.10 |
 | `last_result` / `results` | `CommandResult` 或 null / 数组 | 最新一条结果 / 最近结果                            |
 | `error`                   | `{code,message}` 或 null       | 当前故障                                           |
 | `journal`                 | object                         | `pending,written,dropped,errors,healthy`           |
@@ -428,7 +500,7 @@ J1 正向连续点动，速度 0.1 rad/s：
 
 从未收到的反馈为 `null`。反馈过期后，关节数值保留最后一次测量，`age_ms` 继续增长。控制使用的七轴反馈需全部存在、单轴年龄不超过 200 ms，七轴接收时间跨度不超过 100 ms。仅检查 `feedback_age_ms` 不能证明七轴已经齐全。
 
-TCP 未设置或控制反馈无效时，`tcp:null`。`action.mode` 为 `continuous` 或 `step`，`progress` 范围 0..1。`seq` 和 `generation` 不跨应用重启保存；重新连接应用后重新读取状态。快照通常约 30 Hz 更新，状态变化时也可提前发布。HTTP 返回缓存中的最近快照，调用方还需考虑接收后经过的时间。
+TCP 未设置或控制反馈无效时，`tcp:null`。`action.mode` 为 `continuous`、`step`、`return` 或 `calibration`，`progress` 范围 0..1。`seq` 和 `generation` 不跨应用重启保存；重新连接应用后重新读取状态。快照通常约 30 Hz 更新，状态变化时也可提前发布。HTTP 返回缓存中的最近快照，调用方还需考虑接收后经过的时间。
 
 完整的未连接状态示例和嵌套类型见 [OpenAPI](openapi.json) 的 `Snapshot` 与 `GET /v1/state` 示例。
 
@@ -768,6 +840,10 @@ Tauri 仅向主窗口提供三个命令：
 
 资源：resources/models/{right,left}/robot.urdf 和 meshes/\*.STL；URDF mesh 引用统一为 meshes/文件名；Vite publicDir 指向 resources，前后端使用同一资源。manifest.json 记录 sides、joint_names、lower、upper、source，不改变原始轴与 origin。
 
+### calibration.rs
+
+集中定义测试设置、有限往返目标、固定窗口测量、候选与重复对照判定，不执行串口或数据库 I/O。`arm.rs` 保存一项校准任务，复用现有收纳轨迹与参数应用，在控制周期推进并处理停止、恢复和应用资格。
+
 ### trajectory.rs
 
 提供 `velocity_window`、`integrate` 和七变量盒约束的 `bounded_quadratic`。动态窗口由前一速度、加速度、目标、限制与实际 `dt` 计算；关节与末端求解使用相同的导数约束。当前常量为 `JOINT_SPEED=0.20`、`JOINT_ACCELERATION=0.60`、`JOINT_JERK=6.0`，单位分别为 rad/s、rad/s²、rad/s³。数值输入显式传入，可独立进行离线测试。
@@ -781,6 +857,8 @@ Tauri 仅向主窗口提供三个命令：
 事件库使用 WAL、批量事务、有限 busy_timeout；记录连接、控制权、动作、故障和应用事件，不逐帧存储串口或遥测。不记录 token/lease。队列满计 dropped，写失败计 errors，后台重试不反向阻塞控制。保留最近 100000 条，清理与 checkpoint 都在 writer 内。测试覆盖持久化、队列满和数据库不可写时的行为。
 
 `trace_start(duration_ms,side,port)`、`trace_stop()`、`trace_list(limit)`、`trace_read(id)` 提供采样管理与读取，server 放到 `spawn_blocking`。`sample(at:Instant,data:TraceData)` 提交固定大小数据；采样有独立队列、writer、数据库与按次统计。
+
+报告使用独立容量 8 的有界队列，`record_calibration(&Report)` 单次尝试锁，仅接纳后克隆；JSON 与事务在 writer 内。控制器保留一份未接纳报告，下周期补投。关闭时先结束控制，再由关闭线程有界补投，随后刷新事件与报告。读取与历史清理不在控制线程执行。
 
 ### trace.rs
 

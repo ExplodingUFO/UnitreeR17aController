@@ -275,7 +275,8 @@
                       }
                     ]
                   },
-                  "servo_tuning_revision": 1
+                  "servo_tuning_revision": 1,
+                  "calibration": null
                 }
               }
             }
@@ -642,6 +643,31 @@
                         }
                       ]
                     }
+                  }
+                },
+                "calibrate_start": {
+                  "value": {
+                    "request_id": "req-calibration-001",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 4,
+                    "kind": "calibrate_start",
+                    "settings": {
+                      "axis": 1,
+                      "excursion": 0.10471975511965978,
+                      "speed": 0.017453292519943295,
+                      "max_friction": 0.1
+                    }
+                  }
+                },
+                "calibrate_apply": {
+                  "value": {
+                    "request_id": "req-calibration-use-001",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 4,
+                    "kind": "calibrate_apply",
+                    "calibration_id": "33333333-3333-4333-8333-333333333333"
                   }
                 }
               }
@@ -1110,7 +1136,8 @@
                     }
                   ]
                 },
-                "servo_tuning_revision": 1
+                "servo_tuning_revision": 1,
+                "calibration": null
               }
             }
           },
@@ -1771,6 +1798,336 @@
           },
           "503": {
             "$ref": "#/components/responses/TraceUnavailable"
+          }
+        }
+      }
+    },
+    "/v1/calibrations": {
+      "get": {
+        "operationId": "getCalibrations",
+        "tags": [
+          "校准"
+        ],
+        "summary": "查询校准报告历史",
+        "description": "SQLite持久化最新100份报告，按created_at_ms DESC,id DESC返回；后台写入可能尚未提交。只读不取得控制权。",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 20
+            },
+            "description": "限制到1..100，0按1。",
+            "example": 20
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "报告列表。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/CalibrationReport"
+                  }
+                },
+                "example": [
+                  {
+                    "id": "33333333-3333-4333-8333-333333333333",
+                    "request_id": "req-calibration-001",
+                    "created_at_ms": 1795315200000,
+                    "side": "right",
+                    "port": "/dev/cu.example",
+                    "settings": {
+                      "axis": 1,
+                      "excursion": 0.10471975511965978,
+                      "speed": 0.017453292519943295,
+                      "max_friction": 0.1
+                    },
+                    "center_reference": [
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0
+                    ],
+                    "center_measured": [
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0,
+                      0
+                    ],
+                    "tcp": null,
+                    "baseline": {
+                      "friction_enabled": false,
+                      "joints": [
+                        {
+                          "kd": 10.0,
+                          "velocity_ff": 1.0,
+                          "coulomb": 0.0,
+                          "viscous": 0.0,
+                          "velocity_scale": 0.02,
+                          "max_friction": 0.5
+                        },
+                        {
+                          "kd": 10.0,
+                          "velocity_ff": 1.0,
+                          "coulomb": 0.0,
+                          "viscous": 0.0,
+                          "velocity_scale": 0.02,
+                          "max_friction": 0.5
+                        },
+                        {
+                          "kd": 10.0,
+                          "velocity_ff": 1.0,
+                          "coulomb": 0.0,
+                          "viscous": 0.0,
+                          "velocity_scale": 0.02,
+                          "max_friction": 0.5
+                        },
+                        {
+                          "kd": 10.0,
+                          "velocity_ff": 1.0,
+                          "coulomb": 0.0,
+                          "viscous": 0.0,
+                          "velocity_scale": 0.02,
+                          "max_friction": 0.5
+                        },
+                        {
+                          "kd": 10.0,
+                          "velocity_ff": 1.0,
+                          "coulomb": 0.0,
+                          "viscous": 0.0,
+                          "velocity_scale": 0.02,
+                          "max_friction": 0.5
+                        },
+                        {
+                          "kd": 10.0,
+                          "velocity_ff": 1.0,
+                          "coulomb": 0.0,
+                          "viscous": 0.0,
+                          "velocity_scale": 0.02,
+                          "max_friction": 0.5
+                        },
+                        {
+                          "kd": 10.0,
+                          "velocity_ff": 1.0,
+                          "coulomb": 0.0,
+                          "viscous": 0.0,
+                          "velocity_scale": 0.02,
+                          "max_friction": 0.5
+                        }
+                      ]
+                    },
+                    "recommended": null,
+                    "trials": [],
+                    "outcome": "cancelled",
+                    "improvement": null,
+                    "message": "校准已取消"
+                  }
+                ]
+              }
+            }
+          },
+          "400": {
+            "description": "参数无效。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "code": "invalid_calibration",
+                  "message": "校准查询参数无效"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenOrigin"
+          },
+          "503": {
+            "$ref": "#/components/responses/JournalUnavailable"
+          }
+        }
+      }
+    },
+    "/v1/calibrations/{id}": {
+      "get": {
+        "operationId": "getCalibration",
+        "tags": [
+          "校准"
+        ],
+        "summary": "读取单次校准报告",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "33333333-3333-4333-8333-333333333333"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "完整报告，供查看或保存JSON。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CalibrationReport"
+                },
+                "example": {
+                  "id": "33333333-3333-4333-8333-333333333333",
+                  "request_id": "req-calibration-001",
+                  "created_at_ms": 1795315200000,
+                  "side": "right",
+                  "port": "/dev/cu.example",
+                  "settings": {
+                    "axis": 1,
+                    "excursion": 0.10471975511965978,
+                    "speed": 0.017453292519943295,
+                    "max_friction": 0.1
+                  },
+                  "center_reference": [
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                  ],
+                  "center_measured": [
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                  ],
+                  "tcp": null,
+                  "baseline": {
+                    "friction_enabled": false,
+                    "joints": [
+                      {
+                        "kd": 10.0,
+                        "velocity_ff": 1.0,
+                        "coulomb": 0.0,
+                        "viscous": 0.0,
+                        "velocity_scale": 0.02,
+                        "max_friction": 0.5
+                      },
+                      {
+                        "kd": 10.0,
+                        "velocity_ff": 1.0,
+                        "coulomb": 0.0,
+                        "viscous": 0.0,
+                        "velocity_scale": 0.02,
+                        "max_friction": 0.5
+                      },
+                      {
+                        "kd": 10.0,
+                        "velocity_ff": 1.0,
+                        "coulomb": 0.0,
+                        "viscous": 0.0,
+                        "velocity_scale": 0.02,
+                        "max_friction": 0.5
+                      },
+                      {
+                        "kd": 10.0,
+                        "velocity_ff": 1.0,
+                        "coulomb": 0.0,
+                        "viscous": 0.0,
+                        "velocity_scale": 0.02,
+                        "max_friction": 0.5
+                      },
+                      {
+                        "kd": 10.0,
+                        "velocity_ff": 1.0,
+                        "coulomb": 0.0,
+                        "viscous": 0.0,
+                        "velocity_scale": 0.02,
+                        "max_friction": 0.5
+                      },
+                      {
+                        "kd": 10.0,
+                        "velocity_ff": 1.0,
+                        "coulomb": 0.0,
+                        "viscous": 0.0,
+                        "velocity_scale": 0.02,
+                        "max_friction": 0.5
+                      },
+                      {
+                        "kd": 10.0,
+                        "velocity_ff": 1.0,
+                        "coulomb": 0.0,
+                        "viscous": 0.0,
+                        "velocity_scale": 0.02,
+                        "max_friction": 0.5
+                      }
+                    ]
+                  },
+                  "recommended": null,
+                  "trials": [],
+                  "outcome": "cancelled",
+                  "improvement": null,
+                  "message": "校准已取消"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "编号过长。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "code": "invalid_calibration",
+                  "message": "校准编号无效"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "报告不存在。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "code": "calibration_not_found",
+                  "message": "校准记录不存在"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenOrigin"
+          },
+          "503": {
+            "$ref": "#/components/responses/JournalUnavailable"
           }
         }
       }
@@ -2996,6 +3353,12 @@
           },
           {
             "$ref": "#/components/schemas/ReturnToPoseCommand"
+          },
+          {
+            "$ref": "#/components/schemas/CalibrateStartCommand"
+          },
+          {
+            "$ref": "#/components/schemas/CalibrateApplyCommand"
           }
         ],
         "discriminator": {
@@ -3012,7 +3375,9 @@
             "step": "#/components/schemas/StepCommand",
             "stop": "#/components/schemas/StopCommand",
             "return_to_pose": "#/components/schemas/ReturnToPoseCommand",
-            "configure_servo": "#/components/schemas/ConfigureServoCommand"
+            "configure_servo": "#/components/schemas/ConfigureServoCommand",
+            "calibrate_start": "#/components/schemas/CalibrateStartCommand",
+            "calibrate_apply": "#/components/schemas/CalibrateApplyCommand"
           }
         },
         "description": "全部操作参数与公共字段位于同一层。范围表示有效业务输入；HTTP 202 后仍可能异步 rejected。未知 JSON 字段当前会被忽略。",
@@ -3205,6 +3570,27 @@
                 }
               ]
             }
+          },
+          {
+            "request_id": "req-calibration-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 4,
+            "kind": "calibrate_start",
+            "settings": {
+              "axis": 1,
+              "excursion": 0.10471975511965978,
+              "speed": 0.017453292519943295,
+              "max_friction": 0.1
+            }
+          },
+          {
+            "request_id": "req-calibration-use-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 4,
+            "kind": "calibrate_apply",
+            "calibration_id": "33333333-3333-4333-8333-333333333333"
           }
         ]
       },
@@ -3438,7 +3824,8 @@
             "enum": [
               "continuous",
               "step",
-              "return"
+              "return",
+              "calibration"
             ]
           },
           "axis": {
@@ -3448,7 +3835,7 @@
             ],
             "minimum": 0,
             "maximum": 6,
-            "description": "点动轴索引；收纳返回涉及七轴，mode=return 时为 null。"
+            "description": "点动轴索引；收纳返回涉及七轴，mode=return 时为 null。 mode=calibration 时为正在测试的关节索引。"
           },
           "progress": {
             "type": "number",
@@ -3717,6 +4104,16 @@
             "minimum": 0,
             "maximum": 18446744073709551615,
             "description": "当前配置版本，应用及连接/断开恢复基线时提升；不跨应用重启保存。"
+          },
+          "calibration": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CalibrationStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -3739,7 +4136,8 @@
           "journal",
           "communication",
           "servo_tuning",
-          "servo_tuning_revision"
+          "servo_tuning_revision",
+          "calibration"
         ],
         "description": "完整状态；所有键均存在，可选值用 null。tcp 是实测关节计算的基座 → TCP；未设置 TCP 或反馈无效时为 null。",
         "examples": [
@@ -3911,7 +4309,8 @@
                 }
               ]
             },
-            "servo_tuning_revision": 1
+            "servo_tuning_revision": 1,
+            "calibration": null
           }
         ]
       },
@@ -4101,7 +4500,8 @@
                   }
                 ]
               },
-              "servo_tuning_revision": 1
+              "servo_tuning_revision": 1,
+              "calibration": null
             }
           }
         ]
@@ -5532,6 +5932,485 @@
             "total": 1,
             "total_pages": 1,
             "through_id": 101
+          }
+        ]
+      },
+      "CalibrationSettings": {
+        "type": "object",
+        "properties": {
+          "axis": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 6
+          },
+          "excursion": {
+            "type": "number",
+            "minimum": 0.017453292519943295,
+            "maximum": 0.1745329252,
+            "description": "相对最大位移，rad，1°..10°；目标取一半。最大值兼容十位小数的10°换算。"
+          },
+          "speed": {
+            "type": "number",
+            "minimum": 0.005,
+            "maximum": 0.04,
+            "description": "慢档rad/s，快档为两倍。"
+          },
+          "max_friction": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 2,
+            "description": "选定关节的Fc试验上限Nm，不是本体已验证安全上限。"
+          }
+        },
+        "required": [
+          "axis",
+          "excursion",
+          "speed",
+          "max_friction"
+        ],
+        "examples": [
+          {
+            "axis": 1,
+            "excursion": 0.10471975511965978,
+            "speed": 0.017453292519943295,
+            "max_friction": 0.1
+          }
+        ]
+      },
+      "CalibrationMetrics": {
+        "type": "object",
+        "properties": {
+          "windows": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "velocity_rms": {
+            "type": "number"
+          },
+          "tracking_rms": {
+            "type": "number"
+          },
+          "tracking_peak": {
+            "type": "number"
+          },
+          "other_peak": {
+            "type": "number"
+          },
+          "valid_ms": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "windows",
+          "velocity_rms",
+          "tracking_rms",
+          "tracking_peak",
+          "other_peak",
+          "valid_ms"
+        ],
+        "description": "速度误差以原始运动参考比较；100ms位置窗口，不对微秒级回传包求导。角度rad、速度rad/s。"
+      },
+      "CalibrationTrial": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "phase": {
+            "type": "string",
+            "enum": [
+              "baseline",
+              "candidate",
+              "baseline_check",
+              "validation"
+            ]
+          },
+          "config": {
+            "$ref": "#/components/schemas/ServoTuning"
+          },
+          "metrics": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CalibrationMetrics"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "index",
+          "phase",
+          "config",
+          "metrics"
+        ]
+      },
+      "CalibrationReport": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "request_id": {
+            "type": "string"
+          },
+          "created_at_ms": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "side": {
+            "type": "string",
+            "enum": [
+              "left",
+              "right"
+            ]
+          },
+          "port": {
+            "type": "string"
+          },
+          "settings": {
+            "$ref": "#/components/schemas/CalibrationSettings"
+          },
+          "center_reference": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7
+          },
+          "center_measured": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7
+          },
+          "tcp": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Pose"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "baseline": {
+            "$ref": "#/components/schemas/ServoTuning"
+          },
+          "recommended": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ServoTuning"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "trials": {
+            "type": "array",
+            "maxItems": 6,
+            "items": {
+              "$ref": "#/components/schemas/CalibrationTrial"
+            }
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "improved",
+              "unchanged",
+              "insufficient",
+              "cancelled",
+              "failed"
+            ]
+          },
+          "improvement": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 1
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "request_id",
+          "created_at_ms",
+          "side",
+          "port",
+          "settings",
+          "center_reference",
+          "center_measured",
+          "tcp",
+          "baseline",
+          "recommended",
+          "trials",
+          "outcome",
+          "improvement",
+          "message"
+        ],
+        "examples": [
+          {
+            "id": "33333333-3333-4333-8333-333333333333",
+            "request_id": "req-calibration-001",
+            "created_at_ms": 1795315200000,
+            "side": "right",
+            "port": "/dev/cu.example",
+            "settings": {
+              "axis": 1,
+              "excursion": 0.10471975511965978,
+              "speed": 0.017453292519943295,
+              "max_friction": 0.1
+            },
+            "center_reference": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "center_measured": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "tcp": null,
+            "baseline": {
+              "friction_enabled": false,
+              "joints": [
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                }
+              ]
+            },
+            "recommended": null,
+            "trials": [],
+            "outcome": "cancelled",
+            "improvement": null,
+            "message": "校准已取消"
+          }
+        ]
+      },
+      "CalibrationStatus": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "request_id": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "running",
+              "stopping",
+              "completed",
+              "cancelled",
+              "failed"
+            ]
+          },
+          "stage": {
+            "type": "string",
+            "enum": [
+              "baseline",
+              "candidate",
+              "baseline_check",
+              "validation",
+              "restoring",
+              "done"
+            ]
+          },
+          "axis": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 6
+          },
+          "trial_index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "trial_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "leg_index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "leg_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "progress": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "report": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CalibrationReport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "request_id",
+          "state",
+          "stage",
+          "axis",
+          "trial_index",
+          "trial_count",
+          "leg_index",
+          "leg_count",
+          "progress",
+          "report"
+        ]
+      },
+      "CalibrateStartCommand": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CommandEnvelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "calibrate_start"
+              },
+              "settings": {
+                "$ref": "#/components/schemas/CalibrationSettings"
+              }
+            },
+            "required": [
+              "kind",
+              "settings"
+            ]
+          }
+        ],
+        "description": "已连接、使能、静止并持有控制权时启动有限关节往返。输入范围为本软件限制。Kd固定，候选分别试验；完成恢复起始参数。通过Snapshot.calibration跟踪，stop/释放/过期/故障/关闭取消后续测试。",
+        "examples": [
+          {
+            "request_id": "req-calibration-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 4,
+            "kind": "calibrate_start",
+            "settings": {
+              "axis": 1,
+              "excursion": 0.10471975511965978,
+              "speed": 0.017453292519943295,
+              "max_friction": 0.1
+            }
+          }
+        ]
+      },
+      "CalibrateApplyCommand": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CommandEnvelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "calibrate_apply"
+              },
+              "calibration_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "calibration_id"
+            ]
+          }
+        ],
+        "description": "只应用当前连接最近完成且重复验证通过的结果；要求静止、同工具/起始参数版本并在测试姿态范围内。接受后generation和servo_tuning_revision递增；只返回queued不能当作已应用。历史报告不能借此在新连接直接应用。",
+        "examples": [
+          {
+            "request_id": "req-calibration-use-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 4,
+            "kind": "calibrate_apply",
+            "calibration_id": "33333333-3333-4333-8333-333333333333"
           }
         ]
       }

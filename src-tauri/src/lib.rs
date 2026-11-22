@@ -1,4 +1,5 @@
 mod arm;
+mod calibration;
 mod journal;
 mod kinematics;
 mod protocol;

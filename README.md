@@ -8,6 +8,7 @@
 - 提供本机 HTTP/WebSocket 接口，使用 SQLite 记录操作和运行日志。
 - 在控制页录制短时控制、实际发送与反馈数据，下载 JSON 排查运动问题。
 - 从控制页“点动 → 参数”打开伺服调试弹窗，逐轴调整阻尼、速度前馈权重与平滑摩擦补偿。
+- 从参数弹窗进入“低速校准”，对选定关节自动往返试验、比较摩擦和速度前馈候选，并复测推荐结果。
 
 ![R1-7a 控制器，800×560 内容区](docs/screenshots/recording-control-800x560.png)
 
@@ -42,7 +43,9 @@ src-tauri/target/release/bundle/macos/R1-7a Controller.app
 
 点击点动面板的“参数”打开伺服调试弹窗，可编辑草稿、恢复基线、显式应用和复制配置 JSON。关闭后保留本次连接的草稿及上次编辑位置，控制页的坐标系、速度与 3D 视角保持原样。弹窗提供停止按钮，Esc 停止并关闭弹窗。
 
-基线关闭摩擦补偿，每轴 `kd=10`、`velocity_ff=1`，摩擦系数为零。先连接再配置；应用需要当前控制权，运动、减速停止、使能确认或故障期间拒绝。参数只在当前连接的内存中生效，每次连接或断开恢复基线，不自动持久化。速度前馈权重仅改变报文速度字段，位置轨迹、TCP 路径及停止/收纳时序仍使用原始轨迹速度。完整参数范围与确认方式见[伺服调试配置](docs/implementation-contract.md#59-伺服调试配置)。录制后的自动诊断、参数候选与前后对照设计见[录制分析与优化方案](docs/calibration-analysis-plan.md)，数值方法见[校准方案评估](docs/research/automatic-calibration-2026-11-22.md)。
+基线关闭摩擦补偿，每轴 `kd=10`、`velocity_ff=1`，摩擦系数为零。先连接再配置；应用需要当前控制权，运动、减速停止、使能确认或故障期间拒绝。参数只在当前连接的内存中生效，每次连接或断开恢复基线，不自动持久化。速度前馈权重仅改变报文速度字段，位置轨迹、TCP 路径及停止/收纳时序仍使用原始轨迹速度。完整参数范围与确认方式见[伺服调试配置](docs/implementation-contract.md#59-伺服调试配置)。
+
+低速校准选择一个关节，设置相对位移范围、速度和摩擦补偿试验上限，然后由程序执行两档速度的正反向往返。Kp/Kd 固定，摩擦与速度前馈分别试验；候选通过重复基线和复测比较后才给出推荐。完成后先恢复起始参数，点击“应用推荐”才改变当前配置。停止会取消剩余测试并恢复参数；关闭弹窗可稍后重新查看进度。报告保存到 SQLite，保留最近 100 份，可查看、下载；历史报告不直接应用到新连接。首版保存每轮窗口统计和配置，需要逐帧数据时仍使用控制页录制。操作与验收见[校准试用流程](docs/low-speed-calibration-test-plan.md)，输入输出见[校准接口](docs/implementation-contract.md#510-低速稳定性校准)。
 
 拖动面板之间的分隔线，可调整左右栏宽度、3D/末端坐标区高度和日志高度。双击分隔线恢复默认尺寸，调整结果自动保存。分隔线聚焦后可用方向键微调，Shift 加方向键加大步幅，Enter 还原。日志默认收起，可展开查看最近记录，或切到日志页搜索和翻页；面板空间不足时，内容在各自区域内滚动。
 
@@ -52,7 +55,7 @@ src-tauri/target/release/bundle/macos/R1-7a Controller.app
 
 ## 本机接口与日志
 
-接口默认监听 `127.0.0.1:8177`。顶部“接口”页提供地址和会话令牌、接口与十二种命令的输入输出示例、请求结果，以及 OpenAPI 下载。可用“读取状态”查询实际 JSON 返回值。宽屏中接入信息与返回值并排显示，小窗口自动切为单列。请求字段、返回值和调用顺序见 [API 接入说明](docs/implementation-contract.md)，机器可读定义见 [OpenAPI 3.1](docs/openapi.json)。桌面操作和外部程序共用一份设备状态，同一时间由一个客户端持有控制权；释放后可由其他客户端取得。
+接口默认监听 `127.0.0.1:8177`。顶部“接口”页提供地址和会话令牌、接口输入输出示例、请求结果，以及 OpenAPI 下载。可用“读取状态”查询实际 JSON 返回值。宽屏中接入信息与返回值并排显示，小窗口自动切为单列。请求字段、返回值和调用顺序见 [API 接入说明](docs/implementation-contract.md)，机器可读定义见 [OpenAPI 3.1](docs/openapi.json)。桌面操作和外部程序共用一份设备状态，同一时间由一个客户端持有控制权；释放后可由其他客户端取得。
 
 工作台的停止按钮可取消任一客户端的当前动作，控制权和使能状态保持不变。
 
@@ -76,7 +79,7 @@ cargo run --manifest-path src-tauri/Cargo.toml --example analyze_trace -- /path/
 
 ## 开发与测试
 
-当前开发与测试平台为 macOS arm64，Windows 和 Linux 尚未测试。发送时间对齐版本 `799f759` 已由用户真机测试，运动仍有抖动。本轮摩擦补偿及逐轴阻尼/速度前馈调参尚未真机验证。软件检查与构建结果见[测试记录](docs/implementation-status.md)，方案依据见[补偿方案调查](docs/research/motion-compensation-repositories-2026-11-21.md)。
+当前开发与测试平台为 macOS arm64，Windows 和 Linux 尚未测试。发送时间对齐版本 `799f759` 已由用户真机测试，运动仍有抖动。本轮低速自动校准尚未真机验证，实际减抖效果需要同条件前后对照。软件检查与构建结果见[测试记录](docs/implementation-status.md)，方案依据见[补偿方案调查](docs/research/motion-compensation-repositories-2026-11-21.md)。
 
 个人自用项目，采用 vibe coding 方式开发。
 
@@ -85,7 +88,7 @@ cargo run --manifest-path src-tauri/Cargo.toml --example analyze_trace -- /path/
 ```bash
 npm run format:check
 npm run build
-cargo test --manifest-path src-tauri/Cargo.toml --all-targets --locked
+cargo test --manifest-path src-tauri/Cargo.toml --all-targets --locked -- --test-threads=1
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
 cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 ```

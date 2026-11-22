@@ -109,12 +109,14 @@ export default function ServoPanel({
   open,
   onClose,
   onStop,
+  onCalibrate,
 }: {
   view: View;
   blocked: boolean;
   open: boolean;
   onClose: () => void;
   onStop: () => void;
+  onCalibrate?: () => void;
 }) {
   const s = view.snapshot;
   const applied = s.servo_tuning ?? createServoTuning();
@@ -347,6 +349,7 @@ export default function ServoPanel({
           <button className="stop-button" onClick={onStop}>
             停止 <kbd>Esc</kbd>
           </button>
+          {onCalibrate && <button onClick={onCalibrate}>低速校准</button>}
           <button
             className="servo-close"
             aria-label="关闭伺服参数"

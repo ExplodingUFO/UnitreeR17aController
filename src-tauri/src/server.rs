@@ -114,6 +114,8 @@ async fn launch_at(
         .route("/v1/commands", post(command))
         .route("/v1/logs", get(logs))
         .route("/v1/logs/page", get(log_page))
+        .route("/v1/calibrations", get(calibrations))
+        .route("/v1/calibrations/{id}", get(calibration))
         .route("/v1/traces", post(trace_start).get(traces))
         .route("/v1/traces/stop", post(trace_stop))
         .route("/v1/traces/{id}", get(trace_read))
@@ -193,7 +195,7 @@ impl IntoResponse for ApiError {
                 StatusCode::CONFLICT
             }
             "trace_capacity" => StatusCode::TOO_MANY_REQUESTS,
-            "trace_not_found" => StatusCode::NOT_FOUND,
+            "trace_not_found" | "calibration_not_found" => StatusCode::NOT_FOUND,
             _ => StatusCode::BAD_REQUEST,
         };
         (status, Json(self)).into_response()
@@ -258,6 +260,39 @@ async fn log_page(
                 ApiError::new("journal_unavailable", "日志暂不可读")
             }
         })
+}
+
+#[derive(Default, Deserialize)]
+struct CalibrationQuery {
+    limit: Option<u32>,
+}
+
+async fn calibrations(
+    State(state): State<ApiState>,
+    query: Result<Query<CalibrationQuery>, QueryRejection>,
+) -> Result<Json<Vec<crate::calibration::Report>>, ApiError> {
+    let Query(query) =
+        query.map_err(|_| ApiError::new("invalid_calibration", "校准查询参数无效"))?;
+    let limit = query.limit.unwrap_or(20).clamp(1, 100) as usize;
+    tokio::task::spawn_blocking(move || state.journal.calibrations(limit))
+        .await
+        .map_err(|_| ApiError::new("journal_unavailable", "校准记录读取失败"))?
+        .map(Json)
+        .map_err(|_| ApiError::new("journal_unavailable", "校准记录暂不可读"))
+}
+async fn calibration(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<crate::calibration::Report>, ApiError> {
+    if id.len() > 100 {
+        return Err(ApiError::new("invalid_calibration", "校准编号无效"));
+    }
+    tokio::task::spawn_blocking(move || state.journal.calibration(&id))
+        .await
+        .map_err(|_| ApiError::new("journal_unavailable", "校准记录读取失败"))?
+        .map_err(|_| ApiError::new("journal_unavailable", "校准记录暂不可读"))?
+        .map(Json)
+        .ok_or_else(|| ApiError::new("calibration_not_found", "校准记录不存在"))
 }
 
 #[derive(Default, Deserialize)]
@@ -451,6 +486,168 @@ async fn stream(mut socket: WebSocket, state: ApiState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn calibration_history_requires_auth_and_invalid_start_cannot_move_a_device() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = Journal::start(directory.path().join("events.db")).unwrap();
+        let arm = ArmHandle::spawn(journal.clone()).unwrap();
+        let server = launch_at(
+            arm.clone(),
+            journal.clone(),
+            "calibration-api-test".into(),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await
+        .unwrap();
+        let base = server.base_url();
+        let client = reqwest::Client::new();
+        for path in ["/v1/calibrations", "/v1/calibrations/missing"] {
+            assert_eq!(
+                client
+                    .get(format!("{base}{path}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                client
+                    .get(format!("{base}{path}"))
+                    .bearer_auth("calibration-api-test")
+                    .header(header::ORIGIN, "https://other.invalid")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        let before = arm.snapshot();
+        let control: serde_json::Value = client
+            .post(format!("{base}/v1/control"))
+            .bearer_auth("calibration-api-test")
+            .json(&serde_json::json!({"action":"acquire","client_id":"calibration-api"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let response=client.post(format!("{base}/v1/commands")).bearer_auth("calibration-api-test").json(&serde_json::json!({
+            "request_id":"invalid-calibration","client_id":"calibration-api","lease_id":control["lease_id"],"generation":control["generation"],
+            "kind":"calibrate_start","settings":{"axis":9,"excursion":0.1,"speed":0.02,"max_friction":0.1}
+        })).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if arm
+                    .snapshot()
+                    .results
+                    .iter()
+                    .any(|r| r.request_id == "invalid-calibration" && r.status == "rejected")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let settings = crate::calibration::Settings {
+            axis: 1,
+            excursion: 0.1,
+            speed: 0.02,
+            max_friction: 0.1,
+        };
+        let report = crate::calibration::Report {
+            id: "history-api".into(),
+            request_id: "original-run".into(),
+            created_at_ms: 1000,
+            side: "right".into(),
+            port: "simulation".into(),
+            settings,
+            center_reference: [0.0; 7],
+            center_measured: [0.0; 7],
+            tcp: None,
+            baseline: crate::tuning::ServoTuning::default(),
+            recommended: None,
+            trials: vec![],
+            outcome: "cancelled".into(),
+            improvement: None,
+            message: "校准已取消".into(),
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if journal.record_calibration(&report) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            loop {
+                if journal
+                    .calibration("history-api")
+                    .is_ok_and(|r| r.is_some())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let list: Vec<crate::calibration::Report> = client
+            .get(format!("{base}/v1/calibrations?limit=20"))
+            .bearer_auth("calibration-api-test")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "history-api");
+        let detail: crate::calibration::Report = client
+            .get(format!("{base}/v1/calibrations/history-api"))
+            .bearer_auth("calibration-api-test")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(detail.request_id, "original-run");
+        assert_eq!(
+            client
+                .get(format!("{base}/v1/calibrations/missing"))
+                .bearer_auth("calibration-api-test")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            client
+                .get(format!("{base}/v1/calibrations?limit=oops"))
+                .bearer_auth("calibration-api-test")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let after = arm.snapshot();
+        assert_eq!(after.phase, before.phase);
+        assert_eq!(after.enabled, before.enabled);
+        assert_eq!(after.port, before.port);
+        assert!(after.action.is_none());
+        assert!(after.calibration.is_none());
+        assert!(arm.shutdown(Duration::from_millis(500)));
+        server.shutdown().await;
+        assert!(journal.shutdown(Duration::from_secs(2)));
+    }
     use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

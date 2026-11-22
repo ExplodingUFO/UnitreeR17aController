@@ -798,6 +798,8 @@ struct Committed {
 #[derive(Clone, Copy, Debug)]
 pub struct SentReference {
     pub at: Instant,
+    /// Host completion of the successful seven-packet write, not drive execution.
+    pub completed_at: Instant,
     pub generation: u64,
     pub epoch: u64,
     pub q: [f64; 7],
@@ -1168,6 +1170,7 @@ impl BusHandle {
                                     })
                                     .map(|r| SentReference {
                                         at: started,
+                                        completed_at: Instant::now(),
                                         generation: r.generation,
                                         epoch: r.epoch,
                                         q: prepared.values.map(|s| s.q),

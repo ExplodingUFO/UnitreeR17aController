@@ -48,6 +48,62 @@ export interface ServoTuning {
     JointTuning,
   ];
 }
+export interface CalibrationSettings {
+  axis: number;
+  excursion: number;
+  speed: number;
+  max_friction: number;
+}
+export interface CalibrationMetrics {
+  windows: number;
+  velocity_rms: number;
+  tracking_rms: number;
+  tracking_peak: number;
+  other_peak: number;
+  valid_ms: number;
+}
+export interface CalibrationTrial {
+  index: number;
+  phase: string;
+  config: ServoTuning;
+  metrics: CalibrationMetrics | null;
+}
+export interface CalibrationReport {
+  id: string;
+  request_id: string;
+  created_at_ms: number;
+  side: Side;
+  port: string | null;
+  settings: CalibrationSettings;
+  center_reference: JointPositions;
+  center_measured: JointPositions;
+  tcp: Pose | null;
+  baseline: ServoTuning;
+  recommended: ServoTuning | null;
+  trials: CalibrationTrial[];
+  outcome: "improved" | "unchanged" | "insufficient" | "cancelled" | "failed";
+  improvement: number | null;
+  message: string;
+}
+export interface CalibrationStatus {
+  id: string;
+  request_id: string;
+  state: "running" | "stopping" | "completed" | "cancelled" | "failed";
+  stage:
+    | "baseline"
+    | "candidate"
+    | "baseline_check"
+    | "validation"
+    | "restoring"
+    | "done";
+  axis: number;
+  trial_index: number;
+  trial_count: number;
+  leg_index: number;
+  leg_count: number;
+  progress: number;
+  report: CalibrationReport | null;
+}
 export const SERVO_TUNING_RANGES = {
   kd: [0, 30],
   velocity_ff: [0, 1],
@@ -134,6 +190,7 @@ export type Action = {
 } & (
   | { space: Space; mode: "continuous" | "step"; axis: number }
   | { space: "joint"; mode: "return"; axis: null }
+  | { space: "joint"; mode: "calibration"; axis: number }
 );
 export interface Snapshot {
   seq: number;
@@ -151,6 +208,7 @@ export interface Snapshot {
   servo_tuning_revision: number;
   feedback_age_ms: number | null;
   action: Action | null;
+  calibration?: CalibrationStatus | null;
   last_result: Result | null;
   results: Result[];
   error: { code: string; message: string } | null;
@@ -220,6 +278,19 @@ export interface CommandAck {
   request_id: string;
   status: "queued";
 }
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number | null = null,
+    readonly code: string | null = null,
+    readonly notQueued = status !== null &&
+      ((status >= 400 && status < 500 && status !== 408 && status !== 499) ||
+        (status === 503 && code === "closing")),
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
 export interface MotionArguments {
   space: Space;
   axis: number;
@@ -239,6 +310,8 @@ export type Operation =
   | ({ kind: "return_to_pose" } & ReturnToPoseArguments)
   | { kind: "configure_tcp"; tcp: Pose }
   | { kind: "configure_servo"; config: ServoTuning }
+  | { kind: "calibrate_start"; settings: CalibrationSettings }
+  | { kind: "calibrate_apply"; calibration_id: string }
   | ({
       kind: "jog_start";
       input_seq: number;
@@ -273,6 +346,7 @@ export const emptySnapshot: Snapshot = {
   servo_tuning_revision: 0,
   feedback_age_ms: null,
   action: null,
+  calibration: null,
   last_result: null,
   results: [],
   error: null,
@@ -325,6 +399,7 @@ class DesktopApi {
   private leaseEpoch = 0;
   private polling = false;
   private cancelReturn: (() => void) | null = null;
+  private calibrationRequest: { id: string; pending: boolean } | null = null;
   view: View = {
     snapshot: emptySnapshot,
     connectionEpoch: 0,
@@ -408,7 +483,11 @@ class DesktopApi {
         },
       );
       if (response.ok && options.download) return (await response.blob()) as T;
-      const text = await response.text();
+      const text = await response.text().catch((error) => {
+        if (!response.ok)
+          throw new ApiError(`HTTP ${response.status}`, response.status);
+        throw error;
+      });
       let data: unknown;
       try {
         data = JSON.parse(text);
@@ -418,25 +497,33 @@ class DesktopApi {
       if (!response.ok) {
         const fields =
           data && typeof data === "object"
-            ? (data as { message?: unknown; error?: unknown })
+            ? (data as { code?: unknown; message?: unknown; error?: unknown })
             : null;
         const nested =
           fields?.error && typeof fields.error === "object"
-            ? (fields.error as { message?: unknown }).message
+            ? (fields.error as { code?: unknown; message?: unknown })
             : null;
-        const message = [fields?.message, nested, fields?.error].find(
+        const message = [fields?.message, nested?.message, fields?.error].find(
           (value): value is string => typeof value === "string" && !!value,
         );
-        throw new Error(
-          message ??
-            (text.trim() && !text.trimStart().startsWith("<")
-              ? text
-              : `HTTP ${response.status}`),
+        const code = [fields?.code, nested?.code].find(
+          (value): value is string => typeof value === "string" && !!value,
+        );
+        throw new ApiError(
+          this.errorMessage(
+            message ??
+              (text.trim() && !text.trimStart().startsWith("<")
+                ? text
+                : `HTTP ${response.status}`),
+          ),
+          response.status,
+          code ? this.errorMessage(code) : null,
         );
       }
       return data as T;
     } catch (error) {
-      throw new Error(this.errorMessage(error));
+      if (error instanceof ApiError) throw error;
+      throw new ApiError(this.errorMessage(error));
     }
   }
   async readLogsPage(query: LogPageQuery, signal?: AbortSignal) {
@@ -461,6 +548,20 @@ class DesktopApi {
   async listTraces(limit = 20, signal?: AbortSignal) {
     return this.request<TraceSummary[]>(
       `/v1/traces?limit=${limit}`,
+      undefined,
+      { signal },
+    );
+  }
+  async listCalibrations(limit = 20, signal?: AbortSignal) {
+    return this.request<CalibrationReport[]>(
+      `/v1/calibrations?limit=${encodeURIComponent(String(limit))}`,
+      undefined,
+      { signal },
+    );
+  }
+  async readCalibration(id: string, signal?: AbortSignal) {
+    return this.request<CalibrationReport>(
+      `/v1/calibrations/${encodeURIComponent(id)}`,
       undefined,
       { signal },
     );
@@ -493,7 +594,7 @@ class DesktopApi {
       this.pollTimer = setInterval(() => void this.poll(), 1500);
   }
   dispose() {
-    if (this.cancelReturn)
+    if (this.cancelReturn || this.hasLocalCalibration())
       void this.hostStop("desktop_disposed").catch((error) => this.fail(error));
     this.stopped = true;
     this.clearJog();
@@ -516,6 +617,23 @@ class DesktopApi {
       servo_tuning: snapshot.servo_tuning ?? createServoTuning(),
       servo_tuning_revision: snapshot.servo_tuning_revision ?? 0,
     };
+    if (this.calibrationRequest) {
+      const id = this.calibrationRequest.id;
+      const result = snapshot.results?.find((item) => item.request_id === id);
+      const calibration = snapshot.calibration;
+      if (
+        connectionChanged ||
+        (result && result.status !== "accepted") ||
+        (calibration?.request_id === id &&
+          ["completed", "cancelled", "failed"].includes(calibration.state))
+      )
+        this.calibrationRequest = null;
+      else if (
+        snapshot.action?.request_id === id ||
+        calibration?.request_id === id
+      )
+        this.calibrationRequest.pending = false;
+    }
     if (this.lease && snapshot.owner?.client_id !== "desktop")
       this.dropLease(false);
     if (
@@ -558,7 +676,8 @@ class DesktopApi {
     };
     ws.onclose = () => {
       if (this.socket !== ws) return;
-      const active = !!this.jog || !!this.cancelReturn;
+      const active =
+        !!this.jog || !!this.cancelReturn || this.hasLocalCalibration();
       this.clearJog();
       this.dropLease(false);
       this.publish({ online: false, hasControl: false });
@@ -598,7 +717,8 @@ class DesktopApi {
     if (action === "release") {
       this.leaseEpoch++;
       if (this.renewTimer) clearTimeout(this.renewTimer);
-      await this.cancelJog("release_control");
+      if (this.hasLocalCalibration()) await this.hostStop("release_control");
+      else await this.cancelJog("release_control");
     }
     const epoch = this.leaseEpoch;
     const data = await this.request<ControlReply>("/v1/control", {
@@ -631,8 +751,11 @@ class DesktopApi {
       await this.control("renew");
     } catch (e) {
       if (epoch === this.leaseEpoch) {
+        const calibrationActive = this.hasLocalCalibration();
         this.dropLease();
-        await this.cancelJog("renew_failed").catch(() => {});
+        if (calibrationActive)
+          await this.hostStop("renew_failed").catch(() => {});
+        else await this.cancelJog("renew_failed").catch(() => {});
         this.fail(e);
       }
     } finally {
@@ -645,16 +768,31 @@ class DesktopApi {
     requestId: string = crypto.randomUUID(),
     generation = this.view.snapshot.generation,
   ) {
-    if (!this.view.online) throw new Error("未连接");
-    if (!this.lease || !this.view.hasControl) throw new Error("未持有控制权");
-    return this.request<CommandAck>("/v1/commands", {
-      ...params,
-      kind,
-      request_id: requestId,
-      client_id: "desktop",
-      lease_id: this.lease,
-      generation,
-    });
+    if (!this.view.online)
+      throw new ApiError("未连接", null, "not_connected", true);
+    if (!this.lease || !this.view.hasControl)
+      throw new ApiError("未持有控制权", null, "no_control", true);
+    if (kind === "calibrate_start")
+      this.calibrationRequest = { id: requestId, pending: true };
+    try {
+      return await this.request<CommandAck>("/v1/commands", {
+        ...params,
+        kind,
+        request_id: requestId,
+        client_id: "desktop",
+        lease_id: this.lease,
+        generation,
+      });
+    } catch (error) {
+      if (
+        error instanceof ApiError &&
+        error.notQueued &&
+        this.calibrationRequest?.id === requestId &&
+        this.calibrationRequest.pending
+      )
+        this.calibrationRequest = null;
+      throw error;
+    }
   }
   async configureServo(
     config: ServoTuning,
@@ -940,8 +1078,21 @@ class DesktopApi {
     this.clearJog();
     await this.hostStop(reason);
   }
+  private hasLocalCalibration() {
+    const request = this.calibrationRequest;
+    if (!request) return false;
+    const s = this.view.snapshot;
+    if (s.action)
+      return (
+        s.action.mode === "calibration" && s.action.request_id === request.id
+      );
+    if (s.calibration?.request_id === request.id)
+      return ["running", "stopping"].includes(s.calibration.state);
+    return request.pending && this.view.hasControl;
+  }
   async hostStop(reason = "unspecified") {
     this.clearJog();
+    this.calibrationRequest = null;
     this.cancelReturn?.();
     await invoke("host_stop", { reason });
   }

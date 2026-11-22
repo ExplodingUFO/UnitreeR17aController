@@ -2177,3 +2177,489 @@ summary:focus-visible {
     gap: 0;
   }
 }
+
+.calibration-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 21;
+  display: grid;
+  place-items: center;
+  padding: 56px 16px 16px;
+  background: var(--color-overlay);
+}
+.calibration-panel {
+  display: flex;
+  flex-direction: column;
+  width: 740px;
+  height: 456px;
+  max-width: 100%;
+  max-height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-panel);
+  box-shadow: 0 18px 60px #0005;
+}
+.calibration-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 52px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--color-rule);
+}
+.calibration-header > span {
+  flex: 1;
+  color: var(--color-muted);
+  font-size: 11px;
+}
+.calibration-stop {
+  border-color: var(--color-danger-border);
+  background: var(--color-danger-bg);
+  color: var(--color-primary-text);
+}
+.calibration-stop:hover:enabled {
+  background: var(--color-danger-hover);
+}
+.calibration-stop kbd {
+  margin-left: 8px;
+  font: inherit;
+  font-weight: 400;
+  opacity: 0.8;
+}
+.calibration-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--color-rule);
+}
+.calibration-tabs > button {
+  min-width: 66px;
+  height: 28px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--color-muted);
+}
+.calibration-tabs > button[aria-pressed="true"] {
+  background: var(--color-selected);
+  color: var(--color-primary-text);
+}
+.calibration-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 16px;
+}
+.calibration-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 54px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--color-rule);
+}
+.calibration-footer > span {
+  flex: 1;
+  min-width: 0;
+  color: var(--color-muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.calibration-close {
+  width: 28px;
+  padding: 0;
+  border-color: transparent;
+  background: transparent;
+  color: var(--color-muted);
+  font-size: 22px;
+  font-weight: 400;
+}
+.calibration-running-dot {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin: 0 0 2px 6px;
+  border-radius: 50%;
+  background: var(--color-success);
+}
+.calibration-settings {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+  gap: 28px;
+}
+.calibration-setup h3 {
+  margin-bottom: 10px;
+}
+.calibration-joints {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 4px;
+  margin-bottom: 20px;
+}
+.calibration-joints button {
+  height: 30px;
+  padding: 0;
+  border-color: var(--color-border);
+  background: transparent;
+  color: var(--color-muted);
+}
+.calibration-joints button[aria-pressed="true"] {
+  color: var(--color-primary-text);
+  background: var(--color-selected);
+  border-color: var(--color-focus);
+}
+.calibration-fields {
+  display: grid;
+  gap: 12px;
+}
+.calibration-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 132px;
+  gap: 12px;
+  align-items: center;
+}
+.calibration-field > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.calibration-field input {
+  width: 96px;
+  flex: 1;
+  font-family: var(--font-mono);
+}
+.calibration-field input[aria-invalid="true"] {
+  border-color: var(--color-danger);
+}
+.calibration-field > div > span {
+  width: 28px;
+  flex-shrink: 0;
+  color: var(--color-muted);
+  font-size: 11px;
+}
+.calibration-note {
+  margin: 16px 0 0;
+  color: var(--color-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.calibration-range {
+  padding: 16px 18px;
+  border: 1px solid var(--color-rule);
+  border-radius: 6px;
+  background: var(--scene-background);
+}
+.calibration-range > strong {
+  display: block;
+  margin-top: 8px;
+  font-size: 30px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.calibration-range > strong > span {
+  margin-left: 4px;
+  font-size: 16px;
+  color: var(--color-muted);
+}
+.calibration-range-track {
+  position: relative;
+  height: 6px;
+  margin-top: 24px;
+  background: var(--color-border);
+  border-radius: 4px;
+}
+.calibration-range-track > span {
+  position: absolute;
+  inset: 0 25%;
+  background: var(--color-focus);
+}
+.calibration-range-track > i {
+  position: absolute;
+  left: calc(50% - 1px);
+  top: -5px;
+  width: 2px;
+  height: 16px;
+  background: var(--color-primary-text);
+}
+.calibration-range-limits {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 8px;
+  color: var(--color-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.calibration-range > p {
+  margin: 16px 0 12px;
+  color: var(--color-muted);
+  font-size: 11px;
+}
+.calibration-range dl {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  font-size: 11px;
+}
+.calibration-range dl > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+.calibration-range dt {
+  color: var(--color-muted);
+}
+.calibration-range dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+.calibration-progress-heading,
+.calibration-result-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+.calibration-progress-heading h3,
+.calibration-result-heading h3 {
+  margin-top: 6px;
+  font-size: 18px;
+  font-weight: 500;
+}
+.calibration-progress-heading > strong {
+  font-size: 28px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.calibration-progress {
+  display: block;
+  width: 100%;
+  height: 6px;
+  margin: 24px 0 16px;
+  appearance: none;
+  border: 0;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--color-border);
+  accent-color: var(--color-focus);
+}
+.calibration-progress::-webkit-progress-bar {
+  background: var(--color-border);
+}
+.calibration-progress::-webkit-progress-value {
+  background: var(--color-focus);
+}
+.calibration-progress::-moz-progress-bar {
+  background: var(--color-focus);
+}
+.calibration-stages {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 11px;
+  color: var(--color-muted);
+}
+.calibration-stages li[data-active="true"] {
+  color: var(--color-focus);
+}
+.calibration-progress-facts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  margin: 28px 0 0;
+  padding: 16px 0;
+  border-block: 1px solid var(--color-rule);
+}
+.calibration-progress-facts dt {
+  margin-bottom: 8px;
+  color: var(--color-muted);
+  font-size: 11px;
+}
+.calibration-progress-facts dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+.calibration-improvement {
+  color: var(--color-success);
+  font-size: 24px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.calibration-improvement > small {
+  display: block;
+  margin-top: 2px;
+  text-align: right;
+  font-weight: 400;
+}
+.calibration-report-message {
+  margin: 12px 0;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.calibration-report-context {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  color: var(--color-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.calibration-detail-tabs {
+  display: flex;
+  gap: 4px;
+  margin: 16px 0 8px;
+}
+.calibration-detail-tabs button {
+  height: 26px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--color-muted);
+  font-size: 11px;
+}
+.calibration-detail-tabs button[aria-pressed="true"] {
+  background: var(--color-control);
+  color: var(--color-primary-text);
+}
+.calibration-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.calibration-table th,
+.calibration-table td {
+  padding: 6px 8px;
+  text-align: left;
+  border-bottom: 1px solid var(--color-rule);
+}
+.calibration-table th {
+  font-weight: 400;
+  color: var(--color-muted);
+}
+.calibration-table td[data-changed="true"] {
+  color: var(--color-focus);
+}
+.calibration-table small {
+  font-size: 10px;
+}
+.calibration-table thead {
+  background: var(--color-panel-alt);
+}
+.calibration-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.calibration-metrics {
+  min-width: 600px;
+}
+.calibration-metrics thead small {
+  display: block;
+  margin-top: 3px;
+}
+.calibration-history-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.calibration-history-toolbar > small {
+  flex: 1;
+  text-align: right;
+}
+.calibration-history-toolbar > button {
+  height: 28px;
+  font-size: 11px;
+}
+.calibration-history-list {
+  display: grid;
+  gap: 6px;
+}
+.calibration-history-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto 12px;
+  gap: 16px;
+  align-items: center;
+  width: 100%;
+  height: auto;
+  min-height: 54px;
+  padding: 10px 12px;
+  border-color: var(--color-rule);
+  background: transparent;
+  text-align: left;
+}
+.calibration-history-item > span:first-child {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.calibration-history-item > span:nth-child(2) {
+  font-size: 11px;
+  font-weight: 400;
+}
+.calibration-history-item > span:last-child {
+  color: var(--color-muted);
+  font-size: 18px;
+}
+.calibration-history-download {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+.calibration-empty {
+  padding: 32px 12px;
+  color: var(--color-muted);
+  text-align: center;
+  line-height: 1.6;
+}
+.calibration-empty h3 {
+  color: var(--color-text);
+}
+.calibration-empty p {
+  margin-bottom: 0;
+}
+.calibration-error,
+.calibration-footer > span[data-tone="error"] {
+  color: var(--color-danger);
+}
+.calibration-footer > span[data-tone="success"] {
+  color: var(--color-success);
+}
+@media (max-width: 600px) {
+  .calibration-backdrop {
+    padding-inline: 8px;
+  }
+  .calibration-panel {
+    height: 100%;
+  }
+  .calibration-header {
+    gap: 8px;
+    padding-inline: 12px;
+  }
+  .calibration-header > span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .calibration-settings {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+  }
+  .calibration-footer {
+    flex-wrap: wrap;
+    padding-inline: 12px;
+  }
+  .calibration-footer > span {
+    flex-basis: 100%;
+  }
+  .calibration-stages {
+    flex-wrap: wrap;
+  }
+  .calibration-history-item > span:first-child {
+    display: grid;
+    gap: 4px;
+  }
+}

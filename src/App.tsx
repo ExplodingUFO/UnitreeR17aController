@@ -5,6 +5,7 @@ import ApiPanel from "./ApiPanel";
 import TracePanel from "./TracePanel";
 import LogsPanel from "./LogsPanel";
 import ServoPanel from "./ServoPanel";
+import CalibrationPanel from "./CalibrationPanel";
 import { PanelDivider, usePanelLayout } from "./PanelLayout";
 import {
   api,
@@ -86,6 +87,7 @@ export default function App() {
   const pendingGeneration = useRef(0);
   const [tcpOpen, setTcpOpen] = useState(false);
   const [servoOpen, setServoOpen] = useState(false);
+  const [calibrationOpen, setCalibrationOpen] = useState(false);
   const [tcpFields, setTcpFields] = useState(["0", "0", "0", "0", "0", "0"]);
   const [interfaceOpen, setInterfaceOpen] = useState(false);
   const [safetyIntent, setSafetyIntent] = useState<SafetyIntent | null>(null);
@@ -332,6 +334,7 @@ export default function App() {
     cancel("safety_dialog");
     setTcpOpen(false);
     setServoOpen(false);
+    setCalibrationOpen(false);
     setInterfaceOpen(false);
     setSafetyIntent(intent);
   };
@@ -347,16 +350,26 @@ export default function App() {
     fn();
   };
   const openServo = () => {
+    if (s.action?.mode === "calibration") {
+      setCalibrationOpen(true);
+      return;
+    }
     cancel("servo_dialog");
     setTcpOpen(false);
     setInterfaceOpen(false);
     setServoOpen(true);
+  };
+  const openCalibration = () => {
+    cancel("calibration_dialog");
+    setServoOpen(false);
+    setCalibrationOpen(true);
   };
   const navigate = (next: Page) => {
     cancel("navigation");
     dismissSafety();
     setTcpOpen(false);
     setServoOpen(false);
+    setCalibrationOpen(false);
     setInterfaceOpen(false);
     setPage(next);
     location.hash = next;
@@ -370,6 +383,7 @@ export default function App() {
       setSafetyIntent(null);
       setTcpOpen(false);
       setServoOpen(false);
+      setCalibrationOpen(false);
       setInterfaceOpen(false);
       setPage(currentPage());
     };
@@ -1098,6 +1112,13 @@ export default function App() {
         open={servoOpen}
         blocked={busy || enableInProgress || !!motionPending || !!safetyIntent}
         onClose={() => setServoOpen(false)}
+        onStop={stop}
+        onCalibrate={openCalibration}
+      />
+      <CalibrationPanel
+        view={view}
+        open={calibrationOpen}
+        onClose={() => setCalibrationOpen(false)}
         onStop={stop}
       />
       {tcpOpen && (

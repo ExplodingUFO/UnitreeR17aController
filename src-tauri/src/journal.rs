@@ -2,9 +2,9 @@
 //! `log` accepts summaries, never credentials or per-frame telemetry; use `sample` for frames.
 //! Queue admission tries a mutex once; contention and overflow count as drops.
 //! Disk readers must run within `server`'s spawn_blocking boundary.
-use crate::trace::Recorder;
 pub use crate::trace::{TraceData, TraceRecording, TraceSummary};
-use rusqlite::{Connection, OpenFlags, params};
+use crate::{calibration::Report, trace::Recorder};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
@@ -18,6 +18,7 @@ use std::{
 };
 
 const CAPACITY: usize = 1024;
+const CALIBRATION_CAPACITY: usize = 8;
 const BATCH_SIZE: usize = 128;
 const CLOSED: usize = 1 << (usize::BITS - 1);
 const POLL: Duration = Duration::from_millis(10);
@@ -78,12 +79,16 @@ pub struct LogPage {
 
 struct State {
     queue: Mutex<VecDeque<LogRecord>>,
+    calibrations: Mutex<VecDeque<Report>>,
     // One atomic admission gate orders close against producers already in flight.
     gate: AtomicUsize,
     pending: AtomicU64,
     written: AtomicU64,
     dropped: AtomicU64,
     errors: AtomicU64,
+    calibration_pending: AtomicU64,
+    calibration_dropped: AtomicU64,
+    calibration_errors: AtomicU64,
     healthy: AtomicBool,
     abort: AtomicBool,
     done: AtomicBool,
@@ -93,11 +98,15 @@ impl Default for State {
     fn default() -> Self {
         Self {
             queue: Mutex::new(VecDeque::with_capacity(CAPACITY)),
+            calibrations: Mutex::new(VecDeque::with_capacity(CALIBRATION_CAPACITY)),
             gate: AtomicUsize::new(0),
             pending: AtomicU64::new(0),
             written: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             errors: AtomicU64::new(0),
+            calibration_pending: AtomicU64::new(0),
+            calibration_dropped: AtomicU64::new(0),
+            calibration_errors: AtomicU64::new(0),
             healthy: AtomicBool::new(false),
             abort: AtomicBool::new(false),
             done: AtomicBool::new(false),
@@ -193,6 +202,95 @@ impl Journal {
         // The queue retains its preallocated capacity; only the strings above allocate.
         s.pending.fetch_add(1, Ordering::Relaxed);
         queue.push_back(record);
+    }
+
+    /// Tries admission once; clones only after acquiring the lock and finding space.
+    /// No serialization, SQL, wait or wakeup; rejected calls leave the report with its caller.
+    /// False means close, contention, poisoning or a full preallocated report queue.
+    /// Report admission and persistence are accounted separately from event stats.
+    pub fn record_calibration(&self, report: &Report) -> bool {
+        let s = &self.0.state;
+        let previous = s.gate.fetch_add(1, Ordering::SeqCst);
+        let _admission = Admission(&s.gate);
+        if previous & CLOSED != 0 {
+            s.calibration_dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let Ok(mut queue) = s.calibrations.try_lock() else {
+            s.calibration_dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        if queue.len() >= CALIBRATION_CAPACITY {
+            s.calibration_dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let owned = report.clone();
+        s.calibration_pending.fetch_add(1, Ordering::Relaxed);
+        queue.push_back(owned);
+        true
+    }
+
+    /// Holds the report queue mutex for deterministic admission tests.
+    #[cfg(test)]
+    pub(crate) fn with_calibration_queue_locked<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _queue = self
+            .0
+            .state
+            .calibrations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        f()
+    }
+
+    /// Blocking read, including open and SQLite busy waits; use spawn_blocking.
+    /// Callers supply the usual default of 20; at most 100 reports are returned.
+    pub fn calibrations(&self, limit: usize) -> Result<Vec<Report>, String> {
+        let limit = limit.min(100);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let conn = self.calibration_reader()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT payloadJSON FROM calibrations ORDER BY created_at_ms DESC,id DESC LIMIT ?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([limit as i64], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.map(|row| {
+            let payload = row.map_err(|e| e.to_string())?;
+            serde_json::from_str(&payload).map_err(|e| format!("read calibration: {e}"))
+        })
+        .collect()
+    }
+
+    /// Blocking read; HTTP callers must use spawn_blocking.
+    pub fn calibration(&self, id: &str) -> Result<Option<Report>, String> {
+        let conn = self.calibration_reader()?;
+        let payload: Option<String> = conn
+            .query_row(
+                "SELECT payloadJSON FROM calibrations WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        payload
+            .map(|payload| {
+                serde_json::from_str(&payload).map_err(|e| format!("read calibration: {e}"))
+            })
+            .transpose()
+    }
+
+    fn calibration_reader(&self) -> Result<Connection, String> {
+        let conn = Connection::open_with_flags(
+            &self.0.path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| format!("open calibration reader: {e}"))?;
+        conn.busy_timeout(BUSY).map_err(|e| e.to_string())?;
+        Ok(conn)
     }
 
     /// Independent atomic samples, not a transactionally consistent snapshot.
@@ -323,7 +421,7 @@ impl Journal {
         })
     }
 
-    /// Application-close coordination only. True means every accepted event/sample
+    /// Application-close coordination only. True means every accepted event/report/sample
     /// was committed and both workers exited. False means a timeout or abandoned data.
     /// A blocked OS/SQLite call can outlive this return; no forced cancellation or join.
     pub fn shutdown(&self, timeout: Duration) -> bool {
@@ -384,6 +482,11 @@ fn open_writer(path: &Path) -> rusqlite::Result<Connection> {
              code TEXT NOT NULL,
              message TEXT NOT NULL,
              request_id TEXT
+         );
+         CREATE TABLE IF NOT EXISTS calibrations (
+             id TEXT PRIMARY KEY,
+             created_at_ms INTEGER NOT NULL,
+             payloadJSON TEXT NOT NULL
          );",
     )?;
     // Verify WAL actually took effect (e.g. reject :memory:, which cannot persist).
@@ -422,6 +525,28 @@ fn failed(s: &State) {
     s.healthy.store(false, Ordering::Release);
 }
 
+fn write_calibration(conn: &mut Connection, report: &Report) -> Result<(), String> {
+    // The writer owns this report; all producer and sample locks have been released.
+    // Serialize before opening the independent short report transaction.
+    let payload = serde_json::to_string(report).map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "INSERT INTO calibrations(id,created_at_ms,payloadJSON) VALUES(?1,?2,?3)
+         ON CONFLICT(id) DO UPDATE SET
+             created_at_ms=excluded.created_at_ms,payloadJSON=excluded.payloadJSON",
+        params![report.id, report.created_at_ms, payload],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM calibrations WHERE id IN (
+             SELECT id FROM calibrations ORDER BY created_at_ms DESC,id DESC LIMIT -1 OFFSET 100
+         )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
 fn backoff(s: &State, delay: Duration) {
     let start = Instant::now();
     while !s.abort.load(Ordering::Acquire) && start.elapsed() < delay {
@@ -433,6 +558,7 @@ fn writer(path: &Path, state: Arc<State>) {
     let s = &*state;
     let mut conn = None;
     let mut batch = Vec::with_capacity(BATCH_SIZE);
+    let mut calibration = None;
     let mut delay = Duration::from_millis(20);
     let mut checkpoint_at = Instant::now();
     loop {
@@ -446,8 +572,19 @@ fn writer(path: &Path, state: Arc<State>) {
             }
             s.dropped.fetch_add(count, Ordering::Relaxed);
             s.pending.fetch_sub(count, Ordering::Relaxed);
-            // Producers admitted just before close can still publish a final event.
-            if s.gate.load(Ordering::SeqCst) == CLOSED && s.pending.load(Ordering::Relaxed) == 0 {
+            let mut count = u64::from(calibration.take().is_some());
+            {
+                let mut queue = s.calibrations.lock().unwrap_or_else(|p| p.into_inner());
+                count += queue.len() as u64;
+                queue.clear();
+            }
+            s.calibration_dropped.fetch_add(count, Ordering::Relaxed);
+            s.calibration_pending.fetch_sub(count, Ordering::Relaxed);
+            // Producers admitted just before close can still publish a final record.
+            if s.gate.load(Ordering::SeqCst) == CLOSED
+                && s.pending.load(Ordering::Relaxed) == 0
+                && s.calibration_pending.load(Ordering::Relaxed) == 0
+            {
                 break;
             }
             thread::sleep(POLL);
@@ -478,6 +615,14 @@ fn writer(path: &Path, state: Arc<State>) {
                 batch.push(record);
             }
         }
+        if calibration.is_none() {
+            calibration = s
+                .calibrations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pop_front();
+        }
+        let idle = batch.is_empty() && calibration.is_none();
         if !batch.is_empty() {
             match write_batch(conn.as_mut().unwrap(), &batch) {
                 Ok(()) => {
@@ -496,12 +641,31 @@ fn writer(path: &Path, state: Arc<State>) {
                     continue;
                 }
             }
-        } else {
+        }
+        // Bound report work to one transaction per event batch so neither queue
+        // can monopolize a healthy writer. Retain the report across busy retries.
+        if let Some(report) = &calibration {
+            match write_calibration(conn.as_mut().unwrap(), report) {
+                Ok(()) => {
+                    s.calibration_pending.fetch_sub(1, Ordering::Relaxed);
+                    calibration = None;
+                    delay = Duration::from_millis(20);
+                }
+                Err(_) => {
+                    s.calibration_errors.fetch_add(1, Ordering::Relaxed);
+                    backoff(s, delay);
+                    delay = (delay * 2).min(Duration::from_secs(1));
+                    continue;
+                }
+            }
+        }
+        if idle {
             // Polling avoids producer-side notification and its hidden wakeup locks.
             thread::sleep(POLL);
         }
-        let closing =
-            s.gate.load(Ordering::SeqCst) == CLOSED && s.pending.load(Ordering::Relaxed) == 0;
+        let closing = s.gate.load(Ordering::SeqCst) == CLOSED
+            && s.pending.load(Ordering::Relaxed) == 0
+            && s.calibration_pending.load(Ordering::Relaxed) == 0;
         if closing || checkpoint_at.elapsed() >= Duration::from_secs(5) {
             // PASSIVE never waits for readers; outstanding WAL pages remain safe to reopen.
             if conn
@@ -553,6 +717,384 @@ mod tests {
             journal.stats().dropped == dropped
         });
         attempts
+    }
+
+    fn calibration_report(id: &str, created_at_ms: i64) -> crate::calibration::Report {
+        let baseline = crate::tuning::ServoTuning::default();
+        let mut recommended = baseline;
+        recommended.friction_enabled = true;
+        recommended.joints[2].coulomb = 0.25;
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "request_id": "calibration-request",
+            "created_at_ms": created_at_ms,
+            "side": "left",
+            "port": "test-port",
+            "settings": { "axis": 2, "excursion": 0.1, "speed": 0.02, "max_friction": 0.3 },
+            "center_reference": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            "center_measured": [0.01, 0.11, 0.21, 0.31, 0.41, 0.51, 0.61],
+            "tcp": { "translation": [0.01, 0.02, 0.03], "rotation": [0.0, 0.0, 0.0, 1.0] },
+            "baseline": baseline,
+            "recommended": recommended,
+            "trials": [{
+                "index": 0, "phase": "baseline", "config": baseline,
+                "metrics": {
+                    "windows": 12, "velocity_rms": 0.001, "tracking_rms": 0.002,
+                    "tracking_peak": 0.003, "other_peak": 0.0001, "valid_ms": 1600
+                }
+            }, { "index": 1, "phase": "candidate", "config": recommended, "metrics": null }],
+            "outcome": "improved",
+            "improvement": 0.15,
+            "message": "低速报告，含引号 ' 与换行\n完整保存"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn borrowed_calibration_retries_after_contention_and_keeps_an_owned_persisted_copy() {
+        let dir = tempdir().unwrap();
+        let journal = Journal::start(dir.path().join("events.sqlite3")).unwrap();
+        wait_for(|| journal.stats().healthy);
+        let mut report = calibration_report("borrowed-retry", 1234);
+        let expected = serde_json::to_value(&report).unwrap();
+        thread::scope(|scope| {
+            let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+            let (producer, completed) = journal.with_calibration_queue_locked(|| {
+                let borrowed = &report;
+                let worker = &journal;
+                let producer = scope.spawn(move || {
+                    completed_tx
+                        .send(worker.record_calibration(borrowed))
+                        .unwrap();
+                });
+                let completed = completed_rx.recv_timeout(Duration::from_secs(1));
+                (producer, completed)
+            });
+            producer.join().unwrap();
+            assert!(!completed.expect("borrowed report waited for the queue mutex"));
+        });
+        assert_eq!(serde_json::to_value(&report).unwrap(), expected);
+        let stats = journal.stats();
+        assert_eq!(
+            (stats.written, stats.pending, stats.dropped, stats.errors),
+            (0, 0, 0, 0)
+        );
+        wait_for(|| journal.record_calibration(&report));
+        // The caller keeps its report, while admission captures an independent copy.
+        report.message = "caller changed its report after admission".into();
+        report.trials.clear();
+        assert!(journal.shutdown(Duration::from_secs(2)));
+        assert_eq!(
+            serde_json::to_value(journal.calibration(&report.id).unwrap().unwrap()).unwrap(),
+            expected
+        );
+        let stats = journal.stats();
+        assert_eq!(
+            (stats.written, stats.pending, stats.dropped, stats.errors),
+            (0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn borrowed_calibration_close_while_queue_locked_is_bounded_and_keeps_event_counts() {
+        let dir = tempdir().unwrap();
+        let journal = Journal::start(dir.path().join("events.sqlite3")).unwrap();
+        wait_for(|| journal.stats().healthy);
+        let report = calibration_report("borrowed-close", 1234);
+        let expected = serde_json::to_value(&report).unwrap();
+        thread::scope(|scope| {
+            let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+            let (closer, completed) = journal.with_calibration_queue_locked(|| {
+                let borrowed = &report;
+                let worker = &journal;
+                let closer = scope.spawn(move || {
+                    let start = Instant::now();
+                    let _ = worker.shutdown(Duration::from_millis(15));
+                    let accepted = worker.record_calibration(borrowed);
+                    completed_tx.send((accepted, start.elapsed())).unwrap();
+                });
+                let completed = completed_rx.recv_timeout(Duration::from_secs(1));
+                (closer, completed)
+            });
+            closer.join().unwrap();
+            let (accepted, elapsed) =
+                completed.expect("close or late admission waited for the queue mutex");
+            assert!(!accepted);
+            assert!(elapsed < Duration::from_millis(250));
+        });
+        wait_for(|| journal.0.state.done.load(Ordering::Acquire));
+        assert!(!journal.record_calibration(&report));
+        assert_eq!(serde_json::to_value(&report).unwrap(), expected);
+        assert!(journal.calibration(&report.id).unwrap().is_none());
+        let stats = journal.stats();
+        assert_eq!(
+            (stats.written, stats.pending, stats.dropped, stats.errors),
+            (0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn calibration_report_flushes_on_shutdown_and_survives_reopen_without_event_counts() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nested/events.sqlite3");
+        let journal = Journal::start(path.clone()).unwrap();
+        let attempts = log_until_queued(&journal, || {
+            journal.log("info", "app", "event", "event alongside report", None);
+        });
+        let report = calibration_report("report-1", 1234);
+        wait_for(|| journal.record_calibration(&report));
+        assert!(journal.shutdown(Duration::from_secs(8)));
+        let stats = journal.stats();
+        assert_eq!((stats.written, stats.pending, stats.errors), (1, 0, 0));
+        assert_eq!(stats.dropped, attempts - 1);
+        assert_eq!(journal.recent(20).unwrap().len(), 1);
+        drop(journal);
+
+        let reopened = Journal::start(path).unwrap();
+        wait_for(|| reopened.stats().healthy);
+        let saved = reopened.calibration("report-1").unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(saved).unwrap(),
+            serde_json::to_value(&report).unwrap()
+        );
+        let history = reopened.calibrations(20).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].id, "report-1");
+        assert!(reopened.calibration("missing").unwrap().is_none());
+        let stats = reopened.stats();
+        assert_eq!(
+            (stats.written, stats.pending, stats.dropped, stats.errors),
+            (0, 0, 0, 0)
+        );
+        assert!(reopened.shutdown(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn calibration_history_retains_newest_orders_ties_and_upserts_literal_ids() {
+        let dir = tempdir().unwrap();
+        let journal = Journal::start(dir.path().join("events.sqlite3")).unwrap();
+        // Insert newest first: retention must use report time and ID, not insertion order.
+        for i in (0..105).rev() {
+            let report = calibration_report(&format!("calibration-{i:03}"), 1000 + i / 2);
+            wait_for(|| journal.record_calibration(&report));
+        }
+        let marker = calibration_report("marker", 10_000);
+        wait_for(|| journal.record_calibration(&marker));
+        wait_for(|| journal.calibration("marker").is_ok_and(|r| r.is_some()));
+        let history = journal.calibrations(usize::MAX).unwrap();
+        assert_eq!(history.len(), 100);
+        assert_eq!(history[0].id, "marker");
+        assert_eq!(history[1].id, "calibration-104");
+        assert_eq!(history[2].id, "calibration-103");
+        assert_eq!(history[3].id, "calibration-102");
+        assert_eq!(history[99].id, "calibration-006");
+        assert!(journal.calibration("calibration-005").unwrap().is_none());
+        let first_page = journal.calibrations(20).unwrap();
+        assert_eq!(first_page.len(), 20);
+        assert_eq!(first_page[19].id, "calibration-086");
+        assert!(journal.calibrations(0).unwrap().is_empty());
+
+        let mut updated = calibration_report("calibration-100", 20_000);
+        updated.message = "updated report".into();
+        updated.recommended = None;
+        wait_for(|| journal.record_calibration(&updated));
+        wait_for(|| {
+            journal
+                .calibration("calibration-100")
+                .is_ok_and(|r| r.is_some_and(|r| r.message == "updated report"))
+        });
+        assert_eq!(journal.calibrations(usize::MAX).unwrap().len(), 100);
+        let newest = journal.calibrations(2).unwrap();
+        assert_eq!(newest[0].id, "calibration-100");
+        assert_eq!(newest[0].created_at_ms, 20_000);
+        assert!(newest[0].recommended.is_none());
+        assert_eq!(newest[1].id, "marker");
+
+        let literal = calibration_report("quote' OR 1=1 --", 30_000);
+        wait_for(|| journal.record_calibration(&literal));
+        assert!(journal.shutdown(Duration::from_secs(8)));
+        assert!(journal.calibration("unknown' OR 1=1 --").unwrap().is_none());
+        assert_eq!(
+            journal.calibration(&literal.id).unwrap().unwrap().id,
+            literal.id
+        );
+        assert_eq!(journal.calibrations(1).unwrap()[0].id, literal.id);
+        assert_eq!(journal.calibrations(usize::MAX).unwrap().len(), 100);
+        assert!(journal.calibration("calibration-006").unwrap().is_none());
+        let stats = journal.stats();
+        assert_eq!(
+            (stats.written, stats.pending, stats.dropped, stats.errors),
+            (0, 0, 0, 0)
+        );
+        assert!(journal.recent(20).unwrap().is_empty());
+    }
+
+    #[test]
+    fn calibration_contention_and_closed_admission_reject_without_waiting_or_event_counts() {
+        let dir = tempdir().unwrap();
+        let journal = Journal::start(dir.path().join("events.sqlite3")).unwrap();
+        wait_for(|| journal.stats().healthy);
+        let queue = journal.0.state.calibrations.lock().unwrap();
+        let worker = journal.clone();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let producer = thread::spawn(move || {
+            let report = calibration_report("contended", 1);
+            let accepted = (0..100)
+                .filter(|_| worker.record_calibration(&report))
+                .count();
+            completed_tx.send(accepted).unwrap();
+        });
+        let completed = completed_rx.recv_timeout(Duration::from_secs(1));
+        drop(queue);
+        producer.join().unwrap();
+        assert_eq!(
+            completed.expect("report producer waited for the queue mutex"),
+            0
+        );
+        assert!(journal.shutdown(Duration::from_secs(2)));
+        let queue = journal.0.state.calibrations.lock().unwrap();
+        assert!(!journal.record_calibration(&calibration_report("closed", 2)));
+        assert!(queue.is_empty());
+        assert_eq!(
+            journal.0.state.calibration_pending.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            journal.0.state.calibration_dropped.load(Ordering::Relaxed),
+            101
+        );
+        let stats = journal.stats();
+        assert_eq!(
+            (stats.written, stats.pending, stats.dropped, stats.errors),
+            (0, 0, 0, 0)
+        );
+        assert!(journal.calibrations(20).unwrap().is_empty());
+    }
+
+    #[test]
+    fn calibration_busy_database_saturates_without_blocking_and_recovers_accepted_reports() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.sqlite3");
+        let journal = Journal::start(path.clone()).unwrap();
+        let event_attempts = log_until_queued(&journal, || {
+            journal.log("info", "app", "initial", "one event", None);
+        });
+        wait_for(|| journal.stats().written == 1);
+        let locker = Connection::open(&path).unwrap();
+        locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let worker = journal.clone();
+        let mut report = calibration_report("busy", 1234);
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let producer = thread::spawn(move || {
+            let mut accepted = Vec::new();
+            for i in 0..10_000 {
+                report.id = format!("busy-{i}");
+                if worker.record_calibration(&report) {
+                    accepted.push(report.id.clone());
+                }
+            }
+            completed_tx.send(accepted).unwrap();
+        });
+        let completed = completed_rx.recv_timeout(Duration::from_secs(2));
+        // Always release the database before joining a regressed blocking producer.
+        if completed.is_err() {
+            locker.execute_batch("ROLLBACK").unwrap();
+        }
+        producer.join().unwrap();
+        let accepted = completed.expect("report producer waited for SQLite or queue space");
+        assert!(!accepted.is_empty());
+        assert!(accepted.len() <= CALIBRATION_CAPACITY + 1);
+        wait_for(|| journal.0.state.calibration_errors.load(Ordering::Relaxed) > 0);
+        assert_eq!(
+            journal.0.state.calibration_pending.load(Ordering::Relaxed),
+            accepted.len() as u64
+        );
+        assert_eq!(
+            journal.0.state.calibration_dropped.load(Ordering::Relaxed),
+            10_000 - accepted.len() as u64
+        );
+        let stats = journal.stats();
+        assert_eq!(
+            (stats.written, stats.pending, stats.dropped, stats.errors),
+            (1, 0, event_attempts - 1, 0)
+        );
+        assert!(journal.calibrations(20).unwrap().is_empty());
+        locker.execute_batch("ROLLBACK").unwrap();
+        wait_for(|| {
+            journal
+                .calibrations(100)
+                .is_ok_and(|r| r.len() == accepted.len())
+        });
+        assert!(journal.shutdown(Duration::from_secs(2)));
+        let saved: std::collections::HashSet<_> = journal
+            .calibrations(100)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(saved, accepted.into_iter().collect());
+        assert_eq!(
+            journal.0.state.calibration_pending.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(journal.recent(20).unwrap().len(), 1);
+        let stats = journal.stats();
+        assert_eq!(
+            (stats.written, stats.pending, stats.dropped, stats.errors),
+            (1, 0, event_attempts - 1, 0)
+        );
+    }
+
+    #[test]
+    fn calibration_shutdown_timeout_accounts_abandoned_reports_and_drop_never_joins() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.sqlite3");
+        let journal = Journal::start(path.clone()).unwrap();
+        wait_for(|| journal.stats().healthy);
+        let locker = Connection::open(&path).unwrap();
+        locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let active = calibration_report("active", 1);
+        wait_for(|| journal.record_calibration(&active));
+        wait_for(|| journal.0.state.calibration_errors.load(Ordering::Relaxed) > 0);
+        let queued = calibration_report("queued", 2);
+        wait_for(|| journal.record_calibration(&queued));
+        let rejected = journal.0.state.calibration_dropped.load(Ordering::Relaxed);
+        let start = Instant::now();
+        assert!(!journal.shutdown(Duration::from_millis(15)));
+        assert!(start.elapsed() < Duration::from_millis(250));
+        assert!(!journal.record_calibration(&calibration_report("closed", 3)));
+        wait_for(|| journal.0.state.done.load(Ordering::Acquire));
+        assert_eq!(
+            journal.0.state.calibration_pending.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            journal.0.state.calibration_dropped.load(Ordering::Relaxed),
+            rejected + 3
+        );
+        assert!(journal.calibrations(20).unwrap().is_empty());
+        let stats = journal.stats();
+        assert_eq!(
+            (stats.written, stats.pending, stats.dropped, stats.errors),
+            (0, 0, 0, 0)
+        );
+        locker.execute_batch("ROLLBACK").unwrap();
+
+        let second = Journal::start(path).unwrap();
+        wait_for(|| second.stats().healthy);
+        locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        wait_for(|| second.record_calibration(&active));
+        wait_for(|| second.0.state.calibration_errors.load(Ordering::Relaxed) > 0);
+        let state = second.0.state.clone();
+        let start = Instant::now();
+        drop(second);
+        assert!(start.elapsed() < Duration::from_millis(100));
+        wait_for(|| state.done.load(Ordering::Acquire));
+        assert_eq!(state.calibration_pending.load(Ordering::Relaxed), 0);
+        assert_eq!(state.pending.load(Ordering::Relaxed), 0);
+        assert_eq!(state.dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(state.errors.load(Ordering::Relaxed), 0);
+        locker.execute_batch("ROLLBACK").unwrap();
     }
 
     #[test]
