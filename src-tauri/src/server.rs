@@ -263,36 +263,93 @@ async fn log_page(
 }
 
 #[derive(Default, Deserialize)]
-struct CalibrationQuery {
+struct CalibrationListQuery {
     limit: Option<u32>,
 }
 
 async fn calibrations(
     State(state): State<ApiState>,
-    query: Result<Query<CalibrationQuery>, QueryRejection>,
-) -> Result<Json<Vec<crate::calibration::Report>>, ApiError> {
+    query: Result<Query<CalibrationListQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
     let Query(query) =
         query.map_err(|_| ApiError::new("invalid_calibration", "校准查询参数无效"))?;
     let limit = query.limit.unwrap_or(20).clamp(1, 100) as usize;
-    tokio::task::spawn_blocking(move || state.journal.calibrations(limit))
-        .await
-        .map_err(|_| ApiError::new("journal_unavailable", "校准记录读取失败"))?
-        .map(Json)
-        .map_err(|_| ApiError::new("journal_unavailable", "校准记录暂不可读"))
+    let body = tokio::task::spawn_blocking(move || {
+        let reports = state.journal.calibrations(limit)?;
+        serde_json::to_vec(&reports).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| ApiError::new("journal_unavailable", "校准记录读取失败"))?
+    .map_err(|_| ApiError::new("journal_unavailable", "校准记录暂不可读"))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response())
 }
+
+#[derive(Default, Deserialize)]
+struct CalibrationQuery {
+    points: Option<usize>,
+    download: Option<bool>,
+}
+
 async fn calibration(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-) -> Result<Json<crate::calibration::Report>, ApiError> {
-    if id.len() > 100 {
-        return Err(ApiError::new("invalid_calibration", "校准编号无效"));
-    }
-    tokio::task::spawn_blocking(move || state.journal.calibration(&id))
-        .await
-        .map_err(|_| ApiError::new("journal_unavailable", "校准记录读取失败"))?
-        .map_err(|_| ApiError::new("journal_unavailable", "校准记录暂不可读"))?
-        .map(Json)
-        .ok_or_else(|| ApiError::new("calibration_not_found", "校准记录不存在"))
+    query: Result<Query<CalibrationQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(query) =
+        query.map_err(|_| ApiError::new("invalid_calibration", "校准查询参数无效"))?;
+    tokio::task::spawn_blocking(move || {
+        let report = state
+            .journal
+            .calibration(&id)
+            .map_err(|_| ApiError::new("journal_unavailable", "校准记录暂不可读"))?
+            .ok_or_else(|| ApiError::new("calibration_not_found", "校准记录不存在"))?;
+        let download = query.download.unwrap_or(false);
+        let report = if download {
+            report
+        } else {
+            report.for_plot(query.points.unwrap_or(3000))
+        };
+        let body = serde_json::to_vec(&report)
+            .map_err(|_| ApiError::new("journal_unavailable", "校准记录编码失败"))?;
+        let mut response = (
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            body,
+        )
+            .into_response();
+        if download {
+            // Only the suggested filename is normalized; report IDs remain literal SQL values.
+            let filename: String = report
+                .id
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            response.headers_mut().insert(
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"calibration-{filename}.json\"")
+                    .parse()
+                    .map_err(|_| ApiError::new("journal_unavailable", "校准附件编码失败"))?,
+            );
+        }
+        Ok(response)
+    })
+    .await
+    .map_err(|_| ApiError::new("journal_unavailable", "校准记录读取失败"))?
 }
 
 #[derive(Default, Deserialize)]
@@ -487,6 +544,49 @@ async fn stream(mut socket: WebSocket, state: ApiState) {
 mod tests {
     use super::*;
 
+    fn calibration_report(sample_count: usize) -> crate::calibration::Report {
+        crate::calibration::Report {
+            id: "history-api".into(),
+            request_id: "original-run".into(),
+            created_at_ms: 1000,
+            side: "right".into(),
+            port: "simulation".into(),
+            settings: crate::calibration::Settings {
+                axis: Some(1),
+                excursion: 0.1,
+                speed: 0.02,
+                max_friction: 0.1,
+            },
+            center_reference: [0.0; 7],
+            center_measured: [0.0; 7],
+            tcp: None,
+            baseline: crate::tuning::ServoTuning::default(),
+            recommended: None,
+            trials: vec![],
+            choices: vec![],
+            sample_count,
+            curves: Arc::new(
+                (0..sample_count)
+                    .map(|i| crate::calibration::Point {
+                        t_ms: i as u32 * 20,
+                        trial: usize::from(i >= sample_count / 2),
+                        axis: 1,
+                        reference: [(i % 32) as f64 / 1024.0; 7],
+                        command: (i % 3 != 0).then_some([(i % 32) as f64 / 1024.0; 7]),
+                        feedback: [((i % 32) as f64 - 1.0) / 1024.0; 7],
+                        velocity: [1.0 / 128.0; 7],
+                        feedback_velocity: [3.0 / 256.0; 7],
+                        feedback_age_ms: [2; 7],
+                        command_at_ms: (i % 3 != 0).then_some(i as u32 * 20),
+                    })
+                    .collect(),
+            ),
+            outcome: "cancelled".into(),
+            improvement: None,
+            message: "校准已取消".into(),
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn calibration_history_requires_auth_and_invalid_start_cannot_move_a_device() {
         let directory = tempfile::tempdir().unwrap();
@@ -502,7 +602,11 @@ mod tests {
         .unwrap();
         let base = server.base_url();
         let client = reqwest::Client::new();
-        for path in ["/v1/calibrations", "/v1/calibrations/missing"] {
+        for path in [
+            "/v1/calibrations",
+            "/v1/calibrations/missing",
+            "/v1/calibrations/history-api?download=true&points=1",
+        ] {
             assert_eq!(
                 client
                     .get(format!("{base}{path}"))
@@ -555,29 +659,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let settings = crate::calibration::Settings {
-            axis: 1,
-            excursion: 0.1,
-            speed: 0.02,
-            max_friction: 0.1,
-        };
-        let report = crate::calibration::Report {
-            id: "history-api".into(),
-            request_id: "original-run".into(),
-            created_at_ms: 1000,
-            side: "right".into(),
-            port: "simulation".into(),
-            settings,
-            center_reference: [0.0; 7],
-            center_measured: [0.0; 7],
-            tcp: None,
-            baseline: crate::tuning::ServoTuning::default(),
-            recommended: None,
-            trials: vec![],
-            outcome: "cancelled".into(),
-            improvement: None,
-            message: "校准已取消".into(),
-        };
+        let report = calibration_report(0);
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if journal.record_calibration(&report) {
@@ -648,6 +730,186 @@ mod tests {
         server.shutdown().await;
         assert!(journal.shutdown(Duration::from_secs(2)));
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn calibration_plot_export_and_read_errors_do_not_issue_commands() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.db");
+        let journal = Journal::start(path.clone()).unwrap();
+        let report = calibration_report(6001);
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while !journal.record_calibration(&report) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            while !journal
+                .calibration(&report.id)
+                .is_ok_and(|saved| saved.is_some())
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("calibration fixture did not commit");
+        let arm = ArmHandle::spawn(journal.clone()).unwrap();
+        let token = "calibration-read-only";
+        let server = launch_at(
+            arm.clone(),
+            journal.clone(),
+            token.into(),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await
+        .unwrap();
+        let base = server.base_url();
+        let client = reqwest::Client::new();
+        let before = serde_json::to_value(arm.snapshot()).unwrap();
+        let response = client
+            .get(format!("{base}/v1/calibrations"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let summary = response.bytes().await.unwrap();
+        let history: Vec<crate::calibration::Report> = serde_json::from_slice(&summary).unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(history[0].curves.is_empty());
+        assert_eq!(history[0].sample_count, report.sample_count);
+        assert!(summary.len() * 50 < serde_json::to_vec(&report).unwrap().len());
+        for (query, points, download) in [
+            ("", 3000, false),
+            ("?points=41", 41, false),
+            ("?points=0", 0, false),
+            ("?points=90001&download=false", 90001, false),
+            ("?points=1&download=true", 0, true),
+            ("?download=true", 0, true),
+        ] {
+            let response = client
+                .get(format!("{base}/v1/calibrations/{}{query}", report.id))
+                .bearer_auth(token)
+                .header(header::ORIGIN, "http://localhost:1420")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{query}");
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            if download {
+                assert_eq!(
+                    response.headers()[header::CONTENT_DISPOSITION],
+                    "attachment; filename=\"calibration-history-api.json\""
+                );
+            } else {
+                assert!(!response.headers().contains_key(header::CONTENT_DISPOSITION));
+            }
+            let saved: crate::calibration::Report = response.json().await.unwrap();
+            let expected = report.for_plot(points);
+            assert_eq!(saved.sample_count, 6001);
+            assert_eq!(
+                serde_json::to_value(saved.summary()).unwrap(),
+                serde_json::to_value(expected.summary()).unwrap(),
+                "{query}"
+            );
+            assert_eq!(saved.curves.len(), expected.curves.len(), "{query}");
+            for (i, (saved, expected)) in
+                saved.curves.iter().zip(expected.curves.iter()).enumerate()
+            {
+                assert_eq!(
+                    serde_json::to_value(saved).unwrap(),
+                    serde_json::to_value(expected).unwrap(),
+                    "{query}: curve sample {i}"
+                );
+            }
+        }
+        for query in ["?points=oops", "?points=-1", "?download=oops"] {
+            let response = client
+                .get(format!("{base}/v1/calibrations/{}{query}", report.id))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response.json::<serde_json::Value>().await.unwrap()["code"],
+                "invalid_calibration"
+            );
+        }
+        let response = client
+            .get(format!("{base}/v1/calibrations/{}", "x".repeat(101)))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["code"],
+            "calibration_not_found"
+        );
+
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute(
+            "UPDATE calibration_curves SET payloadJSON='broken json'",
+            [],
+        )
+        .unwrap();
+        let response = client
+            .get(format!("{base}/v1/calibrations"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let history: Vec<crate::calibration::Report> = response.json().await.unwrap();
+        assert!(history[0].curves.is_empty());
+        assert_eq!(history[0].sample_count, 6001);
+        for query in ["", "?download=true"] {
+            let response = client
+                .get(format!("{base}/v1/calibrations/{}{query}", report.id))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                response.json::<serde_json::Value>().await.unwrap()["code"],
+                "journal_unavailable"
+            );
+        }
+        conn.execute_batch("DROP TABLE calibrations").unwrap();
+        for endpoint in ["calibrations", "calibrations/missing"] {
+            let response = client
+                .get(format!("{base}/v1/{endpoint}"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                response.json::<serde_json::Value>().await.unwrap()["code"],
+                "journal_unavailable"
+            );
+        }
+        let after = serde_json::to_value(arm.snapshot()).unwrap();
+        for key in [
+            "generation",
+            "phase",
+            "side",
+            "port",
+            "enabled",
+            "owner",
+            "action",
+            "calibration",
+            "last_result",
+            "results",
+        ] {
+            assert_eq!(before[key], after[key], "calibration read changed {key}");
+        }
+        assert!(arm.shutdown(Duration::from_millis(500)));
+        server.shutdown().await;
+        assert!(journal.shutdown(Duration::from_secs(2)));
+    }
+
     use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

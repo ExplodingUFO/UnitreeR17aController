@@ -2,173 +2,30 @@
 
 use crate::tuning::ServoTuning;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::VecDeque,
-    time::{Duration, Instant},
-};
-
-const STILL_WINDOW: Duration = Duration::from_millis(300);
-const STILL_MAX_GAP: Duration = Duration::from_millis(100);
-const STILL_CAPACITY: usize = 128;
-const STILL_POSITION_LIMIT: f64 = 0.001;
-
-#[derive(Clone, Debug, Serialize)]
-pub struct Readiness {
-    pub state: &'static str,
-    pub code: String,
-    pub message: String,
-    pub joint: Option<usize>,
-    pub observed_ms: u64,
-    pub required_ms: u64,
-    pub position_span: Option<f64>,
-    pub position_limit: f64,
-}
-
-impl Readiness {
-    pub fn unavailable(code: &str, message: impl Into<String>) -> Self {
-        Self {
-            state: "unavailable",
-            code: code.into(),
-            message: message.into(),
-            joint: None,
-            observed_ms: 0,
-            required_ms: STILL_WINDOW.as_millis() as u64,
-            position_span: None,
-            position_limit: STILL_POSITION_LIMIT,
-        }
-    }
-    pub fn ready(&self) -> bool {
-        self.state == "ready"
-    }
-}
-
-#[derive(Clone, Copy)]
-struct PositionObservation {
-    at: Instant,
-    q: f64,
-}
-
-/// Bounded position history for every received joint, not UI/control snapshots.
-/// This observes holding stability; it never filters or modifies device feedback.
-pub struct Stillness {
-    joints: [VecDeque<PositionObservation>; 7],
-}
-
-impl Default for Stillness {
-    fn default() -> Self {
-        Self {
-            joints: std::array::from_fn(|_| VecDeque::with_capacity(STILL_CAPACITY)),
-        }
-    }
-}
-
-impl Stillness {
-    pub fn clear(&mut self) {
-        for joint in &mut self.joints {
-            joint.clear();
-        }
-    }
-    pub fn observe(&mut self, joint: usize, q: f64, at: Instant) {
-        let Some(history) = self.joints.get_mut(joint) else {
-            return;
-        };
-        if !q.is_finite() {
-            history.clear();
-            return;
-        }
-        if history
-            .back()
-            .is_some_and(|last| at <= last.at || at.duration_since(last.at) > STILL_MAX_GAP)
-        {
-            history.clear();
-        }
-        if history.len() == STILL_CAPACITY {
-            history.pop_front();
-        }
-        history.push_back(PositionObservation { at, q });
-        if let Some(cutoff) = at.checked_sub(STILL_WINDOW) {
-            // Keep the sample at/before the beginning: shorter coverage cannot
-            // pass merely because the retained samples have a small span.
-            while history.len() > 1 && history.get(1).is_some_and(|sample| sample.at <= cutoff) {
-                history.pop_front();
-            }
-        }
-    }
-    pub fn status(&self, now: Instant) -> Readiness {
-        let mut result = Readiness::unavailable("feedback_missing", "等待七轴位置反馈");
-        let mut observed_ms = u64::MAX;
-        let mut worst = (0usize, 0.0_f64);
-        for (joint, history) in self.joints.iter().enumerate() {
-            let Some(last) = history.back() else {
-                result.joint = Some(joint);
-                result.message = format!("等待 J{} 位置反馈", joint + 1);
-                return result;
-            };
-            if now
-                .checked_duration_since(last.at)
-                .is_none_or(|age| age > STILL_MAX_GAP)
-            {
-                result.code = "feedback_stale".into();
-                result.joint = Some(joint);
-                result.message = format!("等待 J{} 最新位置反馈", joint + 1);
-                return result;
-            }
-            let first = history.front().unwrap();
-            observed_ms = observed_ms.min(
-                last.at
-                    .duration_since(first.at)
-                    .as_millis()
-                    .min(u64::MAX as u128) as u64,
-            );
-            let (low, high) = history
-                .iter()
-                .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), sample| {
-                    (low.min(sample.q), high.max(sample.q))
-                });
-            let span = high - low;
-            if !span.is_finite() {
-                result.code = "invalid_feedback".into();
-                result.message = format!("J{} 位置反馈无效", joint + 1);
-                result.joint = Some(joint);
-                return result;
-            }
-            if span > worst.1 {
-                worst = (joint, span);
-            }
-        }
-        result.observed_ms = observed_ms.min(result.required_ms);
-        result.joint = Some(worst.0);
-        result.position_span = Some(worst.1);
-        if worst.1 > STILL_POSITION_LIMIT {
-            result.state = "moving";
-            result.code = "position_moving".into();
-            result.message = format!("J{} 位置仍在变化，等待停稳", worst.0 + 1);
-        } else if observed_ms < result.required_ms {
-            result.state = "settling";
-            result.code = "observing".into();
-            result.message = format!(
-                "正在确认静止（{} / {} ms）",
-                result.observed_ms, result.required_ms
-            );
-        } else {
-            result.state = "ready";
-            result.code = "ready".into();
-            result.message = "位置已稳定，可以开始校准".into();
-        }
-        result
-    }
-}
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
-    pub axis: usize,
+    pub axis: Option<usize>,
     pub excursion: f64,
     pub speed: f64,
     pub max_friction: f64,
 }
 
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            axis: None,
+            excursion: 4.0f64.to_radians(),
+            speed: 1.0f64.to_radians(),
+            max_friction: 0.2,
+        }
+    }
+}
+
 fn validate_settings(settings: &Settings) -> Result<(), String> {
-    if settings.axis >= 7 {
+    if settings.axis.is_some_and(|axis| axis >= 7) {
         return Err("校准关节必须为 0..6".into());
     }
     for (name, value, min, max) in [
@@ -191,34 +48,41 @@ fn validate_settings(settings: &Settings) -> Result<(), String> {
 
 pub fn validate(settings: &Settings, baseline: &ServoTuning) -> Result<(), String> {
     validate_settings(settings)?;
-    baseline.validate()?;
-    if !baseline.friction_enabled
-        && baseline.joints.iter().enumerate().any(|(axis, joint)| {
-            axis != settings.axis && (joint.coulomb != 0.0 || joint.viscous != 0.0)
-        })
-    {
-        return Err("其他关节存在未启用的摩擦系数，不能安全开启全局摩擦补偿".into());
-    }
-    Ok(())
+    baseline.validate()
 }
 
-pub fn candidates(settings: &Settings, baseline: ServoTuning) -> Result<Vec<ServoTuning>, String> {
+pub fn candidates(
+    settings: &Settings,
+    axis: usize,
+    baseline: ServoTuning,
+) -> Result<Vec<ServoTuning>, String> {
     validate(settings, &baseline)?;
+    if axis >= 7 {
+        return Err("校准关节必须为 0..6".into());
+    }
     let mut result = Vec::with_capacity(4);
     result.push(baseline);
     if settings.max_friction > 0.0 {
         for coulomb in [settings.max_friction / 2.0, settings.max_friction] {
             let mut candidate = baseline;
+            if !baseline.friction_enabled {
+                // The global switch must not activate dormant coefficients on
+                // any joint, including the measured joint's viscous term.
+                for joint in &mut candidate.joints {
+                    joint.coulomb = 0.0;
+                    joint.viscous = 0.0;
+                }
+            }
             candidate.friction_enabled = true;
-            candidate.joints[settings.axis].coulomb = coulomb;
-            candidate.joints[settings.axis].max_friction = settings.max_friction;
+            candidate.joints[axis].coulomb = coulomb;
+            candidate.joints[axis].max_friction = settings.max_friction;
             if !result.contains(&candidate) {
                 result.push(candidate);
             }
         }
     }
     let mut feedforward = baseline;
-    feedforward.joints[settings.axis].velocity_ff *= 0.75;
+    feedforward.joints[axis].velocity_ff = 0.75;
     if !result.contains(&feedforward) {
         result.push(feedforward);
     }
@@ -231,8 +95,11 @@ pub struct Leg {
     pub speed: f64,
 }
 
-pub fn legs(settings: &Settings, center: [f64; 7]) -> Vec<Leg> {
-    if validate_settings(settings).is_err() || center.iter().any(|value| !value.is_finite()) {
+pub fn legs(settings: &Settings, axis: usize, center: [f64; 7]) -> Vec<Leg> {
+    if validate_settings(settings).is_err()
+        || axis >= 7
+        || center.iter().any(|value| !value.is_finite())
+    {
         return Vec::new();
     }
     let mut result = Vec::with_capacity(6);
@@ -240,7 +107,7 @@ pub fn legs(settings: &Settings, center: [f64; 7]) -> Vec<Leg> {
         for offset in [settings.excursion / 2.0, -settings.excursion / 2.0, 0.0] {
             let mut target = center;
             if offset != 0.0 {
-                target[settings.axis] += offset;
+                target[axis] += offset;
             }
             result.push(Leg { target, speed });
         }
@@ -260,8 +127,6 @@ pub struct Metrics {
 
 const WINDOW_US: u64 = 100_000;
 const MAX_GAP_US: u64 = 300_000;
-const MIN_WINDOWS: u64 = 12;
-const MIN_VALID_MS: u64 = 2000;
 
 #[derive(Clone, Copy)]
 struct WindowStart {
@@ -402,13 +267,15 @@ impl Collector {
 pub struct Trial {
     pub index: usize,
     pub phase: String,
+    #[serde(default)]
+    pub axis: Option<usize>,
     pub config: ServoTuning,
     pub metrics: Option<Metrics>,
 }
 
 fn metrics_valid(metrics: &Metrics) -> bool {
-    metrics.windows >= MIN_WINDOWS
-        && metrics.valid_ms >= MIN_VALID_MS
+    metrics.windows > 0
+        && metrics.valid_ms > 0
         && [
             metrics.velocity_rms,
             metrics.tracking_rms,
@@ -426,28 +293,27 @@ fn valid_metrics(trial: &Trial) -> Option<&Metrics> {
         .filter(|metrics| metrics_valid(metrics))
 }
 
-// Inclusive thresholds tolerate only floating-point roundoff, not a physical
-// measurement allowance. The baseline's strict minimum remains strict.
-fn at_most(value: f64, limit: f64) -> bool {
-    value <= limit || value - limit <= 8.0 * f64::EPSILON * value.abs().max(limit.abs())
+fn normalized_error(baseline: f64, candidate: f64) -> f64 {
+    if baseline > 0.0 {
+        candidate / baseline
+    } else if candidate == 0.0 {
+        1.0
+    } else {
+        f64::INFINITY
+    }
 }
 
-fn improvement(baseline: &Metrics, candidate: &Metrics) -> Option<f64> {
-    if baseline.velocity_rms <= 0.0005 {
-        return None;
+/// Lower is better; the baseline scores 1.0. Each RMS is normalized in its
+/// own units, with 60% velocity and 40% position tracking. An unchanged exact
+/// zero scores 1.0 for that component; a regression from zero scores infinity.
+/// Missing/invalid measurements score infinity, with no minimum duration or
+/// improvement beyond the existence of a measured position window.
+pub fn score(baseline: &Metrics, candidate: &Metrics) -> f64 {
+    if !metrics_valid(baseline) || !metrics_valid(candidate) {
+        return f64::INFINITY;
     }
-    let reduction = baseline.velocity_rms - candidate.velocity_rms;
-    if !at_most(baseline.velocity_rms * 0.15, reduction)
-        || !at_most(0.0001, reduction)
-        || !at_most(
-            candidate.tracking_peak,
-            baseline.tracking_peak * 1.1 + 0.003,
-        )
-        || !at_most(candidate.other_peak, baseline.other_peak + 0.005)
-    {
-        return None;
-    }
-    Some(reduction / baseline.velocity_rms)
+    0.6 * normalized_error(baseline.velocity_rms, candidate.velocity_rms)
+        + 0.4 * normalized_error(baseline.tracking_rms, candidate.tracking_rms)
 }
 
 pub fn recommend(baseline: &Trial, candidates: &[Trial]) -> Option<usize> {
@@ -457,34 +323,36 @@ pub fn recommend(baseline: &Trial, candidates: &[Trial]) -> Option<usize> {
         let Some(metrics) = valid_metrics(candidate) else {
             continue;
         };
-        if improvement(baseline, metrics).is_some()
-            && best.is_none_or(|(_, error)| metrics.velocity_rms < error)
-        {
-            best = Some((candidate.index, metrics.velocity_rms));
+        let error = score(baseline, metrics);
+        if error < 1.0 && best.is_none_or(|(_, best_error)| error < best_error) {
+            best = Some((candidate.index, error));
         }
     }
     best.map(|(index, _)| index)
 }
 
-pub fn confirm(
-    baseline: &Trial,
-    baseline_check: &Trial,
-    candidate: &Trial,
-    validation: &Trial,
-) -> Option<f64> {
-    let baseline = valid_metrics(baseline)?;
-    let baseline_check = valid_metrics(baseline_check)?;
-    let candidate = valid_metrics(candidate)?;
-    let validation = valid_metrics(validation)?;
-    if !at_most(
-        (baseline_check.velocity_rms - baseline.velocity_rms).abs(),
-        baseline.velocity_rms * 0.25 + 0.0005,
-    ) {
-        return None;
-    }
-    let first = improvement(baseline, candidate)?;
-    let repeated = improvement(baseline_check, validation)?;
-    Some(first.min(repeated))
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Point {
+    pub t_ms: u32,
+    pub trial: usize,
+    pub axis: usize,
+    pub reference: [f64; 7],
+    pub command: Option<[f64; 7]>,
+    pub feedback: [f64; 7],
+    pub velocity: [f64; 7],
+    pub feedback_velocity: [f64; 7],
+    pub feedback_age_ms: [u16; 7],
+    pub command_at_ms: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Choice {
+    pub axis: usize,
+    pub baseline_index: usize,
+    pub candidate_index: usize,
+    pub after_index: Option<usize>,
+    pub velocity_change: f64,
+    pub tracking_change: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -504,6 +372,72 @@ pub struct Report {
     pub outcome: String,
     pub improvement: Option<f64>,
     pub message: String,
+    #[serde(default)]
+    pub choices: Vec<Choice>,
+    #[serde(default)]
+    pub sample_count: usize,
+    #[serde(default)]
+    pub curves: Arc<Vec<Point>>,
+}
+
+impl Report {
+    /// Metadata for live snapshots/history; the recorded sample count survives.
+    pub fn summary(&self) -> Self {
+        Self {
+            curves: Arc::default(),
+            ..self.clone()
+        }
+    }
+
+    /// Select real samples without interpolation. Every contiguous trial/axis
+    /// segment keeps its endpoints, even when those alone exceed max_points.
+    /// A zero budget returns all samples with an O(1) clone of their Arc.
+    pub fn for_plot(&self, max_points: usize) -> Self {
+        if max_points == 0 || self.curves.len() <= max_points {
+            return self.clone();
+        }
+        let mut segments = Vec::new();
+        let mut start = 0;
+        for end in 1..=self.curves.len() {
+            if end == self.curves.len()
+                || self.curves[end].trial != self.curves[start].trial
+                || self.curves[end].axis != self.curves[start].axis
+            {
+                segments.push((start, end));
+                start = end;
+            }
+        }
+        let endpoints: usize = segments
+            .iter()
+            .map(|(start, end)| (end - start).min(2))
+            .sum();
+        let mut interiors_left = self.curves.len() - endpoints;
+        let mut extras_left = max_points.saturating_sub(endpoints).min(interiors_left);
+        let mut curves = Vec::with_capacity(endpoints + extras_left);
+        for (start, end) in segments {
+            let interior = (end - start).saturating_sub(2);
+            let extra = if interiors_left == 0 {
+                0
+            } else {
+                (extras_left as u128 * interior as u128 / interiors_left as u128) as usize
+            };
+            interiors_left -= interior;
+            extras_left -= extra;
+            curves.push(self.curves[start].clone());
+            for slot in 1..=extra {
+                let offset =
+                    (slot as u128 * (end - start - 1) as u128 / (extra + 1) as u128) as usize;
+                curves.push(self.curves[start + offset].clone());
+            }
+            if end > start + 1 {
+                curves.push(self.curves[end - 1].clone());
+            }
+        }
+        Self {
+            curves: Arc::new(curves),
+            ..self.clone()
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -519,142 +453,14 @@ pub struct Status {
     pub leg_count: usize,
     pub progress: f64,
     pub report: Option<Report>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live: Option<Point>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn observe_hold(detector: &mut Stillness, origin: Instant, start: u64, end: u64) {
-        for tick in start..=end {
-            for joint in 0..7 {
-                let q = joint as f64 * 0.1 + if tick % 2 == 0 { 0.00006 } else { -0.00006 };
-                detector.observe(joint, q, origin + Duration::from_millis(tick * 10));
-            }
-        }
-    }
-
-    #[test]
-    fn stillness_requires_a_fresh_window_for_every_axis() {
-        let origin = Instant::now();
-        let mut detector = Stillness::default();
-        assert!(!detector.status(origin).ready());
-        observe_hold(&mut detector, origin, 0, 29);
-        let waiting = detector.status(origin + Duration::from_millis(290));
-        assert_eq!(waiting.state, "settling");
-        assert_eq!(waiting.observed_ms, 290);
-        observe_hold(&mut detector, origin, 30, 30);
-        assert!(detector.status(origin + Duration::from_millis(300)).ready());
-        assert!(!detector.status(origin + Duration::from_millis(401)).ready());
-    }
-
-    #[test]
-    fn stillness_rejects_drift_and_a_recovered_spike_in_the_window() {
-        let origin = Instant::now();
-        let mut detector = Stillness::default();
-        for tick in 0..=40 {
-            for joint in 0..7 {
-                detector.observe(
-                    joint,
-                    if joint == 2 {
-                        tick as f64 * 0.00005
-                    } else {
-                        0.0
-                    },
-                    origin + Duration::from_millis(tick * 10),
-                );
-            }
-        }
-        let moving = detector.status(origin + Duration::from_millis(400));
-        assert_eq!(moving.state, "moving");
-        assert_eq!(moving.joint, Some(2));
-        assert!(moving.position_span.unwrap() > moving.position_limit);
-        detector.clear();
-        observe_hold(&mut detector, origin, 0, 40);
-        detector.observe(5, 0.51, origin + Duration::from_millis(401));
-        detector.observe(5, 0.5, origin + Duration::from_millis(402));
-        assert_eq!(
-            detector.status(origin + Duration::from_millis(402)).state,
-            "moving"
-        );
-        observe_hold(&mut detector, origin, 41, 72);
-        assert!(detector.status(origin + Duration::from_millis(720)).ready());
-    }
-
-    #[test]
-    fn stillness_never_bridges_a_gap_or_a_clock_discontinuity() {
-        let origin = Instant::now();
-        for discontinuity in [
-            Duration::from_millis(400),
-            Duration::from_millis(390),
-            Duration::from_millis(501),
-        ] {
-            let mut detector = Stillness::default();
-            observe_hold(&mut detector, origin, 0, 40);
-            detector.observe(4, 0.4, origin + discontinuity);
-            assert!(!detector.status(origin + discontinuity).ready());
-        }
-    }
-
-    #[test]
-    fn stillness_invalid_or_missing_axis_cannot_be_hidden_by_other_axes() {
-        let origin = Instant::now();
-        let mut detector = Stillness::default();
-        observe_hold(&mut detector, origin, 0, 40);
-        detector.observe(3, f64::NAN, origin + Duration::from_millis(401));
-        assert!(!detector.status(origin + Duration::from_millis(401)).ready());
-        detector.observe(3, 0.3, origin + Duration::from_millis(402));
-        assert!(!detector.status(origin + Duration::from_millis(402)).ready());
-        detector.clear();
-        observe_hold(&mut detector, origin, 0, 40);
-        for tick in 41..=55 {
-            for joint in 0..6 {
-                detector.observe(
-                    joint,
-                    joint as f64 * 0.1,
-                    origin + Duration::from_millis(tick * 10),
-                );
-            }
-        }
-        let stale = detector.status(origin + Duration::from_millis(550));
-        assert_eq!(stale.code, "feedback_stale");
-        assert_eq!(stale.joint, Some(6));
-    }
-
-    #[test]
-    fn stillness_history_is_bounded_and_clear_removes_old_evidence() {
-        let origin = Instant::now();
-        let mut detector = Stillness::default();
-        for tick in 0..2000 {
-            for joint in 0..7 {
-                detector.observe(joint, 0.0, origin + Duration::from_micros(tick));
-            }
-        }
-        for joint in &detector.joints {
-            assert!(joint.len() <= STILL_CAPACITY);
-            assert_eq!(joint.capacity(), STILL_CAPACITY);
-        }
-        assert!(
-            !detector
-                .status(origin + Duration::from_micros(1999))
-                .ready()
-        );
-        detector.clear();
-        observe_hold(&mut detector, origin, 0, 40);
-        assert!(detector.status(origin + Duration::from_millis(400)).ready());
-        detector.clear();
-        assert!(!detector.status(origin + Duration::from_millis(400)).ready());
-    }
     use serde_json::{Value, json};
-
-    fn settings() -> Settings {
-        Settings {
-            axis: 3,
-            excursion: 0.1,
-            speed: 0.02,
-            max_friction: 0.8,
-        }
-    }
 
     fn close(actual: f64, expected: f64) {
         assert!(
@@ -663,225 +469,182 @@ mod tests {
         );
     }
 
-    fn tuning_bits_equal(actual: ServoTuning, expected: ServoTuning) {
-        assert_eq!(actual.friction_enabled, expected.friction_enabled);
-        for (actual, expected) in actual.joints.into_iter().zip(expected.joints) {
-            for (a, e) in [
-                (actual.kd, expected.kd),
-                (actual.velocity_ff, expected.velocity_ff),
-                (actual.coulomb, expected.coulomb),
-                (actual.viscous, expected.viscous),
-                (actual.velocity_scale, expected.velocity_scale),
-                (actual.max_friction, expected.max_friction),
-            ] {
-                assert_eq!(a.to_bits(), e.to_bits());
-            }
-        }
-    }
-
     #[test]
-    fn settings_accept_inclusive_si_boundaries_on_every_axis() {
+    fn defaults_select_all_axes_with_a_small_six_leg_programme_for_each() {
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.axis, None);
+        close(settings.excursion, 4.0f64.to_radians());
+        close(settings.speed, 1.0f64.to_radians());
+        close(settings.max_friction, 0.2);
+        assert!(validate(&settings, &ServoTuning::default()).is_ok());
+        let center = [0.5, -0.4, 0.3, -0.2, 0.1, -0.0, 0.7];
         for axis in 0..7 {
-            for (excursion, speed, max_friction) in [
-                (0.01745329252, 0.005, 0.0),
-                (0.1745329252, 0.04, 2.0),
-                (1.0f64.to_radians(), 0.005, 0.0),
-                (10.0f64.to_radians(), 0.04, 2.0),
-            ] {
-                assert!(
-                    validate(
-                        &Settings {
-                            axis,
-                            excursion,
-                            speed,
-                            max_friction
-                        },
-                        &ServoTuning::default(),
-                    )
-                    .is_ok()
+            let programme = legs(&settings, axis, center);
+            assert_eq!(programme.len(), 6);
+            for (index, leg) in programme.iter().enumerate() {
+                let offset = [2.0f64.to_radians(), -2.0f64.to_radians(), 0.0][index % 3];
+                close(leg.speed, (1 + index / 3) as f64 * 1.0f64.to_radians());
+                close(leg.target[axis], center[axis] + offset);
+                for other in (0..7).filter(|other| *other != axis) {
+                    assert_eq!(leg.target[other].to_bits(), center[other].to_bits());
+                }
+                if index % 3 == 2 {
+                    assert_eq!(leg.target.map(f64::to_bits), center.map(f64::to_bits));
+                }
+            }
+        }
+        let selected: Settings = serde_json::from_str(r#"{"axis":3}"#).unwrap();
+        assert_eq!(selected.axis, Some(3));
+        close(selected.excursion, settings.excursion);
+    }
+
+    #[test]
+    fn explicit_small_ranges_move_only_the_requested_axis_relative_to_its_center() {
+        let center = [-0.7, 0.6, -0.5, 0.4, -0.3, 0.2, -0.1];
+        for axis in 0..7 {
+            let settings = Settings {
+                axis: Some(axis),
+                excursion: 2.0f64.to_radians(),
+                speed: 0.5f64.to_radians(),
+                ..Settings::default()
+            };
+            assert!(validate(&settings, &ServoTuning::default()).is_ok());
+            let programme = legs(&settings, axis, center);
+            assert_eq!(programme.len(), 6);
+            for (index, leg) in programme.iter().enumerate() {
+                close(
+                    leg.target[axis] - center[axis],
+                    [1.0f64.to_radians(), -1.0f64.to_radians(), 0.0][index % 3],
                 );
+                close(leg.speed, settings.speed * (1 + index / 3) as f64);
+                for other in (0..7).filter(|other| *other != axis) {
+                    assert_eq!(leg.target[other], center[other]);
+                }
             }
         }
     }
 
     #[test]
-    fn settings_reject_wrong_axis_nonfinite_and_out_of_range_values() {
+    fn settings_and_explicit_axes_reject_invalid_inputs_without_panicking() {
         let baseline = ServoTuning::default();
         for axis in [7, usize::MAX] {
-            assert!(validate(&Settings { axis, ..settings() }, &baseline).is_err());
+            assert!(
+                validate(
+                    &Settings {
+                        axis: Some(axis),
+                        ..Settings::default()
+                    },
+                    &baseline
+                )
+                .is_err()
+            );
+            assert!(candidates(&Settings::default(), axis, baseline).is_err());
+            assert!(legs(&Settings::default(), axis, [0.0; 7]).is_empty());
         }
-        for (field, invalid) in [
-            ("excursion", 0.017453292519),
-            ("excursion", 0.174532925201),
-            ("speed", 0.004999999),
-            ("speed", 0.040000001),
-            ("max_friction", -0.000000001),
-            ("max_friction", 2.000000001),
-        ]
-        .into_iter()
-        .chain(
-            ["excursion", "speed", "max_friction"]
-                .into_iter()
-                .flat_map(|field| {
-                    [f64::NAN, f64::INFINITY, f64::NEG_INFINITY].map(|value| (field, value))
-                }),
-        ) {
-            let mut input = settings();
-            match field {
-                "excursion" => input.excursion = invalid,
-                "speed" => input.speed = invalid,
-                _ => input.max_friction = invalid,
-            }
-            assert!(validate(&input, &baseline).is_err(), "{field}={invalid}");
-            assert!(candidates(&input, baseline).is_err());
-        }
-    }
-
-    #[test]
-    fn validation_rejects_invalid_baseline_and_dormant_other_axis_friction() {
-        let input = settings();
-        let mut baseline = ServoTuning::default();
-        baseline.joints[0].kd = 31.0;
-        assert!(validate(&input, &baseline).is_err());
-        baseline = ServoTuning::default();
-        baseline.joints[input.axis].coulomb = 0.4;
-        baseline.joints[input.axis].viscous = 0.5;
-        assert!(validate(&input, &baseline).is_ok());
-        for other in [0, 6] {
-            for viscous in [false, true] {
-                let mut dormant = baseline;
-                if viscous {
-                    dormant.joints[other].viscous = 0.1;
-                } else {
-                    dormant.joints[other].coulomb = 0.1;
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
+            for field in 0..3 {
+                let mut settings = Settings::default();
+                match field {
+                    0 => settings.excursion = invalid,
+                    1 => settings.speed = invalid,
+                    _ => settings.max_friction = invalid,
                 }
-                dormant.joints[other].max_friction = 0.0;
-                let original = dormant;
-                assert!(validate(&input, &dormant).is_err());
-                assert!(candidates(&input, dormant).is_err());
-                tuning_bits_equal(dormant, original);
-                dormant.friction_enabled = true;
-                assert!(validate(&input, &dormant).is_ok());
+                assert!(validate(&settings, &baseline).is_err());
+                assert!(candidates(&settings, 0, baseline).is_err());
+                assert!(legs(&settings, 0, [0.0; 7]).is_empty());
             }
+        }
+        let mut invalid_baseline = baseline;
+        invalid_baseline.joints[0].kd = 31.0;
+        assert!(validate(&Settings::default(), &invalid_baseline).is_err());
+        assert!(legs(&Settings::default(), 0, [f64::NAN; 7]).is_empty());
+    }
+
+    #[test]
+    fn default_candidates_are_independent_fc_point_one_point_two_and_ff_point_seven_five() {
+        let mut baseline = ServoTuning::default();
+        baseline.joints[3].velocity_ff = 0.8;
+        for axis in 0..7 {
+            let actual = candidates(&Settings::default(), axis, baseline).unwrap();
+            assert_eq!(actual.len(), 4);
+            assert_eq!(actual[0], baseline);
+            for (candidate, coulomb) in actual[1..3].iter().zip([0.1, 0.2]) {
+                let mut expected = baseline;
+                expected.friction_enabled = true;
+                expected.joints[axis].coulomb = coulomb;
+                expected.joints[axis].max_friction = 0.2;
+                assert_eq!(*candidate, expected);
+                assert!(candidate.validate().is_ok());
+            }
+            let mut expected = baseline;
+            expected.joints[axis].velocity_ff = 0.75;
+            assert_eq!(actual[3], expected);
+            assert_eq!(baseline.joints[3].velocity_ff, 0.8);
         }
     }
 
     #[test]
-    fn candidates_change_only_selected_coulomb_or_selected_velocity_feedforward() {
-        let input = settings();
+    fn dormant_friction_is_cleared_before_enabling_only_the_measured_axis() {
+        let mut baseline = ServoTuning::default();
+        for (axis, joint) in baseline.joints.iter_mut().enumerate() {
+            joint.coulomb = 0.2 + axis as f64 * 0.05;
+            joint.viscous = 0.3 + axis as f64 * 0.1;
+            joint.kd += axis as f64;
+        }
+        assert!(validate(&Settings::default(), &baseline).is_ok());
+        for axis in 0..7 {
+            let actual = candidates(&Settings::default(), axis, baseline).unwrap();
+            assert_eq!(actual[0], baseline);
+            for candidate in &actual[1..3] {
+                let applied = candidate.apply([0.02; 7], [0.0; 7]).unwrap();
+                assert!(applied.friction_requested[axis] > 0.0);
+                for other in 0..7 {
+                    assert_eq!(candidate.joints[other].viscous, 0.0);
+                    assert_eq!(candidate.joints[other].kd, baseline.joints[other].kd);
+                    if other != axis {
+                        assert_eq!(candidate.joints[other].coulomb, 0.0);
+                        assert_eq!(applied.friction_requested[other], 0.0);
+                    }
+                }
+            }
+            let mut expected_ff = baseline;
+            expected_ff.joints[axis].velocity_ff = 0.75;
+            assert_eq!(actual[3], expected_ff);
+        }
+    }
+
+    #[test]
+    fn enabled_friction_preserves_other_axes_and_duplicate_candidates_are_omitted() {
         let mut baseline = ServoTuning {
             friction_enabled: true,
             ..ServoTuning::default()
         };
-        for (axis, joint) in baseline.joints.iter_mut().enumerate() {
-            joint.kd = axis as f64 + 8.0;
-            joint.coulomb = 0.05 * axis as f64;
-            joint.viscous = 0.1 * axis as f64;
-            joint.velocity_ff = 0.8;
-            joint.velocity_scale = 0.03;
-            joint.max_friction = 1.2;
-        }
-        baseline.joints[0].coulomb = -0.0;
-        let actual = candidates(&input, baseline).unwrap();
-        assert_eq!(actual.len(), 4);
-        tuning_bits_equal(actual[0], baseline);
-        for coulomb in [0.4, 0.8] {
-            let mut expected = baseline;
-            expected.friction_enabled = true;
-            expected.joints[input.axis].coulomb = coulomb;
-            expected.joints[input.axis].max_friction = 0.8;
-            let candidate = actual[1..]
-                .iter()
-                .find(|candidate| **candidate == expected)
-                .unwrap();
-            tuning_bits_equal(*candidate, expected);
-            assert!(candidate.validate().is_ok());
-        }
-        let mut expected = baseline;
-        expected.joints[input.axis].velocity_ff = 0.6000000000000001;
-        let ff = actual[1..]
-            .iter()
-            .find(|candidate| **candidate == expected)
-            .unwrap();
-        tuning_bits_equal(*ff, expected);
-    }
-
-    #[test]
-    fn candidates_enable_only_safe_friction_and_deduplicate_zero_searches() {
-        let input = settings();
-        let baseline = ServoTuning::default();
-        let actual = candidates(&input, baseline).unwrap();
-        assert_eq!(actual.len(), 4);
-        assert!(!actual[0].friction_enabled);
-        assert_eq!(
-            actual[1..]
-                .iter()
-                .filter(|candidate| candidate.friction_enabled)
-                .count(),
-            2
-        );
-        assert_eq!(
-            actual[1..]
-                .iter()
-                .filter(|candidate| !candidate.friction_enabled)
-                .count(),
-            1
-        );
-        let mut zero = Settings {
-            max_friction: 0.0,
-            ..input.clone()
-        };
-        assert_eq!(candidates(&zero, baseline).unwrap().len(), 2);
-        let mut no_ff = baseline;
-        no_ff.joints[zero.axis].velocity_ff = 0.0;
-        let actual = candidates(&zero, no_ff).unwrap();
-        assert_eq!(actual.len(), 1);
-        tuning_bits_equal(actual[0], no_ff);
-        zero.max_friction = 0.8;
-        let mut existing = baseline;
-        existing.friction_enabled = true;
-        existing.joints[zero.axis].coulomb = 0.4;
-        existing.joints[zero.axis].max_friction = 0.8;
-        let actual = candidates(&zero, existing).unwrap();
+        baseline.joints[0].coulomb = 0.3;
+        baseline.joints[2].viscous = 0.4;
+        baseline.joints[3].coulomb = 0.1;
+        baseline.joints[3].max_friction = 0.2;
+        let actual = candidates(&Settings::default(), 3, baseline).unwrap();
         assert_eq!(actual.len(), 3);
-        tuning_bits_equal(actual[0], existing);
-        assert!(
-            actual[1..]
-                .iter()
-                .any(|candidate| candidate.joints[zero.axis].coulomb == 0.8)
-        );
-    }
-
-    #[test]
-    fn legs_use_half_excursion_then_return_to_center_at_two_speeds() {
-        let input = settings();
-        let center = [0.5, -0.4, 0.3, -0.2, 0.1, -0.0, 0.7];
-        let actual = legs(&input, center);
-        assert_eq!(actual.len(), 6);
-        for (leg, (selected, speed)) in actual.iter().zip([
-            (-0.15, 0.02),
-            (-0.25, 0.02),
-            (-0.2, 0.02),
-            (-0.15, 0.04),
-            (-0.25, 0.04),
-            (-0.2, 0.04),
-        ]) {
-            close(leg.target[input.axis], selected);
-            close(leg.speed, speed);
-            for (axis, position) in center.iter().enumerate() {
-                if axis != input.axis {
-                    assert_eq!(leg.target[axis].to_bits(), position.to_bits());
-                }
+        assert_eq!(actual[0], baseline);
+        assert_eq!(actual[1].joints[3].coulomb, 0.2);
+        for candidate in &actual {
+            for axis in (0..7).filter(|axis| *axis != 3) {
+                assert_eq!(candidate.joints[axis], baseline.joints[axis]);
             }
         }
-        let fastest = legs(
-            &Settings {
-                speed: 0.04,
-                ..input
-            },
-            center,
+        baseline.joints[3].velocity_ff = 0.75;
+        assert_eq!(
+            candidates(
+                &Settings {
+                    max_friction: 0.0,
+                    ..Settings::default()
+                },
+                3,
+                baseline
+            )
+            .unwrap(),
+            vec![baseline]
         );
-        close(fastest[5].speed, 0.08);
     }
 
     fn point(axis: usize, selected: f64) -> [f64; 7] {
@@ -906,18 +669,19 @@ mod tests {
     }
 
     #[test]
-    fn collector_requires_both_window_count_and_two_seconds_of_valid_motion() {
-        assert!(Collector::new(3, [0.0; 7]).finish().is_none());
-        assert!(steady(12, 100_000, 0.02, 0.02).finish().is_none());
-        assert!(steady(19, 100_000, 0.02, 0.02).finish().is_none());
-        let exact = steady(20, 100_000, 0.02, 0.02).finish().unwrap();
-        assert_eq!((exact.windows, exact.valid_ms), (20, 2000));
-        // Sparse valid feedback closes at its first frame >=100 ms; use the
-        // actual span, without inventing interpolated observations or windows.
-        assert!(steady(11, 200_000, 0.02, 0.02).finish().is_none());
-        let enough = steady(12, 200_000, 0.02, 0.02).finish().unwrap();
-        assert_eq!((enough.windows, enough.valid_ms), (12, 2400));
-        close(enough.velocity_rms, 0.0);
+    fn collector_accepts_one_real_position_window_without_a_minimum_trial_duration() {
+        let mut collector = Collector::new(3, [0.0; 7]);
+        assert!(collector.finish().is_none());
+        collector.observe(0, point(3, 0.0), point(3, 0.0), true);
+        collector.observe(99_999, point(3, 0.002), point(3, 0.0015), true);
+        assert!(collector.finish().is_none());
+        collector.observe(140_000, point(3, 0.0028), point(3, 0.0021), true);
+        let actual = collector.finish().unwrap();
+        assert_eq!((actual.windows, actual.valid_ms), (1, 140));
+        close(actual.velocity_rms, 0.005);
+        let sparse = steady(1, 200_000, 0.02, 0.02).finish().unwrap();
+        assert_eq!((sparse.windows, sparse.valid_ms), (1, 200));
+        close(sparse.velocity_rms, 0.0);
     }
 
     #[test]
@@ -1087,256 +851,346 @@ mod tests {
         close(stalled.tracking_peak, 0.0038);
     }
 
-    fn trial(index: usize, velocity_rms: f64) -> Trial {
+    fn trial(index: usize, velocity_rms: f64, tracking_rms: f64) -> Trial {
         Trial {
             index,
             phase: if index == 0 { "baseline" } else { "candidate" }.into(),
+            axis: Some(3),
             config: ServoTuning::default(),
             metrics: Some(Metrics {
-                windows: 24,
-                valid_ms: 2400,
+                windows: 1,
+                valid_ms: 100,
                 velocity_rms,
-                tracking_rms: 0.005,
-                tracking_peak: 0.01,
+                tracking_rms,
+                tracking_peak: tracking_rms * 2.0,
                 other_peak: 0.002,
             }),
         }
     }
 
     #[test]
-    fn recommendation_returns_trial_index_with_best_velocity_error_and_stable_ties() {
-        let baseline = trial(0, 0.004);
+    fn score_normalizes_each_rms_before_combining_velocity_and_tracking() {
+        let baseline = trial(0, 0.004, 0.005).metrics.unwrap();
+        let candidate = trial(1, 0.002, 0.004).metrics.unwrap();
+        close(score(&baseline, &baseline), 1.0);
+        close(score(&baseline, &candidate), 0.6 * 0.5 + 0.4 * 0.8);
+        let mut rescaled_baseline = baseline.clone();
+        let mut rescaled_candidate = candidate.clone();
+        rescaled_baseline.velocity_rms *= 1000.0;
+        rescaled_candidate.velocity_rms *= 1000.0;
+        rescaled_baseline.tracking_rms *= 0.001;
+        rescaled_candidate.tracking_rms *= 0.001;
+        close(
+            score(&rescaled_baseline, &rescaled_candidate),
+            score(&baseline, &candidate),
+        );
+    }
+
+    #[test]
+    fn measured_report_values_recommend_fc_point_two_despite_small_velocity_improvement() {
+        // Measured RMS values exercise the tradeoff: Fc=0.1 wins on velocity,
+        // while Fc=0.2 wins overall with about 38% less position error.
+        let mut baseline = trial(0, 0.010828694820050612, 0.005910435712582818);
+        let configs = candidates(&Settings::default(), 3, baseline.config).unwrap();
+        baseline.metrics.as_mut().unwrap().windows = 184;
+        baseline.metrics.as_mut().unwrap().valid_ms = 20_599;
+        let mut low_friction = trial(1, 0.010345783198140366, 0.004638951499589994);
+        low_friction.config = configs[1];
+        let mut high_friction = trial(2, 0.010688245119382338, 0.0036441167515515152);
+        high_friction.config = configs[2];
+        let mut feedforward = trial(3, 0.010893930573407125, 0.007077228086301605);
+        feedforward.config = configs[3];
+        let before = baseline.metrics.as_ref().unwrap();
+        let after = high_friction.metrics.as_ref().unwrap();
+        assert!((0.38..0.39).contains(&(1.0 - after.tracking_rms / before.tracking_rms)));
+        assert!((0.01..0.02).contains(&(1.0 - after.velocity_rms / before.velocity_rms)));
+        assert!(score(before, after) < score(before, low_friction.metrics.as_ref().unwrap()));
+        assert_eq!(high_friction.config.joints[3].coulomb, 0.2);
+        assert_eq!(
+            recommend(&baseline, &[low_friction, high_friction, feedforward]),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn recommendation_accepts_small_improvements_and_weighted_tradeoffs_without_peak_gates() {
+        let baseline = trial(0, 1e-9, 2e-9);
+        let mut candidate = trial(8, 0.99e-9, 2e-9);
+        candidate.metrics.as_mut().unwrap().tracking_peak = 0.1;
+        candidate.metrics.as_mut().unwrap().other_peak = 0.2;
+        assert_eq!(recommend(&baseline, &[candidate]), Some(8));
+        let candidate = trial(9, 1.1e-9, 1e-9);
+        assert_eq!(recommend(&baseline, &[candidate]), Some(9));
+    }
+
+    #[test]
+    fn recommendation_returns_real_trial_indices_with_stable_ties_and_no_change_is_none() {
+        let baseline = trial(0, 0.004, 0.005);
         assert_eq!(
             recommend(
                 &baseline,
-                &[trial(8, 0.003), trial(2, 0.002), trial(9, 0.002)]
+                &[
+                    trial(8, 0.003, 0.005),
+                    trial(2, 0.002, 0.005),
+                    trial(9, 0.002, 0.005)
+                ]
             ),
             Some(2)
         );
         assert_eq!(
-            recommend(&baseline, &[trial(8, 0.003), trial(2, 0.003)]),
+            recommend(&baseline, &[trial(8, 0.003, 0.005), trial(2, 0.003, 0.005)]),
             Some(8)
+        );
+        assert_eq!(
+            recommend(&baseline, &[trial(1, 0.004, 0.005), trial(2, 0.005, 0.006)]),
+            None
+        );
+        assert_eq!(recommend(&baseline, &[]), None);
+    }
+
+    #[test]
+    fn zero_error_components_allow_improvement_in_the_other_component() {
+        for (baseline, candidate) in [
+            (trial(0, 0.0, 0.005), trial(1, 0.0, 0.004)),
+            (trial(0, 0.004, 0.0), trial(1, 0.003, 0.0)),
+        ] {
+            close(
+                score(
+                    baseline.metrics.as_ref().unwrap(),
+                    baseline.metrics.as_ref().unwrap(),
+                ),
+                1.0,
+            );
+            assert_eq!(recommend(&baseline, &[candidate]), Some(1));
+        }
+        let exact = trial(0, 0.0, 0.0);
+        assert_eq!(recommend(&exact, &[trial(1, 0.0, 0.0)]), None);
+        assert!(
+            score(
+                exact.metrics.as_ref().unwrap(),
+                trial(1, 0.001, 0.0).metrics.as_ref().unwrap()
+            )
+            .is_infinite()
         );
     }
 
     #[test]
-    fn recommendation_rejects_no_change_small_improvement_and_tiny_baselines() {
-        let baseline = trial(0, 0.004);
-        for rms in [0.004, 0.005, 0.003400001] {
-            assert_eq!(recommend(&baseline, &[trial(1, rms)]), None);
-        }
-        assert_eq!(recommend(&trial(0, 0.0005), &[trial(1, 0.0)]), None);
-        assert_eq!(recommend(&trial(0, 0.00051), &[trial(1, 0.00042)]), None);
-        assert_eq!(recommend(&trial(0, 0.0008), &[trial(1, 0.0006)]), Some(1));
-    }
-
-    #[test]
-    fn recommendation_accepts_threshold_equalities_with_only_roundoff_tolerance() {
-        assert_eq!(recommend(&trial(0, 0.004), &[trial(1, 0.0034)]), Some(1));
-        assert_eq!(recommend(&trial(0, 0.01), &[trial(1, 0.0085)]), Some(1));
-        assert_eq!(recommend(&trial(0, 0.0006), &[trial(1, 0.0005)]), Some(1));
-        assert_eq!(recommend(&trial(0, 0.0006), &[trial(1, 0.000500001)]), None);
-        let above = f64::from_bits(0.0005f64.to_bits() + 1);
-        assert_eq!(recommend(&trial(0, above), &[trial(1, 0.0)]), Some(1));
-    }
-
-    #[test]
-    fn recommendation_gates_position_and_other_joint_regressions() {
-        let baseline = trial(0, 0.004);
-        let mut candidate = trial(4, 0.002);
-        candidate.metrics.as_mut().unwrap().tracking_peak = 0.014000001;
-        assert_eq!(recommend(&baseline, &[candidate.clone()]), None);
-        candidate.metrics.as_mut().unwrap().tracking_peak = 0.01 * 1.1 + 0.003;
-        candidate.metrics.as_mut().unwrap().other_peak = 0.007000001;
-        assert_eq!(recommend(&baseline, &[candidate.clone()]), None);
-        candidate.metrics.as_mut().unwrap().other_peak = 0.007;
-        assert_eq!(recommend(&baseline, &[candidate]), Some(4));
-    }
-
-    #[test]
-    fn recommendation_rejects_missing_short_nonfinite_and_negative_metrics() {
-        let baseline = trial(0, 0.004);
-        let good = trial(1, 0.002);
+    fn recommendation_skips_missing_empty_and_invalid_measurements() {
+        let baseline = trial(0, 0.004, 0.005);
+        let good = trial(1, 0.002, 0.004);
         let mut missing = good.clone();
         missing.metrics = None;
-        assert_eq!(recommend(&baseline, &[missing.clone()]), None);
         assert_eq!(recommend(&missing, std::slice::from_ref(&good)), None);
-        for field in [
-            "velocity_rms",
-            "tracking_rms",
-            "tracking_peak",
-            "other_peak",
-            "windows",
-            "valid_ms",
-        ] {
-            for value in [f64::NAN, f64::INFINITY, -0.1] {
-                let mut invalid = good.clone();
-                invalid.index = 9;
-                let metrics = invalid.metrics.as_mut().unwrap();
+        assert_eq!(recommend(&baseline, &[missing]), None);
+        for field in 0..6 {
+            for invalid in [f64::NAN, f64::INFINITY, -0.1] {
+                let mut bad = good.clone();
+                let metrics = bad.metrics.as_mut().unwrap();
                 match field {
-                    "velocity_rms" => metrics.velocity_rms = value,
-                    "tracking_rms" => metrics.tracking_rms = value,
-                    "tracking_peak" => metrics.tracking_peak = value,
-                    "other_peak" => metrics.other_peak = value,
-                    "windows" => metrics.windows = 11,
-                    _ => metrics.valid_ms = 1999,
+                    0 => metrics.velocity_rms = invalid,
+                    1 => metrics.tracking_rms = invalid,
+                    2 => metrics.tracking_peak = invalid,
+                    3 => metrics.other_peak = invalid,
+                    4 => metrics.windows = 0,
+                    _ => metrics.valid_ms = 0,
                 }
-                assert_eq!(
-                    recommend(&baseline, &[invalid.clone()]),
-                    None,
-                    "{field}={value}"
-                );
-                assert_eq!(
-                    recommend(&baseline, &[invalid.clone(), good.clone()]),
-                    Some(1),
-                    "skip invalid candidate {field}"
-                );
-                if field != "velocity_rms" {
-                    invalid.metrics.as_mut().unwrap().velocity_rms = 0.004;
-                }
-                assert_eq!(
-                    recommend(&invalid, std::slice::from_ref(&good)),
-                    None,
-                    "invalid baseline {field}"
-                );
+                assert!(score(baseline.metrics.as_ref().unwrap(), metrics).is_infinite());
+                assert_eq!(recommend(&baseline, &[bad.clone(), good.clone()]), Some(1));
+                assert_eq!(recommend(&bad, std::slice::from_ref(&good)), None);
             }
         }
     }
 
     #[test]
     fn reduced_feedforward_is_scored_against_the_original_motion_reference() {
-        let mut candidate = trial(1, 0.0);
+        let mut candidate = trial(1, 0.0, 0.0);
         candidate.config.joints[3].velocity_ff = 0.75;
         candidate.metrics = steady(24, 100_000, 0.02, 0.015).finish();
         close(candidate.metrics.as_ref().unwrap().velocity_rms, 0.005);
-        assert_eq!(recommend(&trial(0, 0.002), &[candidate]), None);
+        assert_eq!(recommend(&trial(0, 0.002, 0.001), &[candidate]), None);
     }
 
-    #[test]
-    fn confirm_returns_the_smaller_of_two_measured_improvements() {
-        let initial = trial(0, 0.004);
-        let check = trial(7, 0.005);
-        let candidate = trial(3, 0.002);
-        let validation = trial(8, 0.0035);
-        close(
-            confirm(&initial, &check, &candidate, &validation).unwrap(),
-            0.3,
-        );
+    fn curve_point(t_ms: u32, trial: usize, axis: usize) -> Point {
+        let reference = std::array::from_fn(|joint| t_ms as f64 * 0.00002 + joint as f64 * 0.01);
+        Point {
+            t_ms,
+            trial,
+            axis,
+            reference,
+            command: (!t_ms.is_multiple_of(3)).then_some(reference.map(|q| q - 0.0001)),
+            feedback: reference.map(|q| q - 0.001),
+            velocity: [0.02; 7],
+            feedback_velocity: [if t_ms.is_multiple_of(2) { -1.0 } else { 1.0 }; 7],
+            feedback_age_ms: [(t_ms % 100) as u16; 7],
+            command_at_ms: t_ms.checked_sub(4),
+        }
     }
 
-    #[test]
-    fn confirm_rejects_baseline_drift_and_either_failed_repeat() {
-        let initial = trial(0, 0.004);
-        let candidate = trial(3, 0.002);
-        let validation = trial(8, 0.002);
-        assert!(confirm(&initial, &trial(7, 0.0055), &candidate, &validation).is_some());
-        assert!(confirm(&initial, &trial(7, 0.005500001), &candidate, &validation).is_none());
-        assert!(confirm(&initial, &trial(7, 0.002499999), &candidate, &validation).is_none());
-        assert!(confirm(&initial, &initial, &trial(3, 0.004), &validation).is_none());
-        assert!(confirm(&initial, &initial, &candidate, &trial(8, 0.004)).is_none());
-        let mut missing = validation.clone();
-        missing.metrics = None;
-        assert!(confirm(&initial, &initial, &candidate, &missing).is_none());
-        let mut regression = validation;
-        regression.metrics.as_mut().unwrap().other_peak = 0.1;
-        assert!(confirm(&initial, &initial, &candidate, &regression).is_none());
-        let mut invalid_initial = initial.clone();
-        invalid_initial.metrics.as_mut().unwrap().tracking_rms = f64::NAN;
-        assert!(confirm(&invalid_initial, &initial, &candidate, &trial(8, 0.002)).is_none());
-        // For these values both drift differences equal the represented limit.
-        assert!(
-            confirm(
-                &trial(0, 0.002),
-                &trial(7, 0.003),
-                &trial(3, 0.001),
-                &trial(8, 0.0005)
-            )
-            .is_some()
-        );
-        assert!(
-            confirm(
-                &trial(0, 0.002),
-                &trial(7, 0.001),
-                &trial(3, 0.001),
-                &trial(8, 0.0005)
-            )
-            .is_some()
-        );
-    }
-
-    #[test]
-    fn reports_and_status_round_trip_with_the_shared_json_field_names() {
-        let baseline = ServoTuning::default();
-        let report = Report {
-            id: "cal-1".into(),
-            request_id: "request-1".into(),
-            created_at_ms: 1795305600000,
+    fn report(curves: Vec<Point>) -> Report {
+        Report {
+            id: "cal-test".into(),
+            request_id: "request-test".into(),
+            created_at_ms: 1_795_305_600_000,
             side: "left".into(),
             port: "offline-test".into(),
-            settings: settings(),
+            settings: Settings {
+                axis: Some(3),
+                ..Settings::default()
+            },
             center_reference: [0.0; 7],
             center_measured: [0.1; 7],
             tcp: Some(crate::kinematics::Pose {
                 translation: [0.0, 0.0, 0.12],
                 rotation: [0.0, 0.0, 0.0, 1.0],
             }),
-            baseline,
-            recommended: Some(baseline),
-            trials: vec![trial(0, 0.004), trial(1, 0.002)],
-            outcome: "improved".into(),
-            improvement: Some(0.5),
-            message: "离线重复验证".into(),
-        };
-        let expected = serde_json::to_value(&report).unwrap();
-        assert_eq!(expected["request_id"], json!("request-1"));
-        assert_eq!(expected["settings"]["axis"], json!(3));
-        assert_eq!(expected["trials"][0]["metrics"]["valid_ms"], json!(2400));
-        assert_eq!(expected["tcp"]["rotation"], json!([0.0, 0.0, 0.0, 1.0]));
-        let decoded: Report = serde_json::from_value(expected.clone()).unwrap();
-        assert_eq!(serde_json::to_value(decoded).unwrap(), expected);
-        for outcome in [
-            "improved",
-            "unchanged",
-            "insufficient",
-            "cancelled",
-            "failed",
-        ] {
-            let mut current = report.clone();
-            current.outcome = outcome.into();
-            current.recommended = None;
-            current.improvement = None;
-            current.tcp = None;
-            let encoded = serde_json::to_value(current).unwrap();
-            assert_eq!(encoded["recommended"], Value::Null);
-            let decoded: Report = serde_json::from_value(encoded.clone()).unwrap();
-            assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+            baseline: ServoTuning::default(),
+            recommended: None,
+            trials: vec![trial(0, 0.004, 0.005), trial(1, 0.004, 0.005)],
+            outcome: "unchanged".into(),
+            improvement: None,
+            message: "测量完成，当前参数已保持".into(),
+            choices: vec![Choice {
+                axis: 3,
+                baseline_index: 0,
+                candidate_index: 1,
+                after_index: Some(2),
+                velocity_change: 0.01,
+                tracking_change: 0.38,
+            }],
+            sample_count: curves.len(),
+            curves: Arc::new(curves),
         }
-        for state in ["running", "stopping", "completed", "cancelled", "failed"] {
-            for stage in [
-                "baseline",
-                "candidate",
-                "baseline_check",
-                "validation",
-                "restoring",
-                "done",
-            ] {
-                let status = Status {
-                    id: "cal-1".into(),
-                    request_id: "request-1".into(),
-                    state: state.into(),
-                    stage: stage.into(),
-                    axis: 3,
-                    trial_index: 2,
-                    trial_count: 4,
-                    leg_index: 1,
-                    leg_count: 6,
-                    progress: 0.5,
-                    report: Some(report.clone()),
-                };
-                let encoded = serde_json::to_value(status).unwrap();
-                let decoded: Status = serde_json::from_value(encoded.clone()).unwrap();
-                assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+    }
+
+    #[test]
+    fn report_clones_and_unlimited_plots_share_the_curve_allocation() {
+        let report = report((0..100).map(|i| curve_point(i * 20, 0, 3)).collect());
+        let clone = report.clone();
+        let full = report.for_plot(0);
+        let ample_budget = report.for_plot(100);
+        assert!(Arc::ptr_eq(&report.curves, &clone.curves));
+        assert!(Arc::ptr_eq(&report.curves, &full.curves));
+        assert!(Arc::ptr_eq(&report.curves, &ample_budget.curves));
+    }
+
+    #[test]
+    fn summary_has_no_curves_and_preserves_counts_choices_and_completed_measurement() {
+        let report = report((0..5).map(|i| curve_point(i * 20, 0, 3)).collect());
+        let summary = report.summary();
+        assert!(summary.curves.is_empty());
+        assert_eq!(summary.sample_count, 5);
+        assert_eq!(report.curves.len(), 5);
+        let mut expected = serde_json::to_value(&report).unwrap();
+        expected["curves"] = json!([]);
+        assert_eq!(serde_json::to_value(&summary).unwrap(), expected);
+        assert_eq!(summary.outcome, "unchanged");
+        assert!(summary.recommended.is_none());
+    }
+
+    #[test]
+    fn plot_decimation_preserves_real_samples_segment_endpoints_and_total_count() {
+        assert!(report(Vec::new()).for_plot(1).curves.is_empty());
+        let mut points = Vec::new();
+        for (trial, axis, length) in [(5, 0, 5), (8, 1, 19), (8, 2, 2), (5, 0, 1)] {
+            for _ in 0..length {
+                points.push(curve_point(points.len() as u32 * 20, trial, axis));
             }
         }
+        let report = report(points);
+        for budget in [1, 6, 7, 8, 13, 26] {
+            let plot = report.for_plot(budget);
+            assert_eq!(plot.curves.len(), budget.max(7));
+            assert_eq!(plot.sample_count, 27);
+            assert!(
+                plot.curves
+                    .windows(2)
+                    .all(|pair| pair[0].t_ms < pair[1].t_ms)
+            );
+            for point in plot.curves.iter() {
+                let original = &report.curves[(point.t_ms / 20) as usize];
+                assert_eq!(
+                    serde_json::to_value(point).unwrap(),
+                    serde_json::to_value(original).unwrap()
+                );
+            }
+            for index in [0, 4, 5, 23, 24, 25, 26] {
+                assert!(
+                    plot.curves
+                        .iter()
+                        .any(|point| point.t_ms == report.curves[index].t_ms)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_json_without_new_fields_and_with_numeric_axis_still_loads() {
+        let tuning = ServoTuning::default();
+        let legacy = json!({
+            "id": "legacy-calibration", "request_id": "legacy-request",
+            "created_at_ms": 1_795_305_600_000_i64, "side": "left", "port": "offline-test",
+            "settings": { "axis": 3, "excursion": 0.1, "speed": 0.02, "max_friction": 0.2 },
+            "center_reference": ([0.0; 7]), "center_measured": ([0.1; 7]), "tcp": null,
+            "baseline": tuning, "recommended": null,
+            "trials": [{ "index": 0, "phase": "baseline", "config": tuning, "metrics": {
+                "windows": 1, "velocity_rms": 0.004, "tracking_rms": 0.005,
+                "tracking_peak": 0.01, "other_peak": 0.002, "valid_ms": 100
+            }}],
+            "outcome": "unchanged", "improvement": null, "message": "测量完成"
+        });
+        let decoded: Report = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.settings.axis, Some(3));
+        assert_eq!(decoded.trials[0].axis, None);
+        assert!(decoded.choices.is_empty());
+        assert_eq!(decoded.sample_count, 0);
+        assert!(decoded.curves.is_empty());
+        assert_eq!(decoded.for_plot(1).outcome, "unchanged");
+    }
+
+    #[test]
+    fn full_reports_round_trip_with_raw_points_choices_and_after_trials() {
+        let mut report = report(vec![curve_point(0, 0, 3), curve_point(20, 2, 3)]);
+        report.trials.push(Trial {
+            index: 2,
+            phase: "after".into(),
+            ..trial(2, 0.003, 0.003)
+        });
+        let encoded = serde_json::to_value(&report).unwrap();
+        let decoded: Report = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+        assert_eq!(encoded["settings"]["axis"], json!(3));
+        assert_eq!(encoded["curves"][0]["command"], Value::Null);
+        assert_eq!(encoded["choices"][0]["after_index"], json!(2));
+        let mut status = Status {
+            id: report.id.clone(),
+            request_id: report.request_id.clone(),
+            state: "completed".into(),
+            stage: "done".into(),
+            axis: 3,
+            trial_index: 2,
+            trial_count: 3,
+            leg_index: 5,
+            leg_count: 6,
+            progress: 1.0,
+            report: Some(report.summary()),
+            live: None,
+        };
+        let encoded = serde_json::to_value(&status).unwrap();
+        assert!(encoded.get("live").is_none());
+        let decoded: Status = serde_json::from_value(encoded.clone()).unwrap();
+        assert!(decoded.live.is_none());
+        assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+
+        status.state = "running".into();
+        status.stage = "candidate".into();
+        status.report = None;
+        status.live = Some(report.curves[1].clone());
+        let encoded = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            encoded["live"],
+            serde_json::to_value(&report.curves[1]).unwrap()
+        );
+        let decoded: Status = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
     }
 }

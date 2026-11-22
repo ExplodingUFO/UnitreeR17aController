@@ -205,7 +205,8 @@ impl Journal {
     }
 
     /// Tries admission once; clones only after acquiring the lock and finding space.
-    /// No serialization, SQL, wait or wakeup; rejected calls leave the report with its caller.
+    /// Curves share their Arc allocation; no point copies, serialization, SQL, wait or wakeup.
+    /// Rejected calls leave the report with its caller.
     /// False means close, contention, poisoning or a full preallocated report queue.
     /// Report admission and persistence are accounted separately from event stats.
     pub fn record_calibration(&self, report: &Report) -> bool {
@@ -260,15 +261,19 @@ impl Journal {
             .map_err(|e| e.to_string())?;
         rows.map(|row| {
             let payload = row.map_err(|e| e.to_string())?;
-            serde_json::from_str(&payload).map_err(|e| format!("read calibration: {e}"))
+            serde_json::from_str::<Report>(&payload)
+                .map(|report| report.summary())
+                .map_err(|e| format!("read calibration: {e}"))
         })
         .collect()
     }
 
     /// Blocking read; HTTP callers must use spawn_blocking.
     pub fn calibration(&self, id: &str) -> Result<Option<Report>, String> {
-        let conn = self.calibration_reader()?;
-        let payload: Option<String> = conn
+        let mut conn = self.calibration_reader()?;
+        // Retention and upserts cannot mix metadata and curves from different commits.
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let payload: Option<String> = tx
             .query_row(
                 "SELECT payloadJSON FROM calibrations WHERE id = ?1",
                 [id],
@@ -276,9 +281,37 @@ impl Journal {
             )
             .optional()
             .map_err(|e| e.to_string())?;
+        // A read-only legacy database may not have been reopened by the new writer yet.
+        let curves: Option<String> = if payload.is_some()
+            && tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                     WHERE type='table' AND name='calibration_curves')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|e| e.to_string())?
+        {
+            tx.query_row(
+                "SELECT payloadJSON FROM calibration_curves WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?
+        } else {
+            None
+        };
+        tx.commit().map_err(|e| e.to_string())?;
         payload
             .map(|payload| {
-                serde_json::from_str(&payload).map_err(|e| format!("read calibration: {e}"))
+                let mut report: Report =
+                    serde_json::from_str(&payload).map_err(|e| format!("read calibration: {e}"))?;
+                if let Some(curves) = curves {
+                    report.curves = serde_json::from_str(&curves)
+                        .map_err(|e| format!("read calibration curves: {e}"))?;
+                }
+                Ok(report)
             })
             .transpose()
     }
@@ -487,6 +520,10 @@ fn open_writer(path: &Path) -> rusqlite::Result<Connection> {
              id TEXT PRIMARY KEY,
              created_at_ms INTEGER NOT NULL,
              payloadJSON TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS calibration_curves (
+             id TEXT PRIMARY KEY,
+             payloadJSON TEXT NOT NULL
          );",
     )?;
     // Verify WAL actually took effect (e.g. reject :memory:, which cannot persist).
@@ -528,7 +565,8 @@ fn failed(s: &State) {
 fn write_calibration(conn: &mut Connection, report: &Report) -> Result<(), String> {
     // The writer owns this report; all producer and sample locks have been released.
     // Serialize before opening the independent short report transaction.
-    let payload = serde_json::to_string(report).map_err(|e| e.to_string())?;
+    let payload = serde_json::to_string(&report.summary()).map_err(|e| e.to_string())?;
+    let curves = serde_json::to_string(&report.curves).map_err(|e| e.to_string())?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     tx.execute(
         "INSERT INTO calibrations(id,created_at_ms,payloadJSON) VALUES(?1,?2,?3)
@@ -538,8 +576,21 @@ fn write_calibration(conn: &mut Connection, report: &Report) -> Result<(), Strin
     )
     .map_err(|e| e.to_string())?;
     tx.execute(
+        "INSERT INTO calibration_curves(id,payloadJSON) VALUES(?1,?2)
+         ON CONFLICT(id) DO UPDATE SET payloadJSON=excluded.payloadJSON",
+        params![report.id, curves],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
         "DELETE FROM calibrations WHERE id IN (
              SELECT id FROM calibrations ORDER BY created_at_ms DESC,id DESC LIMIT -1 OFFSET 100
+         )",
+        [],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM calibration_curves WHERE NOT EXISTS (
+             SELECT 1 FROM calibrations WHERE calibrations.id=calibration_curves.id
          )",
         [],
     )
@@ -750,13 +801,59 @@ mod tests {
         .unwrap()
     }
 
+    fn calibration_with_curves(id: &str, created_at_ms: i64, samples: usize) -> Report {
+        let mut report = calibration_report(id, created_at_ms);
+        report.sample_count = samples;
+        report.choices = vec![crate::calibration::Choice {
+            axis: 2,
+            baseline_index: 0,
+            candidate_index: 1,
+            after_index: None,
+            velocity_change: -0.1,
+            tracking_change: -0.2,
+        }];
+        report.curves = Arc::new(
+            (0..samples)
+                .map(|i| crate::calibration::Point {
+                    t_ms: i as u32 * 20,
+                    trial: usize::from(i >= samples / 2),
+                    axis: 2,
+                    reference: [(i % 32) as f64 / 1024.0; 7],
+                    command: Some([(i % 32) as f64 / 1024.0; 7]),
+                    feedback: [((i % 32) as f64 - 1.0) / 1024.0; 7],
+                    velocity: [1.0 / 128.0; 7],
+                    feedback_velocity: [3.0 / 256.0; 7],
+                    feedback_age_ms: [2; 7],
+                    command_at_ms: Some(i as u32 * 20),
+                })
+                .collect(),
+        );
+        report
+    }
+
+    fn assert_report_matches(actual: &Report, expected: &Report) {
+        assert_eq!(
+            serde_json::to_value(actual.summary()).unwrap(),
+            serde_json::to_value(expected.summary()).unwrap()
+        );
+        assert_eq!(actual.curves.len(), expected.curves.len());
+        for (i, (actual, expected)) in actual.curves.iter().zip(expected.curves.iter()).enumerate()
+        {
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected).unwrap(),
+                "curve sample {i}"
+            );
+        }
+    }
+
     #[test]
     fn borrowed_calibration_retries_after_contention_and_keeps_an_owned_persisted_copy() {
         let dir = tempdir().unwrap();
         let journal = Journal::start(dir.path().join("events.sqlite3")).unwrap();
         wait_for(|| journal.stats().healthy);
-        let mut report = calibration_report("borrowed-retry", 1234);
-        let expected = serde_json::to_value(&report).unwrap();
+        let mut report = calibration_with_curves("borrowed-retry", 1234, 6001);
+        let expected = report.clone();
         thread::scope(|scope| {
             let (completed_tx, completed_rx) = std::sync::mpsc::channel();
             let (producer, completed) = journal.with_calibration_queue_locked(|| {
@@ -773,20 +870,28 @@ mod tests {
             producer.join().unwrap();
             assert!(!completed.expect("borrowed report waited for the queue mutex"));
         });
-        assert_eq!(serde_json::to_value(&report).unwrap(), expected);
+        assert_report_matches(&report, &expected);
         let stats = journal.stats();
         assert_eq!(
             (stats.written, stats.pending, stats.dropped, stats.errors),
             (0, 0, 0, 0)
         );
+        let locker = Connection::open(&journal.0.path).unwrap();
+        locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let curve_owners = Arc::strong_count(&report.curves);
         wait_for(|| journal.record_calibration(&report));
-        // The caller keeps its report, while admission captures an independent copy.
+        // A blocked writer retains the accepted report, sharing the exact point allocation.
+        assert!(Arc::strong_count(&report.curves) > curve_owners);
         report.message = "caller changed its report after admission".into();
         report.trials.clear();
+        Arc::make_mut(&mut report.curves).clear();
+        report.sample_count = 0;
+        report.choices.clear();
+        locker.execute_batch("ROLLBACK").unwrap();
         assert!(journal.shutdown(Duration::from_secs(2)));
-        assert_eq!(
-            serde_json::to_value(journal.calibration(&report.id).unwrap().unwrap()).unwrap(),
-            expected
+        assert_report_matches(
+            &journal.calibration(&report.id).unwrap().unwrap(),
+            &expected,
         );
         let stats = journal.stats();
         assert_eq!(
@@ -841,7 +946,7 @@ mod tests {
         let attempts = log_until_queued(&journal, || {
             journal.log("info", "app", "event", "event alongside report", None);
         });
-        let report = calibration_report("report-1", 1234);
+        let report = calibration_with_curves("report-1", 1234, 6001);
         wait_for(|| journal.record_calibration(&report));
         assert!(journal.shutdown(Duration::from_secs(8)));
         let stats = journal.stats();
@@ -853,13 +958,30 @@ mod tests {
         let reopened = Journal::start(path).unwrap();
         wait_for(|| reopened.stats().healthy);
         let saved = reopened.calibration("report-1").unwrap().unwrap();
-        assert_eq!(
-            serde_json::to_value(saved).unwrap(),
-            serde_json::to_value(&report).unwrap()
-        );
+        assert_report_matches(&saved, &report);
         let history = reopened.calibrations(20).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].id, "report-1");
+        assert!(history[0].curves.is_empty());
+        assert_eq!(history[0].sample_count, 6001);
+        assert_eq!(
+            serde_json::to_value(&history[0]).unwrap(),
+            serde_json::to_value(report.summary()).unwrap()
+        );
+        let conn = Connection::open(&reopened.0.path).unwrap();
+        let summary: String = conn
+            .query_row("SELECT payloadJSON FROM calibrations", [], |row| row.get(0))
+            .unwrap();
+        let curves: String = conn
+            .query_row("SELECT payloadJSON FROM calibration_curves", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(summary.len() * 50 < curves.len());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&summary).unwrap()["curves"],
+            serde_json::json!([])
+        );
         assert!(reopened.calibration("missing").unwrap().is_none());
         let stats = reopened.stats();
         assert_eq!(
@@ -875,10 +997,10 @@ mod tests {
         let journal = Journal::start(dir.path().join("events.sqlite3")).unwrap();
         // Insert newest first: retention must use report time and ID, not insertion order.
         for i in (0..105).rev() {
-            let report = calibration_report(&format!("calibration-{i:03}"), 1000 + i / 2);
+            let report = calibration_with_curves(&format!("calibration-{i:03}"), 1000 + i / 2, 3);
             wait_for(|| journal.record_calibration(&report));
         }
-        let marker = calibration_report("marker", 10_000);
+        let marker = calibration_with_curves("marker", 10_000, 4);
         wait_for(|| journal.record_calibration(&marker));
         wait_for(|| journal.calibration("marker").is_ok_and(|r| r.is_some()));
         let history = journal.calibrations(usize::MAX).unwrap();
@@ -894,7 +1016,7 @@ mod tests {
         assert_eq!(first_page[19].id, "calibration-086");
         assert!(journal.calibrations(0).unwrap().is_empty());
 
-        let mut updated = calibration_report("calibration-100", 20_000);
+        let mut updated = calibration_with_curves("calibration-100", 20_000, 1);
         updated.message = "updated report".into();
         updated.recommended = None;
         wait_for(|| journal.record_calibration(&updated));
@@ -909,8 +1031,11 @@ mod tests {
         assert_eq!(newest[0].created_at_ms, 20_000);
         assert!(newest[0].recommended.is_none());
         assert_eq!(newest[1].id, "marker");
+        let detail = journal.calibration("calibration-100").unwrap().unwrap();
+        assert_eq!(detail.sample_count, 1);
+        assert_eq!(detail.curves.len(), 1);
 
-        let literal = calibration_report("quote' OR 1=1 --", 30_000);
+        let literal = calibration_with_curves("quote' OR 1=1 --", 30_000, 2);
         wait_for(|| journal.record_calibration(&literal));
         assert!(journal.shutdown(Duration::from_secs(8)));
         assert!(journal.calibration("unknown' OR 1=1 --").unwrap().is_none());
@@ -921,12 +1046,155 @@ mod tests {
         assert_eq!(journal.calibrations(1).unwrap()[0].id, literal.id);
         assert_eq!(journal.calibrations(usize::MAX).unwrap().len(), 100);
         assert!(journal.calibration("calibration-006").unwrap().is_none());
+        let conn = Connection::open(&journal.0.path).unwrap();
+        let curve_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM calibration_curves", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let orphans: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_curves WHERE id NOT IN (SELECT id FROM calibrations)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((curve_count, orphans), (100, 0));
         let stats = journal.stats();
         assert_eq!(
             (stats.written, stats.pending, stats.dropped, stats.errors),
             (0, 0, 0, 0)
         );
         assert!(journal.recent(20).unwrap().is_empty());
+    }
+
+    #[test]
+    fn calibration_summary_and_curves_roll_back_together_on_curve_write_failure() {
+        let dir = tempdir().unwrap();
+        let mut conn = open_writer(&dir.path().join("events.sqlite3")).unwrap();
+        let original = calibration_with_curves("atomic", 1234, 3);
+        write_calibration(&mut conn, &original).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_curve_update BEFORE UPDATE ON calibration_curves
+             BEGIN SELECT RAISE(ABORT, 'curve write failed'); END;
+             CREATE TRIGGER reject_curve_insert BEFORE INSERT ON calibration_curves
+             WHEN NEW.id <> 'atomic'
+             BEGIN SELECT RAISE(ABORT, 'curve insert failed'); END;",
+        )
+        .unwrap();
+        let mut changed = calibration_with_curves("atomic", 5678, 5);
+        changed.message = "must roll back".into();
+        assert!(write_calibration(&mut conn, &changed).is_err());
+        assert!(write_calibration(&mut conn, &calibration_with_curves("new", 9999, 2)).is_err());
+        let (summary, curves): (String, String) = conn
+            .query_row(
+                "SELECT c.payloadJSON,p.payloadJSON FROM calibrations c
+                 JOIN calibration_curves p ON p.id=c.id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&summary).unwrap(),
+            serde_json::to_value(original.summary()).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&curves).unwrap(),
+            serde_json::to_value(&original.curves).unwrap()
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM calibrations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn legacy_calibration_reads_need_no_curve_table_and_writer_reopen_preserves_reports() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.sqlite3");
+        let journal = Journal::start(path.clone()).unwrap();
+        wait_for(|| journal.stats().healthy);
+        assert!(journal.shutdown(Duration::from_secs(2)));
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TABLE calibration_curves").unwrap();
+        let expected = calibration_report("legacy", 1234);
+        let mut legacy = serde_json::to_value(&expected).unwrap();
+        for field in ["curves", "choices", "sample_count"] {
+            legacy.as_object_mut().unwrap().remove(field);
+        }
+        assert_eq!(legacy["settings"]["axis"], 2);
+        conn.execute(
+            "INSERT INTO calibrations(id,created_at_ms,payloadJSON) VALUES(?1,?2,?3)",
+            params![expected.id, expected.created_at_ms, legacy.to_string()],
+        )
+        .unwrap();
+        let before: i64 = conn
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        let saved = journal.calibration("legacy").unwrap().unwrap();
+        assert_eq!(saved.settings.axis, Some(2));
+        assert!(saved.curves.is_empty());
+        assert!(saved.choices.is_empty());
+        assert_eq!(saved.sample_count, 0);
+        assert_eq!(
+            serde_json::to_value(&saved).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(journal.calibrations(20).unwrap().len(), 1);
+        assert!(journal.calibration("missing").unwrap().is_none());
+        let after: i64 = conn
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, after);
+        assert!(conn.prepare("SELECT * FROM calibration_curves").is_err());
+        drop(conn);
+        drop(journal);
+        let reopened = Journal::start(path).unwrap();
+        wait_for(|| reopened.stats().healthy);
+        assert_eq!(
+            serde_json::to_value(reopened.calibration("legacy").unwrap().unwrap()).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        assert!(reopened.shutdown(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn calibration_history_ignores_curve_json_and_reports_json_or_sql_read_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.sqlite3");
+        let journal = Journal::start(path.clone()).unwrap();
+        let report = calibration_with_curves("read-errors", 1234, 3);
+        wait_for(|| journal.record_calibration(&report));
+        assert!(journal.shutdown(Duration::from_secs(2)));
+        let conn = Connection::open(path).unwrap();
+        conn.execute(
+            "UPDATE calibration_curves SET payloadJSON='broken json'",
+            [],
+        )
+        .unwrap();
+        let history = journal.calibrations(20).unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(history[0].curves.is_empty());
+        assert_eq!(history[0].sample_count, 3);
+        assert!(
+            journal
+                .calibration(&report.id)
+                .unwrap_err()
+                .contains("curves")
+        );
+        assert!(journal.calibration("missing").unwrap().is_none());
+        conn.execute("UPDATE calibrations SET payloadJSON='broken json'", [])
+            .unwrap();
+        assert!(journal.calibrations(20).is_err());
+        assert!(journal.calibration(&report.id).is_err());
+        conn.execute_batch("DROP TABLE calibrations").unwrap();
+        assert!(journal.calibrations(20).is_err());
+        assert!(journal.calibration("missing").is_err());
+        let stats = journal.stats();
+        assert_eq!(
+            (stats.written, stats.pending, stats.dropped, stats.errors),
+            (0, 0, 0, 0)
+        );
     }
 
     #[test]

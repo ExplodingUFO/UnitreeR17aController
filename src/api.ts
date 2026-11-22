@@ -49,7 +49,7 @@ export interface ServoTuning {
   ];
 }
 export interface CalibrationSettings {
-  axis: number;
+  axis: number | null;
   excursion: number;
   speed: number;
   max_friction: number;
@@ -65,8 +65,29 @@ export interface CalibrationMetrics {
 export interface CalibrationTrial {
   index: number;
   phase: string;
+  axis?: number | null;
   config: ServoTuning;
   metrics: CalibrationMetrics | null;
+}
+export interface CalibrationPoint {
+  t_ms: number;
+  trial: number;
+  axis: number;
+  reference: JointPositions;
+  command: JointPositions | null;
+  feedback: JointPositions;
+  velocity: JointPositions;
+  feedback_velocity: JointPositions;
+  feedback_age_ms: JointPositions;
+  command_at_ms: number | null;
+}
+export interface CalibrationChoice {
+  axis: number;
+  baseline_index: number;
+  candidate_index: number;
+  after_index: number | null;
+  velocity_change: number;
+  tracking_change: number;
 }
 export interface CalibrationReport {
   id: string;
@@ -81,6 +102,9 @@ export interface CalibrationReport {
   baseline: ServoTuning;
   recommended: ServoTuning | null;
   trials: CalibrationTrial[];
+  sample_count: number;
+  curves: CalibrationPoint[];
+  choices: CalibrationChoice[];
   outcome: "improved" | "unchanged" | "insufficient" | "cancelled" | "failed";
   improvement: number | null;
   message: string;
@@ -94,6 +118,7 @@ export interface CalibrationStatus {
     | "candidate"
     | "baseline_check"
     | "validation"
+    | "after"
     | "restoring"
     | "done";
   axis: number;
@@ -102,17 +127,8 @@ export interface CalibrationStatus {
   leg_index: number;
   leg_count: number;
   progress: number;
+  live?: CalibrationPoint | null;
   report: CalibrationReport | null;
-}
-export interface CalibrationReadiness {
-  state: "ready" | "settling" | "moving" | "unavailable";
-  code: string;
-  message: string;
-  joint: number | null;
-  observed_ms: number;
-  required_ms: number;
-  position_span: number | null;
-  position_limit: number;
 }
 export const SERVO_TUNING_RANGES = {
   kd: [0, 30],
@@ -194,6 +210,91 @@ export const isJointPositions = (value: unknown): value is JointPositions =>
   Array.isArray(value) &&
   value.length === 7 &&
   Array.from(value).every((q) => typeof q === "number" && Number.isFinite(q));
+export function parseCalibrationReport(value: unknown): CalibrationReport {
+  if (!value || typeof value !== "object") throw new Error("报告格式无效");
+  const report = value as CalibrationReport;
+  const axis = report.settings?.axis ?? null;
+  const validAxis = (n: unknown) =>
+    typeof n === "number" && Number.isInteger(n) && n >= 0 && n < 7;
+  const validMetrics = (metrics: CalibrationMetrics | null) =>
+    metrics === null ||
+    (metrics &&
+      [
+        "windows",
+        "velocity_rms",
+        "tracking_rms",
+        "tracking_peak",
+        "other_peak",
+        "valid_ms",
+      ].every((key) =>
+        Number.isFinite(metrics[key as keyof CalibrationMetrics]),
+      ));
+  if (
+    typeof report.id !== "string" ||
+    !report.settings ||
+    (axis !== null && !validAxis(axis)) ||
+    !isServoTuning(report.baseline) ||
+    (report.recommended != null && !isServoTuning(report.recommended)) ||
+    !isJointPositions(report.center_reference) ||
+    !isJointPositions(report.center_measured) ||
+    !Array.isArray(report.trials) ||
+    !report.trials.every(
+      (trial) =>
+        trial &&
+        Number.isInteger(trial.index) &&
+        typeof trial.phase === "string" &&
+        (trial.axis == null || validAxis(trial.axis)) &&
+        isServoTuning(trial.config) &&
+        validMetrics(trial.metrics),
+    ) ||
+    !["improved", "unchanged", "insufficient", "cancelled", "failed"].includes(
+      report.outcome,
+    )
+  )
+    throw new Error("请选择有效的校准 JSON 报告");
+  const curves = report.curves ?? [];
+  const choices = report.choices ?? [];
+  if (
+    !Array.isArray(curves) ||
+    !curves.every(
+      (point) =>
+        point &&
+        Number.isFinite(point.t_ms) &&
+        point.t_ms >= 0 &&
+        Number.isInteger(point.trial) &&
+        validAxis(point.axis) &&
+        [
+          point.reference,
+          point.feedback,
+          point.velocity,
+          point.feedback_velocity,
+          point.feedback_age_ms,
+        ].every(isJointPositions) &&
+        (point.command === null || isJointPositions(point.command)) &&
+        (point.command_at_ms === null || Number.isFinite(point.command_at_ms)),
+    ) ||
+    !Array.isArray(choices) ||
+    !choices.every(
+      (choice) =>
+        choice &&
+        validAxis(choice.axis) &&
+        [choice.baseline_index, choice.candidate_index].every(
+          Number.isInteger,
+        ) &&
+        (choice.after_index == null || Number.isInteger(choice.after_index)) &&
+        Number.isFinite(choice.velocity_change) &&
+        Number.isFinite(choice.tracking_change),
+    )
+  )
+    throw new Error("报告中的曲线或比较数据无效");
+  return {
+    ...report,
+    settings: { ...report.settings, axis },
+    curves,
+    choices,
+    sample_count: report.sample_count ?? curves.length,
+  };
+}
 export type Action = {
   request_id: string;
   progress: number;
@@ -219,7 +320,6 @@ export interface Snapshot {
   feedback_age_ms: number | null;
   action: Action | null;
   calibration?: CalibrationStatus | null;
-  calibration_readiness?: CalibrationReadiness | null;
   last_result: Result | null;
   results: Result[];
   error: { code: string; message: string } | null;
@@ -321,7 +421,7 @@ export type Operation =
   | ({ kind: "return_to_pose" } & ReturnToPoseArguments)
   | { kind: "configure_tcp"; tcp: Pose }
   | { kind: "configure_servo"; config: ServoTuning }
-  | { kind: "calibrate_start"; settings: CalibrationSettings }
+  | { kind: "calibrate_start"; settings?: CalibrationSettings }
   | { kind: "calibrate_apply"; calibration_id: string }
   | ({
       kind: "jog_start";
@@ -358,7 +458,6 @@ export const emptySnapshot: Snapshot = {
   feedback_age_ms: null,
   action: null,
   calibration: null,
-  calibration_readiness: null,
   last_result: null,
   results: [],
   error: null,
@@ -565,17 +664,27 @@ class DesktopApi {
     );
   }
   async listCalibrations(limit = 20, signal?: AbortSignal) {
-    return this.request<CalibrationReport[]>(
+    const reports = await this.request<CalibrationReport[]>(
       `/v1/calibrations?limit=${encodeURIComponent(String(limit))}`,
       undefined,
       { signal },
     );
+    return reports.map(parseCalibrationReport);
   }
-  async readCalibration(id: string, signal?: AbortSignal) {
-    return this.request<CalibrationReport>(
-      `/v1/calibrations/${encodeURIComponent(id)}`,
+  async readCalibration(id: string, signal?: AbortSignal, points = 3000) {
+    return parseCalibrationReport(
+      await this.request<CalibrationReport>(
+        `/v1/calibrations/${encodeURIComponent(id)}?points=${encodeURIComponent(String(points))}`,
+        undefined,
+        { signal },
+      ),
+    );
+  }
+  async downloadCalibration(id: string, signal?: AbortSignal) {
+    return this.request<Blob>(
+      `/v1/calibrations/${encodeURIComponent(id)}?download=true`,
       undefined,
-      { signal },
+      { signal, download: true },
     );
   }
   async stopTrace(signal?: AbortSignal) {
@@ -628,7 +737,6 @@ class DesktopApi {
       ...snapshot,
       servo_tuning: snapshot.servo_tuning ?? createServoTuning(),
       servo_tuning_revision: snapshot.servo_tuning_revision ?? 0,
-      calibration_readiness: snapshot.calibration_readiness ?? null,
     };
     if (this.calibrationRequest) {
       const id = this.calibrationRequest.id;

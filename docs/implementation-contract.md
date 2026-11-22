@@ -34,7 +34,7 @@
 | `POST /v1/traces/stop`  | 无                            | `200 TraceSummary\|null`           | 结束当前采样             |
 | `GET /v1/traces/{id}`   | 可选 `download/attachment`    | `200 TraceRecording`               | 读取或下载采样 JSON      |
 | `GET /v1/calibrations?limit=20` | 可选条数 | `200 CalibrationReport[]` | 查询最近校准报告 |
-| `GET /v1/calibrations/{id}` | 报告 ID | `200 CalibrationReport` | 读取完整校准报告 |
+| `GET /v1/calibrations/{id}?points=3000` | 报告 ID、绘图点数 | `200 CalibrationReport` | 读取校准报告及绘图曲线 |
 
 普通 HTTP 返回值直接使用表中的结构，没有统一的 `data` 包装。只有 WebSocket 状态消息使用 `{type:"state",data:Snapshot}`。
 
@@ -248,7 +248,7 @@ J1 正向连续点动，速度 0.1 rad/s：
 
 七轴按共同的五次多项式生成返回目标，起止速度和加速度为零；控制参考再经过关节速度、加速度和 jerk 限制，按实际控制间隔积分。回程是关节插值，不提供碰撞规划。界面按左右臂与串口保存收纳位，没有预置角度。
 
-`disconnect_after` 默认 `false`，到位后产生 `completed/returned` 并继续使能保持。设为 `true` 时，到位后失能并关闭串口，再产生 `completed/parked`。到位要求七轴实测和参考位置均在目标的 0.01 rad 内、指令速度归零、实测速度不超过 0.02 rad/s，并连续稳定 200 ms。时间进度到达 1 不能作为断开依据。
+`disconnect_after` 默认 `false`，在参考轨迹到位、指令减速结束后产生 `completed/returned` 并继续使能保持。设为 `true` 时，还需七轴实测位置在目标的 0.02 rad（约 1.15°）内，并有覆盖 200 ms 的新反馈，随后失能、关闭串口并产生 `completed/parked`。两种返回均不使用实测 `dq` 判断到位；小幅位置波动在容差内即可。仅到位断开存在到位期限：轨迹时长后 3 秒仍有位置偏差时结束返回、保持使能并报告具体关节与角度。时间进度到达 1 不能单独触发断开。
 
 返回时 `action.mode` 为 `return`、`space` 为 `joint`、`axis` 为 `null`。原有点动仍返回数值轴索引。接口调用方需要处理这个新增动作类型。使能状态下的旧 `disconnect`/`disable` 请求若未传 `allow_release:true`，现在会被拒绝；该变更自 2026-11-21 起生效。
 
@@ -348,7 +348,7 @@ J1 正向连续点动，速度 0.1 rad/s：
 
 ### 5.10 低速稳定性校准
 
-先连接、取得控制权并使能，等待 `calibration_readiness.state:"ready"` 和成功发送的静止目标。`calibrate_start` 是主动运动命令。一次只测试一个关节，其他关节保持参考；测试中拒绝其他运动、TCP 与伺服配置变更。
+连接、取得控制权并使能后，提交 `calibrate_start`。没有其他动作即可开始，不需要额外积累静止窗口，实测速度噪声不会阻止启动。省略 `settings` 时执行默认的七轴程序：
 
 ```json
 {
@@ -356,68 +356,68 @@ J1 正向连续点动，速度 0.1 rad/s：
   "client_id": "example-service",
   "lease_id": "11111111-1111-4111-8111-111111111111",
   "generation": 5,
-  "kind": "calibrate_start",
-  "settings": {
-    "axis": 1,
-    "excursion": 0.10471975511965977,
-    "speed": 0.017453292519943295,
-    "max_friction": 0.1
-  }
+  "kind": "calibrate_start"
 }
 ```
 
-| 字段 | 单位与范围 | 含义 |
+程序保存当前保持目标作为原位，先以起始参数依次测试 J1..J7。每轴在原位 ±2° 往返并回到原位，分 1°/s、2°/s 两档，共六段。随后选择误差较大的两轴，分别试验 Fc=0.1 Nm、Fc=0.2 Nm 和起始速度前馈的 75%；最后合并优选参数，对全部已测轴再测一轮。Kp/Kd 始终保持起始值。参考和实测位置均限制在起始姿态各轴 ±4° 范围内；超出范围停止本轮。测试沿用关节速度、加速度、jerk 约束以及设备故障和停止处理。
+
+API 可选 `settings` 用于指定单轴或缩小试验；桌面使用默认程序，无参数表单。字段可单独省略：
+
+| 字段 | 默认 | 单位与范围 |
 | --- | --- | --- |
-| `axis` | 0..6 | J1..J7，本例为 J2 |
-| `excursion` | rad，1°..10° | 相对起始位置允许的偏移；目标取参考中心 ±半个此值，最后回到中心 |
-| `speed` | rad/s，0.005..0.04 | 低档峰值速度上限；第二档为两倍；小位移的实际峰值由导数约束降低 |
-| `max_friction` | Nm，0..2 | 选定轴的库仑摩擦及摩擦输出试验上限；0 跳过摩擦候选 |
+| `axis` | null，全部七轴 | 指定 0..6 时只测该轴 |
+| `excursion` | 0.06981317007977318（4°） | rad，1°..10°；允许相对偏移，目标取一半 |
+| `speed` | 0.017453292519943295（1°/s） | rad/s，0.005..0.04；第二档为两倍 |
+| `max_friction` | 0.2 | Nm，0..2；Fc 取一半及全部，0 跳过摩擦候选 |
 
-`Snapshot.calibration_readiness` 直接提供准备情况：state 为 ready、settling、moving 或 unavailable；message 为当前原因；joint 为波动最大或缺少观测的关节（0..6/null）；observed_ms / required_ms 为确认进度；position_span / position_limit 为位置峰峰值及阈值（rad）。
+参数候选各自与原始配置比较，不同时搜索摩擦与速度前馈。原始摩擦开关关闭时，试验先清除休眠系数再打开开关，避免改变其他轴的有效摩擦输出。测量用新位置反馈与成功发送参考的 100 ms 位移窗口计算速度误差；无可配对发送时使用控制参考。不对微秒级接收间隔差分，也不把长缺口拼接成完整窗口。
 
-静止确认使用各轴新到达的位置历史：连续覆盖 300 ms，每轴窗内位置跨度不超过 0.001 rad，数据间隔和最新样本年龄不超过 100 ms。缺轴、非有限反馈、重复/倒退时间和长缺口会使相应观测重新积累。单包 dq 幅值不再单独否决静止；反馈与速度字段保留原值。启动及应用还检查控制权、使能、发送目标与上下文，不提供跳过检查的命令。条件未满足时返回 motion_busy 等对应结果，调用方应观察新状态后手动重试，不排队自动启动。
+选择依据是相对起始值的速度误差与位置误差，权重分别为 0.6 和 0.4；综合误差降低即可进入复测，没有 15% 改善或最少运动秒数的额外门槛。结果分别保留两项变化，数据不足或没有改善也会正常完成测试并保留曲线。
 
-校准内部往返的到位确认也使用位置观测，保留原有到位、减速和 200 ms 停驻规则；普通收纳到位断开的判定保持原样。
+HTTP `202 queued` 后，按启动请求 ID 查看结果及 `Snapshot.calibration`。后端自行执行片段；调用方只需续期控制权，不发送 `jog_update`。配置和片段结束会更新 `generation`。
 
-每组配置执行两档速度的六段往返。全部 Kp/Kd 保持起始值，候选分别试验选定轴的半上限/全上限 Coulomb 系数，以及起始速度前馈的 75%；不同时搜索二者。关闭摩擦但其他轴留有非零系数时拒绝启动，避免打开全局开关改变其他轴的有效行为。
-
-比较使用新到达的位置反馈与已成功写完整批的参考，按 100 ms 窗计算速度跟随误差，不对微秒级回包间隔直接差分。窗口中断、长缺口、起停及数据不足不生成推荐。至少 12 个窗口、2 秒有效运动才形成统计。候选须改善主要速度指标且位置与其他轴偏移不过度恶化，再重测基线与候选。算法判据和模拟测试见[试用测试](low-speed-calibration-test-plan.md)；这些阈值不是机械精度声明。
-
-HTTP 返回 `202 queued` 后，读取匹配请求的结果和 `Snapshot.calibration`。配置切换和片段结束会更新 `generation`；运行由后端推进，调用方只需继续续期控制权，不发送逐片段命令或 `jog_update`。`calibration` 包含：
-
-| 字段 | 含义 |
+| 状态字段 | 含义 |
 | --- | --- |
-| `id` / `request_id` | 报告 ID / 原始启动请求 ID |
+| `id` / `request_id` | 报告 ID / 启动请求 ID |
 | `state` | running、stopping、completed、cancelled、failed |
-| `stage` | baseline、candidate、baseline_check、validation、restoring、done |
-| `axis` | 选定关节 |
-| `trial_index/trial_count` | 从 0 开始的配置进度；是否复测由实测决定，总数可调整 |
-| `leg_index/leg_count` | 当前配置的片段进度；每组 6 段 |
-| `progress` | 0..1；结束为 1，成功与否看 state/report |
-| `report` | 执行时为 null；结束后含配置、统计、结论与推荐 |
+| `stage` | baseline、candidate、validation（合并参数复测）、restoring、done |
+| `axis` | 当前测试的关节，0..6 |
+| `trial_index/trial_count` | 从 0 开始的组进度；后续试验由测量选择，总数会调整 |
+| `leg_index/leg_count` | 当前组的片段进度，每组 6 段 |
+| `progress` | 0..1；终态看 state/report |
+| `live` | 当前一个曲线采样点，运行时可用于预览；终态省略 |
+| `report` | 运行时 null；结束后为报告摘要，curves 为空，sample_count 保留原始总数 |
 
-报告 `outcome` 为 improved、unchanged、insufficient、cancelled 或 failed。`recommended` 是完整 `ServoTuning` 或 null；`improvement` 是重复对照中较小的相对改善比例或 null。`trials[]` 保存阶段、实际配置与 `metrics`：窗口数 windows、有效毫秒 valid_ms、速度误差 RMS velocity_rms（rad/s）、位置误差 RMS/峰值 tracking_rms/tracking_peak（rad）及其他轴相对初始实测的最大偏移 other_peak（rad）。
+完整报告新增 `choices`、`sample_count`、`curves`。`trials[]` 的 `axis` 为测试关节，旧报告可为 null；`phase` 为 baseline、candidate、after，历史报告还可含 baseline_check/validation。每轮 `metrics` 包括 windows、valid_ms、velocity_rms（rad/s）、tracking_rms/tracking_peak/other_peak（rad）。`choices[]` 记录各轴 baseline_index、candidate_index、after_index，以及 velocity_change、tracking_change；相对变化为 `1 - after/before`，正值表示误差降低。
 
-正常完成先恢复起始配置，仍保持使能。停止、释放/失去控制权会取消剩余测试，按现有停止过程减速并恢复配置；失能、断开、故障或关闭不会自动重新使能。桌面停止可取消外部程序发起的校准。关闭弹窗仅隐藏窗口，Esc 请求停止并关闭。
+`outcome` 为 improved、unchanged、cancelled 或 failed，旧报告还可含 insufficient。`recommended` 为完整 ServoTuning 或 null；`improvement` 为合并参数复测的综合误差相对降低比例，不是所有单项指标的改善率。正常完成总是先回到原位、恢复起始参数，并继续使能；没有改善仍是 completed。停止会取消剩余动作、按原停止过程减速并恢复参数，不再自动回原位。故障不自动重新使能。
 
-有推荐时，以最新 `generation` 提交：
+每 20 ms 记录一次七轴曲线，最多 90000 点。所有数组按 J1..J7 排列：
 
-```json
-{
-  "request_id": "req-calibration-use-001",
-  "client_id": "example-service",
-  "lease_id": "11111111-1111-4111-8111-111111111111",
-  "generation": 20,
-  "kind": "calibrate_apply",
-  "calibration_id": "33333333-3333-4333-8333-333333333333"
-}
-```
+| `curves[]` 字段 | 含义与单位 |
+| --- | --- |
+| `t_ms` | 相对测试开始时间，ms |
+| `trial` / `axis` | 当前试验索引 / 本轮运动轴；可据此观察其他轴的联动波动 |
+| `reference` | 控制参考位置，rad |
+| `command` | 最近成功写完整批的发送目标位置，rad；尚无记录时 null |
+| `feedback` | 最近七轴实测位置，rad |
+| `velocity` | 最近成功发送的未缩放轨迹速度，rad/s；无记录时为控制参考速度 |
+| `feedback_velocity` | 原始回传速度，rad/s |
+| `feedback_age_ms` | 各轴反馈距本点的时间，ms |
+| `command_at_ms` | 该批发送完成的相对时间，ms；无记录时 null |
 
-仅当前连接中最近完成、复测通过的结果可应用，且需仍使能、静止、新鲜反馈、原始配置版本和相同 TCP，并位于本轮姿态范围。重新连接、参数修改、TCP 修改（即使改回原值）或已应用均使旧结果失效。calibration_unavailable 表示没有对应推荐；stale_calibration 表示上下文改变；calibration_range 表示姿态越界；calibration_storage_busy 表示上一报告尚待接纳，稍后可手动启动。
+这些是主机时刻的观测，保留反馈年龄与发送时间供区分来源；不是设备端同步采样。旧 JSON 没有曲线时显示统计对比，不补造时间点。
 
-报告在后台序列化并写入现有 events.sqlite3，保留最近 100 份。生产者只尝试一次队列锁，未接纳报告由控制器保留并补投；关闭时在控制结束后交接补投，再刷新数据库。`GET /v1/calibrations` 默认 20，limit 限制到 1..100，按创建时间与 ID 降序返回；单份不存在返回 `404 calibration_not_found`。读取走 spawn_blocking。报告不含令牌或控制权凭据，也不改变事件日志统计。
+有推荐时，用最新 `generation` 提交 `kind:"calibrate_apply", calibration_id:"..."`。只应用当前连接最近完成的报告；手工更改过伺服配置或已经应用过的结果不会再次覆盖当前参数。应用沿用普通伺服配置的连接、控制权与空闲要求，不检查之前的 TCP 或测试姿态。TCP 变化不使关节补偿结果失效。
 
-历史报告可以下载、对照，重启后没有直接应用资格。首版保存逐轮窗口统计与配置，需要完整 control/transmit/feedback 时使用已有短时采样。IMU 共振识别和输入整形见[设计方案](calibration-analysis-plan.md)。
+报告元数据和曲线分别存入 events.sqlite3 的 calibrations、calibration_curves 表，同一事务保存，保留最近 100 份。控制线程只采样和尝试队列提交；JSON 编码与 SQL 在写入线程执行，不等待磁盘。未入队报告保留补投，开始下一次测试不等待数据库。历史与当前状态仅带摘要，完整曲线按需读取：
+
+- `GET /v1/calibrations?limit=20`：最近摘要，limit 限制到 1..100。
+- `GET /v1/calibrations/{id}?points=3000`：默认约 3000 个真实采样点，保留每段端点，不插值；端点本身超过预算时可以超出点数。`points=0` 返回全部。
+- `GET /v1/calibrations/{id}?download=true`：完整 JSON 附件，忽略 points。
+
+读取、抽取绘图点和编码都在 `spawn_blocking` 中执行。未找到返回 `404 calibration_not_found`；新完成报告尚未入库时可稍后重读。历史报告可以查看、导入和下载，重启后不自动取得应用资格。操作与测试见[校准试用流程](low-speed-calibration-test-plan.md)。
 
 ## 6. 命令输出与执行结果
 
@@ -475,7 +475,6 @@ HTTP 返回 `202 queued` 后，读取匹配请求的结果和 `Snapshot.calibrat
 | `feedback_age_ms`         | u64 或 null                    | 已有反馈中最大的接收年龄                           |
 | `action`                  | object 或 null                 | 当前动作：`request_id,space,mode,axis,progress`    |
 | `calibration` | `CalibrationStatus` 或 null | 当前校准或最近一次结果，见 5.10 |
-| `calibration_readiness` | `CalibrationReadiness` | 位置静止确认进度和阻止开始的具体原因，见 5.10 |
 | `last_result` / `results` | `CommandResult` 或 null / 数组 | 最新一条结果 / 最近结果                            |
 | `error`                   | `{code,message}` 或 null       | 当前故障                                           |
 | `journal`                 | object                         | `pending,written,dropped,errors,healthy`           |
@@ -849,7 +848,7 @@ Tauri 仅向主窗口提供三个命令：
 
 ### calibration.rs
 
-集中定义测试设置、有限往返目标、固定窗口测量、候选与重复对照判定，不执行串口或数据库 I/O。`arm.rs` 保存一项校准任务，复用现有收纳轨迹与参数应用，在控制周期推进并处理停止、恢复和应用资格。
+集中定义默认逐轴程序、往返目标、固定窗口测量、候选评分、报告和绘图采样，不执行串口或数据库 I/O。`arm.rs` 保存一项校准任务，复用现有收纳轨迹与参数应用，在控制周期推进并处理停止、恢复和应用资格。
 
 ### trajectory.rs
 

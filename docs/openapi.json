@@ -276,17 +276,7 @@
                     ]
                   },
                   "servo_tuning_revision": 1,
-                  "calibration": null,
-                  "calibration_readiness": {
-                    "state": "unavailable",
-                    "code": "not_connected",
-                    "message": "请先连接机械臂",
-                    "joint": null,
-                    "observed_ms": 0,
-                    "required_ms": 300,
-                    "position_span": null,
-                    "position_limit": 0.001
-                  }
+                  "calibration": null
                 }
               }
             }
@@ -661,14 +651,9 @@
                     "client_id": "example-service",
                     "lease_id": "11111111-1111-4111-8111-111111111111",
                     "generation": 4,
-                    "kind": "calibrate_start",
-                    "settings": {
-                      "axis": 1,
-                      "excursion": 0.10471975511965978,
-                      "speed": 0.017453292519943295,
-                      "max_friction": 0.1
-                    }
-                  }
+                    "kind": "calibrate_start"
+                  },
+                  "summary": "启动默认七轴低速测试"
                 },
                 "calibrate_apply": {
                   "value": {
@@ -1147,17 +1132,7 @@
                   ]
                 },
                 "servo_tuning_revision": 1,
-                "calibration": null,
-                "calibration_readiness": {
-                  "state": "unavailable",
-                  "code": "not_connected",
-                  "message": "请先连接机械臂",
-                  "joint": null,
-                  "observed_ms": 0,
-                  "required_ms": 300,
-                  "position_span": null,
-                  "position_limit": 0.001
-                }
+                "calibration": null
               }
             }
           },
@@ -1953,7 +1928,10 @@
                     "trials": [],
                     "outcome": "cancelled",
                     "improvement": null,
-                    "message": "校准已取消"
+                    "message": "校准已取消",
+                    "choices": [],
+                    "sample_count": 0,
+                    "curves": []
                   }
                 ]
               }
@@ -1991,7 +1969,7 @@
         "tags": [
           "校准"
         ],
-        "summary": "读取单次校准报告",
+        "summary": "读取校准报告与曲线，或下载完整JSON",
         "parameters": [
           {
             "name": "id",
@@ -2001,11 +1979,34 @@
               "type": "string"
             },
             "example": "33333333-3333-4333-8333-333333333333"
+          },
+          {
+            "name": "points",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 3000
+            },
+            "description": "绘图采样预算，保留每段端点；端点可超过预算。0返回全部，download=true时忽略。",
+            "example": 3000
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": "true返回完整JSON附件。",
+            "example": false
           }
         ],
         "responses": {
           "200": {
-            "description": "完整报告，供查看或保存JSON。",
+            "description": "默认约3000个真实点，保留段端点，不插值；download=true返回所有点和附件头。sample_count保留原始总数。",
             "content": {
               "application/json": {
                 "schema": {
@@ -2107,13 +2108,30 @@
                   "trials": [],
                   "outcome": "cancelled",
                   "improvement": null,
-                  "message": "校准已取消"
+                  "message": "校准已取消",
+                  "choices": [],
+                  "sample_count": 0,
+                  "curves": []
+                }
+              }
+            },
+            "headers": {
+              "Content-Disposition": {
+                "description": "仅download=true时返回 attachment; filename=\"calibration-<id>.json\"。",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
                 }
               }
             }
           },
           "400": {
-            "description": "编号过长。",
+            "description": "查询参数格式无效。",
             "content": {
               "application/json": {
                 "schema": {
@@ -2121,7 +2139,7 @@
                 },
                 "example": {
                   "code": "invalid_calibration",
-                  "message": "校准编号无效"
+                  "message": "校准查询参数无效"
                 }
               }
             }
@@ -4134,9 +4152,6 @@
                 "type": "null"
               }
             ]
-          },
-          "calibration_readiness": {
-            "$ref": "#/components/schemas/CalibrationReadiness"
           }
         },
         "required": [
@@ -4160,8 +4175,7 @@
           "communication",
           "servo_tuning",
           "servo_tuning_revision",
-          "calibration",
-          "calibration_readiness"
+          "calibration"
         ],
         "description": "完整状态；所有键均存在，可选值用 null。tcp 是实测关节计算的基座 → TCP；未设置 TCP 或反馈无效时为 null。",
         "examples": [
@@ -4334,17 +4348,7 @@
               ]
             },
             "servo_tuning_revision": 1,
-            "calibration": null,
-            "calibration_readiness": {
-              "state": "unavailable",
-              "code": "not_connected",
-              "message": "请先连接机械臂",
-              "joint": null,
-              "observed_ms": 0,
-              "required_ms": 300,
-              "position_span": null,
-              "position_limit": 0.001
-            }
+            "calibration": null
           }
         ]
       },
@@ -4535,17 +4539,7 @@
                 ]
               },
               "servo_tuning_revision": 1,
-              "calibration": null,
-              "calibration_readiness": {
-                "state": "unavailable",
-                "code": "not_connected",
-                "message": "请先连接机械臂",
-                "joint": null,
-                "observed_ms": 0,
-                "required_ms": 300,
-                "position_span": null,
-                "position_limit": 0.001
-              }
+              "calibration": null
             }
           }
         ]
@@ -4701,7 +4695,7 @@
             ]
           }
         ],
-        "description": "七轴通过五次多项式生成共同返回目标，最终控制参考按速度、加速度与 jerk 限制后积分；上限为 0.20 rad/s、0.60 rad/s²、6 rad/s³，jerk 为离线默认值。须已使能、反馈齐全新鲜且无其他动作。位置误差≤0.01 rad、实测速度≤0.02 rad/s并稳定200ms后返回 completed/returned 或 completed/parked。到位超时、取消或跟随偏差超限不会继续断开。关节插值不提供碰撞规划。",
+        "description": "七轴共同五次轨迹返回。保持连接的返回按参考目标和减速结束完成；到位断开另要求实测位置距目标不超过0.02rad并有覆盖200ms的新反馈，不检查实测速度。仅断开模式在轨迹时长后3秒仍有位置偏差时报告具体关节，保持使能。停止取消后续断开。",
         "examples": [
           {
             "request_id": "req-return-001",
@@ -5983,43 +5977,50 @@
         "type": "object",
         "properties": {
           "axis": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "minimum": 0,
-            "maximum": 6
+            "maximum": 6,
+            "default": null,
+            "description": "null 或省略时依次测试七轴；0..6 指定单轴。"
           },
           "excursion": {
             "type": "number",
             "minimum": 0.017453292519943295,
             "maximum": 0.1745329252,
-            "description": "相对最大位移，rad，1°..10°；目标取一半。最大值兼容十位小数的10°换算。"
+            "description": "相对最大位移，rad，1°..10°；目标取一半。最大值兼容十位小数的10°换算。",
+            "default": 0.06981317007977318
           },
           "speed": {
             "type": "number",
             "minimum": 0.005,
             "maximum": 0.04,
-            "description": "慢档rad/s，快档为两倍。"
+            "description": "慢档rad/s，快档为两倍。",
+            "default": 0.017453292519943295
           },
           "max_friction": {
             "type": "number",
             "minimum": 0,
             "maximum": 2,
-            "description": "选定关节的Fc试验上限Nm，不是本体已验证安全上限。"
+            "description": "Fc 试验上限，Nm；候选取一半及全部，0 跳过摩擦候选。",
+            "default": 0.2
           }
         },
-        "required": [
-          "axis",
-          "excursion",
-          "speed",
-          "max_friction"
-        ],
         "examples": [
+          {},
           {
-            "axis": 1,
-            "excursion": 0.10471975511965978,
+            "axis": null,
+            "excursion": 0.06981317007977318,
             "speed": 0.017453292519943295,
-            "max_friction": 0.1
+            "max_friction": 0.2
+          },
+          {
+            "axis": 3
           }
-        ]
+        ],
+        "description": "字段可省略，缺省执行七轴固定程序；输入仍沿用软件运动范围。默认目标为起始保持姿态各轴 ±2°，实际允许偏移 ±4°。"
       },
       "CalibrationMetrics": {
         "type": "object",
@@ -6067,9 +6068,11 @@
             "enum": [
               "baseline",
               "candidate",
+              "after",
               "baseline_check",
               "validation"
-            ]
+            ],
+            "description": "当前程序使用 baseline/candidate/after；其余值用于读取历史报告。"
           },
           "config": {
             "$ref": "#/components/schemas/ServoTuning"
@@ -6083,13 +6086,23 @@
                 "type": "null"
               }
             ]
+          },
+          "axis": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 6,
+            "description": "本轮运动关节；旧报告未记录时为 null。"
           }
         },
         "required": [
           "index",
           "phase",
           "config",
-          "metrics"
+          "metrics",
+          "axis"
         ]
       },
       "CalibrationReport": {
@@ -6159,7 +6172,6 @@
           },
           "trials": {
             "type": "array",
-            "maxItems": 6,
             "items": {
               "$ref": "#/components/schemas/CalibrationTrial"
             }
@@ -6180,10 +6192,30 @@
               "null"
             ],
             "minimum": 0,
-            "maximum": 1
+            "maximum": 1,
+            "description": "合并参数复测的综合相对误差降低比例；速度权重0.6、位置0.4，不是各单项的改善率。"
           },
           "message": {
             "type": "string"
+          },
+          "choices": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CalibrationChoice"
+            }
+          },
+          "sample_count": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 90000,
+            "description": "原始总点数，摘要或绘图抽取后仍保留。"
+          },
+          "curves": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CalibrationPoint"
+            },
+            "description": "时间曲线。状态流和历史列表为空；详情默认抽取真实采样，下载返回全部。旧报告没有逐时刻数据时为空。"
           }
         },
         "required": [
@@ -6201,7 +6233,10 @@
           "trials",
           "outcome",
           "improvement",
-          "message"
+          "message",
+          "choices",
+          "sample_count",
+          "curves"
         ],
         "examples": [
           {
@@ -6300,9 +6335,13 @@
             "trials": [],
             "outcome": "cancelled",
             "improvement": null,
-            "message": "校准已取消"
+            "message": "校准已取消",
+            "choices": [],
+            "sample_count": 0,
+            "curves": []
           }
-        ]
+        ],
+        "description": "校准报告，正常无改善仍为完成测量。摘要不带曲线，详细读取和下载带曲线。正常结束恢复起始参数，推荐须显式应用。"
       },
       "CalibrationStatus": {
         "type": "object",
@@ -6332,7 +6371,8 @@
               "validation",
               "restoring",
               "done"
-            ]
+            ],
+            "description": "合并参数复测在状态中标为 validation，对应 trials.phase=after。"
           },
           "axis": {
             "type": "integer",
@@ -6368,7 +6408,19 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "终态报告摘要，curves 为空且 sample_count 保留；运行中 null。"
+          },
+          "live": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CalibrationPoint"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "运行中的最近曲线点，终态省略；完整曲线由详情读取。"
           }
         },
         "required": [
@@ -6398,28 +6450,32 @@
                 "const": "calibrate_start"
               },
               "settings": {
-                "$ref": "#/components/schemas/CalibrationSettings"
+                "$ref": "#/components/schemas/CalibrationSettings",
+                "description": "可省略，省略时执行默认七轴程序；不接受 null。"
               }
             },
             "required": [
-              "kind",
-              "settings"
+              "kind"
             ]
           }
         ],
-        "description": "已连接、使能、静止并持有控制权时启动有限关节往返。输入范围为本软件限制。Kd固定，候选分别试验；完成恢复起始参数。通过Snapshot.calibration跟踪，stop/释放/过期/故障/关闭取消后续测试。",
+        "description": "连接、使能、持有控制权且没有其他动作时启动。无需额外静止窗口，不按反馈dq拒绝。保存当前保持目标为原位；基线扫七轴，误差较大的两轴分别试摩擦/速度前馈，再合并复测。固定Kp/Kd，完成回原位恢复起始配置。stop等取消后续动作。",
         "examples": [
           {
             "request_id": "req-calibration-001",
             "client_id": "example-service",
             "lease_id": "11111111-1111-4111-8111-111111111111",
             "generation": 4,
+            "kind": "calibrate_start"
+          },
+          {
+            "request_id": "req-calibration-single",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 4,
             "kind": "calibrate_start",
             "settings": {
-              "axis": 1,
-              "excursion": 0.10471975511965978,
-              "speed": 0.017453292519943295,
-              "max_friction": 0.1
+              "axis": 3
             }
           }
         ]
@@ -6446,7 +6502,7 @@
             ]
           }
         ],
-        "description": "只应用当前连接最近完成且重复验证通过的结果；要求静止、同工具/起始参数版本并在测试姿态范围内。接受后generation和servo_tuning_revision递增；只返回queued不能当作已应用。历史报告不能借此在新连接直接应用。",
+        "description": "应用当前连接最近完成且有推荐的报告。手工修改过伺服配置或已应用的结果不会重复覆盖；无额外TCP/测试姿态检查。沿用普通伺服配置的连接、控制权和空闲要求，generation与配置版本递增；HTTP queued仍需从状态确认。",
         "examples": [
           {
             "request_id": "req-calibration-use-001",
@@ -6458,87 +6514,224 @@
           }
         ]
       },
-      "CalibrationReadiness": {
+      "CalibrationPoint": {
         "type": "object",
-        "description": "由七轴新到达位置反馈与控制状态计算的校准准备状态；不改变反馈或自动提交动作。",
         "properties": {
-          "state": {
-            "type": "string",
-            "enum": [
-              "ready",
-              "settling",
-              "moving",
-              "unavailable"
+          "t_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295,
+            "description": "距本轮测试开始的主机时间，ms。"
+          },
+          "trial": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "trials 数组的索引。"
+          },
+          "axis": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 6,
+            "description": "本轮运动轴，其他轴数据也完整记录。"
+          },
+          "reference": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "控制参考位置，rad，J1..J7。"
+          },
+          "command": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "type": "number"
+                },
+                "minItems": 7,
+                "maxItems": 7,
+                "description": "最近成功写完整批的发送目标位置，rad。"
+              },
+              {
+                "type": "null"
+              }
             ]
           },
-          "code": {
-            "type": "string"
+          "feedback": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "七轴缓存实测位置，rad；时效见 feedback_age_ms。"
           },
-          "message": {
-            "type": "string"
+          "velocity": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "最近成功发送的未缩放轨迹速度，rad/s；尚无记录时使用控制参考。"
           },
-          "joint": {
+          "feedback_velocity": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "七轴原始回传速度，rad/s。"
+          },
+          "feedback_age_ms": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "各轴反馈距当前点的年龄，ms。"
+          },
+          "command_at_ms": {
             "type": [
               "integer",
               "null"
             ],
             "minimum": 0,
-            "maximum": 6,
-            "description": "位置波动最大或缺少有效观测的关节，0..6；不是选定测试轴。"
-          },
-          "observed_ms": {
-            "type": "integer",
-            "minimum": 0,
-            "maximum": 300
-          },
-          "required_ms": {
-            "type": "integer",
-            "const": 300
-          },
-          "position_span": {
-            "type": [
-              "number",
-              "null"
-            ],
-            "minimum": 0,
-            "description": "有效观测窗内七轴最大位置峰峰值，rad；无有效观测为null。"
-          },
-          "position_limit": {
-            "type": "number",
-            "const": 0.001,
-            "description": "静止确认的软件位置跨度阈值，rad。"
+            "maximum": 4294967295,
+            "description": "该批发送完成时间，相对测试开始，ms；尚无记录时 null。"
           }
         },
+        "description": "每20ms观察一次的主机时序数据，包含所有七轴。保留各来源时间，不表示设备同步采样。",
         "required": [
-          "state",
-          "code",
-          "message",
-          "joint",
-          "observed_ms",
-          "required_ms",
-          "position_span",
-          "position_limit"
+          "t_ms",
+          "trial",
+          "axis",
+          "reference",
+          "command",
+          "feedback",
+          "velocity",
+          "feedback_velocity",
+          "feedback_age_ms",
+          "command_at_ms"
         ],
         "examples": [
           {
-            "state": "ready",
-            "code": "ready",
-            "message": "位置已稳定，可以开始校准",
-            "joint": 5,
-            "observed_ms": 300,
-            "required_ms": 300,
-            "position_span": 0.00012,
-            "position_limit": 0.001
+            "t_ms": 1020,
+            "trial": 0,
+            "axis": 0,
+            "reference": [
+              0.01,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "command": [
+              0.0098,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "feedback": [
+              0.008,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "velocity": [
+              0.017,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "feedback_velocity": [
+              0.012,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "feedback_age_ms": [
+              2,
+              3,
+              2,
+              3,
+              2,
+              3,
+              2
+            ],
+            "command_at_ms": 1019
+          }
+        ]
+      },
+      "CalibrationChoice": {
+        "type": "object",
+        "properties": {
+          "axis": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 6
           },
+          "baseline_index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "candidate_index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "after_index": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "velocity_change": {
+            "type": "number",
+            "description": "1-after/before，正值为速度误差降低；before为0时0。"
+          },
+          "tracking_change": {
+            "type": "number",
+            "description": "1-after/before，正值为位置误差降低；before为0时0。"
+          }
+        },
+        "description": "每轴候选与合并参数复测的比较；after_index 存在时变化量以复测为准。",
+        "required": [
+          "axis",
+          "baseline_index",
+          "candidate_index",
+          "after_index",
+          "velocity_change",
+          "tracking_change"
+        ],
+        "examples": [
           {
-            "state": "unavailable",
-            "code": "not_connected",
-            "message": "请先连接机械臂",
-            "joint": null,
-            "observed_ms": 0,
-            "required_ms": 300,
-            "position_span": null,
-            "position_limit": 0.001
+            "axis": 3,
+            "baseline_index": 3,
+            "candidate_index": 8,
+            "after_index": 16,
+            "velocity_change": 0.04,
+            "tracking_change": 0.38
           }
         ]
       }

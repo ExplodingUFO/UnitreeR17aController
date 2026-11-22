@@ -361,6 +361,8 @@ export default function App() {
   };
   const openCalibration = () => {
     cancel("calibration_dialog");
+    setTcpOpen(false);
+    setInterfaceOpen(false);
     setServoOpen(false);
     setCalibrationOpen(true);
   };
@@ -472,7 +474,6 @@ export default function App() {
   const resolvedMotionBusy =
     result?.status === "rejected" &&
     result.code === "motion_busy" &&
-    s.calibration_readiness?.state === "ready" &&
     s.phase === "ready" &&
     !s.action;
   const fault =
@@ -584,6 +585,15 @@ export default function App() {
         <section className="panel left-panel" id="device-panel">
           <div className="panel-heading">
             <h2>连接</h2>
+            <button
+              type="button"
+              aria-haspopup="dialog"
+              aria-controls="calibration-dialog"
+              aria-expanded={calibrationOpen}
+              onClick={openCalibration}
+            >
+              校准
+            </button>
             <button disabled={busy} onClick={() => openSafety("parking")}>
               收纳
             </button>

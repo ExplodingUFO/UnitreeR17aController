@@ -1,15 +1,21 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ChangeEvent } from "react";
 import {
   api,
   ApiError,
-  hasFreshFeedback,
+  parseCalibrationReport,
   sameServoTuning,
+  type CalibrationMetrics,
+  type CalibrationPoint,
   type CalibrationReport,
-  type CalibrationSettings,
   type CalibrationStatus,
+  type CalibrationTrial,
   type ServoTuning,
   type View,
 } from "./api";
+import CalibrationChart, {
+  calibrationTrialLabel,
+  calibrationTrials,
+} from "./CalibrationChart";
 
 export interface CalibrationPanelProps {
   view: View;
@@ -17,14 +23,7 @@ export interface CalibrationPanelProps {
   onClose: () => void;
   onStop: () => void;
 }
-
-type Page = "settings" | "progress" | "result" | "history";
-type Draft = {
-  axis: number;
-  excursion: string;
-  speed: string;
-  friction: string;
-};
+type Page = "settings" | "progress" | "result" | "curves" | "history";
 type Pending = {
   kind: "start" | "apply";
   id: string;
@@ -32,46 +31,30 @@ type Pending = {
   generation: number;
   revision: number;
   config: ServoTuning;
-  tcp: string;
-  timedOut: boolean;
   accepted: boolean;
+  uncertain: boolean;
 };
 type Run = {
   id: string;
   connection: string;
   state: "waiting" | "running" | "terminal";
 };
-type Eligibility = {
-  id: string;
-  connection: string;
-  revision: number;
-  tcp: string;
-};
-type Feedback = {
-  text: string;
-  tone: "error" | "info" | "success";
-  code?: string;
-};
-const RAD = Math.PI / 180;
+type Feedback = { text: string; tone: "info" | "error" | "success" };
+type Selection = { id: string; local: boolean };
+const DEG = 180 / Math.PI;
 const stages: Record<CalibrationStatus["stage"], string> = {
-  baseline: "测量基线",
+  baseline: "测量七轴基线",
   candidate: "比较候选参数",
   baseline_check: "复测基线",
-  validation: "验证推荐参数",
-  restoring: "恢复起始参数",
-  done: "已结束",
-};
-const outcomes: Record<CalibrationReport["outcome"], string> = {
-  improved: "低速表现改善",
-  unchanged: "保持原参数",
-  insufficient: "有效数据不足",
-  cancelled: "校准已取消",
-  failed: "校准未完成",
+  validation: "整体对比",
+  after: "整体对比",
+  restoring: "回到原位，恢复参数",
+  done: "测试结束",
 };
 const terminal = (status: CalibrationStatus) =>
   ["completed", "cancelled", "failed"].includes(status.state);
-const degrees = (value: number | null | undefined, digits = 2) =>
-  value != null && Number.isFinite(value) ? (value / RAD).toFixed(digits) : "—";
+const degrees = (value: number | null | undefined, digits = 3) =>
+  value != null && Number.isFinite(value) ? (value * DEG).toFixed(digits) : "—";
 const percent = (value: number) =>
   Math.round(
     Math.min(1, Math.max(0, Number.isFinite(value) ? value : 0)) * 100,
@@ -84,190 +67,296 @@ const timestamp = (value: number) =>
     minute: "2-digit",
     hour12: false,
   });
-function readSettings(draft: Draft): CalibrationSettings | null {
-  const excursion = Number(draft.excursion);
-  const speed = Number(draft.speed) * RAD;
-  const friction = Number(draft.friction);
+const axisLabel = (report: CalibrationReport) =>
+  report.settings.axis == null ? "J1–J7" : `J${report.settings.axis + 1}`;
+function outcome(report: CalibrationReport) {
+  if (report.outcome === "cancelled") return "测试已停止";
+  if (report.outcome === "failed") return "测试未完成";
+  return report.recommended ? "测试完成，有推荐参数" : "测试完成，参数保持原样";
+}
+function change(before: number | undefined, after: number | undefined) {
   if (
-    !Number.isInteger(draft.axis) ||
-    draft.axis < 0 ||
-    draft.axis > 6 ||
-    !draft.excursion.trim() ||
-    !Number.isFinite(excursion) ||
-    excursion < 1 ||
-    excursion > 10 ||
-    !draft.speed.trim() ||
-    !Number.isFinite(speed) ||
-    speed < 0.005 ||
-    speed > 0.04 ||
-    !draft.friction.trim() ||
-    !Number.isFinite(friction) ||
-    friction < 0 ||
-    friction > 2
+    before == null ||
+    after == null ||
+    !Number.isFinite(before) ||
+    !Number.isFinite(after) ||
+    before <= 0
   )
     return null;
-  return {
-    axis: draft.axis,
-    excursion: excursion * RAD,
-    speed,
-    max_friction: friction,
-  };
+  return (before - after) / before;
 }
-function downloadReport(report: CalibrationReport) {
-  const url = URL.createObjectURL(
-    new Blob([JSON.stringify(report, null, 2)], { type: "application/json" }),
+function Change({ value }: { value: number | null }) {
+  return value == null ? null : (
+    <small data-change={value > 0 ? "better" : value < 0 ? "worse" : "same"}>
+      {Math.abs(value) < 0.0005
+        ? "持平"
+        : `${value > 0 ? "降低" : "增加"} ${(Math.abs(value) * 100).toFixed(1)}%`}
+    </small>
   );
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `calibration-${report.id.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`;
-  document.body.append(link);
-  link.click();
-  link.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
-function ReportDetails({ report }: { report: CalibrationReport }) {
-  const [details, setDetails] = useState<"config" | "metrics">("config");
-  const axis = report.settings.axis;
-  const baseline = report.baseline.joints[axis];
-  const recommended = report.recommended?.joints[axis];
+function measuredAxes(report: CalibrationReport) {
+  return Array.from({ length: 7 }, (_, axis) => axis).filter(
+    (axis) => calibrationTrials(report, axis).length > 0,
+  );
+}
+function comparisonFor(report: CalibrationReport, axis: number) {
+  const trials = calibrationTrials(report, axis);
+  const choice = report.choices?.find((item) => item.axis === axis);
+  const baseline =
+    trials.find((trial) => trial.index === choice?.baseline_index) ??
+    trials.find((trial) => trial.phase === "baseline") ??
+    trials[0];
+  const candidates = trials.filter(
+    (trial) => trial !== baseline && trial.metrics,
+  );
+  const score = (trial: CalibrationTrial) => {
+    const b = baseline?.metrics,
+      m = trial.metrics;
+    if (!b || !m) return Infinity;
+    return (
+      (0.6 * m.velocity_rms) / Math.max(b.velocity_rms, 1e-12) +
+      (0.4 * m.tracking_rms) / Math.max(b.tracking_rms, 1e-12)
+    );
+  };
+  const comparison =
+    trials.find((trial) => trial.index === choice?.after_index) ??
+    trials.find((trial) => trial.phase === "after") ??
+    trials.find((trial) => trial.index === choice?.candidate_index) ??
+    candidates.find(
+      (trial) =>
+        report.recommended && sameServoTuning(trial.config, report.recommended),
+    ) ??
+    candidates.reduce<CalibrationTrial | undefined>(
+      (best, trial) => (!best || score(trial) < score(best) ? trial : best),
+      undefined,
+    );
+  return { baseline, comparison };
+}
+function MetricComparison({
+  before,
+  after,
+  field,
+}: {
+  before: CalibrationMetrics | null | undefined;
+  after: CalibrationMetrics | null | undefined;
+  field: "tracking_rms" | "velocity_rms" | "tracking_peak";
+}) {
+  return (
+    <td>
+      <span>
+        {degrees(before?.[field])} → {degrees(after?.[field])}
+      </span>
+      <Change value={change(before?.[field], after?.[field])} />
+    </td>
+  );
+}
+function ReportDetails({
+  report,
+  local,
+}: {
+  report: CalibrationReport;
+  local: boolean;
+}) {
+  const axes = measuredAxes(report);
   const fields = [
-    ["kd", "阻尼 Kd", "Nm·s/rad"],
-    ["velocity_ff", "速度前馈", ""],
-    ["coulomb", "库仑补偿 Fc", "Nm"],
-    ["viscous", "黏性补偿 B", "Nm·s/rad"],
-    ["velocity_scale", "过零速度", "rad/s"],
-    ["max_friction", "补偿限幅", "Nm"],
+    ["kd", "阻尼 Kd"],
+    ["velocity_ff", "速度前馈"],
+    ["coulomb", "补偿 Fc"],
+    ["viscous", "黏性补偿 B"],
+    ["velocity_scale", "过零速度"],
+    ["max_friction", "补偿限幅"],
   ] as const;
   return (
     <div className="calibration-report">
       <div className="calibration-result-heading">
         <div>
           <small>
-            J{axis + 1} · {timestamp(report.created_at_ms)}
+            {axisLabel(report)} · {timestamp(report.created_at_ms)}
+            {local ? " · 导入报告，只读" : ""}
           </small>
-          <h3>{outcomes[report.outcome]}</h3>
+          <h3>{outcome(report)}</h3>
         </div>
-        {report.improvement !== null && Number.isFinite(report.improvement) && (
-          <strong className="calibration-improvement">
-            {(report.improvement * 100).toFixed(1)}%<small>改善</small>
-          </strong>
-        )}
+        <small>
+          {report.curves?.length
+            ? `${(report.sample_count || report.curves.length).toLocaleString()} 采样`
+            : report.trials.length
+              ? `${report.trials.length} 轮测量`
+              : "统计报告"}
+        </small>
       </div>
-      <p className="calibration-report-message">{report.message}</p>
-      <div className="calibration-report-context">
-        <span>参考中心 {degrees(report.center_reference[axis])}°</span>
-        <span>实测中心 {degrees(report.center_measured[axis])}°</span>
-        <span>最大位移 ±{degrees(report.settings.excursion, 1)}°</span>
-        <span>{degrees(report.settings.speed)}°/s</span>
-      </div>
-      <div className="calibration-detail-tabs" aria-label="报告内容">
-        <button
-          aria-pressed={details === "config"}
-          onClick={() => setDetails("config")}
-        >
-          参数对比
-        </button>
-        <button
-          aria-pressed={details === "metrics"}
-          onClick={() => setDetails("metrics")}
-        >
-          测量记录 · {report.trials.length}
-        </button>
-      </div>
-      {details === "config" ? (
-        <table
-          className="calibration-table"
-          aria-label="起始参数与推荐参数对比"
-        >
-          <thead>
-            <tr>
-              <th>J{axis + 1} 参数</th>
-              <th>起始</th>
-              <th>推荐</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <th>摩擦补偿</th>
-              <td>{report.baseline.friction_enabled ? "开启" : "关闭"}</td>
-              <td>
-                {report.recommended
-                  ? report.recommended.friction_enabled
-                    ? "开启"
-                    : "关闭"
-                  : "—"}
-              </td>
-            </tr>
-            {fields.map(([key, label, unit]) => (
-              <tr key={key}>
-                <th>
-                  {label} <small>{unit}</small>
-                </th>
-                <td>{baseline[key]}</td>
-                <td
-                  data-changed={
-                    recommended && recommended[key] !== baseline[key]
-                  }
-                >
-                  {recommended?.[key] ?? "—"}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      ) : report.trials.length ? (
+      <p className="calibration-report-message">
+        {["failed", "cancelled"].includes(report.outcome)
+          ? report.message
+          : report.recommended
+            ? "已恢复起始参数。"
+            : "各轮测量已保留，可查看每轴的变化与曲线。"}
+      </p>
+      {axes.length > 0 && (
         <div className="calibration-table-scroll">
           <table
-            className="calibration-table calibration-metrics"
-            aria-label="校准测量记录"
+            className="calibration-table calibration-axis-results"
+            aria-label="每轴测量比较"
           >
             <thead>
               <tr>
-                <th>试验</th>
-                <th>窗口</th>
-                <th>
-                  速度 RMS<small>°/s</small>
-                </th>
-                <th>
-                  跟踪 RMS<small>°</small>
-                </th>
-                <th>
-                  跟踪峰值<small>°</small>
-                </th>
-                <th>
-                  其他轴峰值<small>°</small>
-                </th>
-                <th>
-                  有效时间<small>s</small>
-                </th>
+                <th>关节 / 对比</th>
+                <th>跟随 RMS · °</th>
+                <th>速度 RMS · °/s</th>
+                <th>跟随峰值 · °</th>
               </tr>
             </thead>
             <tbody>
-              {report.trials.map((trial) => (
-                <tr key={`${trial.index}:${trial.phase}`}>
-                  <th>
-                    {trial.index} ·{" "}
-                    {stages[trial.phase as CalibrationStatus["stage"]] ??
-                      trial.phase}
-                  </th>
-                  <td>{trial.metrics?.windows ?? "—"}</td>
-                  <td>{degrees(trial.metrics?.velocity_rms, 3)}</td>
-                  <td>{degrees(trial.metrics?.tracking_rms, 3)}</td>
-                  <td>{degrees(trial.metrics?.tracking_peak, 3)}</td>
-                  <td>{degrees(trial.metrics?.other_peak, 3)}</td>
-                  <td>
-                    {trial.metrics
-                      ? (trial.metrics.valid_ms / 1000).toFixed(1)
-                      : "—"}
-                  </td>
-                </tr>
-              ))}
+              {axes.map((axis) => {
+                const { baseline, comparison } = comparisonFor(report, axis);
+                return (
+                  <tr key={axis}>
+                    <th>
+                      <b>J{axis + 1}</b>
+                      <small>
+                        {comparison
+                          ? calibrationTrialLabel(report, comparison, axis)
+                          : "仅基线"}
+                      </small>
+                    </th>
+                    <MetricComparison
+                      before={baseline?.metrics}
+                      after={comparison?.metrics}
+                      field="tracking_rms"
+                    />
+                    <MetricComparison
+                      before={baseline?.metrics}
+                      after={comparison?.metrics}
+                      field="velocity_rms"
+                    />
+                    <MetricComparison
+                      before={baseline?.metrics}
+                      after={comparison?.metrics}
+                      field="tracking_peak"
+                    />
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
-      ) : (
-        <p className="calibration-empty">没有测量记录</p>
       )}
+      {report.trials.length > 0 ? (
+        <>
+          <h4 className="calibration-section-label">
+            各轮测量 <small>相对同轴基线</small>
+          </h4>
+          <div className="calibration-table-scroll">
+            <table
+              className="calibration-table calibration-rounds"
+              aria-label="各轮位置速度峰值对比"
+            >
+              <thead>
+                <tr>
+                  <th>试验</th>
+                  <th>跟随 RMS · °</th>
+                  <th>速度 RMS · °/s</th>
+                  <th>跟随峰值 · °</th>
+                  <th>有效时间 · s</th>
+                </tr>
+              </thead>
+              <tbody>
+                {report.trials.map((trial) => {
+                  const axis = trial.axis ?? report.settings.axis;
+                  const baseline =
+                    axis == null ? null : comparisonFor(report, axis).baseline;
+                  return (
+                    <tr key={`${trial.index}:${axis ?? "all"}:${trial.phase}`}>
+                      <th>
+                        {axis == null ? "七轴" : `J${axis + 1}`} ·{" "}
+                        {axis == null
+                          ? trial.phase === "after"
+                            ? "整体对比 after"
+                            : trial.phase
+                          : calibrationTrialLabel(report, trial, axis)}
+                      </th>
+                      <td>
+                        {degrees(trial.metrics?.tracking_rms)}
+                        {trial !== baseline && (
+                          <Change
+                            value={change(
+                              baseline?.metrics?.tracking_rms,
+                              trial.metrics?.tracking_rms,
+                            )}
+                          />
+                        )}
+                      </td>
+                      <td>
+                        {degrees(trial.metrics?.velocity_rms)}
+                        {trial !== baseline && (
+                          <Change
+                            value={change(
+                              baseline?.metrics?.velocity_rms,
+                              trial.metrics?.velocity_rms,
+                            )}
+                          />
+                        )}
+                      </td>
+                      <td>{degrees(trial.metrics?.tracking_peak)}</td>
+                      <td>
+                        {trial.metrics
+                          ? (trial.metrics.valid_ms / 1000).toFixed(1)
+                          : "—"}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </>
+      ) : (
+        <p className="calibration-note">此报告没有完整测量轮次。</p>
+      )}
+      <details className="calibration-parameters">
+        <summary>参数明细</summary>
+        <p className="calibration-note">
+          摩擦补偿：起始{report.baseline.friction_enabled ? "开启" : "关闭"} ·
+          推荐
+          {report.recommended
+            ? report.recommended.friction_enabled
+              ? "开启"
+              : "关闭"
+            : "保持原样"}
+        </p>
+        <div className="calibration-table-scroll">
+          <table className="calibration-table" aria-label="参数明细">
+            <thead>
+              <tr>
+                <th>关节</th>
+                <th>参数</th>
+                <th>起始</th>
+                <th>推荐</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(axes.length ? axes : [report.settings.axis ?? 0]).flatMap(
+                (axis) =>
+                  fields.map(([key, label]) => (
+                    <tr key={`${axis}:${key}`}>
+                      <th>J{axis + 1}</th>
+                      <th>{label}</th>
+                      <td>{report.baseline.joints[axis][key]}</td>
+                      <td
+                        data-changed={
+                          !!report.recommended &&
+                          report.recommended.joints[axis][key] !==
+                            report.baseline.joints[axis][key]
+                        }
+                      >
+                        {report.recommended?.joints[axis][key] ?? "—"}
+                      </td>
+                    </tr>
+                  )),
+              )}
+            </tbody>
+          </table>
+        </div>
+      </details>
     </div>
   );
 }
@@ -278,27 +367,21 @@ export default function CalibrationPanel({
   onClose,
   onStop,
 }: CalibrationPanelProps) {
-  const s = view.snapshot;
-  const status = s.calibration;
-  const readiness = s.calibration_readiness;
-  const feedbackFresh = hasFreshFeedback(view);
+  const s = view.snapshot,
+    status = s.calibration;
   const connection = `${view.baseUrl}:${view.connectionEpoch ?? 0}:${s.side}:${s.port ?? ""}:${["disconnected", "connecting", "closing"].includes(s.phase) ? "detached" : "attached"}`;
-  const tcp = JSON.stringify(s.tcp_transform);
   const [page, setPage] = useState<Page>("settings");
-  const [draft, setDraft] = useState<Draft>({
-    axis: 1,
-    excursion: "6",
-    speed: "1",
-    friction: "0.1",
-  });
   const [pending, setPendingState] = useState<Pending | null>(null);
   const pendingRef = useRef<Pending | null>(null);
   const [run, setRunState] = useState<Run | null>(null);
   const runRef = useRef<Run | null>(null);
   const [liveReport, setLiveReport] = useState<CalibrationReport | null>(null);
-  const [eligibility, setEligibility] = useState<Eligibility | null>(null);
-  const [appliedReport, setAppliedReport] = useState<string | null>(null);
+  const [livePoints, setLivePoints] = useState<{
+    id: string;
+    points: CalibrationPoint[];
+  }>({ id: "", points: [] });
   const [feedback, setFeedback] = useState<Feedback | null>(null);
+  const [appliedReport, setAppliedReport] = useState<string | null>(null);
   const [stopPending, setStopPending] = useState<{
     seq: number;
     id: string | null;
@@ -306,47 +389,47 @@ export default function CalibrationPanel({
   const [history, setHistory] = useState<CalibrationReport[]>([]);
   const [historyBusy, setHistoryBusy] = useState(false);
   const [historyError, setHistoryError] = useState("");
-  const [historyReload, setHistoryReload] = useState(0);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [historyDetail, setHistoryDetail] = useState<CalibrationReport | null>(
-    null,
-  );
+  const [reload, setReload] = useState(0);
+  const [selection, setSelection] = useState<Selection | null>(null);
+  const [details, setDetails] = useState<Record<string, CalibrationReport>>({});
+  const [localReports, setLocalReports] = useState<
+    { report: CalibrationReport; blob: Blob }[]
+  >([]);
   const [detailBusy, setDetailBusy] = useState(false);
   const [detailError, setDetailError] = useState("");
-  const invalidated = useRef(new Set<string>());
-  const listRequest = useRef<AbortController | null>(null);
-  const detailRequest = useRef<AbortController | null>(null);
+  const [downloading, setDownloading] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
   const dialog = useRef<HTMLElement>(null);
   const lastFocus = useRef<HTMLElement | null>(null);
   const alive = useRef(true);
   const previousConnection = useRef({ connection, online: view.online });
-  const latest = useRef({
-    view,
-    connection,
-    open,
-    onClose,
-    onStop,
-    stop: () => {},
-  });
-  latest.current = { view, connection, open, onClose, onStop, stop };
-  const settings = readSettings(draft);
-  const calibrationActive =
+  const lastTerminal = useRef("");
+  const latest = useRef({ connection, open, onClose, stop: () => {} });
+  latest.current = { connection, open, onClose, stop };
+  const active =
     s.action?.mode === "calibration" || (!!status && !terminal(status));
-  const waitingForStart =
-    run?.connection === connection && run.state !== "terminal";
-  const busy =
-    calibrationActive ||
-    !!s.action ||
-    !!pending ||
-    !!stopPending ||
-    waitingForStart;
-  const currentAxis = calibrationActive
-    ? (status?.axis ?? s.action?.axis ?? draft.axis)
-    : draft.axis;
-  const center = feedbackFresh ? s.joints[currentAxis]?.q : null;
-  const excursion = settings?.excursion;
+  const waiting = run?.connection === connection && run.state !== "terminal";
+  const busy = active || !!s.action || !!pending || !!stopPending || waiting;
+  const shownHistory =
+    liveReport && !history.some((report) => report.id === liveReport.id)
+      ? [liveReport, ...history]
+      : history;
+  const local = selection?.local ?? false;
+  const selectedSummary = selection
+    ? local
+      ? localReports.find((item) => item.report.id === selection.id)?.report
+      : shownHistory.find((report) => report.id === selection.id)
+    : liveReport;
+  const report = selectedSummary
+    ? local
+      ? selectedSummary
+      : (details[selectedSummary.id] ?? selectedSummary)
+    : null;
+  const reportId = report?.id ?? null;
   const completedKey =
-    status && terminal(status) ? `${status.id}:${status.state}` : "";
+    status && terminal(status)
+      ? `${status.id}:${status.state}:${status.report?.id ?? ""}`
+      : "";
 
   function setPending(value: Pending | null) {
     pendingRef.current = value;
@@ -361,192 +444,147 @@ export default function CalibrationPanel({
     alive.current = true;
     return () => {
       alive.current = false;
-      listRequest.current?.abort();
-      detailRequest.current?.abort();
     };
   }, []);
-
   useEffect(() => {
-    const previous = previousConnection.current;
+    const before = previousConnection.current;
     previousConnection.current = { connection, online: view.online };
-    if (
-      previous.connection === connection &&
-      !(previous.online && !view.online)
-    )
+    if (before.connection === connection && !(before.online && !view.online))
       return;
-    if (runRef.current) invalidated.current.add(runRef.current.id);
     const request = pendingRef.current;
-    if (request) invalidated.current.add(request.id);
     setPending(null);
     setRun(null);
-    setEligibility(null);
-    setAppliedReport(null);
     setStopPending(null);
-    if (request) setFeedback({ text: "连接已变化，请求未确认", tone: "error" });
+    setAppliedReport(null);
+    if (request) setFeedback({ text: "连接已变化，请求未确认", tone: "info" });
   }, [connection, view.online]);
-
   useEffect(() => {
-    if (status?.report) setLiveReport(status.report);
-    if (!view.online || !status || invalidated.current.has(status.request_id))
-      return;
-    const current = runRef.current;
-    if (
-      !terminal(status) &&
-      s.action?.mode === "calibration" &&
-      s.action.request_id === status.request_id
-    ) {
+    const point = status?.live;
+    if (!point || !status || terminal(status)) return;
+    setLivePoints((before) => {
+      if (before.id !== status.id) return { id: status.id, points: [point] };
+      if (before.points.some((item) => item.t_ms === point.t_ms)) return before;
+      return { id: before.id, points: [...before.points.slice(-4999), point] };
+    });
+  }, [status?.id, status?.live]);
+
+  // Observe reports even after Stop, Close, or a lost acknowledgement.
+  useEffect(() => {
+    if (status?.report) {
+      setLiveReport((before) =>
+        before?.id === status.report!.id ? before : status.report!,
+      );
+      setHistory((before) =>
+        before.some((item) => item.id === status.report!.id)
+          ? before
+          : [status.report!, ...before],
+      );
+    }
+    if (!status) return;
+    if (!terminal(status) && view.online) {
+      const before = runRef.current;
       if (
-        !current ||
-        current.id !== status.request_id ||
-        current.state === "waiting"
+        !before ||
+        before.id !== status.request_id ||
+        before.state === "waiting"
       )
         setRun({ id: status.request_id, connection, state: "running" });
-    } else if (
-      terminal(status) &&
-      current?.id === status.request_id &&
-      current.connection === connection
-    ) {
-      if (current.state !== "terminal") {
-        setRun({ ...current, state: "terminal" });
+    }
+    if (terminal(status)) {
+      if (
+        runRef.current?.id === status.request_id &&
+        runRef.current.state !== "terminal"
+      )
+        setRun({ ...runRef.current, state: "terminal" });
+      if (lastTerminal.current !== completedKey) {
+        lastTerminal.current = completedKey;
+        setSelection(null);
         setPage("result");
       }
-      if (status.report) {
-        setEligibility((before) =>
-          before?.id === status.report!.id
-            ? before
-            : {
-                id: status.report!.id,
-                connection,
-                revision: s.servo_tuning_revision,
-                tcp,
-              },
-        );
-      }
     }
-  }, [status, s.action, s.servo_tuning_revision, connection, tcp, view.online]);
+  }, [status, connection, completedKey, view.online]);
 
   useEffect(() => {
     const request = pendingRef.current;
-    if (!request) return;
-    const fail = (text: string, invalidate = true, code?: string) => {
-      if (invalidate) invalidated.current.add(request.id);
-      setPending(null);
-      if (request.kind === "start") {
-        setRun(null);
-        setPage("settings");
-      }
-      setFeedback({
-        text,
-        code,
-        tone: code === "motion_busy" ? "info" : "error",
-      });
-    };
-    if (!view.online || request.connection !== connection) {
-      fail("连接已变化，请求未确认");
-      return;
-    }
-    if (tcp !== request.tcp) {
-      fail("工具配置已变化，请求未确认");
-      return;
-    }
+    if (!request || request.connection !== connection || !view.online) return;
     const result =
       s.results?.find((item) => item.request_id === request.id) ??
       (s.last_result?.request_id === request.id ? s.last_result : null);
-    const code =
-      request.kind === "start" ? "calibrate_start" : "calibrate_apply";
-    const matchingStatus =
+    const matching =
       request.kind === "start" && status?.request_id === request.id;
-    // The first matching snapshot may already contain the terminal task.
-    // That confirms admission even when intermediate accepted frames were missed.
-    if (matchingStatus && terminal(status)) {
+    if (matching) {
       setPending(null);
-      setRun({ id: request.id, connection, state: "terminal" });
+      setRun({
+        id: request.id,
+        connection,
+        state: terminal(status) ? "terminal" : "running",
+      });
       setFeedback(null);
-      setPage("result");
+      setPage(terminal(status) ? "result" : "progress");
       return;
     }
-    if (result && !["accepted", "completed"].includes(result.status)) {
-      fail(
-        result.message || "请求未接受",
-        false,
-        result.status === "rejected" ? result.code : undefined,
-      );
+    if (result && ["rejected", "failed", "cancelled"].includes(result.status)) {
+      setPending(null);
+      if (request.kind === "start") {
+        setRun(
+          result.status === "rejected"
+            ? null
+            : { id: request.id, connection, state: "terminal" },
+        );
+        setPage(result.status === "rejected" ? "settings" : "result");
+      }
+      setFeedback({
+        text: result.message || "请求未完成",
+        tone: result.status === "failed" ? "error" : "info",
+      });
       return;
     }
     const accepted =
       request.accepted ||
-      (result?.status === "accepted" && result.code === code);
-    if (result?.status === "accepted" && result.code !== code) {
-      fail("命令结果不匹配");
-      return;
-    }
-    // Calibration changes generation while configuring its trials and applying
-    // recommendations. Once accepted, keep observing this request even if its
-    // HTTP acknowledgement or an ownership change arrives later; never resend.
-    if (
-      !accepted &&
-      !matchingStatus &&
-      (!view.hasControl || s.generation !== request.generation)
-    ) {
-      fail("控制权或操作状态已变化，请求未确认");
-      return;
-    }
-    if (request.kind === "start") {
-      if (matchingStatus || accepted) {
-        setPending(null);
-        setRun({
-          id: request.id,
-          connection,
-          state: matchingStatus && terminal(status) ? "terminal" : "running",
-        });
-        setFeedback(null);
-        setPage(matchingStatus && terminal(status) ? "result" : "progress");
-      } else if (
-        s.servo_tuning_revision !== request.revision ||
-        !sameServoTuning(s.servo_tuning, request.config)
-      ) {
-        fail("伺服参数已变化，启动未确认");
-      }
+      (!!result && ["accepted", "completed"].includes(result.status));
+    if (request.kind === "start" && accepted) {
+      setPending(null);
+      setRun({
+        id: request.id,
+        connection,
+        state: result?.status === "completed" ? "terminal" : "running",
+      });
+      setFeedback(null);
+      setPage(result?.status === "completed" ? "result" : "progress");
       return;
     }
     if (
+      request.kind === "apply" &&
       accepted &&
-      s.servo_tuning_revision === request.revision + 1 &&
+      s.servo_tuning_revision > request.revision &&
       sameServoTuning(s.servo_tuning, request.config)
     ) {
       setPending(null);
-      setAppliedReport(liveReport?.id ?? null);
+      setAppliedReport(status?.report?.id ?? null);
       setFeedback({ text: "推荐参数已应用", tone: "success" });
-    } else if (
-      s.servo_tuning_revision > request.revision + 1 ||
-      (s.servo_tuning_revision !== request.revision &&
-        !sameServoTuning(s.servo_tuning, request.config)) ||
-      s.action ||
-      !["ready", "disabled"].includes(s.phase)
+      return;
+    }
+    if (
+      !accepted &&
+      (!view.hasControl || s.generation !== request.generation)
     ) {
-      fail("参数或动作已变化，应用未确认");
+      setPending(null);
+      if (request.kind === "start") setRun(null);
+      setFeedback({ text: "控制状态已变化，请求未确认", tone: "info" });
     } else if (accepted && !request.accepted)
       setPending({ ...request, accepted: true });
-  }, [view, connection, tcp, pending, liveReport]);
+  }, [view, pending, connection]);
 
   useEffect(() => {
-    if (!pending || pending.timedOut) return;
-    const id = pending.id;
+    if (!pending || pending.uncertain) return;
     const timer = setTimeout(() => {
       const request = pendingRef.current;
-      if (!request || request.id !== id) return;
-      setPending({ ...request, timedOut: true });
-      setFeedback({
-        text:
-          request.kind === "start"
-            ? "启动尚未确认，正在等待任务状态"
-            : "应用尚未确认，正在等待参数状态",
-        tone: "error",
-      });
+      if (!request || request.id !== pending.id) return;
+      setPending({ ...request, uncertain: true });
+      setFeedback({ text: "请求尚未确认，继续等待状态或停止", tone: "info" });
     }, 8000);
     return () => clearTimeout(timer);
-  }, [pending?.id, pending?.timedOut]);
-
+  }, [pending?.id, pending?.uncertain]);
   useEffect(() => {
     if (
       stopPending &&
@@ -557,12 +595,12 @@ export default function CalibrationPanel({
       (!status || terminal(status) || status.request_id !== stopPending.id)
     ) {
       setStopPending(null);
-      setRun(null);
+      if (runRef.current && runRef.current.state !== "terminal")
+        setRun({ ...runRef.current, state: "terminal" });
     }
-  }, [stopPending, view.online, s.seq, s.phase, s.action, status]);
-
+  }, [stopPending, view]);
   useEffect(() => {
-    if (open && (calibrationActive || runRef.current?.state === "waiting"))
+    if (open && (active || runRef.current?.state === "waiting"))
       setPage("progress");
   }, [open]);
 
@@ -572,103 +610,93 @@ export default function CalibrationPanel({
       return;
     }
     const controller = new AbortController();
-    listRequest.current = controller;
     setHistoryBusy(true);
     setHistoryError("");
     void api
       .listCalibrations(20, controller.signal)
       .then((reports) => {
         if (
-          !alive.current ||
           controller.signal.aborted ||
           latest.current.connection !== connection
         )
           return;
-        setHistory((previous) => {
-          const received = new Set(reports.map((report) => report.id));
-          return [
-            ...reports,
-            ...previous.filter((report) => !received.has(report.id)),
-          ];
-        });
+        setHistory((before) => [
+          ...reports,
+          ...before.filter(
+            (item) => !reports.some((report) => report.id === item.id),
+          ),
+        ]);
       })
       .catch((error) => {
         if (
-          alive.current &&
           !controller.signal.aborted &&
           latest.current.connection === connection
         )
           setHistoryError(
-            error instanceof Error ? error.message : "历史读取失败",
+            error instanceof Error ? error.message : "读取历史失败",
           );
       })
       .finally(() => {
-        if (
-          alive.current &&
-          !controller.signal.aborted &&
-          listRequest.current === controller
-        )
-          setHistoryBusy(false);
+        if (!controller.signal.aborted) setHistoryBusy(false);
       });
     return () => controller.abort();
-  }, [open, view.online, connection, historyReload, completedKey]);
-
+  }, [open, view.online, connection, reload, completedKey]);
   useEffect(() => {
-    if (!open || !view.online || !selectedId) {
+    if (
+      !open ||
+      !view.online ||
+      !reportId ||
+      local ||
+      !["result", "curves"].includes(page)
+    ) {
       setDetailBusy(false);
       return;
     }
     const controller = new AbortController();
-    detailRequest.current = controller;
     setDetailBusy(true);
     setDetailError("");
     void api
-      .readCalibration(selectedId, controller.signal)
-      .then((report) => {
+      .readCalibration(reportId, controller.signal)
+      .then((detail) => {
         if (
-          !alive.current ||
-          controller.signal.aborted ||
-          latest.current.connection !== connection
+          !controller.signal.aborted &&
+          latest.current.connection === connection
         )
-          return;
-        setHistoryDetail(report);
-        setHistory((reports) =>
-          reports.map((item) => (item.id === report.id ? report : item)),
-        );
+          setDetails((before) => ({ ...before, [detail.id]: detail }));
       })
       .catch((error) => {
         if (
-          alive.current &&
           !controller.signal.aborted &&
           latest.current.connection === connection
         )
           setDetailError(
-            error instanceof Error ? error.message : "报告读取失败",
+            error instanceof Error ? error.message : "读取报告失败",
           );
       })
       .finally(() => {
-        if (
-          alive.current &&
-          !controller.signal.aborted &&
-          detailRequest.current === controller
-        )
-          setDetailBusy(false);
+        if (!controller.signal.aborted) setDetailBusy(false);
       });
     return () => controller.abort();
-  }, [open, view.online, connection, selectedId]);
+  }, [
+    open,
+    view.online,
+    connection,
+    reportId,
+    local,
+    reload,
+    page === "result" || page === "curves",
+  ]);
 
   useEffect(() => {
     if (!open) return;
     const previous = document.activeElement;
     const frame = requestAnimationFrame(() => {
-      const field = lastFocus.current;
-      if (field?.isConnected && field.getClientRects().length) field.focus();
-      else
-        (
-          dialog.current?.querySelector<HTMLElement>(
-            ".calibration-joints button[aria-pressed=true]",
-          ) ?? dialog.current
-        )?.focus();
+      if (
+        lastFocus.current?.isConnected &&
+        lastFocus.current.getClientRects().length
+      )
+        lastFocus.current.focus();
+      else dialog.current?.focus();
     });
     return () => {
       cancelAnimationFrame(frame);
@@ -678,13 +706,8 @@ export default function CalibrationPanel({
         previous.getClientRects().length
       )
         previous.focus();
-      else
-        Array.from(document.querySelectorAll<HTMLElement>(".stop-button"))
-          .find((button) => button.getClientRects().length)
-          ?.focus();
     };
   }, [open]);
-
   useEffect(() => {
     let escapeHeld = false;
     const keydown = (event: KeyboardEvent) => {
@@ -701,11 +724,11 @@ export default function CalibrationPanel({
       if (!latest.current.open || event.key !== "Tab") return;
       const controls = Array.from(
         dialog.current?.querySelectorAll<HTMLElement>(
-          'button:not(:disabled), input:not(:disabled), select:not(:disabled), a[href], [tabindex="0"]',
+          'button:not(:disabled), input:not(:disabled), select:not(:disabled), summary, a[href], [tabindex="0"]',
         ) ?? [],
       ).filter((element) => element.getClientRects().length);
-      const first = controls[0];
-      const last = controls[controls.length - 1];
+      const first = controls[0],
+        last = controls.at(-1);
       if (
         !controls.includes(document.activeElement as HTMLElement) ||
         (event.shiftKey && document.activeElement === first) ||
@@ -726,118 +749,49 @@ export default function CalibrationPanel({
     };
   }, []);
 
-  const preparationBlock =
+  const idleReason =
     !view.online || ["disconnected", "connecting", "closing"].includes(s.phase)
-      ? "未连接"
+      ? "请先连接机械臂"
       : !view.hasControl
-        ? "未取得控制权"
+        ? "请先取得控制权"
         : s.phase === "fault" || s.error
-          ? s.error?.message || "故障"
+          ? s.error?.message || "请先处理故障"
           : !s.enabled
-            ? "未使能"
-            : s.phase !== "ready" || s.action || calibrationActive
-              ? "等待当前动作结束"
-              : !feedbackFresh
-                ? "等待新鲜的七轴反馈"
-                : "";
-  const preparationTitle =
-    (preparationBlock &&
-      (s.phase === "fault" || s.error
-        ? "准备异常"
-        : view.online && view.hasControl && readiness?.code === "motion_busy"
-          ? "检测中"
-          : preparationBlock)) ||
-    (readiness
-      ? {
-          ready: "可开始",
-          settling: "检测中",
-          moving: "待停稳",
-          unavailable:
-            readiness.code === "motion_busy" ? "检测中" : "暂不可开始",
-        }[readiness.state]
-      : "等待准备状态");
-  const unavailableReason =
-    view.online && view.hasControl && readiness?.state === "unavailable"
-      ? readiness.message
-      : "";
-  const preparationMessage =
-    s.error?.message ||
-    unavailableReason ||
-    (preparationBlock
-      ? "准备条件恢复后会重新检测。"
-      : readiness?.message || "等待准备状态，确认后请手动开始。");
-  const startReason =
-    (preparationBlock && (unavailableReason || preparationBlock)) ||
-    (busy ? "等待当前请求完成" : "") ||
-    (readiness?.state === "ready"
-      ? ""
-      : readiness?.message || preparationTitle);
-  const observing =
-    !preparationBlock &&
-    !!readiness &&
-    ["ready", "settling", "moving"].includes(readiness.state);
-  const requiredMs =
-    readiness && readiness.required_ms > 0 ? readiness.required_ms : 300;
-  const observedMs = observing
-    ? Math.min(requiredMs, Math.max(0, readiness.observed_ms))
-    : 0;
-  const preparationTone =
-    s.error || view.error || readiness?.code === "fault" ? "error" : "info";
-  // A refused start is never queued for retry. Follow live preparation state
-  // instead of keeping that temporary refusal on screen after it recovers.
-  const currentFeedback = feedback?.code === "motion_busy" ? null : feedback;
-  const validation = !settings
-    ? "最大位移 1–10°，速度 0.2865–2.2918°/s，补偿上限 0–2 Nm"
-    : "";
-  const applyReason = !liveReport?.recommended
-    ? "本次没有推荐参数"
-    : !eligibility ||
-        eligibility.id !== liveReport.id ||
-        eligibility.connection !== connection
-      ? "此报告不属于当前连接的校准"
-      : preparationBlock
-        ? unavailableReason || preparationBlock
-        : readiness?.state !== "ready"
-          ? readiness?.message || preparationTitle
-          : stopPending
-            ? "等待停止确认"
-            : tcp !== eligibility.tcp
-              ? "工具配置已变化"
-              : appliedReport === liveReport.id
-                ? "推荐参数已应用"
-                : s.servo_tuning_revision !== eligibility.revision ||
-                    !sameServoTuning(s.servo_tuning, liveReport.baseline)
-                  ? "起始参数已变化，请重新校准"
-                  : pending
-                    ? "等待当前请求完成"
-                    : "";
-
+            ? "请先使能机械臂"
+            : s.phase !== "ready" || s.action
+              ? "请先停止当前动作"
+              : "";
+  const startReason = idleReason || (busy ? "等待当前请求完成" : "");
+  // The current report and servo config are sufficient; TCP/pose changes do not invalidate tuning.
+  const applyReason =
+    local || reportId !== status?.report?.id
+      ? "历史报告仅供查看"
+      : !report?.recommended
+        ? "本次参数保持原样"
+        : idleReason ||
+          (busy ? "等待当前请求完成" : "") ||
+          (appliedReport === reportId ? "推荐参数已应用" : "") ||
+          (!sameServoTuning(s.servo_tuning, report.baseline)
+            ? "伺服参数已修改，请重新测试"
+            : "");
   function stop() {
-    const current = runRef.current;
-    const request = pendingRef.current;
-    if (current) invalidated.current.add(current.id);
-    if (request) invalidated.current.add(request.id);
+    const id =
+      status?.request_id ??
+      runRef.current?.id ??
+      pendingRef.current?.id ??
+      null;
     setPending(null);
-    setRun(null);
-    setStopPending({
-      seq: s.seq,
-      id: status?.request_id ?? current?.id ?? request?.id ?? null,
-    });
+    setStopPending({ seq: s.seq, id });
     setFeedback({ text: "已请求停止", tone: "info" });
     onStop();
   }
   function send(kind: "start" | "apply") {
-    if (pendingRef.current || !open) return;
     if (
-      kind === "start"
-        ? !settings || !!startReason || !!validation
-        : !!applyReason || !liveReport?.recommended
+      !open ||
+      pendingRef.current ||
+      (kind === "start" ? startReason : applyReason)
     )
       return;
-    if (!hasFreshFeedback(latest.current.view)) {
-      setFeedback({ text: "等待新鲜的七轴反馈", tone: "info" });
-      return;
-    }
     const id = crypto.randomUUID();
     const request: Pending = {
       kind,
@@ -846,24 +800,23 @@ export default function CalibrationPanel({
       generation: s.generation,
       revision: s.servo_tuning_revision,
       config: structuredClone(
-        kind === "apply" ? liveReport!.recommended! : s.servo_tuning,
+        kind === "apply" ? report!.recommended! : s.servo_tuning,
       ),
-      tcp,
-      timedOut: false,
       accepted: false,
+      uncertain: false,
     };
     setPending(request);
     setFeedback(null);
     if (kind === "start") {
       setRun({ id, connection, state: "waiting" });
-      setEligibility(null);
       setAppliedReport(null);
+      setSelection(null);
       setPage("progress");
     }
     void api
       .command(
         kind === "start" ? "calibrate_start" : "calibrate_apply",
-        kind === "start" ? { settings } : { calibration_id: liveReport!.id },
+        kind === "start" ? {} : { calibration_id: reportId },
         id,
         s.generation,
       )
@@ -875,11 +828,8 @@ export default function CalibrationPanel({
         )
           return;
         if (ack.request_id !== id || ack.status !== "queued") {
-          setPending({ ...pendingRef.current, timedOut: true });
-          setFeedback({
-            text: "命令入队响应无效，正在等待状态",
-            tone: "error",
-          });
+          setPending({ ...pendingRef.current, uncertain: true });
+          setFeedback({ text: "请求尚未确认，正在等待状态", tone: "info" });
         }
       })
       .catch((error) => {
@@ -896,22 +846,64 @@ export default function CalibrationPanel({
         ) {
           setPending(null);
           if (kind === "start") {
-            if (runRef.current?.id === id) setRun(null);
+            setRun(null);
             setPage("settings");
           }
+          setFeedback({ text: error.message, tone: "info" });
+        } else {
+          setPending({ ...pendingRef.current, uncertain: true });
           setFeedback({
-            text: error.message,
-            code: error.code ?? undefined,
-            tone: error.code === "motion_busy" ? "info" : "error",
+            text: `${kind === "start" ? "启动" : "应用"}未确认：${error instanceof Error ? error.message : "请求失败"}`,
+            tone: "info",
           });
-          return;
         }
-        setPending({ ...pendingRef.current, timedOut: true });
+      });
+  }
+  async function importReport(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    try {
+      const imported = parseCalibrationReport(JSON.parse(await file.text()));
+      if (!alive.current) return;
+      setLocalReports((before) => [
+        { report: imported, blob: file },
+        ...before.filter((item) => item.report.id !== imported.id),
+      ]);
+      setSelection({ id: imported.id, local: true });
+      setFeedback(null);
+      setPage("result");
+    } catch (error) {
+      setFeedback({
+        text: error instanceof Error ? error.message : "报告读取失败",
+        tone: "error",
+      });
+    }
+  }
+  async function download() {
+    if (!report || downloading) return;
+    setDownloading(true);
+    try {
+      const blob = local
+        ? localReports.find((item) => item.report.id === report.id)!.blob
+        : await api.downloadCalibration(report.id);
+      const url = URL.createObjectURL(blob),
+        link = document.createElement("a");
+      link.href = url;
+      link.download = `calibration-${report.id.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) {
+      if (alive.current)
         setFeedback({
-          text: `${kind === "start" ? "启动" : "应用"}未确认：${error instanceof Error ? error.message : "请求失败"}`,
+          text: error instanceof Error ? error.message : "下载失败",
           tone: "error",
         });
-      });
+    } finally {
+      if (alive.current) setDownloading(false);
+    }
   }
 
   const progress = percent(
@@ -922,37 +914,29 @@ export default function CalibrationPanel({
     stopPending || status?.state === "stopping"
       ? "正在停止并恢复参数"
       : pending?.kind === "start"
-        ? pending.timedOut
+        ? pending.uncertain
           ? "等待启动确认"
-          : "等待任务接受"
-        : status && !terminal(status)
+          : "等待测试开始"
+        : active && status
           ? stages[status.stage]
-          : calibrationActive || waitingForStart
-            ? "等待校准状态"
+          : waiting
+            ? "等待测试状态"
             : status
               ? stages[status.stage]
-              : "尚未开始校准";
-  const shownHistory =
-    liveReport && !history.some((report) => report.id === liveReport.id)
-      ? [liveReport, ...history]
-      : history;
-  const selectedReport =
-    historyDetail?.id === selectedId
-      ? historyDetail
-      : shownHistory.find((report) => report.id === selectedId);
-  const footerFeedback =
-    s.error?.message ||
-    view.error ||
-    currentFeedback?.text ||
+              : "尚未开始";
+  const axis =
+    status?.axis ?? (s.action?.mode === "calibration" ? s.action.axis : 0);
+  const footer =
+    feedback?.text ||
     (page === "settings"
-      ? validation || startReason
-      : page === "result" && liveReport?.recommended
-        ? applyReason
-        : "") ||
-    (page === "settings"
-      ? "完成后恢复起始参数，推荐值需手动应用。"
-      : "关闭窗口后可从参数入口继续查看。");
-
+      ? startReason || "完成后回原位并恢复起始参数。"
+      : page === "result" && report?.recommended
+        ? applyReason || "点击“应用推荐”采用本次建议。"
+        : "");
+  const historyEntries = [
+    ...localReports.map((item) => ({ report: item.report, local: true })),
+    ...shownHistory.map((item) => ({ report: item, local: false })),
+  ];
   return (
     <div
       className="calibration-backdrop"
@@ -964,6 +948,8 @@ export default function CalibrationPanel({
       <section
         ref={dialog}
         className="calibration-panel"
+        data-page={page}
+        id="calibration-dialog"
         role="dialog"
         aria-modal="true"
         aria-labelledby="calibration-title"
@@ -985,7 +971,6 @@ export default function CalibrationPanel({
           <button
             className="calibration-close"
             aria-label="关闭低速校准"
-            title="关闭"
             onClick={onClose}
           >
             ×
@@ -994,9 +979,10 @@ export default function CalibrationPanel({
         <nav className="calibration-tabs" aria-label="校准页面">
           {(
             [
-              ["settings", "设置"],
+              ["settings", "开始"],
               ["progress", "进度"],
               ["result", "结果"],
+              ["curves", "曲线"],
               ["history", "历史"],
             ] as const
           ).map(([key, label]) => (
@@ -1004,10 +990,13 @@ export default function CalibrationPanel({
               key={key}
               aria-pressed={page === key}
               aria-controls={`calibration-${key}`}
-              onClick={() => setPage(key)}
+              onClick={() => {
+                setPage(key);
+                setFeedback(null);
+              }}
             >
               {label}
-              {key === "progress" && calibrationActive && (
+              {key === "progress" && (active || waiting) && (
                 <i className="calibration-running-dot" />
               )}
             </button>
@@ -1015,165 +1004,48 @@ export default function CalibrationPanel({
         </nav>
         <div className="calibration-body" id={`calibration-${page}`}>
           {page === "settings" && (
-            <div className="calibration-settings">
-              <div className="calibration-setup">
-                <h3>测试关节</h3>
-                <div className="calibration-joints" aria-label="测试关节">
-                  {Array.from({ length: 7 }, (_, axis) => (
-                    <button
-                      key={axis}
-                      aria-pressed={draft.axis === axis}
-                      disabled={busy}
-                      onClick={() => {
-                        setDraft({ ...draft, axis });
-                        setFeedback(null);
-                      }}
-                    >
-                      J{axis + 1}
-                    </button>
-                  ))}
-                </div>
-                <div className="calibration-fields">
-                  {(
-                    [
-                      ["excursion", "最大位移 ±", "°", 1, 10, 0.5],
-                      [
-                        "speed",
-                        "测试速度",
-                        "°/s",
-                        0.005 / RAD,
-                        0.04 / RAD,
-                        0.1,
-                      ],
-                      ["friction", "补偿试验上限", "Nm", 0, 2, 0.01],
-                    ] as const
-                  ).map(([key, label, unit, min, max, step]) => {
-                    const value = Number(draft[key]);
-                    const invalid =
-                      !draft[key].trim() ||
-                      !Number.isFinite(value) ||
-                      value < min ||
-                      value > max;
-                    return (
-                      <label key={key} className="calibration-field">
-                        <span>{label}</span>
-                        <div>
-                          <input
-                            type="number"
-                            aria-label={label}
-                            aria-invalid={invalid}
-                            aria-describedby={
-                              invalid ? "calibration-feedback" : undefined
-                            }
-                            min={min}
-                            max={max}
-                            step={step}
-                            value={draft[key]}
-                            disabled={busy}
-                            onChange={(event) => {
-                              setDraft({ ...draft, [key]: event.target.value });
-                              setFeedback(null);
-                            }}
-                          />
-                          <span>{unit}</span>
-                        </div>
-                      </label>
-                    );
-                  })}
+            <div className="calibration-start">
+              <div className="calibration-intro">
+                <small>J1–J7 · 自动小范围测试</small>
+                <h3>以当前姿态为原位</h3>
+                <p>
+                  逐轴往返 ±2°，以 1、2°/s
+                  测量跟随与速度变化。自动比较后，七轴回到原位。
+                </p>
+                <div className="calibration-start-facts">
+                  <span>
+                    <b>7</b> 个关节
+                  </span>
+                  <span>
+                    <b>±2°</b> 目标范围
+                  </span>
+                  <span>
+                    <b>1 / 2</b> °/s
+                  </span>
                 </div>
                 <p className="calibration-note">
-                  固定阻尼，比较摩擦补偿与速度前馈。
+                  连接、取得控制权并使能后即可开始，测试中可随时停止。
                 </p>
               </div>
-              <div className="calibration-context">
-                <section
-                  className="calibration-readiness"
-                  aria-label="校准准备状态"
-                  data-state={
-                    preparationBlock
-                      ? "unavailable"
-                      : (readiness?.state ?? "unavailable")
-                  }
-                  data-tone={preparationTone}
-                >
-                  <div className="calibration-readiness-heading">
-                    <small>开始前检查</small>
-                    <strong role="status">{preparationTitle}</strong>
-                  </div>
-                  <p>{preparationMessage}</p>
-                  <progress
-                    className="calibration-progress"
-                    aria-label="静止确认进度"
-                    max={requiredMs}
-                    value={observedMs}
-                  />
-                  <div className="calibration-readiness-time">
-                    <span>
-                      {readiness
-                        ? `${Math.round(observedMs)} / ${requiredMs} ms`
-                        : "尚无准备数据"}
-                    </span>
-                    <span>需连续静止</span>
-                  </div>
-                  <dl>
-                    <div>
-                      <dt>
-                        {observing && readiness.joint != null
-                          ? `最大波动 J${readiness.joint + 1}`
-                          : "最大位置波动"}
-                      </dt>
-                      <dd>
-                        {degrees(observing ? readiness.position_span : null, 3)}
-                        °
-                        <small>
-                          {" "}
-                          / {degrees(readiness?.position_limit, 3)}°
-                        </small>
-                      </dd>
-                    </div>
-                  </dl>
-                </section>
-                <div className="calibration-range">
-                  <div className="calibration-range-heading">
-                    <small>
-                      J{currentAxis + 1}{" "}
-                      {feedbackFresh ? "当前实测" : "实测反馈不可用"}
-                    </small>
-                    <strong>
-                      {degrees(center)}
-                      <span>°</span>
-                    </strong>
-                  </div>
-                  <div className="calibration-range-track">
-                    <span />
-                    <i />
-                  </div>
-                  <div className="calibration-range-limits">
-                    <span>
-                      {excursion != null ? `−${degrees(excursion, 1)}` : "—"}°
-                    </span>
-                    <span>
-                      {excursion != null ? `+${degrees(excursion, 1)}` : "—"}°
-                    </span>
-                  </div>
-                  <p>目标相对发送参考；实际位移相对起始实测。</p>
-                  <dl>
-                    <div>
-                      <dt>目标偏移</dt>
-                      <dd>
-                        {excursion != null
-                          ? `±${degrees(excursion / 2, 1)}°`
-                          : "—"}
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>实测偏移上限</dt>
-                      <dd>
-                        {excursion != null ? `±${degrees(excursion, 1)}°` : "—"}
-                      </dd>
-                    </div>
-                  </dl>
-                </div>
+              <div className="calibration-preview">
+                <h3>试验预览</h3>
+                <ol>
+                  <li>
+                    <b>测量基线</b>
+                    <span>J1 → J7，逐轴记录</span>
+                  </li>
+                  <li>
+                    <b>比较参数</b>
+                    <span>对跟随与速度变化较大的轴试验</span>
+                  </li>
+                  <li>
+                    <b>整体对比</b>
+                    <span>复测七轴，回原位并恢复参数</span>
+                  </li>
+                </ol>
+                <p className="calibration-note">
+                  曲线记录控制参考、成功发送与实测值。
+                </p>
               </div>
             </div>
           )}
@@ -1182,9 +1054,7 @@ export default function CalibrationPanel({
               <div className="calibration-progress-heading">
                 <div>
                   <small>
-                    {calibrationActive
-                      ? `J${currentAxis + 1} · 有限往返`
-                      : "低速往返测试"}
+                    {active ? `当前 J${axis + 1}` : "七轴小范围测试"}
                   </small>
                   <h3>{progressTitle}</h3>
                 </div>
@@ -1192,28 +1062,34 @@ export default function CalibrationPanel({
               </div>
               <progress
                 className="calibration-progress"
-                max="100"
+                max={100}
                 value={progress}
                 aria-label="校准进度"
               />
               <ol className="calibration-stages">
-                {(
-                  [
-                    "baseline",
-                    "candidate",
-                    "baseline_check",
-                    "validation",
-                    "restoring",
-                  ] as const
-                ).map((stage) => (
-                  <li key={stage} data-active={status?.stage === stage}>
-                    {stages[stage]}
-                  </li>
-                ))}
+                {(["baseline", "candidate", "after", "restoring"] as const).map(
+                  (stage) => (
+                    <li
+                      key={stage}
+                      data-active={
+                        status?.stage === stage ||
+                        (stage === "after" && status?.stage === "validation")
+                      }
+                    >
+                      {stages[stage]}
+                    </li>
+                  ),
+                )}
               </ol>
               <dl className="calibration-progress-facts">
                 <div>
-                  <dt>试验</dt>
+                  <dt>当前关节</dt>
+                  <dd>
+                    J{axis + 1} · {degrees(s.joints[axis]?.q, 2)}°
+                  </dd>
+                </div>
+                <div>
+                  <dt>试验轮次</dt>
                   <dd>
                     {status
                       ? `${status.trial_index} / ${status.trial_count}`
@@ -1221,180 +1097,190 @@ export default function CalibrationPanel({
                   </dd>
                 </div>
                 <div>
-                  <dt>往返片段</dt>
+                  <dt>运动片段</dt>
                   <dd>
                     {status ? `${status.leg_index} / ${status.leg_count}` : "—"}
-                  </dd>
-                </div>
-                <div>
-                  <dt>当前实测</dt>
-                  <dd>
-                    J{currentAxis + 1} · {degrees(center)}°
                   </dd>
                 </div>
               </dl>
               <p className="calibration-note">
                 {!view.online
-                  ? "状态连接已断开"
-                  : terminal(
-                        status ?? ({ state: "running" } as CalibrationStatus),
-                      )
-                    ? "校准已结束，可在结果页查看报告。"
-                    : "结束时恢复起始参数，随后可查看比较结果。"}
+                  ? "连接已断开"
+                  : "完成后回原位并恢复起始参数，结果与曲线会保留。"}
               </p>
-              {status?.report && (
-                <button onClick={() => setPage("result")}>查看结果</button>
+              <button onClick={() => setPage("curves")}>查看实时曲线</button>
+              {liveReport && (
+                <button
+                  onClick={() => {
+                    setSelection(null);
+                    setPage("result");
+                  }}
+                >
+                  查看结果
+                </button>
               )}
             </div>
           )}
-          {page === "result" &&
-            (liveReport ? (
-              <ReportDetails key={liveReport.id} report={liveReport} />
-            ) : (
-              <div className="calibration-empty">
-                <h3>尚无校准报告</h3>
-                <p>
-                  {calibrationActive
-                    ? "校准结束后在此查看结果。"
-                    : "开始一次低速往返测试，或查看历史记录。"}
-                </p>
-              </div>
-            ))}
+          {page === "curves" && active && status
+            ? open && (
+                <CalibrationChart
+                  key={status.id}
+                  live={{
+                    id: status.id,
+                    axis: status.axis,
+                    points:
+                      livePoints.id === status.id ? livePoints.points : [],
+                  }}
+                />
+              )
+            : (page === "result" || page === "curves") && (
+                <>
+                  {detailError && !local && (
+                    <p className="calibration-error" role="alert">
+                      {detailError}{" "}
+                      <button onClick={() => setReload((before) => before + 1)}>
+                        重试
+                      </button>
+                    </p>
+                  )}
+                  {detailBusy && (
+                    <p className="calibration-loading" role="status">
+                      正在读取曲线…
+                    </p>
+                  )}
+                  {report ? (
+                    page === "result" ? (
+                      <ReportDetails
+                        key={`${local}:${report.id}`}
+                        report={report}
+                        local={local}
+                      />
+                    ) : (
+                      <CalibrationChart
+                        key={`${local}:${report.id}`}
+                        report={report}
+                      />
+                    )
+                  ) : (
+                    <div className="calibration-empty">
+                      <h3>
+                        {active || waiting || run?.state === "terminal"
+                          ? "等待测试报告"
+                          : "尚无测试报告"}
+                      </h3>
+                      <p>完成一次测试，或从历史导入已有报告。</p>
+                    </div>
+                  )}
+                </>
+              )}
           {page === "history" && (
             <div className="calibration-history">
               <div className="calibration-history-toolbar">
-                {selectedId ? (
-                  <button
-                    onClick={() => {
-                      setSelectedId(null);
-                      setDetailError("");
-                    }}
-                  >
-                    ‹ 返回列表
-                  </button>
-                ) : (
-                  <span>最近 {shownHistory.length} 份报告</span>
-                )}
-                <small>
-                  {detailBusy && selectedId
-                    ? "正在读取报告…"
-                    : historyBusy
-                      ? "正在读取…"
-                      : !view.online
-                        ? "离线记录"
-                        : ""}
-                </small>
+                <span>{historyEntries.length} 份报告</span>
+                <small>{historyBusy ? "正在读取…" : "导入报告仅供查看"}</small>
+                <button onClick={() => fileInput.current?.click()}>
+                  导入报告
+                </button>
                 <button
                   disabled={!view.online || historyBusy}
-                  onClick={() => setHistoryReload((value) => value + 1)}
+                  onClick={() => setReload((before) => before + 1)}
                 >
                   刷新
                 </button>
               </div>
-              {(selectedId ? detailError : historyError) && (
+              {historyError && (
                 <p className="calibration-error" role="alert">
-                  {selectedId ? detailError : historyError}
+                  {historyError}
                 </p>
               )}
-              {selectedId ? (
-                selectedReport ? (
-                  <>
-                    <ReportDetails
-                      key={selectedReport.id}
-                      report={selectedReport}
-                    />
-                    <div className="calibration-history-download">
-                      <button onClick={() => downloadReport(selectedReport)}>
-                        下载 JSON
-                      </button>
-                    </div>
-                  </>
-                ) : (
-                  <p className="calibration-empty">
-                    {detailBusy ? "正在读取报告…" : "未读取到报告"}
-                  </p>
-                )
-              ) : shownHistory.length ? (
+              {historyEntries.length ? (
                 <div className="calibration-history-list">
-                  {shownHistory.map((report) => (
+                  {historyEntries.map(({ report: item, local: isLocal }) => (
                     <button
                       className="calibration-history-item"
-                      key={report.id}
+                      key={`${isLocal}:${item.id}`}
                       onClick={() => {
-                        setHistoryDetail(report);
-                        setSelectedId(report.id);
-                        setDetailError("");
+                        setSelection({ id: item.id, local: isLocal });
+                        setFeedback(null);
+                        setPage("result");
                       }}
                     >
                       <span>
-                        <b>J{report.settings.axis + 1}</b>
+                        <b>{axisLabel(item)}</b>
                         <small>
-                          {report.side === "left" ? "左臂" : "右臂"} ·{" "}
-                          {timestamp(report.created_at_ms)}
+                          {timestamp(item.created_at_ms)}
+                          {isLocal
+                            ? " · 导入"
+                            : ` · ${item.side === "left" ? "左臂" : "右臂"}`}
                         </small>
                       </span>
-                      <span>{outcomes[report.outcome]}</span>
+                      <span>{outcome(item)}</span>
                       <span aria-hidden="true">›</span>
                     </button>
                   ))}
                 </div>
               ) : (
                 <p className="calibration-empty">
-                  {historyBusy ? "正在读取校准记录…" : "暂无校准记录"}
+                  {historyBusy
+                    ? "正在读取校准记录…"
+                    : "暂无校准记录，可导入已有 JSON 报告。"}
                 </p>
               )}
             </div>
           )}
         </div>
+        <input
+          ref={fileInput}
+          type="file"
+          accept="application/json,.json"
+          aria-label="导入校准报告"
+          hidden
+          onChange={(event) => void importReport(event)}
+        />
         <footer className="calibration-footer">
           <span
             id="calibration-feedback"
-            data-tone={
-              s.error || view.error
-                ? "error"
-                : (currentFeedback?.tone ??
-                  (validation && page === "settings"
-                    ? "error"
-                    : preparationTone))
-            }
-            role={
-              s.error || view.error || currentFeedback?.tone === "error"
-                ? "alert"
-                : "status"
-            }
+            data-tone={feedback?.tone ?? "info"}
+            role={feedback?.tone === "error" ? "alert" : "status"}
           >
-            {footerFeedback}
+            {footer}
           </span>
           {page === "settings" && (
             <button
               className="primary"
-              disabled={!!startReason || !settings || busy}
+              disabled={!!startReason}
               aria-busy={pending?.kind === "start"}
               onClick={() => send("start")}
             >
               开始校准
             </button>
           )}
-          {page === "result" && liveReport && (
-            <button onClick={() => downloadReport(liveReport)}>
-              下载 JSON
-            </button>
-          )}
-          {page === "result" && liveReport?.recommended && (
+          {(page === "result" || page === "curves") && report && (
             <button
-              className="primary"
-              disabled={!!applyReason}
-              title={applyReason || "应用推荐参数"}
-              aria-busy={pending?.kind === "apply"}
-              onClick={() => send("apply")}
+              disabled={downloading || (!local && !view.online)}
+              onClick={() => void download()}
             >
-              {pending?.kind === "apply"
-                ? "等待确认…"
-                : appliedReport === liveReport.id
-                  ? "已应用"
-                  : "应用推荐"}
+              {downloading ? "正在下载…" : "下载完整 JSON"}
             </button>
           )}
+          {page === "result" &&
+            report?.recommended &&
+            !local &&
+            reportId === status?.report?.id && (
+              <button
+                className="primary"
+                disabled={!!applyReason}
+                title={applyReason || "应用推荐参数"}
+                aria-busy={pending?.kind === "apply"}
+                onClick={() => send("apply")}
+              >
+                {pending?.kind === "apply"
+                  ? "等待确认…"
+                  : appliedReport === reportId
+                    ? "已应用"
+                    : "应用推荐"}
+              </button>
+            )}
           <button onClick={onClose}>关闭</button>
         </footer>
       </section>

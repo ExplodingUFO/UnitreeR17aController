@@ -1,7 +1,7 @@
 use crate::{
     calibration::{
-        self, Collector, Leg, Readiness as CalibrationReadiness, Report as CalibrationReport,
-        Settings as CalibrationSettings, Status as CalibrationStatus, Stillness, Trial,
+        self, Choice, Collector, Leg, Point, Report as CalibrationReport,
+        Settings as CalibrationSettings, Status as CalibrationStatus, Trial,
     },
     journal::{Journal, JournalStats, TraceData},
     kinematics::{
@@ -42,6 +42,7 @@ const SERVO_KP: f64 = 60.0;
 const SERVO_KD: f64 = 10.0;
 const TAU_FF_LIMIT: f64 = 8.0;
 const RETURN_SETTLE_TIME: Duration = Duration::from_millis(200);
+const RETURN_POSITION_TOLERANCE: f64 = 0.02;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ApiError {
@@ -132,7 +133,6 @@ pub struct Snapshot {
     pub servo_tuning: ServoTuning,
     pub servo_tuning_revision: u64,
     pub calibration: Option<CalibrationStatus>,
-    pub calibration_readiness: CalibrationReadiness,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -193,6 +193,7 @@ pub enum Operation {
         config: Box<ServoTuning>,
     },
     CalibrateStart {
+        #[serde(default)]
         settings: CalibrationSettings,
     },
     CalibrateApply {
@@ -273,7 +274,7 @@ pub struct ArmHandle {
     reference_epoch: Arc<AtomicU64>,
     stop_reason: Arc<Mutex<Option<String>>>,
     shutdown: Arc<AtomicBool>,
-    finished: Receiver<Option<CalibrationReport>>,
+    finished: Receiver<VecDeque<CalibrationReport>>,
     journal: Journal,
     state: watch::Receiver<Snapshot>,
 }
@@ -350,12 +351,12 @@ impl ArmHandle {
     pub fn shutdown(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         self.request_shutdown();
-        let Ok(pending_report) = self.finished.recv_timeout(timeout) else {
+        let Ok(pending_reports) = self.finished.recv_timeout(timeout) else {
             return false;
         };
         // Motion and device I/O have ended. Only this close coordinator may wait
         // for report admission, before the journal itself is asked to flush.
-        if let Some(report) = pending_report {
+        for report in pending_reports {
             loop {
                 if self.journal.record_calibration(&report) {
                     break;
@@ -490,9 +491,14 @@ enum CalibrationStep {
     Moving,
     Restore,
 }
+struct CalibrationPlan {
+    phase: String,
+    axis: usize,
+    config: ServoTuning,
+}
 struct CalibrationRun {
     report: CalibrationReport,
-    queue: Vec<(String, ServoTuning)>,
+    queue: Vec<CalibrationPlan>,
     legs: Vec<Leg>,
     trial: usize,
     leg: usize,
@@ -502,8 +508,17 @@ struct CalibrationRun {
     deadline: Instant,
     observed: Option<Instant>,
     sent: VecDeque<SentReference>,
-    winner: Option<usize>,
+    candidates_added: bool,
+    after_added: bool,
+    proposed: Option<ServoTuning>,
+    points: Vec<Point>,
+    last_sample: Instant,
     cancelled: bool,
+}
+impl CalibrationRun {
+    fn axis(&self) -> usize {
+        self.queue[self.trial.min(self.queue.len() - 1)].axis
+    }
 }
 fn calibration_reference(sent: &VecDeque<SentReference>, at: Instant) -> Option<SentReference> {
     sent.iter()
@@ -525,7 +540,6 @@ struct Core {
     port: Option<String>,
     bus: Option<BusHandle>,
     feedback: [Option<Observation>; 7],
-    stillness: Stillness,
     reference: [f64; 7],
     velocity: [f64; 7],
     acceleration: [f64; 7],
@@ -542,7 +556,7 @@ struct Core {
     calibration: Option<CalibrationRun>,
     calibration_result: Option<CalibrationStatus>,
     calibration_apply_revision: Option<u64>,
-    pending_calibration_report: Option<CalibrationReport>,
+    pending_calibration_report: VecDeque<CalibrationReport>,
     stopping: bool,
     generation: u64,
     seq: u64,
@@ -581,7 +595,6 @@ impl Core {
             port: None,
             bus: None,
             feedback: std::array::from_fn(|_| None),
-            stillness: Stillness::default(),
             reference: [0.0; 7],
             velocity: [0.0; 7],
             acceleration: [0.0; 7],
@@ -598,7 +611,7 @@ impl Core {
             calibration: None,
             calibration_result: None,
             calibration_apply_revision: None,
-            pending_calibration_report: None,
+            pending_calibration_report: VecDeque::new(),
             stopping: false,
             generation: 1,
             seq: 0,
@@ -946,7 +959,6 @@ impl Core {
                 self.port = Some(port);
                 self.bus = Some(bus);
                 self.feedback = std::array::from_fn(|_| None);
-                self.stillness.clear();
                 self.enabled = false;
                 self.error = None;
                 self.motion = None;
@@ -980,7 +992,6 @@ impl Core {
                 }
                 self.reference = self.measured(now)?;
                 self.check_positions(&self.reference)?;
-                self.stillness.clear();
                 self.reset_derivatives();
                 self.enable_request = Some((id.into(), now));
                 self.stopping = false;
@@ -1025,7 +1036,6 @@ impl Core {
                 }
                 tcp.rotation.iter_mut().for_each(|q| *q /= norm);
                 self.tcp = Some(tcp);
-                self.calibration_apply_revision = None;
                 self.bump_generation();
             }
             Operation::ConfigureServo { config } => {
@@ -1150,41 +1160,6 @@ impl Core {
         self.dirty = true;
         Ok(())
     }
-    fn calibration_readiness(&self, now: Instant) -> CalibrationReadiness {
-        if self.bus.is_none() || self.port.is_none() || self.phase == Phase::Connecting {
-            return CalibrationReadiness::unavailable("not_connected", "请先连接机械臂");
-        }
-        if let Some(error) = &self.error {
-            return CalibrationReadiness::unavailable("fault", error.message.clone());
-        }
-        if self.clear_request.is_some() {
-            return CalibrationReadiness::unavailable("motion_busy", "正在确认清错结果");
-        }
-        if self.enable_request.is_some() {
-            return CalibrationReadiness::unavailable("motion_busy", "正在确认使能状态");
-        }
-        if self.calibration.is_some() {
-            return CalibrationReadiness::unavailable("motion_busy", "校准正在进行");
-        }
-        if let Err(error) = self.motion_anchor(now) {
-            return CalibrationReadiness::unavailable(&error.code, error.message);
-        }
-        self.stillness.status(now)
-    }
-    fn require_calibration_ready(&self, now: Instant) -> Result<(), ApiError> {
-        let ready = self.calibration_readiness(now);
-        if ready.ready() {
-            return Ok(());
-        }
-        Err(ApiError::new(
-            if matches!(ready.code.as_str(), "observing" | "position_moving") {
-                "motion_busy"
-            } else {
-                &ready.code
-            },
-            ready.message,
-        ))
-    }
     fn begin_calibration(
         &mut self,
         id: &str,
@@ -1194,109 +1169,112 @@ impl Core {
         calibration::validate(&settings, &self.servo_tuning)
             .map_err(|e| ApiError::new("invalid_calibration", e))?;
         self.flush_calibration_report();
-        if self.pending_calibration_report.is_some() {
-            return Err(ApiError::new(
-                "calibration_storage_busy",
-                "上一份校准报告正在保存，请稍后重试",
-            ));
-        }
-        self.require_calibration_ready(now)?;
         let anchor = self.motion_anchor(now)?;
         let measured = self.measured(now)?;
-        if (0..7).any(|i| {
-            (anchor[i] - measured[i]).abs()
-                > if i == settings.axis {
-                    settings.excursion * 0.4
-                } else {
-                    0.03
-                }
-        }) {
-            return Err(ApiError::new(
-                "calibration_tracking",
-                "当前参考与实测偏差超出校准起始范围",
-            ));
-        }
-        let configs = calibration::candidates(&settings, self.servo_tuning)
-            .map_err(|e| ApiError::new("invalid_calibration", e))?;
-        let legs = calibration::legs(&settings, anchor);
-        let queue = configs
-            .into_iter()
-            .enumerate()
-            .map(|(i, c)| (if i == 0 { "baseline" } else { "candidate" }.into(), c))
+        let axes = settings
+            .axis
+            .map_or_else(|| (0..7).collect::<Vec<_>>(), |axis| vec![axis]);
+        let queue = axes
+            .iter()
+            .map(|axis| CalibrationPlan {
+                phase: "baseline".into(),
+                axis: *axis,
+                config: self.servo_tuning,
+            })
             .collect();
-        let report = CalibrationReport {
-            id: uuid::Uuid::new_v4().to_string(),
-            request_id: id.into(),
-            created_at_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-                .min(i64::MAX as u128) as i64,
-            side: self.side.clone(),
-            port: self
-                .port
-                .clone()
-                .ok_or_else(|| ApiError::new("not_connected", "请先连接机械臂"))?,
-            settings: settings.clone(),
-            center_reference: anchor,
-            center_measured: measured,
-            tcp: self.tcp,
-            baseline: self.servo_tuning,
-            recommended: None,
-            trials: Vec::with_capacity(6),
-            outcome: "insufficient".into(),
-            improvement: None,
-            message: "正在测量基线".into(),
-        };
+        let first = axes[0];
         self.calibration = Some(CalibrationRun {
-            report,
+            report: CalibrationReport {
+                id: uuid::Uuid::new_v4().to_string(),
+                request_id: id.into(),
+                created_at_ms: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(i64::MAX as u128) as i64,
+                side: self.side.clone(),
+                port: self
+                    .port
+                    .clone()
+                    .ok_or_else(|| ApiError::new("not_connected", "请先连接机械臂"))?,
+                settings: settings.clone(),
+                center_reference: anchor,
+                center_measured: measured,
+                tcp: self.tcp,
+                baseline: self.servo_tuning,
+                recommended: None,
+                trials: Vec::with_capacity(20),
+                choices: Vec::new(),
+                sample_count: 0,
+                curves: Arc::default(),
+                outcome: "unchanged".into(),
+                improvement: None,
+                message: "测试完成，参数保持原样".into(),
+            },
             queue,
-            legs,
+            legs: calibration::legs(&settings, first, anchor),
             trial: 0,
             leg: 0,
             step: CalibrationStep::Configure,
-            collector: Collector::new(settings.axis, measured),
+            collector: Collector::new(first, measured),
             started: now,
             deadline: now + Duration::from_secs(2),
             observed: None,
             sent: VecDeque::with_capacity(32),
-            winner: None,
+            candidates_added: false,
+            after_added: false,
+            proposed: None,
+            points: Vec::with_capacity(90_000),
+            last_sample: now,
             cancelled: false,
         });
         self.calibration_result = None;
         self.calibration_apply_revision = None;
         self.phase();
+        self.dirty = true;
         Ok(())
     }
     fn calibration_snapshot(&self, run: &CalibrationRun) -> CalibrationStatus {
         let restoring = matches!(run.step, CalibrationStep::Restore);
-        let trial_count = if run.winner.is_some() {
+        let axes = if run.report.settings.axis.is_some() {
+            1
+        } else {
+            7
+        };
+        let total = if run.after_added {
             run.queue.len()
         } else {
-            run.queue.len() + 2
+            (axes * 2 + axes.min(2) * 3).max(run.queue.len())
         };
+        let phase = &run.queue[run.trial.min(run.queue.len() - 1)].phase;
         CalibrationStatus {
             id: run.report.id.clone(),
             request_id: run.report.request_id.clone(),
             state: if restoring { "stopping" } else { "running" }.into(),
             stage: if restoring {
                 "restoring"
+            } else if phase == "after" {
+                "validation"
             } else {
-                &run.queue[run.trial.min(run.queue.len() - 1)].0
+                phase
             }
             .into(),
-            axis: run.report.settings.axis,
-            trial_index: run.trial.min(trial_count),
-            trial_count,
+            axis: run.axis(),
+            trial_index: run.trial.min(total),
+            trial_count: total,
             leg_index: run.leg.min(run.legs.len()),
             leg_count: run.legs.len(),
             progress: ((run.trial as f64 + run.leg as f64 / run.legs.len().max(1) as f64)
-                / trial_count.max(1) as f64)
+                / total.max(1) as f64)
                 .min(0.99),
             report: None,
+            live: run.points.last().cloned(),
         }
     }
-    fn finish_calibration(&mut self, run: CalibrationRun) {
+    fn finish_calibration(&mut self, mut run: CalibrationRun) {
+        let axis = run.axis();
+        run.report.sample_count = run.points.len();
+        run.report.curves = Arc::new(run.points);
         let report = run.report;
         let state = match report.outcome.as_str() {
             "cancelled" => "cancelled",
@@ -1305,11 +1283,7 @@ impl Core {
         };
         self.record(
             &report.request_id,
-            if state == "completed" {
-                "completed"
-            } else {
-                state
-            },
+            state,
             "calibration_done",
             &report.message,
         );
@@ -1320,16 +1294,22 @@ impl Core {
             request_id: report.request_id.clone(),
             state: state.into(),
             stage: "done".into(),
-            axis: report.settings.axis,
+            axis,
             trial_index: report.trials.len(),
             trial_count: report.trials.len(),
             leg_index: run.leg.min(run.legs.len()),
             leg_count: run.legs.len(),
             progress: 1.0,
-            report: Some(report.clone()),
+            report: Some(report.summary()),
+            live: None,
         });
-        debug_assert!(self.pending_calibration_report.is_none());
-        self.pending_calibration_report = Some(report);
+        // Normally the previous report was admitted during the next control tick.
+        // Keep a completed report available in the UI even if storage is unavailable.
+        self.flush_calibration_report();
+        if self.pending_calibration_report.len() == 100 {
+            self.pending_calibration_report.pop_front();
+        }
+        self.pending_calibration_report.push_back(report);
         self.flush_calibration_report();
         self.phase();
         self.dirty = true;
@@ -1337,10 +1317,10 @@ impl Core {
     fn flush_calibration_report(&mut self) {
         if self
             .pending_calibration_report
-            .as_ref()
+            .front()
             .is_some_and(|report| self.journal.record_calibration(report))
         {
-            self.pending_calibration_report = None;
+            self.pending_calibration_report.pop_front();
         }
     }
     fn restore_calibration_disabled(&mut self) {
@@ -1355,97 +1335,271 @@ impl Core {
         self.finish_calibration(run);
         self.calibration_apply_revision = None;
     }
+    fn extend_calibration_plan(run: &mut CalibrationRun) {
+        if !run.candidates_added {
+            run.candidates_added = true;
+            let mut axes = run
+                .report
+                .trials
+                .iter()
+                .filter(|trial| trial.phase == "baseline")
+                .filter_map(|trial| {
+                    trial.metrics.as_ref().map(|m| {
+                        (
+                            trial.axis.unwrap_or(0),
+                            m.velocity_rms + 2.0 * m.tracking_rms,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            axes.sort_by(|a, b| b.1.total_cmp(&a.1));
+            for (axis, _) in axes.into_iter().take(2) {
+                if let Ok(configs) =
+                    calibration::candidates(&run.report.settings, axis, run.report.baseline)
+                {
+                    for config in configs.into_iter().skip(1) {
+                        run.queue.push(CalibrationPlan {
+                            phase: "candidate".into(),
+                            axis,
+                            config,
+                        });
+                    }
+                }
+            }
+            if run.trial < run.queue.len() {
+                return;
+            }
+        }
+        if !run.after_added {
+            run.after_added = true;
+            let mut proposed = run.report.baseline;
+            for axis in 0..7 {
+                let Some(baseline) = run
+                    .report
+                    .trials
+                    .iter()
+                    .find(|t| t.phase == "baseline" && t.axis == Some(axis))
+                else {
+                    continue;
+                };
+                let candidates = run
+                    .report
+                    .trials
+                    .iter()
+                    .filter(|t| t.phase == "candidate" && t.axis == Some(axis))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let Some(best) = calibration::recommend(baseline, &candidates) else {
+                    continue;
+                };
+                let selected = &run.report.trials[best];
+                if selected.config.friction_enabled && !proposed.friction_enabled {
+                    for joint in &mut proposed.joints {
+                        joint.coulomb = 0.0;
+                        joint.viscous = 0.0;
+                    }
+                    proposed.friction_enabled = true;
+                }
+                proposed.joints[axis] = selected.config.joints[axis];
+                if proposed.friction_enabled && !selected.config.friction_enabled {
+                    proposed.joints[axis].coulomb = 0.0;
+                    proposed.joints[axis].viscous = 0.0;
+                }
+                let before = baseline.metrics.as_ref().unwrap();
+                let after = selected.metrics.as_ref().unwrap();
+                run.report.choices.push(Choice {
+                    axis,
+                    baseline_index: baseline.index,
+                    candidate_index: best,
+                    after_index: None,
+                    velocity_change: if before.velocity_rms > 0.0 {
+                        1.0 - after.velocity_rms / before.velocity_rms
+                    } else {
+                        0.0
+                    },
+                    tracking_change: if before.tracking_rms > 0.0 {
+                        1.0 - after.tracking_rms / before.tracking_rms
+                    } else {
+                        0.0
+                    },
+                });
+            }
+            if !run.report.choices.is_empty() {
+                run.proposed = Some(proposed);
+                for trial in run.report.trials.iter().filter(|t| t.phase == "baseline") {
+                    run.queue.push(CalibrationPlan {
+                        phase: "after".into(),
+                        axis: trial.axis.unwrap_or(0),
+                        config: proposed,
+                    });
+                }
+                return;
+            }
+        }
+        let mut before_total = 0.0;
+        let mut after_total = 0.0;
+        for after in run.report.trials.iter().filter(|t| t.phase == "after") {
+            if let Some(before) = run
+                .report
+                .trials
+                .iter()
+                .find(|t| t.phase == "baseline" && t.axis == after.axis)
+                && let (Some(b), Some(a)) = (&before.metrics, &after.metrics)
+            {
+                before_total += calibration::score(b, b);
+                after_total += calibration::score(b, a);
+            }
+        }
+        for choice in &mut run.report.choices {
+            if let Some(after) = run
+                .report
+                .trials
+                .iter()
+                .find(|t| t.phase == "after" && t.axis == Some(choice.axis))
+            {
+                choice.after_index = Some(after.index);
+                if let (Some(b), Some(a)) = (
+                    &run.report.trials[choice.baseline_index].metrics,
+                    &after.metrics,
+                ) {
+                    choice.velocity_change = if b.velocity_rms > 0.0 {
+                        1.0 - a.velocity_rms / b.velocity_rms
+                    } else {
+                        0.0
+                    };
+                    choice.tracking_change = if b.tracking_rms > 0.0 {
+                        1.0 - a.tracking_rms / b.tracking_rms
+                    } else {
+                        0.0
+                    };
+                }
+            }
+        }
+        if before_total > 0.0 && after_total < before_total {
+            run.report.recommended = run.proposed;
+            run.report.improvement = Some((before_total - after_total) / before_total);
+            run.report.outcome = "improved".into();
+            run.report.message = "测试完成，可使用对照参数".into();
+        } else {
+            run.report.outcome = "unchanged".into();
+            run.report.message = "测试完成，参数保持原样".into();
+        }
+        run.step = CalibrationStep::Restore;
+    }
     fn advance_calibration(&mut self, now: Instant) {
         let Some(mut run) = self.calibration.take() else {
             return;
         };
-        if !run.cancelled && now.saturating_duration_since(run.started) > Duration::from_secs(1800)
-        {
-            self.calibration = Some(run);
-            self.end_motion("failed", "calibration_timeout", "校准超时，已停止");
-            return;
-        }
         if !self.enabled || self.error.is_some() {
             run.cancelled = true;
             run.report.outcome = "failed".into();
-            run.report.message = "校准已结束，设备未就绪".into();
+            run.report.recommended = None;
+            run.report.message = self
+                .error
+                .as_ref()
+                .map_or("测试已结束".into(), |e| e.message.clone());
             self.calibration = Some(run);
             self.restore_calibration_disabled();
             return;
         }
-        if let Some(sent) = self.bus.as_ref().and_then(|bus| bus.latest_reference()) {
-            if run.sent.back().is_none_or(|last| sent.at > last.at) {
-                if run.sent.len() == 32 {
-                    run.sent.pop_front();
-                }
-                run.sent.push_back(sent);
-            }
-        } else if self.bus.is_none() {
+        let latest = self.bus.as_ref().and_then(|bus| bus.latest_reference());
+        if let Some(sent) = latest
+            && run.sent.back().is_none_or(|last| sent.at > last.at)
+        {
             if run.sent.len() == 32 {
                 run.sent.pop_front();
             }
-            run.sent.push_back(SentReference {
-                at: now,
-                completed_at: now,
-                generation: self.generation,
-                epoch: self.reference_version,
-                q: self.reference,
-                dq: self.velocity,
+            run.sent.push_back(sent);
+        }
+        if !run.report.trials.is_empty()
+            && now.saturating_duration_since(run.last_sample) >= Duration::from_millis(20)
+            && run.points.len() < 90_000
+            && let Ok(feedback) = self.measured(now)
+        {
+            run.last_sample = now;
+            run.points.push(Point {
+                t_ms: now
+                    .saturating_duration_since(run.started)
+                    .as_millis()
+                    .min(u32::MAX as u128) as u32,
+                trial: run.trial.min(run.report.trials.len() - 1),
+                axis: run.report.trials[run.trial.min(run.report.trials.len() - 1)]
+                    .axis
+                    .unwrap_or(run.axis()),
+                reference: self.reference,
+                command: latest.map(|sent| sent.q),
+                feedback,
+                velocity: latest.map_or(self.velocity, |sent| sent.dq),
+                feedback_velocity: std::array::from_fn(|i| {
+                    self.feedback[i].as_ref().unwrap().value.dq
+                }),
+                feedback_age_ms: std::array::from_fn(|i| {
+                    now.saturating_duration_since(self.feedback[i].as_ref().unwrap().at)
+                        .as_millis()
+                        .min(u16::MAX as u128) as u16
+                }),
+                command_at_ms: latest.map(|sent| {
+                    sent.completed_at
+                        .saturating_duration_since(run.started)
+                        .as_millis()
+                        .min(u32::MAX as u128) as u32
+                }),
             });
         }
         if matches!(run.step, CalibrationStep::Moving) {
-            let axis = run.report.settings.axis;
+            let axis = run.axis();
             if let Some(at) = self.feedback[axis]
                 .as_ref()
                 .map(|o| o.at)
                 .filter(|at| run.observed.is_none_or(|last| *at > last))
             {
                 run.observed = Some(at);
-                if let Some(sent) = calibration_reference(&run.sent, at) {
-                    if let Ok(q) = self.measured(now) {
-                        let moving = self.motion.is_some()
-                            && sent.dq[axis].abs() >= run.legs[run.leg].speed * 0.2;
-                        run.collector.observe(
-                            at.saturating_duration_since(run.started)
-                                .as_micros()
-                                .min(u64::MAX as u128) as u64,
-                            sent.q,
-                            q,
-                            moving,
-                        );
-                    }
-                } else {
+                if let Ok(q) = self.measured(now) {
+                    let sent = calibration_reference(&run.sent, at);
+                    let moving = self.motion.is_some()
+                        && self.velocity[axis].abs() >= run.legs[run.leg].speed * 0.2;
                     run.collector.observe(
                         at.saturating_duration_since(run.started).as_micros() as u64,
-                        self.reference,
-                        self.reference,
-                        false,
+                        sent.map_or(self.reference, |s| s.q),
+                        q,
+                        moving,
                     );
                 }
             }
         }
-        let was_restoring = matches!(run.step, CalibrationStep::Restore);
         let mut failure = None;
         match run.step {
             CalibrationStep::Configure => {
-                let config = run.queue[run.trial].1;
-                match self.apply(
-                    &run.report.request_id,
-                    Operation::ConfigureServo {
-                        config: Box::new(config),
-                    },
-                    now,
-                    now,
-                ) {
+                let plan = &run.queue[run.trial];
+                let config = plan.config;
+                let axis = plan.axis;
+                let applied = if self.servo_tuning == config {
+                    Ok(())
+                } else {
+                    self.apply(
+                        &run.report.request_id,
+                        Operation::ConfigureServo {
+                            config: Box::new(config),
+                        },
+                        now,
+                        now,
+                    )
+                };
+                match applied {
                     Ok(()) => {
                         run.report.trials.push(Trial {
                             index: run.trial,
-                            phase: run.queue[run.trial].0.clone(),
+                            axis: Some(axis),
+                            phase: plan.phase.clone(),
                             config,
                             metrics: None,
                         });
-                        run.collector =
-                            Collector::new(run.report.settings.axis, run.report.center_measured);
+                        run.legs = calibration::legs(
+                            &run.report.settings,
+                            axis,
+                            run.report.center_reference,
+                        );
+                        run.collector = Collector::new(axis, run.report.center_measured);
                         run.leg = 0;
                         run.step = CalibrationStep::Move;
                         run.deadline = now + Duration::from_secs(2);
@@ -1458,13 +1612,10 @@ impl Core {
             }
             CalibrationStep::Move => {
                 let leg = &run.legs[run.leg];
-                let child = format!("cal:{}:{}:{}", run.report.id, run.trial, run.leg);
-                match self.begin_return(&child, leg.target, leg.speed, false, now) {
+                let id = format!("cal:{}:{}:{}", run.report.id, run.trial, run.leg);
+                match self.begin_return(&id, leg.target, leg.speed, false, now) {
                     Ok(()) => {
-                        let motion = self.motion.as_mut().unwrap();
-                        motion.calibration = true;
-                        run.deadline =
-                            now + Duration::from_secs_f64((motion.duration * 3.0 + 5.0).min(240.0));
+                        self.motion.as_mut().unwrap().calibration = true;
                         run.step = CalibrationStep::Moving;
                     }
                     Err(e) if e.code == "motion_busy" && now < run.deadline => {}
@@ -1472,9 +1623,7 @@ impl Core {
                 }
             }
             CalibrationStep::Moving => {
-                if now >= run.deadline {
-                    failure = Some(ApiError::new("calibration_timeout", "校准片段未能按时到位"));
-                } else if self.motion.is_none() && !self.stopping {
+                if self.motion.is_none() && !self.stopping {
                     run.collector.observe(
                         now.saturating_duration_since(run.started).as_micros() as u64,
                         self.reference,
@@ -1485,101 +1634,26 @@ impl Core {
                     run.step = CalibrationStep::Move;
                     run.deadline = now + Duration::from_secs(2);
                     if run.leg == run.legs.len() {
-                        let metrics = run.collector.finish();
-                        run.report.trials[run.trial].metrics = metrics;
-                        if run.report.trials[run.trial].metrics.is_none() {
-                            run.report.outcome = "insufficient".into();
-                            run.report.message = "有效采样不足，已保留起始参数".into();
-                            run.step = CalibrationStep::Restore;
-                        } else if run.trial == 0
-                            && run.report.trials[0]
-                                .metrics
-                                .as_ref()
-                                .is_some_and(|m| m.velocity_rms <= 0.0005)
-                        {
-                            run.report.outcome = "unchanged".into();
-                            run.report.message = "本轮基线未观察到需要补偿的速度波动".into();
-                            run.step = CalibrationStep::Restore;
-                        } else {
-                            run.trial += 1;
-                            run.step = CalibrationStep::Configure;
-                            if run.trial == run.queue.len() {
-                                if let Some(winner) = run.winner {
-                                    let count = run.report.trials.len();
-                                    let improvement = calibration::confirm(
-                                        &run.report.trials[0],
-                                        &run.report.trials[count - 2],
-                                        &run.report.trials[winner],
-                                        &run.report.trials[count - 1],
-                                    );
-                                    run.report.improvement = improvement;
-                                    run.report.recommended =
-                                        improvement.map(|_| run.report.trials[winner].config);
-                                    run.report.outcome = if improvement.is_some() {
-                                        "improved"
-                                    } else {
-                                        "unchanged"
-                                    }
-                                    .into();
-                                    run.report.message = if improvement.is_some() {
-                                        "复测通过，可使用推荐参数"
-                                    } else {
-                                        "复测未确认改善，已保留起始参数"
-                                    }
-                                    .into();
-                                    run.step = CalibrationStep::Restore;
-                                } else if let Some(winner) = calibration::recommend(
-                                    &run.report.trials[0],
-                                    &run.report.trials[1..],
-                                ) {
-                                    run.winner = Some(winner);
-                                    run.queue
-                                        .push(("baseline_check".into(), run.report.baseline));
-                                    run.queue.push((
-                                        "validation".into(),
-                                        run.report.trials[winner].config,
-                                    ));
-                                } else {
-                                    run.report.outcome = "unchanged".into();
-                                    run.report.message = "未观察到明确改善，已保留起始参数".into();
-                                    run.step = CalibrationStep::Restore;
-                                }
-                            }
+                        run.report.trials[run.trial].metrics = run.collector.finish();
+                        run.trial += 1;
+                        run.step = CalibrationStep::Configure;
+                        if run.trial == run.queue.len() {
+                            Self::extend_calibration_plan(&mut run);
                         }
                     }
                 }
             }
             CalibrationStep::Restore => {
                 if self.motion.is_none() && !self.stopping && self.at_rest() {
-                    match self.apply(
-                        &run.report.request_id,
-                        Operation::ConfigureServo {
-                            config: Box::new(run.report.baseline),
-                        },
-                        now,
-                        now,
-                    ) {
-                        Ok(()) => {
-                            self.finish_calibration(run);
-                            return;
-                        }
-                        Err(e) if e.code == "motion_busy" && now < run.deadline => {}
-                        Err(e) => {
-                            self.servo_tuning = run.report.baseline;
-                            self.servo_tuning_revision += 1;
-                            self.bump_generation();
-                            run.report.outcome = "failed".into();
-                            run.report.recommended = None;
-                            run.report.message = format!("起始参数已恢复：{}", e.message);
-                            self.finish_calibration(run);
-                            return;
-                        }
+                    if self.servo_tuning != run.report.baseline {
+                        self.servo_tuning = run.report.baseline;
+                        self.servo_tuning_revision += 1;
+                        self.bump_generation();
                     }
+                    self.finish_calibration(run);
+                    return;
                 }
             }
-        }
-        if !was_restoring && matches!(run.step, CalibrationStep::Restore) {
-            run.deadline = now + Duration::from_secs(2);
         }
         self.calibration = Some(run);
         if let Some(e) = failure {
@@ -1591,43 +1665,16 @@ impl Core {
         let report = self
             .calibration_result
             .as_ref()
-            .and_then(|status| status.report.as_ref())
-            .filter(|r| r.id == id && r.outcome == "improved")
-            .ok_or_else(|| ApiError::new("calibration_unavailable", "当前没有可应用的校准结果"))?
-            .clone();
+            .and_then(|s| s.report.as_ref())
+            .filter(|r| r.id == id)
+            .ok_or_else(|| ApiError::new("calibration_unavailable", "当前没有这份测试结果"))?;
         let config = report
             .recommended
-            .ok_or_else(|| ApiError::new("calibration_unavailable", "当前没有推荐参数"))?;
-        let same_tcp = match (self.tcp, report.tcp) {
-            (None, None) => true,
-            (Some(a), Some(b)) => a.translation == b.translation && a.rotation == b.rotation,
-            _ => false,
-        };
-        if self.calibration_apply_revision != Some(self.servo_tuning_revision)
-            || self.servo_tuning != report.baseline
-            || self.side != report.side
-            || self.port.as_deref() != Some(&report.port)
-            || !same_tcp
-        {
+            .ok_or_else(|| ApiError::new("calibration_unavailable", "本次参数保持原样"))?;
+        if self.calibration_apply_revision != Some(self.servo_tuning_revision) {
             return Err(ApiError::new(
                 "stale_calibration",
-                "连接、工具或参数已改变，请重新校准",
-            ));
-        }
-        self.require_calibration_ready(now)?;
-        self.motion_anchor(now)?;
-        let q = self.measured(now)?;
-        if (0..7).any(|i| {
-            (q[i] - report.center_measured[i]).abs()
-                > if i == report.settings.axis {
-                    report.settings.excursion
-                } else {
-                    0.035
-                }
-        }) {
-            return Err(ApiError::new(
-                "calibration_range",
-                "当前位置超出本次校准范围",
+                "当前参数已改动，请使用参数窗口查看对照值",
             ));
         }
         self.apply(
@@ -1668,7 +1715,6 @@ impl Core {
         self.bus = None;
         self.port = None;
         self.feedback = std::array::from_fn(|_| None);
-        self.stillness.clear();
         self.error = None;
         self.clear_request = None;
         self.clear_pending = [false; 7];
@@ -1998,14 +2044,9 @@ impl Core {
         {
             let invalid = self.measured(now).map(|q| {
                 (0..7).any(|i| {
-                    let limit = if i == run.report.settings.axis {
-                        run.report.settings.excursion
-                    } else {
-                        0.035
-                    };
+                    let limit = run.report.settings.excursion;
                     (q[i] - run.report.center_measured[i]).abs() > limit
                         || (self.reference[i] - run.report.center_reference[i]).abs() > limit
-                        || (self.reference[i] - q[i]).abs() > 0.10
                 })
             });
             match invalid {
@@ -2082,8 +2123,23 @@ impl Core {
         };
         let elapsed = now.saturating_duration_since(motion.started).as_secs_f64();
         let mode = motion.mode;
-        if matches!(mode, MotionMode::Return { .. }) && elapsed > motion.duration + 3.0 {
-            self.end_motion("failed", "target_timeout", "收纳到位超时，已停止返回");
+        if matches!(
+            mode,
+            MotionMode::Return {
+                disconnect_after: true
+            }
+        ) && elapsed > motion.duration + 3.0
+        {
+            let (axis, error) = (0..7)
+                .map(|i| (i, (measured[i] - motion.target[i]).abs()))
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .unwrap();
+            let message = format!(
+                "收纳位尚差 J{} {:.1}°，保持使能",
+                axis + 1,
+                error.to_degrees()
+            );
+            self.end_motion("failed", "target_timeout", &message);
             if let Err(e) = self.decelerate(measured, dt) {
                 self.fault(&e.code, e.message);
             }
@@ -2101,7 +2157,12 @@ impl Core {
         };
         let within_target = |q: &[f64; 7]| {
             if motion.space == Space::Joint {
-                (0..7).all(|i| (q[i] - motion.target[i]).abs() <= 0.01)
+                let tolerance = if matches!(mode, MotionMode::Return { .. }) {
+                    RETURN_POSITION_TOLERANCE
+                } else {
+                    0.01
+                };
+                (0..7).all(|i| (q[i] - motion.target[i]).abs() <= tolerance)
             } else {
                 self.model
                     .as_ref()
@@ -2116,8 +2177,16 @@ impl Core {
                     })
             }
         };
-        let at_target =
-            mode.timed() && t >= 1.0 && within_target(&measured) && within_target(&self.reference);
+        let needs_measured_position = !matches!(
+            mode,
+            MotionMode::Return {
+                disconnect_after: false
+            }
+        );
+        let at_target = mode.timed()
+            && t >= 1.0
+            && within_target(&self.reference)
+            && (!needs_measured_position || within_target(&measured));
         if at_target {
             self.stop_path = Self::motion_path(motion);
             if let Err(e) = self.decelerate(measured, dt) {
@@ -2126,20 +2195,7 @@ impl Core {
             }
             if self.at_rest() {
                 if let MotionMode::Return { disconnect_after } = mode {
-                    let slow = if self.motion.as_ref().unwrap().calibration {
-                        self.stillness.status(now).ready()
-                    } else {
-                        self.feedback.iter().all(|sample| {
-                            sample.as_ref().is_some_and(|sample| {
-                                sample.value.dq.is_finite() && sample.value.dq.abs() <= 0.02
-                            })
-                        })
-                    };
                     let motion = self.motion.as_mut().unwrap();
-                    if !slow {
-                        motion.settled_since = None;
-                        return;
-                    }
                     let since = *motion.settled_since.get_or_insert(now);
                     let observed_until = self
                         .feedback
@@ -2576,24 +2632,18 @@ impl Core {
         let error = value.error;
         let timeout = value.timeout;
         let mode = value.mode;
-        self.stillness.observe(
-            id,
-            if value.dq.is_finite() {
-                value.q
-            } else {
-                f64::NAN
-            },
-            at,
-        );
         if let Some(motion) = &mut self.motion
-            && matches!(motion.mode, MotionMode::Return { .. })
+            && matches!(
+                motion.mode,
+                MotionMode::Return {
+                    disconnect_after: true
+                }
+            )
             && (!value.q.is_finite()
-                || !value.dq.is_finite()
-                || (value.q - motion.target[id]).abs() > 0.01
-                || (!motion.calibration && value.dq.abs() > 0.02))
+                || (value.q - motion.target[id]).abs() > RETURN_POSITION_TOLERANCE)
         {
             // Do not let a later frame in the same receive batch conceal
-            // a position/velocity excursion during the settle interval.
+            // a position departure during the release interval.
             motion.settled_since = None;
         }
         self.feedback[id] = Some(Observation { value, at });
@@ -2712,7 +2762,7 @@ impl Core {
                     request_id: run.report.request_id.clone(),
                     space: Space::Joint,
                     mode: "calibration".into(),
-                    axis: Some(run.report.settings.axis),
+                    axis: Some(run.axis()),
                     progress: self.calibration_snapshot(run).progress,
                 })
                 .or_else(|| {
@@ -2747,7 +2797,6 @@ impl Core {
                 .as_ref()
                 .map(|run| self.calibration_snapshot(run))
                 .or_else(|| self.calibration_result.clone()),
-            calibration_readiness: self.calibration_readiness(now),
         }
     }
 }
@@ -2772,7 +2821,7 @@ fn run(
     stop_reason: Arc<Mutex<Option<String>>>,
     shutdown: Arc<AtomicBool>,
     state: watch::Sender<Snapshot>,
-) -> Option<CalibrationReport> {
+) -> VecDeque<CalibrationReport> {
     let mut seen_epoch = 0;
     let mut last_control = Instant::now();
     let mut published = last_control;
@@ -2866,7 +2915,7 @@ fn run(
             std::thread::sleep(wait);
         }
     }
-    core.pending_calibration_report.take()
+    std::mem::take(&mut core.pending_calibration_report)
 }
 
 #[cfg(test)]
@@ -3550,14 +3599,6 @@ mod tests {
             now,
         )
         .unwrap();
-        core.stillness.clear();
-        for tick in 0..=40 {
-            let at = now - Duration::from_millis(400 - tick * 10);
-            for i in 0..7 {
-                let value = core.feedback[i].as_ref().unwrap().value.clone();
-                core.accept_feedback(value, at);
-            }
-        }
         let (bus, sent) = BusHandle::test_idle_bus();
         core.bus = Some(bus);
         sent.send_replace(Some(SentReference {
@@ -3583,7 +3624,7 @@ mod tests {
     }
     fn calibration_settings() -> CalibrationSettings {
         CalibrationSettings {
-            axis: 1,
+            axis: Some(1),
             excursion: 0.1,
             speed: 0.02,
             max_friction: 0.1,
@@ -3634,7 +3675,6 @@ mod tests {
         let samples = capture["samples"].as_array().unwrap();
         let first_tx = samples.iter().find(|s| s["source"] == "transmit").unwrap();
         core.reference = std::array::from_fn(|i| first_tx["q_ref"][i].as_f64().unwrap());
-        core.stillness.clear();
         let mut reproduced = false;
         for sample in samples {
             let us = sample["at_us"].as_u64().unwrap();
@@ -3661,12 +3701,11 @@ mod tests {
                 q: core.reference,
                 dq: [0.0; 7],
             }));
-            let readiness = core.calibration_readiness(now);
             let old_velocity_gate = core
                 .feedback
                 .iter()
                 .any(|o| o.as_ref().is_some_and(|o| o.value.dq.abs() > 0.02));
-            if readiness.ready() && old_velocity_gate {
+            if us >= 400_000 && core.motion_anchor(now).is_ok() && old_velocity_gate {
                 calibration_request(
                     &mut core,
                     "recorded-hold",
@@ -3677,10 +3716,7 @@ mod tests {
                 );
                 assert!(core.calibration.is_some(), "{:?}", core.results.front());
                 assert_eq!(core.results.front().unwrap().status, "accepted");
-                println!(
-                    "recorded stationary hold accepted at {us} us; {} ms observed, span={:?} rad",
-                    readiness.observed_ms, readiness.position_span
-                );
+                println!("recorded hold accepted at {us} us");
                 reproduced = true;
                 break;
             }
@@ -3692,7 +3728,7 @@ mod tests {
         assert!(core.journal.shutdown(Duration::from_secs(2)));
     }
     #[test]
-    fn calibration_start_rejects_position_drift_even_when_reported_velocity_is_zero() {
+    fn calibration_start_records_minor_movement_instead_of_rejecting_it() {
         let origin = Instant::now();
         let (mut core, _directory, sent) = calibration_fixture(origin);
         for tick in 0..=60 {
@@ -3720,8 +3756,8 @@ mod tests {
             },
             origin + Duration::from_millis(600),
         );
-        assert!(core.calibration.is_none());
-        assert_eq!(core.results.front().unwrap().code, "motion_busy");
+        assert!(core.calibration.is_some());
+        assert_eq!(core.results.front().unwrap().status, "accepted");
     }
     #[test]
     fn calibration_internal_return_settles_with_noisy_velocity_feedback() {
@@ -3801,13 +3837,12 @@ mod tests {
         if let Some(lease) = core.lease.as_mut() {
             lease.expires = now + Duration::from_millis(LEASE_MS);
         }
-        let selected = core
-            .calibration
-            .as_ref()
-            .map_or(1, |r| r.report.settings.axis);
+        let selected = core.calibration.as_ref().map_or(1, |r| r.axis());
         let amplitude = if !jitter {
             0.0
-        } else if core.servo_tuning.friction_enabled {
+        } else if core.servo_tuning.friction_enabled
+            && core.servo_tuning.joints[selected].coulomb > 0.0
+        {
             if core.servo_tuning.joints[selected].coulomb >= 0.09 {
                 0.0004
             } else {
@@ -3863,11 +3898,80 @@ mod tests {
         }
         let report = core.snapshot(origin).calibration.unwrap().report.unwrap();
         assert_eq!(report.outcome, "unchanged");
-        assert_eq!(report.trials.len(), 1);
+        assert_eq!(report.trials.len(), 4);
         assert!(report.recommended.is_none());
         assert_eq!(core.servo_tuning, baseline);
         assert!(core.motion.is_none());
         assert!(core.at_rest());
+    }
+    #[test]
+    fn calibration_default_program_sweeps_seven_axes_and_persists_actual_time_curves() {
+        let origin = Instant::now();
+        let (mut core, _dir, sent) = calibration_fixture(origin);
+        let center = core.reference;
+        let baseline = core.servo_tuning;
+        calibration_request(
+            &mut core,
+            "automatic-seven-axes",
+            serde_json::from_value(serde_json::json!({"kind": "calibrate_start"})).unwrap(),
+            origin,
+        );
+        for tick in 1..100_000 {
+            let now = origin + Duration::from_millis(tick * 10);
+            calibration_tick(&mut core, &sent, now, origin, true);
+            assert!(core.error.is_none());
+            assert!(
+                (0..7)
+                    .all(|i| (core.reference[i] - center[i]).abs() <= 4.0_f64.to_radians() + 1e-6)
+            );
+            if core.calibration.is_none() {
+                break;
+            }
+        }
+        assert!(core.calibration.is_none());
+        let report = core
+            .calibration_result
+            .as_ref()
+            .unwrap()
+            .report
+            .as_ref()
+            .unwrap();
+        let measured_axes = report
+            .trials
+            .iter()
+            .filter(|trial| trial.phase == "baseline")
+            .map(|trial| trial.axis.unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(measured_axes, (0..7).collect::<Vec<_>>());
+        assert!(report.sample_count > 1000);
+        assert!(
+            report.curves.is_empty(),
+            "state snapshots carry metadata, not the full recording"
+        );
+        assert!(report.trials.iter().any(|trial| trial.phase == "after"));
+        let id = report.id.clone();
+        let count = report.sample_count;
+        assert_eq!(core.servo_tuning, baseline);
+        assert!((0..7).all(|i| (core.reference[i] - center[i]).abs() < 0.01));
+        assert!(core.journal.shutdown(Duration::from_secs(5)));
+        let stored = core.journal.calibration(&id).unwrap().unwrap();
+        assert_eq!(stored.curves.len(), count);
+        assert!(
+            stored
+                .curves
+                .windows(2)
+                .all(|pair| pair[1].t_ms > pair[0].t_ms)
+        );
+        assert!(stored.curves.iter().all(|point| point.command.is_some()));
+        assert!(
+            stored
+                .curves
+                .iter()
+                .all(|point| { stored.trials[point.trial].axis == Some(point.axis) })
+        );
+        assert!(stored.curves.iter().any(|point| {
+            (point.command.unwrap()[point.axis] - point.feedback[point.axis]).abs() > 0.0001
+        }));
     }
     #[test]
     fn calibration_repeats_candidate_then_restores_and_requires_explicit_apply() {
@@ -3910,11 +4014,8 @@ mod tests {
                 .map(|t| (&t.phase, t.metrics.as_ref().map(|m| m.velocity_rms)))
                 .collect::<Vec<_>>()
         );
-        assert_eq!(
-            report.trials[report.trials.len() - 2].phase,
-            "baseline_check"
-        );
-        assert_eq!(report.trials.last().unwrap().phase, "validation");
+        assert_eq!(report.trials.last().unwrap().phase, "after");
+        assert_eq!(report.choices.len(), 1);
         assert_eq!(core.servo_tuning, baseline);
         assert!(core.enabled);
         assert!(core.at_rest());
@@ -4003,7 +4104,7 @@ mod tests {
         }
     }
     #[test]
-    fn calibration_tool_change_and_return_to_previous_tcp_still_invalidates_result() {
+    fn calibration_joint_compensation_does_not_require_retesting_after_tcp_reference_changes() {
         let origin = Instant::now();
         let (mut core, _dir, sent) = calibration_fixture(origin);
         calibration_request(
@@ -4056,7 +4157,7 @@ mod tests {
             },
             now,
         );
-        assert_eq!(core.results.front().unwrap().code, "stale_calibration");
+        assert_eq!(core.results.front().unwrap().code, "calibrate_apply");
     }
     #[test]
     fn calibration_boundary_ranges_speeds_and_axes_finish_without_leaving_limits() {
@@ -4071,7 +4172,7 @@ mod tests {
                         "edge-calibration",
                         Operation::CalibrateStart {
                             settings: CalibrationSettings {
-                                axis,
+                                axis: Some(axis),
                                 excursion,
                                 speed,
                                 max_friction: 0.1,
@@ -4244,13 +4345,9 @@ mod tests {
             let report_id = run.report.id.clone();
             journal.with_calibration_queue_locked(|| {
                 core.finish_calibration(run);
-                assert!(core.pending_calibration_report.is_some());
-                assert_eq!(
-                    core.begin_calibration("blocked", calibration_settings(), origin)
-                        .unwrap_err()
-                        .code,
-                    "calibration_storage_busy"
-                );
+                assert!(!core.pending_calibration_report.is_empty());
+                core.flush_calibration_report();
+                assert_eq!(core.pending_calibration_report.len(), 1);
             });
             if close_immediately {
                 let arm = ArmHandle::spawn_core(core).unwrap();
@@ -4274,7 +4371,7 @@ mod tests {
                 stopped.0.join().unwrap();
             } else {
                 core.flush_calibration_report();
-                assert!(core.pending_calibration_report.is_none());
+                assert!(core.pending_calibration_report.is_empty());
             }
             assert!(journal.shutdown(Duration::from_secs(2)));
             let reopened = Journal::start(directory.path().join("events.sqlite3")).unwrap();
@@ -4363,6 +4460,47 @@ mod tests {
         }
     }
     #[test]
+    fn return_completes_at_target_despite_continuous_velocity_noise_and_small_position_jitter() {
+        for disconnect_after in [false, true] {
+            let mut now = Instant::now();
+            let (mut core, _dir) = observed_core(now);
+            core.enabled = true;
+            core.port = Some("memory-only".into());
+            let mut target = core.reference;
+            target[3] += 0.05;
+            core.begin_return("noisy-return", target, 0.05, disconnect_after, now)
+                .unwrap();
+            for tick in 0..1000 {
+                now += Duration::from_millis(10);
+                for i in 0..7 {
+                    let mut feedback = core.feedback[i].as_ref().unwrap().value.clone();
+                    feedback.q = core.reference[i]
+                        + if i == 3 {
+                            if tick % 2 == 0 { 0.0015 } else { -0.0015 }
+                        } else {
+                            0.0
+                        };
+                    feedback.dq = if i == 3 { 0.05 } else { 0.0 };
+                    core.accept_feedback(feedback, now);
+                }
+                core.advance(now, 0.01);
+                if core.motion.is_none() {
+                    break;
+                }
+            }
+            let result = core.results.front().unwrap();
+            assert_eq!(result.status, "completed", "{result:?}");
+            assert_eq!(
+                result.code,
+                if disconnect_after {
+                    "parked"
+                } else {
+                    "returned"
+                }
+            );
+        }
+    }
+    #[test]
     fn stopped_return_never_disconnects_later() {
         let mut now = Instant::now();
         let (mut core, _directory) = observed_core(now);
@@ -4413,28 +4551,22 @@ mod tests {
         assert!(core.results.iter().all(|r| r.code != "parked"));
     }
     #[test]
-    fn return_requires_a_fresh_uninterrupted_stationary_settle_window() {
+    fn return_disconnect_waits_for_position_arrival() {
         let mut now = Instant::now();
         let (mut core, _directory) = observed_core(now);
         core.enabled = true;
         core.port = Some("memory-only".into());
         core.begin_return("return", core.reference, 0.1, true, now)
             .unwrap();
-        for tick in 1..=50 {
+        for _ in 0..50 {
             now += Duration::from_millis(10);
             follow_reference(&mut core, now);
-            if tick <= 25 {
-                core.feedback[0].as_mut().unwrap().value.dq = 0.1;
-            }
-            // A new position excursion resets the earlier settle interval.
-            if tick == 40 {
-                core.feedback[0].as_mut().unwrap().value.q += 0.02;
-            }
+            core.feedback[0].as_mut().unwrap().value.q += 0.03;
             core.advance(now, 0.01);
             assert!(core.motion.is_some());
             assert!(core.enabled);
         }
-        for _ in 0..12 {
+        for _ in 0..25 {
             now += Duration::from_millis(10);
             follow_reference(&mut core, now);
             core.advance(now, 0.01);
@@ -4541,31 +4673,7 @@ mod tests {
         journal.shutdown(Duration::from_millis(200));
     }
     #[test]
-    fn return_cannot_wait_forever_on_nonzero_measured_velocity() {
-        let mut now = Instant::now();
-        let (mut core, _directory) = observed_core(now);
-        core.enabled = true;
-        core.port = Some("memory-only".into());
-        core.begin_return("return", core.reference, 0.1, true, now)
-            .unwrap();
-        for _ in 0..400 {
-            now += Duration::from_millis(10);
-            for sample in core.feedback.iter_mut().flatten() {
-                sample.at = now;
-                sample.value.dq = 0.1;
-            }
-            core.advance(now, 0.01);
-            if core.motion.is_none() {
-                break;
-            }
-        }
-        assert!(core.motion.is_none());
-        assert!(core.enabled);
-        assert!(core.port.is_some());
-        assert_eq!(core.results.front().unwrap().code, "target_timeout");
-    }
-    #[test]
-    fn return_settle_observes_every_feedback_even_if_a_later_frame_recovers() {
+    fn return_disconnect_observes_position_departure_even_if_a_later_frame_recovers() {
         let mut now = Instant::now();
         let (mut core, _directory) = observed_core(now);
         core.enabled = true;
@@ -4579,16 +4687,16 @@ mod tests {
         }
         assert!(core.motion.as_ref().unwrap().settled_since.is_some());
         let mut spike = core.feedback[0].as_ref().unwrap().value.clone();
-        spike.dq = 0.1;
+        spike.q += 0.03;
         core.accept_feedback(spike.clone(), now + Duration::from_millis(2));
-        spike.dq = 0.0;
+        spike.q -= 0.03;
         core.accept_feedback(spike, now + Duration::from_millis(3));
         now += Duration::from_millis(10);
         follow_reference(&mut core, now);
         core.advance(now, 0.01);
         assert!(
             core.enabled,
-            "a recovered last sample must not conceal a speed spike"
+            "a recovered last sample must not conceal a position departure"
         );
         assert!(core.port.is_some());
         assert!(core.motion.is_some());
