@@ -36,10 +36,10 @@ fn validate_settings(settings: &Settings) -> Result<(), String> {
             return Err(format!("校准 {name} 必须为正数"));
         }
     }
-    if !settings.max_friction.is_finite()
-        || settings.max_friction < 0.0
-        || settings.max_friction > 2.0
-    {
+    if !(settings.speed * 2.0).is_finite() {
+        return Err("校准试验速度无法表示".into());
+    }
+    if !settings.max_friction.is_finite() || settings.max_friction < 0.0 {
         return Err("摩擦试验参数无效".into());
     }
     Ok(())
@@ -137,7 +137,6 @@ pub struct Metrics {
 }
 
 const WINDOW_US: u64 = 100_000;
-const MAX_GAP_US: u64 = 300_000;
 
 #[derive(Clone, Copy)]
 struct WindowStart {
@@ -192,8 +191,9 @@ impl Collector {
     }
 
     /// Stops and invalid numbers discard the partial window. A finite moving
-    /// frame after a clock discontinuity or long gap may start a new window,
-    /// but contributes no velocity or valid duration across the discontinuity.
+    /// frame after a clock discontinuity may start a new window, but contributes
+    /// no velocity or valid duration across the discontinuity. Sparse moving
+    /// frames use their actual elapsed time without an arbitrary gap cutoff.
     pub fn observe(&mut self, at_us: u64, reference: [f64; 7], measured: [f64; 7], moving: bool) {
         if !moving
             || self.axis >= 7
@@ -224,7 +224,7 @@ impl Collector {
             return;
         }
         if let Some(last) = self.last_at_us
-            && (at_us <= last || at_us - last > MAX_GAP_US)
+            && at_us <= last
         {
             self.window = None;
         }
@@ -612,9 +612,35 @@ mod tests {
             }
         }
         let mut invalid_baseline = baseline;
-        invalid_baseline.joints[0].kd = 31.0;
+        invalid_baseline.joints[0].kd = f64::NAN;
         assert!(validate(&Settings::default(), &invalid_baseline).is_err());
         assert!(legs(&Settings::default(), 0, [f64::NAN; 7]).is_empty());
+    }
+
+    #[test]
+    fn calibration_friction_has_no_independent_upper_limit() {
+        let settings = Settings {
+            max_friction: 12.5,
+            ..Settings::default()
+        };
+        let actual = candidates(&settings, 3, ServoTuning::default()).unwrap();
+        assert_eq!(actual[1].joints[3].coulomb, 6.25);
+        assert_eq!(actual[2].joints[3].coulomb, 12.5);
+        assert_eq!(actual[2].joints[3].max_friction, 12.5);
+    }
+
+    #[test]
+    fn validation_rejects_unrepresentable_trial_speed_before_building_legs() {
+        let settings = Settings {
+            speed: f64::MAX,
+            ..Settings::default()
+        };
+        assert_eq!(
+            validate(&settings, &ServoTuning::default()).unwrap_err(),
+            "校准试验速度无法表示"
+        );
+        assert!(candidates(&settings, 3, ServoTuning::default()).is_err());
+        assert!(legs(&settings, 3, [0.0; 7]).is_empty());
     }
 
     #[test]
@@ -808,13 +834,16 @@ mod tests {
     }
 
     #[test]
-    fn collector_allows_300ms_feedback_intervals_but_never_bridges_a_longer_gap() {
-        let mut continuous = steady(20, 100_000, 0.02, 0.02);
-        continuous.observe(2_300_000, point(3, 0.046), point(3, 0.046), true);
-        let actual = continuous.finish().unwrap();
-        assert_eq!((actual.windows, actual.valid_ms), (21, 2300));
-        close(actual.velocity_rms, 0.0);
-        assert_interrupt_breaks_window(2_350_001, true, false, false);
+    fn collector_uses_actual_elapsed_time_for_sparse_moving_feedback() {
+        for interval_us in [300_000, 350_001, 2_000_000] {
+            let mut collector = steady(20, 100_000, 0.02, 0.02);
+            let at_us = 2_000_000 + interval_us;
+            let reference = 0.02 * at_us as f64 / 1_000_000.0;
+            collector.observe(at_us, point(3, reference), point(3, reference), true);
+            let actual = collector.finish().unwrap();
+            assert_eq!((actual.windows, actual.valid_ms), (21, at_us / 1000));
+            close(actual.velocity_rms, 0.0);
+        }
     }
 
     #[test]

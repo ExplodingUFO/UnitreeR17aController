@@ -1,7 +1,6 @@
 /* Hallmark · shape: app screen · genre: modern-minimal · theme: existing project system · redesign: full · nav: control, API, logs · signature: measured arm beside jog controls · states: loading, empty, error, connected · floor: 0 FAIL · reflex: 0 · finish-review: subagent, 0 findings · v2.0.0 */
 /* Hallmark · pre-emit critique: P4 H4 E4 S5 R5 V4 · weakest: E; align connection fields with an independent response reader on wide windows, stack them on narrow windows. */
 /* Hallmark · answered F4 · neutral fills are instrument controls; blue marks selections and enable, red identifies stop. */
-/* Hallmark · dropped onChange={(e) => setAngularSpeed, onChange={(e) => setLinearSpeed, onClick={() => changeControls(() => setSpace(value))} · Updated the three input handlers to use backend speed limits and clamp speed when changing motion space; the controls and request paths remain. */
 :root {
   --font-body:
     -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",

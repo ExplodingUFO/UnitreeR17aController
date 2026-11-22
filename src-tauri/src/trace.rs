@@ -1,4 +1,4 @@
-//! Short, bounded observation captures. Producers try a preallocated queue's mutex
+//! Bounded observation captures. Producers try a preallocated queue's mutex
 //! once and drop on contention or overflow; they never wait for its lock or allocate.
 //! Serialization and disk work run on readers/writer after releasing the queue lock.
 use crate::reference::Timing;
@@ -29,6 +29,13 @@ const COMPLETE: u8 = 3;
 const FAILED: u8 = 4;
 const POLL: Duration = Duration::from_millis(10);
 const BUSY: Duration = Duration::from_millis(40);
+
+pub(crate) fn duration_ns(duration_ms: u64) -> Result<u64, String> {
+    duration_ms
+        .checked_mul(1_000_000)
+        .filter(|duration| *duration > 0)
+        .ok_or_else(|| "invalid_trace_duration".into())
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
@@ -285,9 +292,7 @@ impl Recorder {
         side: &str,
         port: Option<&str>,
     ) -> Result<TraceSummary, String> {
-        if !(1000..=20_000).contains(&duration_ms) {
-            return Err("invalid_trace_duration".into());
-        }
+        let duration = duration_ns(duration_ms)?;
         if !matches!(side, "left" | "right") || port.is_some_and(|p| p.len() > 512) {
             return Err("invalid_trace_context".into());
         }
@@ -302,6 +307,7 @@ impl Recorder {
             return Err("closing".into());
         }
         let now = nanos(self.0.origin, Instant::now()).unwrap_or(0);
+        let deadline = now.checked_add(duration).ok_or("invalid_trace_duration")?;
         let active = state.active.load(Ordering::SeqCst);
         if active != 0 {
             if now < state.slot(active).deadline_ns.load(Ordering::Relaxed) {
@@ -331,8 +337,7 @@ impl Recorder {
         let slot = &state.slots[index];
         slot.token.store(token, Ordering::Release);
         slot.start_ns.store(now, Ordering::Relaxed);
-        slot.deadline_ns
-            .store(now + duration_ms * 1_000_000, Ordering::Relaxed);
+        slot.deadline_ns.store(deadline, Ordering::Relaxed);
         for counter in [
             &slot.attempts,
             &slot.accepted,
@@ -1264,7 +1269,7 @@ mod tests {
         // The full seven-joint configuration stays inline: no producer allocation,
         // with the 4096-slot queue still bounded to at most 6 MiB of payloads.
         assert!(std::mem::size_of::<TraceData>() <= 1536);
-        for duration in [0, 999, 20_001, u64::MAX] {
+        for duration in [0, u64::MAX / 1_000_000 + 1, u64::MAX] {
             assert_eq!(
                 recorder.trace_start(duration, "left", None).unwrap_err(),
                 "invalid_trace_duration"
@@ -1333,6 +1338,31 @@ mod tests {
         assert_eq!(reopened.trace_read(&trace.id).unwrap().samples.len(), 5);
         assert!(reopened.trace_list(0).unwrap().is_empty());
         close(&reopened);
+    }
+
+    #[test]
+    fn resource_limits_accept_short_and_long_recordings() {
+        let directory = tempfile::tempdir().unwrap();
+        let recorder = Recorder::start(&directory.path().join("events.db")).unwrap();
+        for duration_ms in [25, 60_000] {
+            let trace = recorder.trace_start(duration_ms, "right", None).unwrap();
+            let start = start_time(&recorder);
+            let submitted = sample_until_queued(
+                &recorder,
+                start + Duration::from_millis(duration_ms - 1),
+                feedback(),
+            );
+            recorder.sample(start + Duration::from_millis(duration_ms), feedback());
+            wait_for(|| summary(&recorder, &trace.id).status == "complete");
+            let recording = recorder.trace_read(&trace.id).unwrap();
+            assert_eq!(recording.trace.duration_ms, duration_ms);
+            assert_eq!(recording.trace.accepted, 1);
+            assert_eq!(recording.trace.written, 1);
+            assert_eq!(recording.trace.dropped, submitted - 1);
+            assert_eq!(recording.samples.len(), 1);
+            assert_eq!(recording.samples[0].at_us, (duration_ms - 1) * 1000);
+        }
+        close(&recorder);
     }
 
     #[test]

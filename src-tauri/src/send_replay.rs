@@ -149,8 +149,6 @@ fn limits() -> MotionLimits {
     MotionLimits {
         joint_velocity: [JOINT_SPEED; 7],
         joint_acceleration: [JOINT_ACCELERATION; 7],
-        max_reference_error: 0.60,
-        max_joint_step: 0.01,
         linear_speed: LINEAR_CAP,
         angular_speed: ANGULAR_CAP,
     }

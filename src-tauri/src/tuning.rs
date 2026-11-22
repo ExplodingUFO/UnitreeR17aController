@@ -1,11 +1,7 @@
 //! Stateless velocity feedforward and friction compensation for seven joints.
 
+use crate::protocol::{DriveMode, Setpoint, encode};
 use serde::{Deserialize, Serialize};
-
-const TORQUE_LIMIT: f64 = 8.0;
-const VELOCITY_LIMIT: f64 = 0.2;
-// Accept roundoff at the planner's velocity boundary, in rad/s.
-const VELOCITY_TOLERANCE: f64 = 1e-9;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ServoTuning {
@@ -30,7 +26,7 @@ pub struct JointTuning {
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct Applied {
     pub dq_feedforward: [f64; 7],
-    /// Friction after its own limit, before the total torque limit.
+    /// Friction after the configured max_friction limit.
     pub friction_requested: [f64; 7],
     /// Delivered torque minus the supplied gravity torque.
     pub friction_applied: [f64; 7],
@@ -54,34 +50,50 @@ impl Default for JointTuning {
 impl ServoTuning {
     pub fn validate(&self) -> Result<(), String> {
         for (index, joint) in self.joints.iter().enumerate() {
-            for (name, value, min, max) in [
-                ("kd", joint.kd, 0.0, 30.0),
-                ("velocity_ff", joint.velocity_ff, 0.0, 1.0),
-                ("coulomb", joint.coulomb, 0.0, 2.0),
-                ("viscous", joint.viscous, 0.0, 10.0),
-                ("velocity_scale", joint.velocity_scale, 0.001, 0.2),
-                ("max_friction", joint.max_friction, 0.0, 2.0),
+            for (name, value) in [
+                ("kd", joint.kd),
+                ("velocity_ff", joint.velocity_ff),
+                ("coulomb", joint.coulomb),
+                ("viscous", joint.viscous),
+                ("velocity_scale", joint.velocity_scale),
+                ("max_friction", joint.max_friction),
             ] {
                 if !value.is_finite() {
                     return Err(format!("J{} {name}非有限", index + 1));
                 }
-                if !(min..=max).contains(&value) {
-                    return Err(format!("J{} {name}超限", index + 1));
+                if value < 0.0 || (name == "velocity_scale" && value == 0.0) {
+                    return Err(format!("J{} {name}符号无效", index + 1));
                 }
             }
+            // Kd is a wire field; keep its SDK and signed-integer limits in
+            // the encoder instead of maintaining a second tuning range.
+            encode(
+                index as u8,
+                Setpoint {
+                    mode: DriveMode::Servo,
+                    q: 0.0,
+                    dq: 0.0,
+                    tau: 0.0,
+                    kp: 0.0,
+                    kd: joint.kd,
+                },
+            )
+            .map_err(|error| format!("J{} kd: {error}", index + 1))?;
         }
         Ok(())
     }
 
     /// Compute from the sampled motion velocity, without changing the motion plan.
     /// The friction switch does not disable the independent velocity FF weight.
+    /// Configuration is validated when it is accepted, not on every send.
     pub fn apply(&self, dq: [f64; 7], gravity: [f64; 7]) -> Result<Applied, String> {
-        self.validate()?;
         for index in 0..7 {
-            if !dq[index].is_finite() || dq[index].abs() > VELOCITY_LIMIT + VELOCITY_TOLERANCE {
+            // Motion speeds are already bounded by the active profile and
+            // model before this stateless feedforward calculation.
+            if !dq[index].is_finite() {
                 return Err(format!("J{} 速度无效", index + 1));
             }
-            if !gravity[index].is_finite() || gravity[index].abs() > TORQUE_LIMIT {
+            if !gravity[index].is_finite() {
                 return Err(format!("J{} 重力无效", index + 1));
             }
         }
@@ -99,6 +111,9 @@ impl ServoTuning {
             if joint.velocity_ff != 1.0 {
                 result.dq_feedforward[index] = velocity * joint.velocity_ff;
             }
+            if !result.dq_feedforward[index].is_finite() {
+                return Err(format!("J{} 速度前馈非有限", index + 1));
+            }
             if !self.friction_enabled || velocity == 0.0 {
                 continue;
             }
@@ -112,12 +127,14 @@ impl ServoTuning {
                 continue;
             }
 
-            let total = gravity[index] + requested;
-            let tau = total.clamp(-TORQUE_LIMIT, TORQUE_LIMIT);
+            let tau = gravity[index] + requested;
+            let friction = tau - gravity[index];
+            if !tau.is_finite() || !friction.is_finite() {
+                return Err(format!("J{} 力矩前馈非有限", index + 1));
+            }
             result.friction_requested[index] = requested;
-            result.friction_applied[index] = tau - gravity[index];
+            result.friction_applied[index] = friction;
             result.tau[index] = tau;
-            result.clamped[index] |= total < -TORQUE_LIMIT || total > TORQUE_LIMIT;
         }
         Ok(result)
     }
@@ -127,13 +144,13 @@ impl ServoTuning {
 mod tests {
     use super::*;
 
-    const FIELDS: [(&str, f64, f64); 6] = [
-        ("kd", 0.0, 30.0),
-        ("velocity_ff", 0.0, 1.0),
-        ("coulomb", 0.0, 2.0),
-        ("viscous", 0.0, 10.0),
-        ("velocity_scale", 0.001, 0.2),
-        ("max_friction", 0.0, 2.0),
+    const FIELDS: [(&str, f64); 6] = [
+        ("kd", 50.0),
+        ("velocity_ff", 2.0),
+        ("coulomb", 3.0),
+        ("viscous", 20.0),
+        ("velocity_scale", 1.0),
+        ("max_friction", 3.0),
     ];
 
     fn field_mut(joint: &mut JointTuning, field: usize) -> &mut f64 {
@@ -347,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn total_torque_cap_reports_actual_delivered_friction() {
+    fn friction_adds_to_gravity_without_a_second_torque_cap() {
         let tuning = enabled(JointTuning {
             viscous: 5.0,
             max_friction: 2.0,
@@ -360,18 +377,18 @@ mod tests {
             result.friction_requested,
             [1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 0.0],
         );
-        assert_bits(result.tau, [8.0, -8.0, -6.75, 6.75, 8.0, -8.0, -0.0]);
+        assert_bits(result.tau, [8.75, -8.75, -6.75, 6.75, 9.0, -9.0, -0.0]);
         assert_bits(
             result.friction_applied,
-            [0.25, -0.25, 1.0, -1.0, 0.0, 0.0, 0.0],
+            [1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 0.0],
         );
-        assert_eq!(
-            result.clamped,
-            [true, true, false, false, true, true, false]
-        );
+        assert_eq!(result.clamped, [false; 7]);
         for (index, gravity) in gravity.into_iter().enumerate() {
             assert_eq!(result.friction_applied[index], result.tau[index] - gravity);
-            assert!(result.tau[index].abs() <= 8.0);
+            assert_eq!(
+                result.tau[index],
+                gravity + result.friction_requested[index]
+            );
         }
     }
 
@@ -431,27 +448,30 @@ mod tests {
     }
 
     #[test]
-    fn all_tuning_ranges_accept_endpoints_and_reject_values_outside() {
+    fn tuning_uses_mathematical_signs_instead_of_software_caps() {
         for index in 0..7 {
-            for (field, (name, min, max)) in FIELDS.into_iter().enumerate() {
-                for endpoint in [min, max] {
+            for (field, (name, above_old_cap)) in FIELDS.into_iter().enumerate() {
+                for allowed in [
+                    if name == "velocity_scale" {
+                        0.0001
+                    } else {
+                        0.0
+                    },
+                    above_old_cap,
+                ] {
                     let mut tuning = ServoTuning::default();
-                    *field_mut(&mut tuning.joints[index], field) = endpoint;
-                    assert!(
-                        tuning.validate().is_ok(),
-                        "J{} {name}={endpoint}",
-                        index + 1
-                    );
+                    *field_mut(&mut tuning.joints[index], field) = allowed;
+                    assert!(tuning.validate().is_ok(), "J{} {name}={allowed}", index + 1);
                 }
-                for outside in [min - 1e-9, max + 1e-9] {
-                    let mut tuning = ServoTuning::default();
-                    *field_mut(&mut tuning.joints[index], field) = outside;
-                    let error = tuning.validate().unwrap_err();
-                    assert!(error.starts_with(&format!("J{} ", index + 1)));
-                    assert!(error.contains(name));
-                    assert!(tuning.apply([0.0; 7], [0.0; 7]).is_err());
-                }
+                let mut tuning = ServoTuning::default();
+                *field_mut(&mut tuning.joints[index], field) = -1e-9;
+                let error = tuning.validate().unwrap_err();
+                assert!(error.starts_with(&format!("J{} ", index + 1)));
+                assert!(error.contains(name));
             }
+            let mut tuning = ServoTuning::default();
+            tuning.joints[index].velocity_scale = 0.0;
+            assert!(tuning.validate().is_err());
         }
     }
 
@@ -464,44 +484,63 @@ mod tests {
                     *field_mut(&mut tuning.joints[index], field) = invalid;
                     let error = tuning.validate().unwrap_err();
                     assert!(error.starts_with(&format!("J{} ", index + 1)));
-                    assert!(tuning.apply([0.0; 7], [0.0; 7]).is_err());
                 }
             }
         }
     }
 
     #[test]
-    fn sampled_inputs_reject_nonfinite_values_and_out_of_range_values() {
+    fn sampled_inputs_reject_nonfinite_velocity_and_invalid_gravity() {
         let tuning = ServoTuning::default();
         for index in 0..7 {
-            for invalid in [
-                f64::NAN,
-                f64::INFINITY,
-                f64::NEG_INFINITY,
-                0.2 + 2.0 * VELOCITY_TOLERANCE,
-                -0.2 - 2.0 * VELOCITY_TOLERANCE,
-            ] {
+            for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
                 let mut dq = [0.0; 7];
                 dq[index] = invalid;
                 let error = tuning.apply(dq, [0.0; 7]).unwrap_err();
                 assert!(error.starts_with(&format!("J{} ", index + 1)));
             }
-            for invalid in [
-                f64::NAN,
-                f64::INFINITY,
-                f64::NEG_INFINITY,
-                8.0 + 1e-12,
-                -8.0 - 1e-12,
-            ] {
+            for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
                 let mut gravity = [0.0; 7];
                 gravity[index] = invalid;
                 let error = tuning.apply([0.0; 7], gravity).unwrap_err();
                 assert!(error.starts_with(&format!("J{} ", index + 1)));
             }
         }
-        for endpoint in [-0.2 - VELOCITY_TOLERANCE, 0.2 + VELOCITY_TOLERANCE] {
-            let result = tuning.apply([endpoint; 7], [8.0; 7]).unwrap();
-            assert_bits(result.dq_feedforward, [endpoint; 7]);
+        for velocity in [-1.0, -0.6, -0.21, 0.21, 0.6, 1.0] {
+            let result = tuning.apply([velocity; 7], [8.0; 7]).unwrap();
+            assert_bits(result.dq_feedforward, [velocity; 7]);
+        }
+        for gravity in [8.0 + 1e-12, -8.0 - 1e-12, -32.0, 32.0, f64::MAX] {
+            let result = tuning.apply([0.0; 7], [gravity; 7]).unwrap();
+            assert_bits(result.tau, [gravity; 7]);
+        }
+    }
+
+    #[test]
+    fn finite_parameters_must_still_produce_finite_velocity_feedforward() {
+        let mut tuning = ServoTuning::default();
+        tuning.joints[0].velocity_ff = f64::MAX;
+        assert!(tuning.validate().is_ok());
+        let error = tuning.apply([2.0; 7], [0.0; 7]).unwrap_err();
+        assert!(error.starts_with("J1 "));
+        assert!(error.contains("非有限"));
+        tuning.joints[0].velocity_ff = 1.0;
+        tuning.joints[0].velocity_scale = f64::from_bits(1);
+        assert!(tuning.apply([2.0; 7], [0.0; 7]).is_ok());
+    }
+
+    #[test]
+    fn finite_parameters_must_still_produce_finite_torque() {
+        let tuning = enabled(JointTuning {
+            coulomb: f64::MAX,
+            max_friction: f64::MAX,
+            ..JointTuning::default()
+        });
+        assert!(tuning.validate().is_ok());
+        for sign in [-1.0, 1.0] {
+            let error = tuning.apply([sign; 7], [sign * f64::MAX; 7]).unwrap_err();
+            assert!(error.starts_with("J1 "));
+            assert!(error.contains("非有限"));
         }
     }
 
@@ -519,7 +558,7 @@ mod tests {
             assert!(serde_json::from_value::<ServoTuning>(missing).is_err());
         }
         for index in 0..7 {
-            for (name, _, _) in FIELDS {
+            for (name, _) in FIELDS {
                 let mut missing = full.clone();
                 missing["joints"][index]
                     .as_object_mut()

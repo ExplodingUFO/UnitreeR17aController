@@ -6,7 +6,7 @@ use crate::{
 use axum::{
     Json, Router,
     extract::{
-        DefaultBodyLimit, Path, Query, State, WebSocketUpgrade,
+        Path, Query, State, WebSocketUpgrade,
         rejection::{JsonRejection, QueryRejection},
         ws::{Message, WebSocket},
     },
@@ -107,6 +107,8 @@ pub(crate) async fn launch_at(
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
         .expose_headers([header::CONTENT_DISPOSITION]);
+    // Keep Axum's default 2 MiB JSON limit: formatted calibration programmes
+    // can exceed 16 KiB without containing any more motion data.
     let router = Router::new()
         .route("/v1/ports", get(ports))
         .route("/v1/state", get(snapshot))
@@ -122,7 +124,6 @@ pub(crate) async fn launch_at(
         .route("/v1/traces/{id}", get(trace_read))
         .route("/v1/events", get(events))
         .with_state(state.clone())
-        .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(middleware::from_fn_with_state(state, authorize))
         .layer(cors);
     let (stop, stopped) = oneshot::channel();
@@ -407,7 +408,7 @@ struct TraceStartRequest {
 
 fn trace_error(code: String) -> ApiError {
     let message = match code.as_str() {
-        "invalid_trace_duration" => "采样时长应为 1000–20000 毫秒",
+        "invalid_trace_duration" => "采样时长须为可表示的正整数毫秒",
         "invalid_trace_context" => "采样上下文无效",
         "trace_active" => "已有采样正在记录",
         "trace_capacity" => "采样写入积压，请稍后重试",
@@ -427,9 +428,7 @@ async fn trace_start(
     let duration_ms = request
         .duration_ms
         .unwrap_or(crate::trace::DEFAULT_DURATION_MS);
-    if !(1000..=20_000).contains(&duration_ms) {
-        return Err(trace_error("invalid_trace_duration".into()));
-    }
+    crate::trace::duration_ns(duration_ms).map_err(trace_error)?;
     // Merely observe an existing connection. This never acquires a lease, sends
     // a control/command request, enables motors, or opens a serial device.
     let snapshot = state.arm.snapshot();
@@ -590,6 +589,95 @@ async fn stream(mut socket: WebSocket, state: ApiState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resource_limits_accept_formatted_calibration_commands() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = Journal::start(directory.path().join("events.db")).unwrap();
+        let arm = ArmHandle::spawn(journal.clone()).unwrap();
+        let server = launch_at(
+            arm.clone(),
+            journal.clone(),
+            "formatted-calibration".into(),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await
+        .unwrap();
+        let joints = [
+            1.0485035052359992,
+            0.3369648851818667,
+            -0.024104830439799833,
+            0.5221767742481414,
+            1.683944156955803,
+            0.07362801043445026,
+            0.34971860713891384,
+        ];
+        let guide: Vec<_> = (0..51)
+            .map(|i| {
+                serde_json::json!({
+                    "axis": i / 17,
+                    "offset": (i % 17 - 8) as f64 * 0.0012345678901234,
+                    "joints": joints,
+                })
+            })
+            .collect();
+        let request = serde_json::json!({
+            "request_id": "12345678-1234-1234-1234-123456789012",
+            "client_id": "12345678-1234-1234-1234-123456789012",
+            "lease_id": "12345678-1234-1234-1234-123456789012",
+            "generation": 1,
+            "kind": "calibrate_start",
+            "settings": {
+                "axis": null, "excursion": 0.2, "speed": 0.02, "max_friction": 0.1,
+                "cartesian": {
+                    "side": "right", "origin": joints,
+                    "tcp": crate::kinematics::Pose::identity(),
+                    "amplitude": 0.02, "speed": 0.01,
+                    "segments": [
+                        {"axis": 0, "offset": 0.01},
+                        {"axis": 1, "offset": 0.01},
+                        {"axis": 2, "offset": 0.01}
+                    ],
+                    "guide": guide,
+                }
+            }
+        });
+        let compact = serde_json::to_string(&request).unwrap();
+        let formatted = serde_json::to_string_pretty(&request).unwrap();
+        assert!(compact.len() < 16 * 1024);
+        assert!(formatted.len() > 16 * 1024);
+        serde_json::from_str::<CommandRequest>(&formatted).unwrap();
+        let client = reqwest::Client::new();
+        let url = format!("{}/v1/commands", server.base_url());
+        for body in [&compact, &formatted] {
+            let response = client
+                .post(&url)
+                .bearer_auth("formatted-calibration")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body.clone())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+        // JSON still has a finite resource limit, including leading whitespace.
+        let response = client
+            .post(&url)
+            .bearer_auth("formatted-calibration")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(format!("{}{compact}", " ".repeat(2 * 1024 * 1024)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let snapshot = arm.snapshot();
+        assert!(snapshot.port.is_none());
+        assert!(!snapshot.enabled);
+        assert!(snapshot.action.is_none());
+        assert!(arm.shutdown(Duration::from_secs(2)));
+        server.shutdown().await;
+        assert!(journal.shutdown(Duration::from_secs(2)));
+    }
 
     fn calibration_report(sample_count: usize) -> crate::calibration::Report {
         crate::calibration::Report {
@@ -1424,21 +1512,27 @@ mod tests {
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
         }
         let before = serde_json::to_value(arm.snapshot()).unwrap();
-        let response = client
-            .post(format!("{base}/v1/traces"))
-            .bearer_auth(token)
-            .json(&serde_json::json!({}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            response.json::<serde_json::Value>().await.unwrap()["code"],
-            "not_connected"
-        );
         for body in [
-            serde_json::json!({"duration_ms":999}),
-            serde_json::json!({"duration_ms":20_001}),
+            serde_json::json!({}),
+            serde_json::json!({"duration_ms":25}),
+            serde_json::json!({"duration_ms":60_000}),
+        ] {
+            let response = client
+                .post(format!("{base}/v1/traces"))
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response.json::<serde_json::Value>().await.unwrap()["code"],
+                "not_connected"
+            );
+        }
+        for body in [
+            serde_json::json!({"duration_ms":0}),
+            serde_json::json!({"duration_ms":u64::MAX}),
             serde_json::json!({"duration_ms":-1}),
             serde_json::json!({"duration_ms":"1000"}),
             serde_json::json!({"lease_id":"must-not-be-recorded"}),

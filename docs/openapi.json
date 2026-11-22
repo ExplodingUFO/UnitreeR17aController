@@ -4,7 +4,7 @@
   "info": {
     "title": "R1-7a Controller 本机 API",
     "version": "0.1.0",
-    "description": "对应当前桌面软件。应用从 127.0.0.1:8177 提供 HTTP 与 WebSocket，随桌面启停。token 从桌面“接口”面板取得，每次启动变化。POST /v1/commands 的 202 仅代表入队，执行结果从 Snapshot.results 按 request_id 读取。字段范围表示有效业务输入；业务校验可在入队后返回 rejected。所有量采用 m、rad、s，显式 _ms 字段采用 ms，_us 字段采用 μs。UTF-8 字节上限使用 x-utf8-max-bytes 表示。示例数值为协议示例。 短时采样沿用 Bearer/Origin 校验，无需运动租约。关节速度/加速度/jerk 由MotionTuning配置，默认为1 rad/s、0.60 rad/s²、6 rad/s³；实际串口发送可重复或合并参考，物理 jerk 尚未验证。 伺服调试提供逐轴阻尼/速度前馈权重和可开关平滑摩擦，完整配置见 ServoTuning；仅当前连接内存生效，连接/断开恢复基线，算法尚未真机验证。",
+    "description": "对应当前桌面软件。应用从 127.0.0.1:8177 提供 HTTP 与 WebSocket，随桌面启停。token 从桌面“接口”面板取得，每次启动变化。POST /v1/commands 的 202 仅代表入队，执行结果从 Snapshot.results 按 request_id 读取。字段范围表示有效业务输入；业务校验可在入队后返回 rejected。所有量采用 m、rad、s，显式 _ms 字段采用 ms，_us 字段采用 μs。示例数值为协议示例。 短时采样沿用 Bearer/Origin 校验，无需运动租约。关节速度/加速度/jerk 由MotionTuning配置，默认为1 rad/s、0.60 rad/s²、6 rad/s³；实际串口发送可重复或合并参考，物理 jerk 尚未验证。 伺服调试提供逐轴阻尼/速度前馈权重和可开关平滑摩擦，完整配置见 ServoTuning；仅当前连接内存生效，连接/断开恢复基线，算法尚未真机验证。",
     "license": {
       "name": "BSD-3-Clause",
       "url": "https://opensource.org/license/bsd-3-clause"
@@ -1310,7 +1310,7 @@
           "采样"
         ],
         "summary": "开始短时采样",
-        "description": "观察现有端口连接；要求 port 非 null 且 phase 不在 disconnected/connecting/closing。无需控制权或 lease，不申请控制权、打开端口、使能或启动运动。默认 10000 ms，范围 1000..20000。预分配队列容量 4096，内联完整伺服配置后样本存储约 5 MiB（不含 writer/SQLite 开销），生产者 Mutex.try_lock 竞争或队列满立即计 dropped，无等待、SQL、JSON 编码或分配；独立 writer 轮询取出后写入 events.sqlite3.traces.sqlite3。",
+        "description": "观察现有端口连接；要求 port 非 null 且 phase 不在 disconnected/connecting/closing。无需控制权或 lease，不申请控制权、打开端口、使能或启动运动。默认 10000 ms，时长为可表示的正整数毫秒。预分配队列容量 4096，内联完整伺服配置后样本存储约 5 MiB（不含 writer/SQLite 开销），生产者 Mutex.try_lock 竞争或队列满立即计 dropped，无等待、SQL、JSON 编码或分配；独立 writer 轮询取出后写入 events.sqlite3.traces.sqlite3。",
         "requestBody": {
           "required": true,
           "content": {
@@ -1377,7 +1377,7 @@
                   "invalid_trace_duration": {
                     "value": {
                       "code": "invalid_trace_duration",
-                      "message": "采样时长应为 1000–20000 毫秒"
+                      "message": "采样时长须为可表示的正整数毫秒"
                     }
                   },
                   "invalid_trace_context": {
@@ -2624,9 +2624,7 @@
               "translation": {
                 "type": "array",
                 "items": {
-                  "type": "number",
-                  "minimum": -2,
-                  "maximum": 2
+                  "type": "number"
                 },
                 "minItems": 3,
                 "maxItems": 3
@@ -2635,7 +2633,7 @@
             "required": []
           }
         ],
-        "description": "Link7 → TCP 工具变换。四元数范数至少 1e-9，后端归一化；此条件在控制线程中校验。",
+        "description": "Link7 到 TCP 的工具变换；平移使用有限米数，非零有限四元数由后端归一化。",
         "examples": [
           {
             "translation": [
@@ -2666,8 +2664,7 @@
           "client_id": {
             "type": "string",
             "minLength": 1,
-            "x-utf8-max-bytes": 64,
-            "description": "客户端标识；非空，UTF-8 编码后最多 64 字节。"
+            "description": "非空客户端标识。"
           },
           "lease_id": {
             "anyOf": [
@@ -2789,14 +2786,12 @@
           "request_id": {
             "type": "string",
             "minLength": 1,
-            "x-utf8-max-bytes": 100,
-            "description": "每个新请求使用新标识；非空，UTF-8 编码后最多 100 字节。"
+            "description": "每个新请求使用新标识；非空。"
           },
           "client_id": {
             "type": "string",
             "minLength": 1,
-            "x-utf8-max-bytes": 64,
-            "description": "客户端标识；非空，UTF-8 编码后最多 64 字节。"
+            "description": "非空客户端标识。"
           },
           "lease_id": {
             "type": "string",
@@ -2912,8 +2907,7 @@
               "port": {
                 "type": "string",
                 "minLength": 1,
-                "x-utf8-max-bytes": 300,
-                "description": "使用 /v1/ports 返回的 name；UTF-8 最多 300 字节。"
+                "description": "操作系统返回的串口名；非空，按原值使用。"
               },
               "side": {
                 "type": "string",
@@ -3123,42 +3117,36 @@
           "kd": {
             "type": "number",
             "minimum": 0,
-            "maximum": 30,
             "default": 10,
-            "description": "阻尼，Nm·s/rad；默认值表示基线，请求仍须显式提供。"
+            "description": "非负阻尼，Nm·s/rad；实际可表示范围由对应关节协议编码决定。"
           },
           "velocity_ff": {
             "type": "number",
             "minimum": 0,
-            "maximum": 1,
             "default": 1,
             "description": "速度前馈权重，无量纲；仅缩放 wire dq，不改变轨迹速度、位置积分、TCP 或停止/收纳时序；默认值表示基线，请求仍须显式提供。"
           },
           "coulomb": {
             "type": "number",
             "minimum": 0,
-            "maximum": 2,
             "default": 0,
             "description": "库仑摩擦幅值 Fc，Nm；默认值表示基线，请求仍须显式提供。"
           },
           "viscous": {
             "type": "number",
             "minimum": 0,
-            "maximum": 10,
             "default": 0,
             "description": "黏性系数 B，Nm·s/rad；默认值表示基线，请求仍须显式提供。"
           },
           "velocity_scale": {
             "type": "number",
-            "minimum": 0.001,
-            "maximum": 0.2,
             "default": 0.02,
-            "description": "平滑过零尺度 epsilon，rad/s；默认值表示基线，请求仍须显式提供。"
+            "description": "平滑过零尺度 epsilon，rad/s；默认值表示基线，请求仍须显式提供。",
+            "exclusiveMinimum": 0
           },
           "max_friction": {
             "type": "number",
             "minimum": 0,
-            "maximum": 2,
             "default": 0.5,
             "description": "摩擦补偿幅值上限，Nm；默认值表示基线，请求仍须显式提供。"
           }
@@ -3205,7 +3193,7 @@
           "friction_enabled",
           "joints"
         ],
-        "description": "完整配置，不支持部分更新或请求缺字段补默认。每次连接/断开恢复基线，仅当前连接内存生效，不自动持久化。摩擦为 clamp(Fc*tanh(v/epsilon)+B*v,±max_friction)，与重力相加后 clamp 到 ±8 Nm；v 为未缩放轨迹速度，v=0 时摩擦严格为零。无独立扭矩变化率限制、自动辨识、观测器或量化补偿；算法尚未真机验证。",
+        "description": "完整配置。连接和断开恢复基线，仅当前连接内存生效。摩擦为 clamp(Fc*tanh(v/epsilon)+B*v,±max_friction)，与重力相加；v为未缩放轨迹速度，v=0时摩擦项为零。补偿不另设运动速度或总附加前馈8Nm上限；实际输出遵循协议编码。",
         "examples": [
           {
             "friction_enabled": false,
@@ -3292,7 +3280,7 @@
             ]
           }
         ],
-        "description": "先连接并等待确认，持有者显式应用完整配置。未连接/connecting 拒绝 not_connected，关闭按原有 closing 检查拒绝；故障或待清错拒绝 fault；运动/减速停止/使能确认拒绝 motion_busy。已使能空闲时须有完整新鲜反馈及当前 generation/epoch 下 50 ms 内的静止成功发送目标，复制其 q 再应用。接受后配置版本及 generation 提升，旧运动请求 stale_context。HTTP 202 queued 后结果为 accepted/configure_servo 或 rejected，不产生独立 completed；不表示设备确认。",
+        "description": "先连接并等待确认，持有者显式应用完整配置。未连接/connecting 拒绝 not_connected，关闭按原有 closing 检查拒绝；故障或待清错拒绝 fault；运动/减速停止/使能确认拒绝 motion_busy。已使能空闲时使用当前连接最近成功发送的位置，尚无记录时使用当前有限参考；不额外要求发送年龄、零速或旧上下文匹配。接受后配置版本及 generation 提升，旧运动请求 stale_context。HTTP 202 queued 后结果为 accepted/configure_servo 或 rejected，不产生独立 completed；不表示设备确认。",
         "examples": [
           {
             "request_id": "req-configure-servo-001",
@@ -3407,7 +3395,7 @@
             },
             "minItems": 7,
             "maxItems": 7,
-            "description": "七轴合计前馈限幅后的实际摩擦增量 tau_ff-tau_gravity，Nm；仍为编码前值。"
+            "description": "七轴实际摩擦增量 tau_ff-tau_gravity，Nm；仍为编码前值。"
           },
           "clamped": {
             "type": "array",
@@ -3416,7 +3404,7 @@
             },
             "minItems": 7,
             "maxItems": 7,
-            "description": "逐轴标记摩擦自身或合计前馈任一发生截断；恰好等于边界不算截断。"
+            "description": "逐轴标记摩擦自身发生截断；恰好等于边界不算截断。"
           }
         },
         "required": [
@@ -3493,10 +3481,9 @@
               },
               "ttl_ms": {
                 "type": "integer",
-                "minimum": 50,
-                "maximum": 500,
+                "minimum": 1,
                 "default": 150,
-                "description": "输入有效期，单位 ms；从后端首次接收开始计算。"
+                "description": "正整数毫秒，默认150；须在单调时钟可表示范围内。从接收起算，真正过期的输入不会执行。"
               },
               "input_seq": {
                 "type": "integer",
@@ -3556,10 +3543,9 @@
               },
               "ttl_ms": {
                 "type": "integer",
-                "minimum": 50,
-                "maximum": 500,
+                "minimum": 1,
                 "default": 150,
-                "description": "输入有效期，单位 ms；从后端首次接收开始计算。"
+                "description": "正整数毫秒，默认150；须在单调时钟可表示范围内。从接收起算，真正过期的输入不会执行。"
               }
             },
             "required": [
@@ -5018,7 +5004,7 @@
               "disconnect_after": {
                 "type": "boolean",
                 "default": false,
-                "description": "到位稳定后释放扭矩并关闭串口；false 则保持使能连接。调用方需先确保收纳位存在机械支撑。"
+                "description": "到位并完成参考减速后释放扭矩并关闭串口；false 则保持使能连接。调用方需先确保收纳位存在机械支撑。"
               }
             },
             "required": [
@@ -5028,7 +5014,7 @@
             ]
           }
         ],
-        "description": "七轴共同五次轨迹返回。保持连接的返回按参考目标和减速结束完成；到位断开另要求实测位置距目标不超过0.02rad并有覆盖200ms的新反馈，不检查实测速度。仅断开模式在轨迹时长后3秒仍有位置偏差时报告具体关节，保持使能。停止取消后续断开。",
+        "description": "七轴共同五次轨迹返回。保持连接的返回按参考目标和减速结束完成；到位断开另要求有效实测位置距目标不超过0.02rad，不检查实测速度，不再等待额外稳定窗口或以预计时长结束。停止取消后续断开。",
         "examples": [
           {
             "request_id": "req-return-001",
@@ -5058,10 +5044,10 @@
               "integer",
               "null"
             ],
-            "minimum": 1000,
-            "maximum": 20000,
+            "minimum": 1,
+            "maximum": 18446744073709,
             "default": 10000,
-            "description": "采样窗口，ms。省略或 null 使用 10000；整数范围外返回 invalid_trace_duration。"
+            "description": "正整数毫秒；内部纳秒计时可表示。默认10000；提前停止不改写请求窗口。"
           }
         },
         "additionalProperties": false,
@@ -5092,9 +5078,9 @@
           },
           "duration_ms": {
             "type": "integer",
-            "minimum": 1000,
-            "maximum": 20000,
-            "description": "请求的窗口，ms；提前停止不改写该值。"
+            "minimum": 1,
+            "maximum": 18446744073709,
+            "description": "正整数毫秒；内部纳秒计时可表示。默认10000；提前停止不改写请求窗口。"
           },
           "side": {
             "type": "string",
@@ -5478,7 +5464,7 @@
                   "constraint",
                   "expired"
                 ],
-                "description": "aligned 已按发送时刻取样速度并连续积分位置，含速度/首次零点封顶；bounded 受目标边界限制或保持；stale 源年龄超过 50 ms；future 取样时刻早于源或不晚于上一成功伺服批次；invalid 数值或参数无效；constraint 路径/TCP 速度/参考偏差/相邻成功目标位移或方向检查失败；expired 输入或租约有效期已到。"
+                "description": "aligned 已按发送时刻取样速度并连续积分位置，含速度/首次零点封顶；bounded 受目标边界限制或保持；stale 源年龄超过 50 ms；future 取样时刻早于源或不晚于上一成功伺服批次；invalid 数值或参数无效；constraint 为历史记录兼容标记，当前发送层不再重复检查这些运动窗口；expired 输入或租约有效期已到。"
               },
               "age_us": {
                 "type": [
@@ -5522,7 +5508,7 @@
             },
             "minItems": 7,
             "maxItems": 7,
-            "description": "该批次编码前最终总附加前馈扭矩，Nm，J1..J7；重力与可选摩擦合成后逐轴限制到 ±8 Nm。与 tau_wire 比较编码误差，不是电机总输出扭矩。"
+            "description": "该批次编码前最终总附加前馈扭矩，Nm，J1..J7；重力与可选摩擦合成后按实际协议编码。与 tau_wire 比较编码误差，不是电机总输出扭矩。"
           },
           "q_wire": {
             "type": "array",
@@ -5617,7 +5603,7 @@
           "kd",
           "write_us"
         ],
-        "description": "成功写完整个七轴批次的样本，字段位于顶层。普通批次保持原始 10 ms 网格并跳过错过槽位，主机起点至少相隔 5 ms；新鲜源按 q+dq*age+0.5*ddq*age² 取样，含速度/首次零点封顶、不可变 TCP/路径、全局 TCP 速度、上一成功伺服目标和目标边界复核。写前复查 epoch 与输入/租约有效期；已开始的写入沿用原有 20 ms 整批预算。控制器 Euler 积分与 jerk 限制不变，不保证实际 TX 节拍或物理 jerk，尚未硬件验收。"
+        "description": "成功写完整个七轴批次的样本，字段位于顶层。普通批次保持原始 10 ms 网格并跳过错过槽位，主机起点至少相隔 5 ms；新鲜源按 q+dq*age+0.5*ddq*age² 取样，含配置速度/首次零点封顶及动作目标边界处理；位置从上一成功伺服目标连续积分。写前复查 epoch 与输入/租约有效期；单个报文写入保留 I/O 进度预算，完整报文间的调度间隙不再触发整批失败。控制器 Euler 积分与 jerk 限制不变，不保证实际 TX 节拍或物理 jerk，尚未硬件验收。"
       },
       "TraceFeedbackSample": {
         "type": "object",
@@ -6334,7 +6320,6 @@
           "max_friction": {
             "type": "number",
             "minimum": 0,
-            "maximum": 2,
             "description": "Fc 试验上限，Nm；候选取一半及全部，0 跳过摩擦候选。",
             "default": 0.2
           },
@@ -7917,7 +7902,7 @@
         }
       },
       "PayloadTooLarge": {
-        "description": "请求体超过 16 KiB；框架返回纯文本。",
+        "description": "请求体超过框架默认 2 MiB；框架返回纯文本。",
         "content": {
           "text/plain": {
             "schema": {

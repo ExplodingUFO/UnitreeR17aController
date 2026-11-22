@@ -43,8 +43,6 @@ pub enum Frame {
 pub struct MotionLimits {
     pub joint_velocity: [f64; 7],
     pub joint_acceleration: [f64; 7],
-    pub max_reference_error: f64,
-    pub max_joint_step: f64,
     pub linear_speed: f64,
     pub angular_speed: f64,
 }
@@ -401,11 +399,11 @@ impl Kinematics {
         seed: &[f64; 7],
         tcp: &TcpTransform,
         target: &Pose,
-        max_joint_step: f64,
+        trust_radius: f64,
         bounds: ContinuationBounds,
     ) -> Result<[f64; 7], String> {
         to_isometry(target)?;
-        if !max_joint_step.is_finite() || max_joint_step <= 0.0 {
+        if !trust_radius.is_finite() || trust_radius <= 0.0 {
             return Err("invalid IK continuation trust region".into());
         }
         let length = self.reach_radius(tcp).max(f64::MIN_POSITIVE);
@@ -433,10 +431,10 @@ impl Kinematics {
                 let gradient = -jacobian.transpose() * error;
                 let window = trajectory::VelocityWindow {
                     low: std::array::from_fn(|i| {
-                        (seed[i] - max_joint_step).max(bounds.lower[i]) - q[i]
+                        (seed[i] - trust_radius).max(bounds.lower[i]) - q[i]
                     }),
                     high: std::array::from_fn(|i| {
-                        (seed[i] + max_joint_step).min(bounds.upper[i]) - q[i]
+                        (seed[i] + trust_radius).min(bounds.upper[i]) - q[i]
                     }),
                 };
                 let Ok(step) = trajectory::bounded_quadratic(h, gradient, window, [0.0; 7]) else {
@@ -610,12 +608,7 @@ impl Kinematics {
         }
         self.validate_q(&reference)?;
         self.validate_q(&measured)?;
-        let scalars = [
-            limits.max_reference_error,
-            limits.max_joint_step,
-            limits.linear_speed,
-            limits.angular_speed,
-        ];
+        let scalars = [limits.linear_speed, limits.angular_speed];
         if !scalars
             .iter()
             .chain(limits.joint_velocity.iter())
@@ -624,15 +617,11 @@ impl Kinematics {
         {
             return Err("motion limits must be finite positive values".into());
         }
-        let max_step = limits.max_joint_step;
         let speeds: [f64; 7] =
             std::array::from_fn(|i| limits.joint_velocity[i].min(self.joints[i].velocity));
         for i in 0..7 {
             if !previous_velocity[i].is_finite() || previous_velocity[i].abs() > speeds[i] + 1e-12 {
                 return Err("previous velocity exceeds a finite joint velocity limit".into());
-            }
-            if (reference[i] - measured[i]).abs() > limits.max_reference_error {
-                return Err("reference is too far from measured joints".into());
             }
         }
         let (current, jacobian) = self.evaluate(&reference, &tcp)?;
@@ -747,25 +736,8 @@ impl Kinematics {
         }
         for i in 0..7 {
             let acceleration = limits.joint_acceleration[i];
-            let lower = measured[i] - limits.max_reference_error;
-            let upper = measured[i] + limits.max_reference_error;
-            let mut low = (-speeds[i])
-                .max(-max_step / dt)
-                .max((lower - reference[i]) / dt)
-                .max(previous_velocity[i] - acceleration * dt);
-            let mut high = speeds[i]
-                .min(max_step / dt)
-                .min((upper - reference[i]) / dt)
-                .min(previous_velocity[i] + acceleration * dt);
-            // Conservative one-step braking envelope: distance after this step
-            // must still accommodate v^2/(2a). This is a model constraint only.
-            let brake_speed = |distance: f64| {
-                let at = acceleration * dt;
-                let twice_ad = 2.0 * acceleration * distance.max(0.0);
-                twice_ad / ((at * at + twice_ad).sqrt() + at)
-            };
-            low = low.max(-brake_speed(reference[i] - lower));
-            high = high.min(brake_speed(upper - reference[i]));
+            let low = (-speeds[i]).max(previous_velocity[i] - acceleration * dt);
+            let high = speeds[i].min(previous_velocity[i] + acceleration * dt);
             if low > high + 1e-12 {
                 return Err("joint constraints require stopping/resynchronization".into());
             }
@@ -791,8 +763,6 @@ impl Kinematics {
             if !dq[i].is_finite()
                 || dq[i].abs() > speeds[i] + 1e-10
                 || (dq[i] - previous_velocity[i]).abs() > limits.joint_acceleration[i] * dt + 1e-10
-                || (q[i] - reference[i]).abs() > max_step + 1e-12
-                || (q[i] - measured[i]).abs() > limits.max_reference_error + 1e-12
             {
                 return Err("final candidate violates joint constraints".into());
             }
@@ -1030,17 +1000,6 @@ impl Kinematics {
                 dt,
             )?;
         }
-        for i in 0..7 {
-            window.low[i] = window.low[i]
-                .max(-limits.max_joint_step / dt)
-                .max((input.measured[i] - limits.max_reference_error - input.reference[i]) / dt);
-            window.high[i] = window.high[i]
-                .min(limits.max_joint_step / dt)
-                .min((input.measured[i] + limits.max_reference_error - input.reference[i]) / dt);
-            if window.low[i] > window.high[i] {
-                return Err("Cartesian derivative and reference bounds conflict".into());
-            }
-        }
         if !state.stopping {
             let unconstrained = h
                 .cholesky()
@@ -1063,8 +1022,6 @@ impl Kinematics {
                 || dq[i].abs() > speeds[i] + 1e-10
                 || ddq[i].abs() > limits.joint_acceleration[i] + 1e-9
                 || (ddq[i] - state.acceleration[i]).abs() > state.jerk[i] * dt + 1e-8
-                || (q[i] - input.reference[i]).abs() > limits.max_joint_step + 1e-12
-                || (q[i] - input.measured[i]).abs() > limits.max_reference_error + 1e-12
             {
                 return Err("smoothed output violates final joint derivatives".into());
             }
@@ -1175,8 +1132,6 @@ mod tests {
         MotionLimits {
             joint_velocity: [0.4; 7],
             joint_acceleration: [1.5; 7],
-            max_reference_error: 0.08,
-            max_joint_step: 0.01,
             linear_speed: 0.03,
             angular_speed: 0.2,
         }
@@ -1210,8 +1165,6 @@ mod tests {
         MotionLimits {
             joint_velocity: [0.20; 7],
             joint_acceleration: [0.60; 7],
-            max_reference_error: 0.60,
-            max_joint_step: 0.01,
             linear_speed: 0.015,
             angular_speed: 0.15,
         }
@@ -1554,13 +1507,15 @@ mod tests {
         for j in 0..7 {
             assert!(c.q[j].is_finite() && c.dq[j].is_finite());
             assert!((c.q[j] - i.reference[j] - c.dq[j] * i.dt).abs() < 1e-14);
-            assert!((c.q[j] - i.reference[j]).abs() <= i.limits.max_joint_step + 1e-12);
+            assert!(
+                (c.q[j] - i.reference[j]).abs()
+                    <= i.limits.joint_velocity[j].min(k.speed_limits()[j]) * i.dt + 1e-12
+            );
             assert!(c.dq[j].abs() <= i.limits.joint_velocity[j] + 1e-12);
             assert!(
                 (c.dq[j] - i.previous_velocity[j]).abs()
                     <= i.limits.joint_acceleration[j] * i.dt + 1e-10
             );
-            assert!((c.q[j] - i.measured[j]).abs() <= i.limits.max_reference_error + 1e-12);
         }
     }
 
@@ -2015,15 +1970,13 @@ mod tests {
     }
 
     #[test]
-    fn joint_velocity_acceleration_reference_and_increment_constraints() {
+    fn joint_velocity_and_acceleration_constraints_at_model_endpoints() {
         let coaxial = planar_urdf().replace("xyz=\"1 0 0\"", "xyz=\"0 0 0\"");
         let k = Kinematics::from_urdf(&coaxial).unwrap();
         let mut i = input(
             [0.0; 7],
             velocity([0.0, 0.0, 0.0, 0.0, 0.0, 0.1], Frame::Base),
         );
-        i.limits.max_joint_step = 1e-5;
-        i.limits.max_reference_error = 2e-5;
         i.limits.joint_velocity = [0.01; 7];
         i.limits.joint_acceleration = [0.001; 7];
         let c = k.step(i.clone()).unwrap();
@@ -2135,7 +2088,6 @@ mod tests {
         let mut limits = limits();
         limits.joint_velocity = [0.2; 7];
         limits.joint_acceleration = [0.6; 7];
-        limits.max_reference_error = 0.6;
         limits.linear_speed = 0.015;
         limits.angular_speed = 0.15;
         for side in ["right", "left"] {
@@ -2189,11 +2141,6 @@ mod tests {
             [0.0; 7],
             velocity([0.0, 0.0, 0.0, 0.0, 0.0, 0.1], Frame::Base),
         );
-        let mut increment = base.clone();
-        increment.limits.max_joint_step = 1e-5;
-        let c = k.step(increment.clone()).unwrap();
-        check_bounds(&k, &increment, &c);
-        assert!(c.q.iter().any(|q| (*q - 1e-5).abs() < 1e-12));
         let mut acceleration = base.clone();
         acceleration.limits.joint_acceleration = [0.001; 7];
         let c = k.step(acceleration.clone()).unwrap();
@@ -2209,14 +2156,10 @@ mod tests {
         urdf_speed.limits.joint_velocity = [100.0; 7];
         urdf_speed.limits.joint_acceleration = [100.0; 7];
         urdf_speed.limits.angular_speed = 10.0;
-        urdf_speed.limits.max_joint_step = 0.1;
         let c = k.step(urdf_speed.clone()).unwrap();
         check_bounds(&k, &urdf_speed, &c);
         assert!(c.dq.iter().all(|v| v.abs() <= 1.0 + 1e-12));
         assert!(c.dq.iter().any(|v| (*v - 1.0).abs() < 1e-12));
-        let mut reference = base.clone();
-        reference.measured = [-reference.limits.max_reference_error; 7];
-        assert!(k.step(reference).is_err());
         let mut inward = base.clone();
         inward.reference = [4.0; 7];
         inward.measured = [4.0; 7];
@@ -2230,6 +2173,95 @@ mod tests {
             ..base
         };
         assert!(k.step(impossible_reversal).is_err());
+    }
+
+    #[test]
+    fn finite_feedback_offsets_do_not_change_cartesian_steps_or_braking() {
+        for side in ["left", "right"] {
+            let model = Kinematics::load(side).unwrap();
+            let q = interior();
+            let tcp = Pose {
+                translation: [0.0, 0.0, 0.1],
+                ..Pose::identity()
+            };
+            let path = CartesianPath {
+                origin: model.fk(&q, &tcp).unwrap(),
+                axis: 5,
+                frame: Frame::Tool,
+            };
+            for smoothed in [false, true] {
+                let mut sample = StepInput {
+                    tcp,
+                    smoothing: smoothed.then_some(SmoothingState {
+                        hold: None,
+                        acceleration: [0.0; 7],
+                        jerk: [trajectory::JOINT_JERK; 7],
+                        path: Some(path),
+                        stopping: false,
+                    }),
+                    planning: smoothed.then_some(CartesianPlanning {
+                        origin: q,
+                        guide: None,
+                    }),
+                    ..input(q, velocity([0.0, 0.0, 0.0, 0.0, 0.0, 0.05], Frame::Tool))
+                };
+                for tick in 0..220 {
+                    if smoothed && tick == 60 {
+                        sample.target = velocity([0.0; 6], Frame::Tool);
+                        sample.smoothing.as_mut().unwrap().stopping = true;
+                    }
+                    let candidate = model.step(sample.clone()).unwrap();
+                    check_bounds(&model, &sample, &candidate);
+                    for measured in [q.map(|x| x - 2.0), q.map(|x| x + 8.0), [f64::MAX; 7]] {
+                        let changed = model
+                            .step(StepInput {
+                                measured,
+                                ..sample.clone()
+                            })
+                            .unwrap();
+                        assert_eq!(changed.q, candidate.q);
+                        assert_eq!(changed.dq, candidate.dq);
+                        assert_eq!(changed.ddq, candidate.ddq);
+                        assert_eq!(changed.speed_scale, candidate.speed_scale);
+                    }
+                    sample.reference = candidate.q;
+                    sample.measured = candidate.q;
+                    sample.previous_velocity = candidate.dq;
+                    if let Some(state) = &mut sample.smoothing {
+                        state.acceleration = candidate.ddq;
+                        path.check(&model.fk(&candidate.q, &tcp).unwrap()).unwrap();
+                    }
+                }
+                if smoothed {
+                    assert!(sample.previous_velocity.iter().all(|v| v.abs() < 1e-5));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn integrated_joint_travel_uses_velocity_and_period_without_a_second_step_cap() {
+        let coaxial = planar_urdf().replace("xyz=\"1 0 0\"", "xyz=\"0 0 0\"");
+        let model = Kinematics::from_urdf(&coaxial).unwrap();
+        for smoothed in [false, true] {
+            let sample = StepInput {
+                dt: 1.0,
+                smoothing: smoothed.then_some(SmoothingState {
+                    hold: None,
+                    acceleration: [0.0; 7],
+                    jerk: [trajectory::JOINT_JERK; 7],
+                    path: None,
+                    stopping: false,
+                }),
+                ..input(
+                    [0.0; 7],
+                    velocity([0.0, 0.0, 0.0, 0.0, 0.0, 0.2], Frame::Base),
+                )
+            };
+            let candidate = model.step(sample.clone()).unwrap();
+            check_bounds(&model, &sample, &candidate);
+            assert!(candidate.q.iter().any(|q| q.abs() > 0.01));
+        }
     }
 
     #[test]
@@ -2338,9 +2370,6 @@ mod tests {
             })
             .is_err()
         );
-        let mut stale = i.clone();
-        stale.measured[0] += 0.081;
-        assert!(k.step(stale).is_err());
         let mut invalid = i.clone();
         invalid.limits.joint_velocity[0] = 0.0;
         assert!(k.step(invalid).is_err());

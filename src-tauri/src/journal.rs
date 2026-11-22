@@ -1,4 +1,4 @@
-//! Bounded event journal with an independent short-capture worker.
+//! Bounded event journal with an independent capture worker.
 //! `log` accepts summaries, never credentials or per-frame telemetry; use `sample` for frames.
 //! Queue admission tries a mutex once; contention and overflow count as drops.
 //! Disk readers must run within `server`'s spawn_blocking boundary.
@@ -339,8 +339,8 @@ impl Journal {
         }
     }
 
-    /// Observation only. HTTP supplies the 10000ms default; Rust callers supply
-    /// 1000..=20000 milliseconds explicitly.
+    /// Observation only. HTTP supplies the 10000ms default; explicit durations
+    /// must be positive and fit the recorder's nanosecond clock.
     pub fn trace_start(
         &self,
         duration_ms: u64,

@@ -119,22 +119,18 @@ export default function TracePanel({
   }, [online]);
 
   const seconds = Number(duration);
+  const durationMs = Math.ceil(seconds * 1000);
   const validDuration =
     duration.trim() !== "" &&
-    Number.isInteger(seconds) &&
-    seconds >= 1 &&
-    seconds <= 20;
+    Number.isFinite(seconds) &&
+    seconds > 0 &&
+    Number.isSafeInteger(durationMs) &&
+    durationMs > 0;
   const recording = traces.some((trace) => trace.status === "recording");
   const active = traces.some((trace) =>
     ["recording", "writing"].includes(trace.status),
   );
-  const canStart =
-    online &&
-    connected &&
-    listState === "ready" &&
-    !active &&
-    !busy &&
-    validDuration;
+  const canStart = online && connected && !recording && !busy && validDuration;
   const canStop = online && recording && !busy;
 
   const changeTrace = async (kind: "start" | "stop") => {
@@ -150,7 +146,7 @@ export default function TracePanel({
     try {
       const trace =
         kind === "start"
-          ? await api.startTrace(seconds * 1000, controller.signal)
+          ? await api.startTrace(durationMs, controller.signal)
           : await api.stopTrace(controller.signal);
       if (controller.signal.aborted) return;
       if (trace)
@@ -159,7 +155,12 @@ export default function TracePanel({
             .sort((a, b) => b.started_at_ms - a.started_at_ms)
             .slice(0, 20),
         );
-      else setNotice("当前没有正在采样的记录");
+      else {
+        setTraces((current) =>
+          current.filter((item) => item.status !== "recording"),
+        );
+        setNotice("当前没有正在采样的记录");
+      }
     } catch (error) {
       if (!controller.signal.aborted)
         setActionError(
@@ -233,15 +234,14 @@ export default function TracePanel({
           <input
             id="trace-duration"
             type="number"
-            min="1"
-            max="20"
-            step="1"
+            min="0"
+            step="any"
             required
             value={duration}
             aria-label="录制时长，秒"
-            title="1–20 秒"
+            title="正数秒，按整数毫秒记录"
             aria-invalid={!validDuration}
-            disabled={active || !!busy}
+            disabled={recording || !!busy}
             onChange={(event) => setDuration(event.target.value)}
           />
           <span>秒</span>
@@ -256,7 +256,7 @@ export default function TracePanel({
           title={status}
         >
           <span className="trace-indicator" aria-hidden="true" />
-          {busy ? "处理中" : recording ? "停止" : active ? "写入中" : "录制"}
+          {busy ? "处理中" : recording ? "停止" : "录制"}
         </button>
         <button
           ref={historyButton}

@@ -11,7 +11,7 @@
 | 服务生命周期   | 随桌面应用启动和退出                                   |
 | 访问范围       | 当前仅监听本机回环地址                                 |
 | HTTP 认证      | `Authorization: Bearer <token>`                        |
-| POST 格式      | `Content-Type: application/json`，请求体最多 16 KiB    |
+| POST 格式      | `Content-Type: application/json`，请求体最多 2 MiB    |
 | 状态与数值     | JSON；长度用米，角度用弧度；`_ms` 用毫秒，`_us` 用微秒 |
 
 应用每次启动生成新的 `token`。外部程序从桌面顶部“接口”页复制令牌；当前没有通过 HTTP 获取令牌的接口。令牌用于访问应用，`lease_id` 用于持有控制权，两者用途不同。
@@ -61,7 +61,7 @@
 | 字段        | 类型           | 输入要求                                                          |
 | ----------- | -------------- | ----------------------------------------------------------------- |
 | `action`    | string         | `acquire`、`renew`、`release`                                     |
-| `client_id` | string         | 非空，UTF-8 编码后不超过 64 字节；建议使用可辨认的 ASCII 名称     |
+| `client_id` | string         | 非空；建议使用可辨认的名称     |
 | `lease_id`  | string 或 null | `acquire` 可省略；`renew`、`release` 必须传入取得控制权时返回的值 |
 
 取得控制权：
@@ -110,7 +110,7 @@
 
 | 字段         | 类型          | 要求                                                       |
 | ------------ | ------------- | ---------------------------------------------------------- |
-| `request_id` | string        | 非空，UTF-8 不超过 100 字节；每个新请求使用新值，建议 UUID |
+| `request_id` | string        | 非空；每个新请求使用新值，建议 UUID |
 | `client_id`  | string        | 当前持有控制权的客户端标识                                 |
 | `lease_id`   | string        | 当前控制权凭据                                             |
 | `generation` | 非负整数，u64 | 最新状态或控制权响应中的值                                 |
@@ -138,7 +138,7 @@
 | `return_to_pose` | `joints:[number;7],speed,disconnect_after?:boolean`   | 该请求 `completed/returned`（继续保持）或 `completed/parked`（已断开）  |
 | `stop`           | 无                                                    | 原动作收到 `cancelled`、`action:null`，等待 `stopping` 结束             |
 
-`connect.port` 使用枚举返回的 `name`，非空且 UTF-8 不超过 300 字节。串口当前使用 6,000,000 波特率。更换串口或左右臂前先断开连接；切换左右臂会清除已设置的 TCP。
+`connect.port` 使用枚举返回的 `name`，非空。串口当前使用 6,000,000 波特率。更换串口或左右臂前先断开连接；切换左右臂会清除已设置的 TCP。
 
 连接被接受表示串口已经打开，连接确认仍需反馈。使能进入 `enabling` 后，最多等待一秒，收齐七轴在使能请求之后的新鲜反馈，并确认设备模式、错误与超时状态。清错也需要反馈确认，完成后不会自动使能。
 
@@ -162,7 +162,7 @@
 { "translation": [0.0, 0.0, 0.02], "rotation": [0.0, 0.0, 0.0, 1.0] }
 ```
 
-`configure_tcp.tcp` 表示 **Link7 → TCP** 的工具变换，不是运动目标。每个平移分量范围为 [-2,2] m；四元数范数需至少为 1e-9，后端会归一化。取得控制权后可离线设置；运动、减速停止或待确认使能时不能设置。配置保存在本次应用内存中。
+`configure_tcp.tcp` 表示 **Link7 → TCP** 的工具变换，不是运动目标。平移为有限米数；非零有限四元数由后端归一化。取得控制权后可离线设置；运动、减速停止或待确认使能时不能设置。配置保存在本次应用内存中。
 
 ### 5.4 完整请求示例
 
@@ -236,7 +236,7 @@ J1 正向连续点动，速度 0.1 rad/s：
 
 ### 5.5 连续点动与固定步长
 
-连续点动的 `request_id` 同时是 `action_id`。建议设置 `ttl_ms:350`，每 100 ms 发送一次 `jog_update`，并独立续期控制权。`ttl_ms` 范围为 50..500，省略时默认 150；有效期从后端首次收到请求开始计算，排队不会延长有效期。
+连续点动的 `request_id` 同时是 `action_id`。建议设置 `ttl_ms:350`，每 100 ms 发送一次 `jog_update`，并独立续期控制权。`ttl_ms` 为可表示的正整数毫秒，省略时默认 150；有效期从后端首次收到请求开始计算，排队不会延长有效期。
 
 每次更新使用新的 `request_id`，保持相同的 `action_id`、动作期间有效的 `generation`，并递增 `input_seq`。更新只延长当前动作，不改变轴、方向或速度。后端只保留最新一条待处理更新，中间更新可能被合并。
 
@@ -250,7 +250,7 @@ J1 正向连续点动，速度 0.1 rad/s：
 
 七轴按共同的五次多项式生成返回目标，起止速度和加速度为零；控制参考再经过关节速度、加速度和 jerk 限制，按实际控制间隔积分。回程是关节插值，不提供碰撞规划。界面按左右臂与串口保存收纳位，没有预置角度。
 
-`disconnect_after` 默认 `false`，在参考轨迹到位、指令减速结束后产生 `completed/returned` 并继续使能保持。设为 `true` 时，还需七轴实测位置在目标的 0.02 rad（约 1.15°）内，并有覆盖 200 ms 的新反馈，随后失能、关闭串口并产生 `completed/parked`。两种返回均不使用实测 `dq` 判断到位；小幅位置波动在容差内即可。仅到位断开存在到位期限：轨迹时长后 3 秒仍有位置偏差时结束返回、保持使能并报告具体关节与角度。时间进度到达 1 不能单独触发断开。
+`disconnect_after` 默认 `false`，在参考轨迹到位、指令减速结束后产生 `completed/returned` 并继续使能保持。设为 `true` 时，还需七轴实测位置在目标的 0.02 rad（约 1.15°）内，随后失能、关闭串口并产生 `completed/parked`。两种返回均不使用实测 `dq` 判断到位；小幅位置波动在容差内即可。实际位置尚未到位时继续保持连接与使能，不按预计用时报告失败。时间进度到达 1 不能单独触发断开。
 
 返回时 `action.mode` 为 `return`、`space` 为 `joint`、`axis` 为 `null`。原有点动仍返回数值轴索引。接口调用方需要处理这个新增动作类型。使能状态下的旧 `disconnect`/`disable` 请求若未传 `allow_release:true`，现在会被拒绝；该变更自 2026-11-21 起生效。
 
@@ -281,7 +281,7 @@ J1 正向连续点动，速度 0.1 rad/s：
 
 停止权限、租约与 generation 校验、原请求的 cancelled 结果保持原有语义。正常停止按 jerk 限制减速，可能需要更长时间；`action:null` 后仍须等待 `stopping` 结束。停止求解惩罚关节速度本身，使冗余方向的速度也减至零，连续性由导数硬约束维持。笛卡尔路径无法满足制动约束时，写入 `control/stop_path` 警告并转为受限关节制动。故障、失能和关闭继续优先处理。
 
-离散参考的导数限制不保证实际 TX 节拍或机械臂物理运动的 jerk。发送时间对齐、轨迹与采样尚未真机验收；伺服基线仍为 `kp=60`、`kd=10` 和 URDF 重力前馈；本轮可显式配置逐轴阻尼、速度前馈权重及平滑摩擦，总附加前馈逐轴限制到 ±8 Nm。
+离散参考的导数限制不保证实际 TX 节拍或机械臂物理运动的 jerk。发送时间对齐、轨迹与采样尚未真机验收；伺服基线仍为 `kp=60`、`kd=10` 和 URDF 重力前馈；本轮可显式配置逐轴阻尼、速度前馈权重及平滑摩擦，总附加前馈按实际协议编码。
 
 ### 5.8 发送时间对齐
 
@@ -291,13 +291,13 @@ J1 正向连续点动，速度 0.1 rad/s：
 
 有上一成功整批伺服目标时，位置按 `q_previous + 0.5*(dq_previous + dq_sample)*Δt_tx` 连续积分，使用两次主机批次起点的实际间隔。新控制参考只更新取样速度，不重新锚定发送位置，避免控制器离散积分与外推交接时的位置回跳。
 
-新点动、固定步长和收纳回程从最近成功发送的静止目标建立起点，避免多次动作积累控制参考与发送位置的残差。该目标必须属于当前 generation/epoch、年龄不超过 50 ms、七轴指令速度均为零；未确认时返回 `motion_busy`，不排队启动下一段。目标仍需满足相对实测的 0.6 rad 偏差限制。此交接读取单值内存快照，不访问日志或数据库。
+新点动、固定步长和收纳回程从当前连接最近成功发送的位置建立起点；尚无发送记录时使用当前有限参考。此位置交接不额外等待发送记录的年龄、generation/epoch 或零速判定；动作取消仍由 epoch 和输入有效期执行。此交接只读内存快照，不访问日志或数据库。
 
 发送端按当前有效关节速度对预测速度限幅，保留 TCP 和动作目标，不再次进行路径、实测跟随或固定关节增量检查。轨迹生成与发送积分的细小残差不会产生运动失败。
 
 关节目标越界时限制在目标或本次积分起点，并将对应速度置零；末端目标越界时保持上一成功伺服位置（无历史则保持源位置），整组速度置零。取消后的减速不再追逐旧目标。
 
-源参考携带 generation、epoch 与有效截止时间；运动期间截止时间取输入有效期与租约到期时间的较早者。取样前及写入前复查 epoch 和有效期，写入前同时检查优先命令；失效候选不提交。已开始写入的七轴批次仍使用原有 20 ms 整批预算，不在批次中途插入其它报文；这不是实际线上 TX 或电机确认的时限保证。
+源参考携带 generation、epoch 与有效截止时间；运动期间截止时间取输入有效期与租约到期时间的较早者。取样前及写入前复查 epoch 和有效期，写入前同时检查优先命令；失效候选不提交。单报文写入保留 I/O 进度预算，完整报文之间的调度间隙不再触发整批失败；不在半帧中插入其它报文。这不是电机确认的时限保证。
 
 参考过旧或时间暂时未对齐时，若有上一成功整批伺服目标，就保持位置并将速度置零；新参考到达后恢复取样，不结束当前校准或点动。非有限输入与动作有效期到期仍结束动作。迟到的旧 generation/epoch 事件不会影响新的动作。
 
@@ -307,14 +307,14 @@ J1 正向连续点动，速度 0.1 rad/s：
 
 `configure_servo` 应用完整 `config:ServoTuning`，不是部分更新。`friction_enabled` 为必填 boolean，`joints` 为 J1..J7 顺序的恰好七项；各项以下六个字段全部必填且必须有限。表中范围均含端点，基线值不表示请求可以省略字段。
 
-| 每轴字段 | 含义与单位 | 闭区间范围 | 基线 |
+| 每轴字段 | 含义与单位 | 有效数值 | 基线 |
 | --- | --- | --- | --- |
-| `kd` | 阻尼，Nm·s/rad | [0,30] | 10 |
-| `velocity_ff` | 速度前馈权重，无量纲 | [0,1] | 1 |
-| `coulomb` | 库仑摩擦幅值 Fc，Nm | [0,2] | 0 |
-| `viscous` | 黏性系数 B，Nm·s/rad | [0,10] | 0 |
-| `velocity_scale` | 平滑过零尺度 epsilon，rad/s | [0.001,0.2] | 0.02 |
-| `max_friction` | 摩擦补偿幅值上限，Nm | [0,2] | 0.5 |
+| `kd` | 阻尼，Nm·s/rad | 非负，实际协议可表示 | 10 |
+| `velocity_ff` | 速度前馈权重，无量纲 | 非负 | 1 |
+| `coulomb` | 库仑摩擦幅值 Fc，Nm | 非负 | 0 |
+| `viscous` | 黏性系数 B，Nm·s/rad | 非负 | 0 |
+| `velocity_scale` | 平滑过零尺度 epsilon，rad/s | 正数 | 0.02 |
+| `max_friction` | 摩擦补偿幅值上限，Nm | 非负 | 0.5 |
 
 全局基线为 `friction_enabled:false`。完整请求示例：
 
@@ -342,11 +342,11 @@ J1 正向连续点动，速度 0.1 rad/s：
 
 认证、租约、去重和 `generation` 校验沿用普通命令。先连接并等待连接确认，再配置；没有控制权不得应用。未连接或 `connecting` 返回 `rejected/not_connected`，关闭期间按原有关闭检查拒绝；故障或待清错返回 `rejected/fault`。运动、减速停止或使能确认期间返回 `rejected/motion_busy`。有限数值超出业务范围时，HTTP 仍可先返回 **202 queued**，再出现 `rejected/invalid_servo_tuning`；缺字段、类型错误或数组长度错误属于 JSON 提取错误。JSON 不支持 NaN/Infinity。
 
-已使能且空闲时，还须具备完整新鲜反馈，以及当前 generation/epoch 下最近成功写完整批、新鲜且七轴轨迹速度为零的发送目标（年龄不超过 50 ms）。缺少静止目标返回 `motion_busy`；反馈无效或跟随偏差超限按原检查拒绝。控制器先复制该目标的 `q` 并清零导数，再应用配置，不回拉到另一份位置。接受后 `servo_tuning_revision` 与 `generation` 均提升，旧运动请求将因 `stale_context` 失效；使用最新快照继续操作。结果为 `accepted/configure_servo`，无需等待独立的 completed；接受只确认软件配置应用，不表示设备已确认参数或物理效果。
+已使能且空闲时，控制器读取当前连接最后成功发送的位置，尚无记录时使用当前有限参考，清零导数再应用配置。完整新鲜反馈用于当前连接状态；不另设发送年龄、零速或跟随误差门槛。接受后 `servo_tuning_revision` 与 `generation` 均提升，旧运动请求将因 `stale_context` 失效；使用最新快照继续操作。结果为 `accepted/configure_servo`，无需等待独立的 completed；接受只确认软件配置应用，不表示设备已确认参数或物理效果。
 
 每次连接或断开都恢复基线并更新配置版本；配置只保存在当前连接内存中，不自动持久化。在控制页点击“点动 → 参数”打开弹窗，编辑、恢复基线只改草稿，须显式应用；复制 JSON 不发送命令。关闭弹窗保留当前连接的草稿，已提交请求继续等待确认；重新连接清除旧草稿。
 
-发送端以对齐后的未缩放轨迹速度 `v` 计算 `requested=clamp(Fc*tanh(v/epsilon)+B*v, ±max_friction)`，再计算 `tau_ff=clamp(tau_gravity+requested, ±8 Nm)`。摩擦开关关闭或 `v=0` 时摩擦项严格为零。速度前馈独立为 `dq_feedforward=velocity_ff*v`，只作用于最终报文速度字段；`Reference.dq`、位置积分、TCP/目标复核、停止与收纳时序保持原值。±8 Nm 是附加前馈通道的上限，不是电机总输出扭矩上限。
+发送端以对齐后的未缩放轨迹速度 `v` 计算 `requested=clamp(Fc*tanh(v/epsilon)+B*v, ±max_friction)`，再计算 `tau_ff=tau_gravity+requested`，并按实际协议编码。摩擦开关关闭或 `v=0` 时摩擦项严格为零。速度前馈独立为 `dq_feedforward=velocity_ff*v`，只作用于最终报文速度字段；`Reference.dq`、位置积分、TCP/目标复核、停止与收纳时序保持原值。输出字段仍须满足实际协议的可表示范围；该范围不是电机总输出扭矩的保证。
 
 参数标定与减抖效果尚未真机验证；候选方案和证据见[补偿方案调查](research/motion-compensation-repositories-2026-11-21.md)。
 
@@ -413,7 +413,7 @@ Kp/Kd 保持起始值。推荐只涉及平滑摩擦与速度前馈，末端前�
 | `axis` | null，七轴 | 0..6 指定单轴；末端程序测试七轴 |
 | `excursion` | 0.2792526803190927（16°） | 有限正数，rad，目标取一半；末端程序采用 program.joint_excursion |
 | `speed` | 0.03490658503988659（2°/s） | 有限正数，rad/s，第二档两倍 |
-| `max_friction` | 0.2 | Nm，0..2，Fc 取一半及全部，0 跳过摩擦候选 |
+| `max_friction` | 0.2 | Nm，非负，Fc 取一半及全部，0 跳过摩擦候选 |
 | `cartesian` | null | 已预览的 CartesianProgram |
 
 测试沿用已有运动学、速度/加速度/jerk、停止和设备故障处理。片段完成看生成的参考轨迹，不用原始反馈速度或另设的位置静止窗决定下一步。HTTP `202 queued` 后按请求 ID 查看结果及 `Snapshot.calibration`；后端自行推进，客户端只需续期控制权，不发送逐段点动。
@@ -548,7 +548,7 @@ Kp/Kd 保持起始值。推荐只涉及平滑摩擦与速度前馈，末端前�
 | `temperature` / `voltage` | number 或 null，°C / V | 温度 / 电压              |
 | `error`                   | u32 或 null            | 设备错误值               |
 
-从未收到的反馈为 `null`。反馈过期后，关节数值保留最后一次测量，`age_ms` 继续增长。控制使用的七轴反馈需全部存在、单轴年龄不超过 200 ms，七轴接收时间跨度不超过 100 ms。仅检查 `feedback_age_ms` 不能证明七轴已经齐全。
+从未收到的反馈为 `null`。反馈过期后，关节数值保留最后一次测量，`age_ms` 继续增长。控制使用的七轴反馈需全部存在、单轴年龄不超过 200 ms，不再附加七轴接收跨度门槛。仅检查 `feedback_age_ms` 不能证明七轴已经齐全。
 
 TCP 未设置或控制反馈无效时，`tcp:null`。`action.mode` 为 `continuous`、`step`、`return` 或 `calibration`，`progress` 范围 0..1。`seq` 和 `generation` 不跨应用重启保存；重新连接应用后重新读取状态。快照通常约 30 Hz 更新，状态变化时也可提前发布。HTTP 返回缓存中的最近快照，调用方还需考虑接收后经过的时间。
 
@@ -608,7 +608,7 @@ TCP 未设置或控制反馈无效时，`tcp:null`。`action.mode` 为 `continuo
 | --- | --- | --- |
 | `page` | u32，默认 1 | 0 按 1，超过末页时返回末页 |
 | `page_size` | u32，默认 50 | 限制到 1..500，0 按 1 |
-| `search` | string，默认空串 | UTF-8 最多 512 字节；在级别、来源、编号、内容和请求 ID 中搜索字面子串；ASCII 不区分大小写 |
+| `search` | string，默认空串 | UTF-8 完整的2 字节；在级别、来源、编号、内容和请求 ID 中搜索字面子串；ASCII 不区分大小写 |
 | `through_id` | 可选 i64 | 非负；省略时取当前最大 ID，传入时只查询不大于该 ID 的记录；0 表示空范围 |
 
 ```http
@@ -647,7 +647,7 @@ Authorization: Bearer <token>
 
 | 请求                      | 行为                                                                                                                                                                                                              |
 | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `POST /v1/traces`         | JSON 对象，`duration_ms` 为整数，默认 10000，范围 1000..20000；`{}` 或 `{"duration_ms":null}` 使用默认值，未知字段被拒绝。返回 `200 TraceSummary`。                                                               |
+| `POST /v1/traces`         | JSON 对象，`duration_ms` 为整数，默认 10000，可表示的正整数毫秒；`{}` 或 `{"duration_ms":null}` 使用默认值，未知字段被拒绝。返回 `200 TraceSummary`。                                                               |
 | `GET /v1/traces?limit=20` | `limit` 为可省略的 u32，默认 20；实际限制到 1..10，0 按 1，超过 10 按 10。返回最近的 `TraceSummary[]`。                                                                                                           |
 | `POST /v1/traces/stop`    | 无需请求体。结束当前记录并返回 `200 TraceSummary`；没有正在记录的采样时返回 JSON `null`。                                                                                                                         |
 | `GET /v1/traces/{id}`     | 返回 `{trace:TraceSummary,samples:TraceSample[]}`。`download=true` 或别名 `attachment=true` 增加 `Content-Disposition: attachment; filename="trace-{id}.json"`，内容仍为 JSON。响应带 `Cache-Control: no-store`。 |
@@ -814,12 +814,12 @@ CLI 原有输出字段保留，新增 `tuning`：`servo_batches_with_tuning/serv
 | `not_owner`、`stale_context`                                                                                                     | 控制权或上下文变化；读取状态，重新确认操作                        |
 | `not_connected`、`fault`、`enable_busy`、`motion_busy`                                                                           | 当前运行阶段不接受该操作                                          |
 | `invalid_motion`、`invalid_step`、`speed_limit`、`invalid_tcp`、`invalid_ttl`、`invalid_servo_tuning`                                                    | 修改输入                                                          |
-| `feedback_missing`、`feedback_stale`、`invalid_feedback`、`feedback_span`                                                        | 反馈不满足控制条件                                                |
+| `feedback_missing`、`feedback_stale`、`invalid_feedback`                                                        | 反馈不满足控制条件                                                |
 | `tcp_missing`                                                                                                                    | 设置 TCP 后再使用末端点动                                         |
 | `support_required`、`disable_first`                                                                                              | 确认支撑后释放保持；清错前先失能                                  |
 | `invalid_pose`                                                                                                                   | 检查收纳位的七轴数值和相对行程                                    |
 | `no_action`、`stale_input`、`input_expired`                                                                                      | 连续点动已经结束，或更新序号/有效期不符                           |
-| `joint_dynamics`、`kinematics`、`following_error`、`target_timeout`                                                              | 本次运动不能继续，结合状态和日志检查原因                          |
+| `joint_dynamics`、`kinematics`                                                              | 本次运动不能继续，结合状态和日志检查原因                          |
 | `send_reference`                                                                                                                 | 参考无法安全取样；动作或使能请求 failed，保留原有使能状态与控制权 |
 | `communication_error`、`feedback_timeout`、`device_error`、`device_timeout`、`device_disabled`、`enable_timeout`、`clear_failed` | 通信、设备或确认失败                                              |
 | `stopped`、`host_stop`、`released`、`lease_expired`、`disabled`、`disconnected`、`clearing`、`closing`                           | 动作取消原因                                                      |
@@ -860,7 +860,7 @@ Tauri 仅向主窗口提供三个命令：
 
 导出 `PortInfo {name,label,kind}`、`enumerate_ports() -> Vec<PortInfo>`。
 
-导出 `DriveMode::{Disabled,Servo,ClearFault}`、`Setpoint {mode,q,dq,tau,kp,kd}`，数值均为标定后的 URDF 关节量。`Feedback {id,q,dq,tau,temperature,voltage,error,warning,mode,timeout}`。伺服模式默认 `kp=60`、`kd=10`；`tau` 为重力与可选平滑摩擦合成后的总附加前馈，逐轴限幅 ±8 Nm；`dq` 为加权后的速度前馈，`kd` 按当前配置逐轴设置。
+导出 `DriveMode::{Disabled,Servo,ClearFault}`、`Setpoint {mode,q,dq,tau,kp,kd}`，数值均为标定后的 URDF 关节量。`Feedback {id,q,dq,tau,temperature,voltage,error,warning,mode,timeout}`。伺服模式默认 `kp=60`、`kd=10`；`tau` 为重力与可选平滑摩擦合成后的总附加前馈，按实际协议编码；`dq` 为加权后的速度前馈，`kd` 按当前配置逐轴设置。
 
 `BusHandle::open_recorded(port,side,baud,timeout,journal,reference_epoch)` 创建串口会话；`publish(values,seq,reference)` 发布最新七轴参考及其来源时间、导数和动作约束。`drain()->(Vec<(Feedback,Instant)>,Option<BusError>)` 读取带时间戳反馈，以及 I/O 错误或带 generation/epoch 的参考拒绝。`disable()` 和 `write_blocking()` 提交优先停机/清错写入；`stats()->BusStats` 读取通信与批次时间统计。原始 `send` / `send_with_sequence` 只用于协议测试。
 

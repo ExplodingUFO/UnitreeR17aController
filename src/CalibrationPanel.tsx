@@ -13,7 +13,7 @@ import {
   type CalibrationTrial,
   type ServoTuning,
   type View,
-  hasFreshFeedback,
+  hasJointFeedback,
 } from "./api";
 import RobotScene, {
   stagePoints,
@@ -42,7 +42,6 @@ type Pending = {
   id: string;
   connection: string;
   generation: number;
-  revision: number;
   config: ServoTuning;
   accepted: boolean;
   uncertain: boolean;
@@ -128,10 +127,19 @@ function comparisonFor(report: CalibrationReport, axis: number) {
     const b = baseline?.metrics,
       m = trial.metrics;
     if (!b || !m) return Infinity;
-    return (
-      (0.6 * m.velocity_rms) / Math.max(b.velocity_rms, 1e-12) +
-      (0.4 * m.tracking_rms) / Math.max(b.tracking_rms, 1e-12)
-    );
+    const velocity =
+      b.velocity_rms > 0
+        ? m.velocity_rms / b.velocity_rms
+        : m.velocity_rms === 0
+          ? 1
+          : Infinity;
+    const tracking =
+      b.tracking_rms > 0
+        ? m.tracking_rms / b.tracking_rms
+        : m.tracking_rms === 0
+          ? 1
+          : Infinity;
+    return 0.6 * velocity + 0.4 * tracking;
   };
   const comparison =
     trials.find((trial) => trial.index === choice?.after_index) ??
@@ -716,7 +724,6 @@ export default function CalibrationPanel({
     points: CalibrationPoint[];
   }>({ id: "", points: [] });
   const [feedback, setFeedback] = useState<Feedback | null>(null);
-  const [appliedReport, setAppliedReport] = useState<string | null>(null);
   const [stopPending, setStopPending] = useState<{
     seq: number;
     id: string | null;
@@ -761,6 +768,9 @@ export default function CalibrationPanel({
       : (details[selectedSummary.id] ?? selectedSummary)
     : null;
   const reportId = report?.id ?? null;
+  const recommendedApplied =
+    !!report?.recommended &&
+    sameServoTuning(s.servo_tuning, report.recommended);
   const completedKey =
     status && terminal(status)
       ? `${status.id}:${status.state}:${status.report?.id ?? ""}`
@@ -789,7 +799,7 @@ export default function CalibrationPanel({
     setPreviewBusy(false);
     setPreviewPlaying(false);
     setPreviewProgress(0);
-  }, [previewContext, previewSettings, s.action?.request_id]);
+  }, [previewContext, previewSettings]);
   useEffect(() => {
     if (open) return;
     previewRequest.current?.abort();
@@ -818,7 +828,6 @@ export default function CalibrationPanel({
     setPending(null);
     setRun(null);
     setStopPending(null);
-    setAppliedReport(null);
     if (request) setFeedback({ text: "连接已变化，请求未确认", tone: "info" });
   }, [connection, view.online]);
   useEffect(() => {
@@ -919,11 +928,9 @@ export default function CalibrationPanel({
     if (
       request.kind === "apply" &&
       accepted &&
-      s.servo_tuning_revision > request.revision &&
       sameServoTuning(s.servo_tuning, request.config)
     ) {
       setPending(null);
-      setAppliedReport(status?.report?.id ?? null);
       setFeedback({ text: "推荐参数已应用", tone: "success" });
       return;
     }
@@ -1123,15 +1130,14 @@ export default function CalibrationPanel({
       ? "请先连接机械臂"
       : !view.hasControl
         ? "请先取得控制权"
-        : s.phase === "fault" || s.error
+        : s.phase === "fault"
           ? s.error?.message || "请先处理故障"
-          : !s.enabled
-            ? "请先使能机械臂"
-            : s.phase !== "ready" || s.action
-              ? "请先停止当前动作"
-              : "";
+          : !["ready", "disabled"].includes(s.phase) || s.action
+            ? "请先停止当前动作"
+            : "";
   const startReason =
     idleReason ||
+    (!s.enabled ? "请先使能机械臂" : "") ||
     (busy ? "等待当前请求完成" : "") ||
     (previewBusy || !preview ? "请先生成并检查运动预览" : "");
   const previewReason =
@@ -1154,10 +1160,7 @@ export default function CalibrationPanel({
         ? "本次参数保持原样"
         : idleReason ||
           (busy ? "等待当前请求完成" : "") ||
-          (appliedReport === reportId ? "推荐参数已应用" : "") ||
-          (!sameServoTuning(s.servo_tuning, report.baseline)
-            ? "伺服参数已修改，请重新测试"
-            : "");
+          (recommendedApplied ? "推荐参数已应用" : "");
   function stop() {
     const id =
       status?.request_id ??
@@ -1229,7 +1232,6 @@ export default function CalibrationPanel({
       id,
       connection,
       generation: s.generation,
-      revision: s.servo_tuning_revision,
       config: structuredClone(
         kind === "apply" ? report!.recommended! : s.servo_tuning,
       ),
@@ -1240,7 +1242,6 @@ export default function CalibrationPanel({
     setFeedback(null);
     if (kind === "start") {
       setRun({ id, connection, state: "waiting" });
-      setAppliedReport(null);
       setSelection(null);
       setPage("progress");
     }
@@ -1539,9 +1540,9 @@ export default function CalibrationPanel({
                     <RobotScene
                       side={s.side}
                       joints={s.joints}
-                      valid={hasFreshFeedback(view)}
+                      valid={hasJointFeedback(view)}
                       source={
-                        hasFreshFeedback(view)
+                        hasJointFeedback(view)
                           ? "实测姿态 · 拖动旋转 / 滚轮缩放"
                           : "参考姿态 · 拖动旋转 / 滚轮缩放"
                       }
@@ -1821,7 +1822,7 @@ export default function CalibrationPanel({
                         key={`${local}:${report.id}`}
                         report={report}
                         local={local}
-                        applied={appliedReport === report.id}
+                        applied={recommendedApplied}
                         onCurves={() => setPage("curves")}
                       />
                     ) : (
@@ -1962,7 +1963,7 @@ export default function CalibrationPanel({
               >
                 {pending?.kind === "apply"
                   ? "等待确认…"
-                  : appliedReport === reportId
+                  : recommendedApplied
                     ? "已应用"
                     : "应用推荐"}
               </button>

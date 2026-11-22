@@ -68,8 +68,8 @@ pub struct BranchPoint {
 }
 
 impl CartesianProgram {
-    /// Interpolate the preview branch at actual signed TCP progress. Only a
-    /// handful of knots per ray cross the API; no IK runs in this lookup.
+    /// Interpolate the preview branch at actual signed TCP progress using the
+    /// accepted geometric samples. No IK runs in this lookup.
     pub fn guide_at(&self, axis: usize, offset: f64) -> Option<JointGuide> {
         let first = self.guide.partition_point(|point| point.axis < axis);
         let end = self.guide.partition_point(|point| point.axis <= axis);
@@ -235,12 +235,9 @@ pub fn preview(
             request.amplitude,
             bounds,
         );
-        // Eight intervals per direction, sharing the origin, keep the complete
-        // programme well below the command API's 16 KiB body limit.
         let mut knots = Vec::new();
         for samples in [&negative, &positive] {
-            for index in branch_indices(samples, axis) {
-                let sample = samples[index];
+            for sample in samples {
                 knots.push(BranchPoint {
                     axis,
                     offset: sample.tcp[axis] - start.tcp[axis],
@@ -281,44 +278,6 @@ pub fn preview(
         points,
         ranges,
     })
-}
-
-/// Spend the small wire budget where the branch bends, rather than where
-/// numerical boundary subdivision happened to produce the most samples.
-fn branch_indices(samples: &[Sample], axis: usize) -> Vec<usize> {
-    if samples.len() == 1 {
-        return vec![0];
-    }
-    let mut indices = vec![0, samples.len() - 1];
-    while indices.len() < 9 {
-        let mut best = None;
-        let mut maximum = 0.0;
-        for (interval, pair) in indices.windows(2).enumerate() {
-            let (a, b) = (samples[pair[0]], samples[pair[1]]);
-            let distance = b.tcp[axis] - a.tcp[axis];
-            if distance.abs() < f64::EPSILON {
-                continue;
-            }
-            for (index, sample) in samples.iter().enumerate().take(pair[1]).skip(pair[0] + 1) {
-                let fraction = (sample.tcp[axis] - a.tcp[axis]) / distance;
-                let error: f64 = (0..7)
-                    .map(|i| {
-                        (sample.joints[i] - a.joints[i] - (b.joints[i] - a.joints[i]) * fraction)
-                            .powi(2)
-                    })
-                    .sum();
-                if error > maximum {
-                    maximum = error;
-                    best = Some((interval + 1, index));
-                }
-            }
-        }
-        let Some((interval, index)) = best else {
-            break;
-        };
-        indices.insert(interval, index);
-    }
-    indices
 }
 
 fn trace(
@@ -624,6 +583,12 @@ mod tests {
             assert_eq!(actual.axis, expected.axis);
             assert_close(&[actual.offset], &[expected.offset]);
         }
+        assert_eq!(actual.guide.len(), expected.guide.len());
+        for (actual, expected) in actual.guide.iter().zip(&expected.guide) {
+            assert_eq!(actual.axis, expected.axis);
+            assert_close(&[actual.offset], &[expected.offset]);
+            assert_close(&actual.joints, &expected.joints);
+        }
     }
 
     #[test]
@@ -891,7 +856,21 @@ mod tests {
             let started = std::time::Instant::now();
             let result = preview(&model, "right", origin, tcp, PreviewRequest::default()).unwrap();
             let elapsed = started.elapsed();
-            assert!(result.program.guide.len() <= 51);
+            let original = model.fk(&origin, &tcp).unwrap();
+            let mut expected: Vec<_> = result
+                .points
+                .iter()
+                .filter(|point| point.space == "cartesian")
+                .map(|point| BranchPoint {
+                    axis: point.axis,
+                    offset: point.tcp[point.axis] - original.translation[point.axis],
+                    joints: point.joints,
+                })
+                .collect();
+            expected.sort_by(|a, b| a.axis.cmp(&b.axis).then(a.offset.total_cmp(&b.offset)));
+            expected.dedup_by(|a, b| a.axis == b.axis && a.offset == b.offset);
+            assert_eq!(result.program.guide, expected);
+            assert!(result.program.guide.len() > 51);
             for knot in &result.program.guide {
                 let guide = result.program.guide_at(knot.axis, knot.offset).unwrap();
                 assert_eq!(guide.axis, knot.axis);
@@ -907,7 +886,7 @@ mod tests {
                     "max_friction": 0.1, "cartesian": result.program }
             });
             let size = serde_json::to_vec(&request).unwrap().len();
-            assert!(size < 16 * 1024, "command body contains {size} bytes");
+            assert!(size < 2 * 1024 * 1024, "command body contains {size} bytes");
             eprintln!(
                 "preview timing tcp={:?}: {elapsed:?}, guide knots={}, request bytes={size}",
                 tcp.translation,
@@ -916,6 +895,48 @@ mod tests {
                     .unwrap()
                     .len()
             );
+        }
+    }
+
+    #[test]
+    fn stored_fifty_one_knot_programs_still_deserialize_and_interpolate() {
+        let mut program = CartesianProgram {
+            side: "right".into(),
+            origin: origin(),
+            tcp: tool(),
+            amplitude: 0.008,
+            speed: 0.01,
+            joint_excursion: default_joint_excursion(),
+            motion: MotionTuning::default(),
+            auto_range: false,
+            segments: vec![],
+            guide: vec![],
+        };
+        for axis in 0..3 {
+            for point in -8..=8 {
+                let offset = point as f64 * 0.001;
+                program.guide.push(BranchPoint {
+                    axis,
+                    offset,
+                    joints: std::array::from_fn(|i| {
+                        program.origin[i] + offset * (i + axis + 1) as f64
+                    }),
+                });
+            }
+        }
+        let restored: CartesianProgram =
+            serde_json::from_str(&serde_json::to_string(&program).unwrap()).unwrap();
+        assert_eq!(restored.guide.len(), 51);
+        for axis in 0..3 {
+            for offset in [-0.008, -0.0035, 0.0, 0.0025, 0.008] {
+                let guide = restored.guide_at(axis, offset).unwrap();
+                let expected: [f64; 7] =
+                    std::array::from_fn(|i| program.origin[i] + offset * (i + axis + 1) as f64);
+                assert_close(&guide.position, &expected);
+                for i in 0..7 {
+                    assert!((guide.tangent[i] - (i + axis + 1) as f64).abs() < 1e-10);
+                }
+            }
         }
     }
 

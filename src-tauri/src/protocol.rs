@@ -15,7 +15,7 @@ use serialport::{
 use std::collections::BTreeMap;
 use std::io;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread::{self, JoinHandle};
@@ -24,7 +24,6 @@ use tokio::sync::watch;
 
 const COMMAND_LEN: usize = 20;
 const FEEDBACK_LEN: usize = 26;
-const MAX_TRANSACTION: Duration = Duration::from_millis(20);
 const IO_SLICE: Duration = Duration::from_millis(1);
 const WRITE_PERIOD: Duration = Duration::from_millis(10);
 const PI: f64 = std::f64::consts::PI;
@@ -164,7 +163,7 @@ pub struct BusStats {
     /// All CRC-valid frames received during exchanges, including other IDs.
     pub received: u64,
     pub crc_errors: u64,
-    /// Seven-joint cycles whose shared feedback budget expired.
+    /// Packet progress deadlines (or test feedback deadlines) that expired.
     pub timeouts: u64,
     pub transmit: TransmitStats,
 }
@@ -246,13 +245,11 @@ fn parse_calibration(source: &str) -> Result<[Calibration; 7], String> {
         let dir = number(fields[1])?;
         let scale = number(fields[2])?.abs();
         let offset = number(fields[3])?;
-        if id >= 7 || seen[id] || dir.abs() < 1e-6 || scale < 1e-6 {
+        let gain = dir * scale;
+        if id >= 7 || seen[id] || !gain.is_finite() || gain == 0.0 {
             return Err("invalid or duplicate calibration joint".into());
         }
-        values[id] = Calibration {
-            gain: dir * scale,
-            offset,
-        };
+        values[id] = Calibration { gain, offset };
         seen[id] = true;
     }
     if seen.iter().any(|v| !v) {
@@ -314,7 +311,7 @@ fn crc32(words: &[u8]) -> u32 {
     crc
 }
 
-fn encode(id: u8, s: Setpoint) -> Result<[u8; COMMAND_LEN], String> {
+pub(crate) fn encode(id: u8, s: Setpoint) -> Result<[u8; COMMAND_LEN], String> {
     if id >= 7 {
         return Err("joint ID must be 0..6".into());
     }
@@ -463,13 +460,17 @@ pub struct Bus {
 
 impl Bus {
     /// Opens an exclusive native serial port; sends nothing. The supplied
-    /// timeout is the TOTAL seven-joint cycle budget, capped at 20ms (minimum 1ms).
+    /// timeout bounds progress within one packet. Completed packets and the
+    /// required inter-packet gaps do not consume the next packet's budget.
     pub fn open(port: &str, side: &str, baud: u32, timeout: Duration) -> Result<Self, String> {
         let calibration = calibrations(side)?;
         if baud == 0 {
             return Err("baud rate must be positive".into());
         }
-        let budget = timeout.clamp(Duration::from_millis(1), MAX_TRANSACTION);
+        if timeout.is_zero() || Instant::now().checked_add(timeout).is_none() {
+            return Err("serial I/O timeout must be positive and representable".into());
+        }
+        let budget = timeout;
         let port = serialport::new(port, baud)
             .data_bits(DataBits::Eight)
             .parity(Parity::None)
@@ -600,13 +601,22 @@ impl Bus {
         if self.incomplete_write {
             return Err("previous command was partially written; reconnect serial port".into());
         }
-        let deadline = Instant::now() + self.budget;
+        let started = Instant::now();
         let mut packets = [[0u8; COMMAND_LEN]; 7];
         for (i, packet) in packets.iter_mut().enumerate() {
             *packet = encode(i as u8, self.calibration[i].command(setpoints[i]))?;
         }
-        for packet in &packets {
-            self.write_packet(packet, deadline)?;
+        for (joint, packet) in packets.iter().enumerate() {
+            // Only an incomplete packet has an I/O progress deadline. Time
+            // spent after a completed packet cannot prove a transport failure.
+            let deadline = Instant::now() + self.budget;
+            self.write_packet(packet, deadline).map_err(|error| {
+                format!(
+                    "serial batch J{} after {} us: {error}",
+                    joint + 1,
+                    started.elapsed().as_micros()
+                )
+            })?;
             // The official SDK keeps this gap after every packet, including
             // the last one, before the adapter turns around to receive.
             std::thread::sleep(Duration::from_micros(200));
@@ -800,7 +810,9 @@ pub struct SentReference {
     pub at: Instant,
     /// Host completion of the successful seven-packet write, not drive execution.
     pub completed_at: Instant,
+    #[cfg(test)]
     pub generation: u64,
+    #[cfg(test)]
     pub epoch: u64,
     pub q: [f64; 7],
     pub dq: [f64; 7],
@@ -977,6 +989,7 @@ pub struct BusHandle {
     command: Sender<BusCommand>,
     events: EventReceiver<BusEvent>,
     stats: Arc<Mutex<BusStats>>,
+    failure: Arc<OnceLock<String>>,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     reader: Option<JoinHandle<()>>,
@@ -1039,6 +1052,8 @@ impl BusHandle {
         let reader_stats = stats.clone();
         let writer_stats = stats;
         let writer_journal = journal.clone();
+        let failure = Arc::new(OnceLock::new());
+        let writer_failure = failure.clone();
         let join = thread::Builder::new()
             .name("arm-serial-tx".into())
             .spawn(move || {
@@ -1063,11 +1078,19 @@ impl BusHandle {
                                         (journal, started, TransmitMetadata::direct(0))
                                     }),
                                 );
+                                if let Err(error) = &result {
+                                    let _ = writer_failure.set(error.clone());
+                                    let _ = writer_events.send(BusEvent::Error(error.clone()));
+                                }
                                 if result.is_ok() {
                                     committed = Some(Committed::direct(started, values));
                                 }
                                 sent_tx.send_replace(None);
+                                let failed = result.is_err();
                                 let _ = reply.send(result);
+                                if failed {
+                                    break;
+                                }
                                 // Sticky until this bus is closed; cached motion cannot revive it.
                                 disabled = true;
                             }
@@ -1079,12 +1102,23 @@ impl BusHandle {
                                         (journal, started, TransmitMetadata::direct(0))
                                     }),
                                 );
+                                if let Err(error) = &result {
+                                    let _ = writer_failure.set(error.clone());
+                                    let _ = writer_events.send(BusEvent::Error(error.clone()));
+                                }
                                 if result.is_ok() {
                                     last = PublishedSetpoints {
                                         values: *setpoints,
                                         seq: 0,
                                         reference: None,
                                     };
+                                    // ClearFault is an action, not a hold target.
+                                    // Keep other joints' states, but never replay it as a heartbeat.
+                                    for value in &mut last.values {
+                                        if value.mode == DriveMode::ClearFault {
+                                            value.mode = DriveMode::Disabled;
+                                        }
+                                    }
                                     committed = Some(Committed::direct(started, *setpoints));
                                     rejected = None;
                                     next_write = next_deadline(next_write, started, Instant::now());
@@ -1098,7 +1132,11 @@ impl BusHandle {
                                     previous_write = Some(started);
                                 }
                                 sent_tx.send_replace(None);
+                                let failed = result.is_err();
                                 let _ = reply.send(result);
+                                if failed {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1114,13 +1152,14 @@ impl BusHandle {
                             let prepared = match last.prepare(started, committed) {
                                 Ok(prepared) => prepared,
                                 Err(error) => {
+                                    let _ = writer_failure.set(error.clone());
                                     sent_tx.send_replace(None);
                                     let _ = writer_events.send(BusEvent::Error(error));
                                     break;
                                 }
                             };
                             // A stop or priority command can arrive while FK is evaluated.
-                            // Once writing begins, the existing bounded whole-batch rule applies.
+                            // Once writing begins, each packet has a bounded progress deadline.
                             let valid = last.is_current(&reference_epoch, Instant::now());
                             if valid && command_rx.is_empty() {
                                 if let Err(error) = bus.write_all_recorded(
@@ -1138,6 +1177,7 @@ impl BusHandle {
                                         )
                                     }),
                                 ) {
+                                    let _ = writer_failure.set(error.clone());
                                     sent_tx.send_replace(None);
                                     let _ = writer_events.send(BusEvent::Error(error));
                                     break;
@@ -1154,11 +1194,13 @@ impl BusHandle {
                                     .filter(|_| {
                                         prepared.values.iter().all(|s| s.mode == DriveMode::Servo)
                                     })
-                                    .map(|r| SentReference {
+                                    .map(|_source| SentReference {
                                         at: started,
                                         completed_at: Instant::now(),
-                                        generation: r.generation,
-                                        epoch: r.epoch,
+                                        #[cfg(test)]
+                                        generation: _source.generation,
+                                        #[cfg(test)]
+                                        epoch: _source.epoch,
                                         q: prepared.values.map(|s| s.q),
                                         dq: prepared.motion_velocity,
                                     });
@@ -1185,6 +1227,11 @@ impl BusHandle {
                                 }
                                 previous_write = Some(started);
                                 next_write = next_deadline(next_write, started, Instant::now());
+                                for value in &mut last.values {
+                                    if value.mode == DriveMode::ClearFault {
+                                        value.mode = DriveMode::Disabled;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1196,6 +1243,7 @@ impl BusHandle {
             })
             .map_err(|error| format!("spawn serial I/O thread: {error}"))?;
         let reader_stop = stop.clone();
+        let reader_failure = failure.clone();
         let reader = match thread::Builder::new()
             .name("arm-serial-rx".into())
             .spawn(move || {
@@ -1227,6 +1275,7 @@ impl BusHandle {
                             }
                         }
                         Err(error) => {
+                            let _ = reader_failure.set(error.clone());
                             let _ = event_tx.send(BusEvent::Error(error));
                             break;
                         }
@@ -1250,6 +1299,7 @@ impl BusHandle {
             command: command_tx,
             events: event_rx,
             stats: handle_stats,
+            failure,
             stop,
             join: Some(join),
             reader: Some(reader),
@@ -1268,7 +1318,7 @@ impl BusHandle {
                 seq,
                 reference: None,
             })
-            .map_err(|_| "serial I/O thread is closed".into())
+            .map_err(|_| self.io_error("serial I/O thread is closed".into()))
     }
 
     pub fn publish(
@@ -1283,7 +1333,11 @@ impl BusHandle {
                 seq,
                 reference: Some(reference),
             })
-            .map_err(|_| "serial I/O thread is closed".into())
+            .map_err(|_| self.io_error("serial I/O thread is closed".into()))
+    }
+
+    fn io_error(&self, fallback: String) -> String {
+        self.failure.get().cloned().unwrap_or(fallback)
     }
 
     pub fn latest_reference(&self) -> Option<SentReference> {
@@ -1307,6 +1361,7 @@ impl BusHandle {
                 command,
                 events,
                 stats: Arc::new(Mutex::new(BusStats::default())),
+                failure: Arc::new(OnceLock::new()),
                 stop: Arc::new(AtomicBool::new(false)),
                 join: None,
                 reader: None,
@@ -1315,13 +1370,28 @@ impl BusHandle {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_failed_bus(message: &str) -> Self {
+        let (mut bus, _) = Self::test_idle_bus();
+        let (events, receiver) = unbounded();
+        bus.failure.set(message.into()).unwrap();
+        events.send(BusEvent::Error(message.into())).unwrap();
+        bus.events = receiver;
+        bus
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_clear_response_bus() -> Self {
+        tests::clear_response_bus()
+    }
+
     pub fn drain(&self) -> (Vec<(Feedback, Instant)>, Option<BusError>) {
         let mut feedback = Vec::new();
         let mut error = None;
         for event in self.events.try_iter() {
             match event {
                 BusEvent::Feedback(value, at) => feedback.push((value, at)),
-                BusEvent::Error(message) => error = Some(BusError::Io(message)),
+                BusEvent::Error(message) => error = Some(BusError::Io(self.io_error(message))),
                 BusEvent::ReferenceRejected {
                     generation,
                     epoch,
@@ -1346,10 +1416,11 @@ impl BusHandle {
         let (reply, result) = bounded(1);
         self.command
             .send_timeout(BusCommand::Disable(reply), Duration::from_millis(100))
-            .map_err(|error| format!("serial I/O command queue: {error}"))?;
+            .map_err(|error| self.io_error(format!("serial I/O command queue: {error}")))?;
         result
             .recv_timeout(Duration::from_millis(500))
-            .map_err(|error| format!("serial disable acknowledgement: {error}"))?
+            .map_err(|error| self.io_error(format!("serial disable acknowledgement: {error}")))?
+            .map_err(|error| self.io_error(error))
     }
 
     pub fn write_blocking(&self, setpoints: [Setpoint; 7]) -> Result<(), String> {
@@ -1359,10 +1430,11 @@ impl BusHandle {
                 BusCommand::Write(Box::new(setpoints), reply),
                 Duration::from_millis(100),
             )
-            .map_err(|error| format!("serial I/O command queue: {error}"))?;
+            .map_err(|error| self.io_error(format!("serial I/O command queue: {error}")))?;
         result
             .recv_timeout(Duration::from_millis(500))
-            .map_err(|error| format!("serial write acknowledgement: {error}"))?
+            .map_err(|error| self.io_error(format!("serial write acknowledgement: {error}")))?
+            .map_err(|error| self.io_error(error))
     }
 
     pub fn stats(&self) -> BusStats {
@@ -1400,6 +1472,8 @@ fn transient(e: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_IO_BUDGET: Duration = Duration::from_millis(20);
 
     #[test]
     fn baseline_tuning_keeps_encoded_commands_and_disabled_packets_unchanged() {
@@ -1625,8 +1699,6 @@ mod tests {
                                 limits: MotionLimits {
                                     joint_velocity: [JOINT_SPEED; 7],
                                     joint_acceleration: [JOINT_ACCELERATION; 7],
-                                    max_reference_error: 0.60,
-                                    max_joint_step: 0.01,
                                     linear_speed: 0.015,
                                     angular_speed: 0.15,
                                 },
@@ -1929,7 +2001,7 @@ mod tests {
         epoch.fetch_add(1, Ordering::AcqRel);
         // An already-started seven-packet batch may finish. No old snapshot
         // may start another batch after the bounded in-flight write completes.
-        thread::sleep(MAX_TRANSACTION + WRITE_PERIOD);
+        thread::sleep(TEST_IO_BUDGET + WRITE_PERIOD);
         let canceled_count = wire.lock().unwrap().written.len();
         thread::sleep(WRITE_PERIOD * 2);
         assert_eq!(wire.lock().unwrap().written.len(), canceled_count);
@@ -2246,9 +2318,12 @@ mod tests {
         fail_kind: Option<io::ErrorKind>,
         active: VecDeque<Vec<u8>>,
         after_tx: VecDeque<Vec<u8>>,
+        after_clear: VecDeque<Vec<u8>>,
         clears: usize,
         read_error: Option<io::ErrorKind>,
         late_read: bool,
+        pause_after_servo_packet: Option<(u8, Duration)>,
+        fail_once_for_mode: Option<(u8, io::ErrorKind)>,
     }
 
     struct FakePort {
@@ -2283,6 +2358,13 @@ mod tests {
     impl Write for FakePort {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             let mut w = self.wire.lock().unwrap();
+            if let Some((mode, kind)) = w.fail_once_for_mode
+                && buf.len() == COMMAND_LEN
+                && (buf[2] >> 4) & 7 == mode
+            {
+                w.fail_once_for_mode = None;
+                return Err(io::Error::from(kind));
+            }
             if w.fail_after.is_some_and(|n| w.written.len() >= n) {
                 return Err(io::Error::from(
                     w.fail_kind.unwrap_or(io::ErrorKind::BrokenPipe),
@@ -2296,6 +2378,22 @@ mod tests {
             if w.written.len().is_multiple_of(COMMAND_LEN) {
                 let staged = std::mem::take(&mut w.after_tx);
                 w.active.extend(staged);
+                if n == COMMAND_LEN && buf[2] == 0x66 {
+                    let healthy = std::mem::take(&mut w.after_clear);
+                    w.active.extend(healthy);
+                }
+            }
+            let pause = w.pause_after_servo_packet.and_then(|(joint, pause)| {
+                (n == COMMAND_LEN && buf[2] & 0x7f == (joint | 0x10)).then_some(pause)
+            });
+            if pause.is_some() {
+                w.pause_after_servo_packet = None;
+            }
+            drop(w);
+            // The complete packet was accepted before this scheduling gap.
+            // This must not consume the next packet's I/O progress deadline.
+            if let Some(pause) = pause {
+                thread::sleep(pause);
             }
             Ok(n)
         }
@@ -2411,6 +2509,25 @@ mod tests {
         )
     }
 
+    pub(super) fn clear_response_bus() -> BusHandle {
+        let healthy = (0..7)
+            .map(|id| {
+                let mut packet = vec![0; FEEDBACK_LEN];
+                packet[..2].copy_from_slice(&[0xfc, 0xee]);
+                packet[2] = id | 0x10;
+                let crc = crc32(&packet[2..22]);
+                packet[22..26].copy_from_slice(&crc.to_le_bytes());
+                packet
+            })
+            .collect();
+        let (bus, _) = fake_bus(Wire {
+            write_chunk: COMMAND_LEN,
+            after_clear: healthy,
+            ..Wire::default()
+        });
+        BusHandle::start(bus).unwrap()
+    }
+
     fn wait_for_protocol(mut ready: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(3);
         while !ready() {
@@ -2495,7 +2612,7 @@ mod tests {
                 ..Wire::default()
             });
             bus.calibration = calibration;
-            bus.budget = MAX_TRANSACTION;
+            bus.budget = TEST_IO_BUDGET;
             let handle = BusHandle::start_recorded(bus, Some(journal.clone())).unwrap();
             let first = std::array::from_fn(|i| Setpoint {
                 mode: DriveMode::Servo,
@@ -2718,7 +2835,7 @@ mod tests {
             gain: 1.0,
             offset: 0.0,
         }; 7];
-        bus.budget = MAX_TRANSACTION;
+        bus.budget = TEST_IO_BUDGET;
         let position_lsb: [f64; 7] = std::array::from_fn(|i| 2.0 * PI / 32768.0 / ratio(i as u8));
         let velocity_lsb: [f64; 7] = std::array::from_fn(|i| 2.0 * PI / 64.0 / ratio(i as u8));
         let torque_lsb: [f64; 7] = std::array::from_fn(|i| ratio(i as u8) / 2560.0);
@@ -3149,6 +3266,604 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn exited_writer_keeps_the_first_io_failure_for_publish_and_commands() {
+        let (bus, wire) = fake_bus(Wire {
+            write_chunk: 5,
+            fail_after: Some(5),
+            ..Wire::default()
+        });
+        let handle = BusHandle::start(bus).unwrap();
+        let until = Instant::now() + Duration::from_secs(1);
+        while !handle.join.as_ref().unwrap().is_finished() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(handle.join.as_ref().unwrap().is_finished());
+        let first = handle.send(stopped_setpoints()).unwrap_err();
+        assert!(first.contains("serial batch J1"), "{first}");
+        assert!(first.contains("wrote 5/20 command bytes"), "{first}");
+        assert!(matches!(handle.drain().1, Some(BusError::Io(ref e)) if e == &first));
+        wire.lock().unwrap().read_error = Some(io::ErrorKind::ConnectionReset);
+        let until = Instant::now() + Duration::from_secs(1);
+        while !handle.reader.as_ref().unwrap().is_finished() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(handle.reader.as_ref().unwrap().is_finished());
+        assert!(matches!(handle.drain().1, Some(BusError::Io(ref e)) if e == &first));
+        assert_eq!(handle.send(stopped_setpoints()).unwrap_err(), first);
+        assert_eq!(
+            handle.write_blocking(stopped_setpoints()).unwrap_err(),
+            first
+        );
+        assert_eq!(handle.disable().unwrap_err(), first);
+        assert_eq!(wire.lock().unwrap().written.len(), 5);
+    }
+
+    #[test]
+    fn configured_motion_above_the_old_compensation_cap_keeps_transmitting() {
+        for (speed, weight, friction) in [
+            (-0.21, 1.0, false),
+            (0.6, 1.0, false),
+            (0.6, 0.0, false),
+            (-0.6, 1.0, true),
+        ] {
+            let (bus, _wire) = fake_bus(Wire {
+                write_chunk: COMMAND_LEN,
+                ..Wire::default()
+            });
+            let handle = BusHandle::start(bus).unwrap();
+            let mut velocity = [0.0; 7];
+            velocity[5] = speed;
+            let mut reference =
+                Reference::joint(Instant::now(), [0.0; 7], velocity, [0.0; 7], 1, 0);
+            reference.joint_velocity = [1.0; 7];
+            reference.servo_tuning.friction_enabled = friction;
+            reference.servo_tuning.joints[5].velocity_ff = weight;
+            reference.servo_tuning.joints[5].coulomb = 0.2;
+            let values = std::array::from_fn(|i| Setpoint {
+                mode: DriveMode::Servo,
+                q: 0.0,
+                dq: velocity[i],
+                tau: 0.0,
+                kp: 60.0,
+                kd: 10.0,
+            });
+            handle.publish(values, 1, reference).unwrap();
+            let until = Instant::now() + Duration::from_millis(500);
+            while handle.latest_reference().is_none()
+                && !handle.join.as_ref().unwrap().is_finished()
+                && Instant::now() < until
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let sent = handle.latest_reference().unwrap_or_else(|| {
+                panic!(
+                    "configured speed {speed}, FF {weight}: {:?}",
+                    handle.drain().1
+                )
+            });
+            assert_eq!(sent.dq[5], speed);
+            assert!(handle.drain().1.is_none());
+            handle.disable().unwrap();
+        }
+    }
+
+    #[test]
+    fn sender_completed_packet_scheduling_gap_does_not_fail_the_next_packet() {
+        let (mut bus, wire) = fake_bus(Wire {
+            write_chunk: COMMAND_LEN,
+            pause_after_servo_packet: Some((2, Duration::from_millis(30))),
+            ..Wire::default()
+        });
+        bus.budget = Duration::from_millis(20);
+        let handle = BusHandle::start(bus).unwrap();
+        let now = Instant::now();
+        let reference = Reference::joint(now, [0.5; 7], [0.0; 7], [0.0; 7], 42, 0);
+        let values = [Setpoint {
+            mode: DriveMode::Servo,
+            q: 0.5,
+            dq: 0.0,
+            tau: 0.0,
+            kp: 60.0,
+            kd: 10.0,
+        }; 7];
+        handle.publish(values, 1, reference).unwrap();
+        wait_for_protocol(|| {
+            handle.latest_reference().is_some() || handle.join.as_ref().unwrap().is_finished()
+        });
+        let sent = handle.latest_reference().unwrap_or_else(|| {
+            panic!("completed packet gap killed writer: {:?}", handle.drain().1)
+        });
+        assert_eq!(sent.generation, 42);
+        assert!(handle.drain().1.is_none());
+        let written = {
+            let wire = wire.lock().unwrap();
+            assert!(wire.pause_after_servo_packet.is_none());
+            assert!(wire.command_times.windows(2).any(|pair| {
+                pair[0].0 == 2
+                    && pair[1].0 == 3
+                    && pair[1].1.duration_since(pair[0].1) >= Duration::from_millis(30)
+            }));
+            wire.written.clone()
+        };
+        let servo: Vec<_> = written
+            .as_chunks::<COMMAND_LEN>()
+            .0
+            .iter()
+            .filter(|p| p[2] & 0x70 == 0x10)
+            .take(7)
+            .map(|p| p[2] & 0x0f)
+            .collect();
+        assert_eq!(servo, (0..7).collect::<Vec<_>>());
+        handle.disable().unwrap();
+    }
+
+    #[test]
+    fn sender_priority_command_failure_exits_instead_of_resuming_cached_motion() {
+        for mode in [0, 6] {
+            let (bus, wire) = fake_bus(Wire {
+                write_chunk: COMMAND_LEN,
+                ..Wire::default()
+            });
+            let handle = BusHandle::start(bus).unwrap();
+            let reference = Reference::joint(Instant::now(), [0.5; 7], [0.0; 7], [0.0; 7], 1, 0);
+            handle
+                .publish(
+                    [Setpoint {
+                        mode: DriveMode::Servo,
+                        q: 0.5,
+                        dq: 0.0,
+                        tau: 0.0,
+                        kp: 60.0,
+                        kd: 10.0,
+                    }; 7],
+                    1,
+                    reference,
+                )
+                .unwrap();
+            wait_for_protocol(|| handle.latest_reference().is_some());
+            wire.lock().unwrap().fail_once_for_mode = Some((mode, io::ErrorKind::BrokenPipe));
+            let error = if mode == 0 {
+                handle.disable()
+            } else {
+                handle.write_blocking(
+                    [Setpoint {
+                        mode: DriveMode::ClearFault,
+                        ..stop()
+                    }; 7],
+                )
+            }
+            .unwrap_err();
+            assert!(error.contains("wrote 0/20 command bytes"), "{error}");
+            let after_failure = wire.lock().unwrap().written.len();
+            thread::sleep(WRITE_PERIOD * 3);
+            assert!(
+                handle.join.as_ref().unwrap().is_finished(),
+                "failed priority write left writer alive"
+            );
+            assert_eq!(wire.lock().unwrap().written.len(), after_failure);
+            assert!(handle.latest_reference().is_none());
+            assert_eq!(handle.disable().unwrap_err(), error);
+        }
+    }
+
+    #[test]
+    fn sender_priority_failure_keeps_an_earlier_reader_error() {
+        let (bus, wire) = fake_bus(Wire {
+            write_chunk: COMMAND_LEN,
+            ..Wire::default()
+        });
+        let handle = BusHandle::start(bus).unwrap();
+        wire.lock().unwrap().read_error = Some(io::ErrorKind::ConnectionReset);
+        wait_for_protocol(|| handle.reader.as_ref().unwrap().is_finished());
+        let first = handle.failure.get().unwrap().clone();
+        wire.lock().unwrap().fail_once_for_mode = Some((6, io::ErrorKind::BrokenPipe));
+        let error = handle
+            .write_blocking(
+                [Setpoint {
+                    mode: DriveMode::ClearFault,
+                    ..stop()
+                }; 7],
+            )
+            .unwrap_err();
+        assert_eq!(error, first);
+        wait_for_protocol(|| handle.join.as_ref().unwrap().is_finished());
+        assert_eq!(handle.disable().unwrap_err(), first);
+        assert!(matches!(handle.drain().1, Some(BusError::Io(ref e)) if e == &first));
+    }
+
+    #[test]
+    fn sender_tuning_above_old_software_caps_reaches_prepare_and_wire() {
+        let (bus, wire) = fake_bus(Wire {
+            write_chunk: COMMAND_LEN,
+            ..Wire::default()
+        });
+        let handle = BusHandle::start(bus).unwrap();
+        let mut reference = Reference::joint(Instant::now(), [0.0; 7], [0.4; 7], [0.0; 7], 7, 0);
+        reference.servo_tuning.friction_enabled = true;
+        for joint in &mut reference.servo_tuning.joints {
+            joint.kd = 50.0;
+            joint.velocity_ff = 1.5;
+            joint.coulomb = 3.0;
+            joint.viscous = 12.0;
+            joint.velocity_scale = 1.0;
+            joint.max_friction = 3.0;
+        }
+        let values = [Setpoint {
+            mode: DriveMode::Servo,
+            q: 0.0,
+            dq: 0.4,
+            tau: 0.0,
+            kp: 60.0,
+            kd: 10.0,
+        }; 7];
+        handle.publish(values, 1, reference.clone()).unwrap();
+        wait_for_protocol(|| {
+            handle.latest_reference().is_some() || handle.join.as_ref().unwrap().is_finished()
+        });
+        let sent = handle
+            .latest_reference()
+            .unwrap_or_else(|| panic!("tuning hit old caps: {:?}", handle.drain().1));
+        assert_eq!(sent.dq, [0.4; 7]);
+        let written = wire.lock().unwrap().written.clone();
+        let packets: Vec<_> = written
+            .as_chunks::<COMMAND_LEN>()
+            .0
+            .iter()
+            .filter(|p| p[2] & 0x70 == 0x10)
+            .take(7)
+            .collect();
+        assert_eq!(packets.len(), 7);
+        let calibration = calibrations("right").unwrap();
+        for (i, packet) in packets.into_iter().enumerate() {
+            let applied = reference.servo_tuning.apply([0.4; 7], [0.0; 7]).unwrap();
+            let expected = encode(
+                i as u8,
+                calibration[i].command(Setpoint {
+                    q: sent.q[i],
+                    dq: applied.dq_feedforward[i],
+                    tau: applied.tau[i],
+                    kd: 50.0,
+                    ..values[i]
+                }),
+            )
+            .unwrap();
+            // Position is sampled on every heartbeat. The first packet's
+            // tuning fields remain the same even if latest_reference advanced.
+            assert_eq!(packet[2], expected[2]);
+            assert_eq!(packet[4..8], expected[4..8]);
+            assert_eq!(packet[12..16], expected[12..16]);
+        }
+        assert!(handle.drain().1.is_none());
+        handle.disable().unwrap();
+    }
+
+    #[test]
+    fn sender_partial_packet_timeout_never_commits_or_retries() {
+        let (bus, wire) = fake_bus(Wire {
+            write_chunk: COMMAND_LEN,
+            ..Wire::default()
+        });
+        let handle = BusHandle::start(bus).unwrap();
+        let reference = Reference::joint(Instant::now(), [0.5; 7], [0.0; 7], [0.0; 7], 1, 0);
+        handle
+            .publish(
+                [Setpoint {
+                    mode: DriveMode::Servo,
+                    q: 0.5,
+                    dq: 0.0,
+                    tau: 0.0,
+                    kp: 60.0,
+                    kd: 10.0,
+                }; 7],
+                1,
+                reference,
+            )
+            .unwrap();
+        wait_for_protocol(|| handle.latest_reference().is_some());
+        let limit = {
+            let mut wire = wire.lock().unwrap();
+            let limit = wire.written.len() + 5;
+            wire.write_chunk = 5;
+            wire.fail_after = Some(limit);
+            wire.fail_kind = Some(io::ErrorKind::TimedOut);
+            limit
+        };
+        wait_for_protocol(|| handle.join.as_ref().unwrap().is_finished());
+        let error = handle.disable().unwrap_err();
+        assert!(error.contains("deadline expired"), "{error}");
+        assert!(error.contains("wrote 5/20 command bytes"), "{error}");
+        assert!(matches!(handle.drain().1, Some(BusError::Io(ref e)) if e == &error));
+        assert!(handle.latest_reference().is_none());
+        assert_eq!(wire.lock().unwrap().written.len(), limit);
+    }
+
+    #[test]
+    fn sender_torque_uses_the_friction_parameter_and_final_encoder() {
+        for sign in [-1.0, 1.0] {
+            let (bus, wire) = fake_bus(Wire {
+                write_chunk: COMMAND_LEN,
+                ..Wire::default()
+            });
+            let handle = BusHandle::start(bus).unwrap();
+            let mut reference =
+                Reference::joint(Instant::now(), [0.0; 7], [sign * 0.4; 7], [0.0; 7], 1, 0);
+            reference.servo_tuning.friction_enabled = true;
+            for joint in &mut reference.servo_tuning.joints {
+                joint.coulomb = 30.0;
+                joint.max_friction = 20.0;
+            }
+            let values = [Setpoint {
+                mode: DriveMode::Servo,
+                q: 0.0,
+                dq: sign * 0.4,
+                tau: sign * 12.0,
+                kp: 60.0,
+                kd: 10.0,
+            }; 7];
+            handle.publish(values, 1, reference).unwrap();
+            wait_for_protocol(|| {
+                handle.latest_reference().is_some() || handle.join.as_ref().unwrap().is_finished()
+            });
+            assert!(
+                handle.latest_reference().is_some(),
+                "torque rejected before encoder: {:?}",
+                handle.drain().1
+            );
+            let packets: Vec<_> = wire
+                .lock()
+                .unwrap()
+                .written
+                .as_chunks::<COMMAND_LEN>()
+                .0
+                .iter()
+                .filter(|p| p[2] & 0x70 == 0x10)
+                .take(7)
+                .copied()
+                .collect();
+            assert_eq!(packets.len(), 7);
+            let calibration = calibrations("right").unwrap();
+            for (i, packet) in packets.into_iter().enumerate() {
+                let expected = encode(
+                    i as u8,
+                    calibration[i].command(Setpoint {
+                        tau: sign * 32.0,
+                        ..values[i]
+                    }),
+                )
+                .unwrap();
+                assert_eq!(packet[4..6], expected[4..6]);
+            }
+            assert!(handle.drain().1.is_none());
+            handle.disable().unwrap();
+        }
+        let (bus, wire) = fake_bus(Wire {
+            write_chunk: COMMAND_LEN,
+            ..Wire::default()
+        });
+        let handle = BusHandle::start(bus).unwrap();
+        let reference = Reference::joint(Instant::now(), [0.0; 7], [0.0; 7], [0.0; 7], 1, 0);
+        let values = [Setpoint {
+            mode: DriveMode::Servo,
+            q: 0.0,
+            dq: 0.0,
+            tau: 170.0,
+            kp: 60.0,
+            kd: 10.0,
+        }; 7];
+        handle.publish(values, 1, reference).unwrap();
+        wait_for_protocol(|| handle.join.as_ref().unwrap().is_finished());
+        let error = handle.disable().unwrap_err();
+        assert!(error.contains("SDK range"), "{error}");
+        assert!(handle.latest_reference().is_none());
+        assert!(
+            wire.lock()
+                .unwrap()
+                .written
+                .as_chunks::<COMMAND_LEN>()
+                .0
+                .iter()
+                .all(|p| p[2] & 0x70 == 0)
+        );
+    }
+
+    #[test]
+    fn sender_calibration_requires_a_representable_gain_instead_of_a_numeric_floor() {
+        let source = (0..7)
+            .map(|i| format!("{i} 1 1e-8 0"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let calibration = parse_calibration(&source).unwrap();
+        let (mut bus, wire) = fake_bus(Wire {
+            write_chunk: COMMAND_LEN,
+            ..Wire::default()
+        });
+        bus.calibration = calibration;
+        let handle = BusHandle::start(bus).unwrap();
+        let reference = Reference::joint(Instant::now(), [0.0; 7], [0.0; 7], [0.0; 7], 1, 0);
+        handle
+            .publish(
+                [Setpoint {
+                    mode: DriveMode::Servo,
+                    q: 0.0,
+                    dq: 0.0,
+                    tau: 0.0,
+                    kp: 60.0,
+                    kd: 10.0,
+                }; 7],
+                1,
+                reference,
+            )
+            .unwrap();
+        wait_for_protocol(|| {
+            handle.latest_reference().is_some() || handle.join.as_ref().unwrap().is_finished()
+        });
+        assert!(
+            handle.latest_reference().is_some(),
+            "{:?}",
+            handle.drain().1
+        );
+        assert!(
+            wire.lock()
+                .unwrap()
+                .written
+                .as_chunks::<COMMAND_LEN>()
+                .0
+                .iter()
+                .any(|p| p[2] & 0x70 == 0x10)
+        );
+        handle.disable().unwrap();
+        for (direction, scale) in [("0", "1"), ("1", "0"), ("3e38", "3e38"), ("1e-30", "1e-30")] {
+            let source = (0..7)
+                .map(|i| format!("{i} {direction} {scale} 0"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                parse_calibration(&source).is_err(),
+                "gain={direction}*{scale}"
+            );
+        }
+    }
+
+    #[test]
+    fn tuning_kd_validation_matches_the_actual_encoder() {
+        for index in 0..7 {
+            for kd in [
+                0.0,
+                30.0,
+                30.0001,
+                50.0,
+                102.68,
+                102.68131,
+                102.69,
+                103.0,
+                f32::MAX as f64,
+                f64::MAX,
+            ] {
+                let mut tuning = crate::tuning::ServoTuning::default();
+                tuning.joints[index].kd = kd;
+                let mut value = stop();
+                value.mode = DriveMode::Servo;
+                value.kd = kd;
+                assert_eq!(
+                    tuning.validate().is_ok(),
+                    encode(index as u8, value).is_ok(),
+                    "J{} kd={kd}",
+                    index + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sender_clear_fault_is_sent_once_without_periodic_action_retries() {
+        for published in [false, true] {
+            let (bus, wire) = fake_bus(Wire {
+                write_chunk: COMMAND_LEN,
+                ..Wire::default()
+            });
+            let handle = BusHandle::start(bus).unwrap();
+            let values = [Setpoint {
+                mode: DriveMode::ClearFault,
+                ..stop()
+            }; 7];
+            if published {
+                let reference =
+                    Reference::joint(Instant::now(), [0.0; 7], [0.0; 7], [0.0; 7], 1, 0);
+                handle.publish(values, 1, reference).unwrap();
+            } else {
+                handle.write_blocking(values).unwrap();
+            }
+            wait_for_protocol(|| {
+                wire.lock()
+                    .unwrap()
+                    .written
+                    .as_chunks::<COMMAND_LEN>()
+                    .0
+                    .iter()
+                    .any(|p| p[2] & 0x70 == 0x60)
+            });
+            thread::sleep(WRITE_PERIOD * 4);
+            handle.disable().unwrap();
+            let clears = wire
+                .lock()
+                .unwrap()
+                .written
+                .as_chunks::<COMMAND_LEN>()
+                .0
+                .iter()
+                .filter(|p| p[2] & 0x70 == 0x60)
+                .count();
+            assert_eq!(
+                clears, 7,
+                "ClearFault was retried by the heartbeat (published={published})"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires R17A_CALIBRATION_TRACE pointing to a private calibration capture"]
+    fn recorded_calibration_tail_keeps_compensation_within_configured_motion() {
+        let path = std::env::var("R17A_CALIBRATION_TRACE").expect("set the capture path");
+        let capture: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let points = capture["curves"].as_array().unwrap();
+        let last = &points[points.len() - 1];
+        let previous = &points[points.len() - 2];
+        let dt = (last["t_ms"].as_f64().unwrap() - previous["t_ms"].as_f64().unwrap()) / 1000.0;
+        let q: [f64; 7] = serde_json::from_value(last["reference"].clone()).unwrap();
+        let dq: [f64; 7] = serde_json::from_value(last["velocity"].clone()).unwrap();
+        let previous_dq: [f64; 7] = serde_json::from_value(previous["velocity"].clone()).unwrap();
+        let ddq = std::array::from_fn(|i| (dq[i] - previous_dq[i]) / dt);
+        let program: crate::calibration_path::CartesianProgram =
+            serde_json::from_value(capture["settings"]["cartesian"].clone()).unwrap();
+        let motion = program.motion;
+        let model = Arc::new(crate::kinematics::Kinematics::load(&program.side).unwrap());
+        let origin = model.fk(&program.origin, &program.tcp).unwrap();
+        let mut delta = [0.0; 6];
+        delta[program.segments[0].axis] = program.segments[0].offset;
+        let now = Instant::now();
+        let mut reference = Reference::joint(now, q, dq, ddq, 1, 0);
+        reference.joint_velocity = motion.speed_limits(model.speed_limits());
+        reference.cartesian = Some(crate::reference::CartesianGuard {
+            model,
+            tcp: program.tcp,
+            path: crate::kinematics::CartesianPath {
+                origin,
+                axis: program.segments[0].axis,
+                frame: crate::kinematics::Frame::Base,
+            },
+            goal: Some(
+                crate::kinematics::offset_pose(&origin, delta, crate::kinematics::Frame::Base)
+                    .unwrap(),
+            ),
+        });
+        reference.servo_tuning = serde_json::from_value(capture["baseline"].clone()).unwrap();
+        let source = PublishedSetpoints {
+            values: std::array::from_fn(|i| Setpoint {
+                mode: DriveMode::Servo,
+                q: q[i],
+                dq: dq[i],
+                tau: 0.0,
+                kp: 60.0,
+                kd: 10.0,
+            }),
+            seq: 1,
+            reference: Some(reference),
+        };
+        let sample = source
+            .prepare(now + Duration::from_millis(10), None)
+            .unwrap();
+        println!(
+            "recorded J6 {:.9}, continued 10 ms {:.9} rad/s",
+            dq[5], sample.motion_velocity[5]
+        );
+        assert!(dq[5].abs() < 0.2 && sample.motion_velocity[5].abs() > 0.2);
+        assert!(sample.motion_velocity[5].abs() < motion.joint_speed);
+        assert_eq!(sample.values[5].dq, sample.motion_velocity[5]);
+        assert!(sample.rejection.is_none());
     }
 
     #[test]

@@ -177,14 +177,14 @@ export interface CalibrationStatus {
   live?: CalibrationPoint | null;
   report: CalibrationReport | null;
 }
-export const SERVO_TUNING_RANGES = {
-  kd: [0, 30],
-  velocity_ff: [0, 1],
-  coulomb: [0, 2],
-  viscous: [0, 10],
-  velocity_scale: [0.001, 0.2],
-  max_friction: [0, 2],
-} as const;
+const SERVO_TUNING_FIELDS = [
+  "kd",
+  "velocity_ff",
+  "coulomb",
+  "viscous",
+  "velocity_scale",
+  "max_friction",
+] as const;
 export function createServoTuning(): ServoTuning {
   return {
     friction_enabled: false,
@@ -208,13 +208,12 @@ export function isServoTuning(value: unknown): value is ServoTuning {
     Array.from(config.joints).every(
       (joint) =>
         joint &&
-        Object.entries(SERVO_TUNING_RANGES).every(([key, [min, max]]) => {
-          const number = joint[key as keyof JointTuning];
+        SERVO_TUNING_FIELDS.every((key) => {
+          const number = joint[key];
           return (
             typeof number === "number" &&
             Number.isFinite(number) &&
-            number >= min &&
-            number <= max
+            (key === "velocity_scale" ? number > 0 : number >= 0)
           );
         }),
     )
@@ -226,9 +225,7 @@ export function sameServoTuning(a: ServoTuning, b: ServoTuning): boolean {
     a.joints.length === 7 &&
     b.joints.length === 7 &&
     a.joints.every((joint, index) =>
-      (Object.keys(SERVO_TUNING_RANGES) as (keyof JointTuning)[]).every(
-        (key) => joint[key] === b.joints[index][key],
-      ),
+      SERVO_TUNING_FIELDS.every((key) => joint[key] === b.joints[index][key]),
     )
   );
 }
@@ -529,20 +526,12 @@ export interface View {
   baseUrl: string;
   hasControl: boolean;
 }
-export function hasFreshFeedback(view: View, now = performance.now()) {
+export function hasJointFeedback(view: View) {
   const s = view.snapshot;
-  const elapsed = Math.max(0, now - view.receivedAt);
-  const fresh = (age: number | null) =>
-    age !== null &&
-    Number.isFinite(age) &&
-    age >= 0 &&
-    age + elapsed <= FEEDBACK_MAX_AGE_MS;
   return (
     view.online &&
     !["disconnected", "connecting", "closing"].includes(s.phase) &&
-    fresh(s.feedback_age_ms) &&
-    isJointPositions(s.joints.map((joint) => joint.q)) &&
-    s.joints.every((joint) => fresh(joint.age_ms))
+    isJointPositions(s.joints.map((joint) => joint.q))
   );
 }
 class DesktopApi {
@@ -1117,24 +1106,14 @@ class DesktopApi {
     if (this.cancelReturn) throw new Error("正在返回收纳位");
     if (!isJointPositions(params.joints))
       throw new Error("收纳位必须包含七个有效关节位置");
-    if (
-      !Number.isFinite(params.speed) ||
-      params.speed <= 0 ||
-      params.speed > 0.2
-    )
-      throw new Error("返回速度须大于 0，且不超过 0.20 rad/s");
+    if (!Number.isFinite(params.speed) || params.speed <= 0)
+      throw new Error("返回速度须为有限正数");
     const s = this.view.snapshot;
-    if (!hasFreshFeedback(this.view))
-      throw new Error("需要完整、新鲜的七轴反馈");
+    if (!hasJointFeedback(this.view))
+      throw new Error("需要完整、有效的七轴反馈");
     if (!s.enabled || s.phase !== "ready" || s.action || this.jog)
       throw new Error("请先停止动作，并等待使能就绪");
     if (!this.view.hasControl) throw new Error("请先取得控制权");
-    if (
-      params.joints.some(
-        (q, index) => Math.abs(q - s.joints[index].q!) > Math.PI * 2,
-      )
-    )
-      throw new Error("返回行程不能超过单轴一圈（2π rad）");
     const generation = s.generation;
     return new Promise<Result>((resolve, reject) => {
       let settled = false;
@@ -1237,15 +1216,6 @@ class DesktopApi {
       if (this.jog !== jog) return;
       jog.timer = setInterval(() => {
         if (this.jog !== jog || jog.updating) return;
-        if (
-          this.view.snapshot.feedback_age_ms === null ||
-          this.view.snapshot.feedback_age_ms +
-            Math.max(0, performance.now() - this.view.receivedAt) >
-            FEEDBACK_MAX_AGE_MS
-        ) {
-          void this.cancelJog("feedback_stale").catch((e) => this.fail(e));
-          return;
-        }
         jog.updating = true;
         void this.command(
           "jog_update",

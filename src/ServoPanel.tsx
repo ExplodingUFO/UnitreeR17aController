@@ -3,7 +3,7 @@ import {
   api,
   createServoTuning,
   sameServoTuning,
-  SERVO_TUNING_RANGES,
+  isServoTuning,
   DEFAULT_MOTION_TUNING,
   type MotionTuning,
   type JointTuning,
@@ -145,21 +145,10 @@ function toDraft(config: ServoTuning): Draft {
 function readDraft(draft: Draft): ServoTuning | null {
   if (
     draft.joints.length !== 7 ||
-    draft.joints.some((joint) =>
-      fields.some(({ key }) => {
-        const value = Number(joint[key]);
-        const [min, max] = SERVO_TUNING_RANGES[key];
-        return (
-          !joint[key].trim() ||
-          !Number.isFinite(value) ||
-          value < min ||
-          value > max
-        );
-      }),
-    )
+    draft.joints.some((joint) => fields.some(({ key }) => !joint[key].trim()))
   )
     return null;
-  return {
+  const config = {
     friction_enabled: draft.friction_enabled,
     joints: draft.joints.map((joint) => ({
       kd: Number(joint.kd),
@@ -170,6 +159,7 @@ function readDraft(draft: Draft): ServoTuning | null {
       max_friction: Number(joint.max_friction),
     })) as ServoTuning["joints"],
   };
+  return isServoTuning(config) ? config : null;
 }
 
 export default function ServoPanel({
@@ -301,13 +291,12 @@ export default function ServoPanel({
 
   const invalid = draft.joints.flatMap((joint, index) =>
     fields.flatMap((field) => {
-      const [min, max] = SERVO_TUNING_RANGES[field.key];
       const number = Number(joint[field.key]);
       return !joint[field.key].trim() ||
         !Number.isFinite(number) ||
-        number < min ||
-        number > max
-        ? [{ index, ...field, min, max }]
+        number < 0 ||
+        (field.key === "velocity_scale" && number === 0)
+        ? [{ index, ...field }]
         : [];
     }),
   )[0];
@@ -332,7 +321,7 @@ export default function ServoPanel({
                       ? "等待当前操作完成"
                       : "";
   const validation = invalid
-    ? `J${invalid.index + 1} ${invalid.label}：${invalid.min}–${invalid.max}${invalid.unit === "权重" ? "" : ` ${invalid.unit}`}`
+    ? `J${invalid.index + 1} ${invalid.label}：须为有限${invalid.key === "velocity_scale" ? "正数" : "非负数"}${invalid.unit === "权重" ? "" : ` ${invalid.unit}`}`
     : "";
   const feedback = error || validation || copyFeedback || applyReason;
   const status = pending
@@ -563,13 +552,12 @@ export default function ServoPanel({
                   <tr key={index}>
                     <th scope="row">J{index + 1}</th>
                     {fields.map(({ key, label, unit, step }) => {
-                      const [min, max] = SERVO_TUNING_RANGES[key];
                       const number = Number(joint[key]);
                       const invalid =
                         !joint[key].trim() ||
                         !Number.isFinite(number) ||
-                        number < min ||
-                        number > max;
+                        number < 0 ||
+                        (key === "velocity_scale" && number === 0);
                       return (
                         <td key={key}>
                           <input
@@ -579,9 +567,8 @@ export default function ServoPanel({
                             aria-describedby={
                               invalid ? "servo-feedback" : undefined
                             }
-                            title={`${min}–${max} ${unit}；已应用 ${applied.joints[index][key]}`}
-                            min={min}
-                            max={max}
+                            title={`${key === "velocity_scale" ? "大于 0" : "不小于 0"} ${unit}；已应用 ${applied.joints[index][key]}`}
+                            min={0}
                             step={step}
                             value={joint[key]}
                             data-changed={

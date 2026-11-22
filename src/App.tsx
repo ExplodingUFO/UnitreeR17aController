@@ -10,7 +10,7 @@ import { PanelDivider, usePanelLayout } from "./PanelLayout";
 import {
   api,
   FEEDBACK_MAX_AGE_MS,
-  hasFreshFeedback,
+  hasJointFeedback,
   isJointPositions,
   type JointPositions,
   type Phase,
@@ -208,7 +208,7 @@ export default function App() {
       : s.feedback_age_ms + Math.max(0, now - view.receivedAt);
   const feedbackExpired =
     feedbackAge !== null && feedbackAge > FEEDBACK_MAX_AGE_MS;
-  const valid = hasFreshFeedback(view, now);
+  const valid = hasJointFeedback(view);
   const feedbackStatus = !connected
     ? "未连接"
     : feedbackAge === null
@@ -238,9 +238,7 @@ export default function App() {
           : enableInProgress
             ? "使能中"
             : !valid
-              ? feedbackExpired
-                ? "反馈过期"
-                : "等待反馈"
+              ? "等待反馈"
               : !s.enabled
                 ? "未使能"
                 : space === "cartesian" && !s.tcp_configured
@@ -400,6 +398,12 @@ export default function App() {
       api.fail(new Error("请输入大于 0 的速度"));
       return;
     }
+    const amount = angular ? angularStep / DEG : linearStep / 1000;
+    if (mode === "step" && (!Number.isFinite(amount) || amount <= 0)) {
+      pointer.current = null;
+      api.fail(new Error("请输入大于 0 的步长"));
+      return;
+    }
     setPressed(`${axis}:${direction}`);
     api.clearError();
     const params = { space, axis, direction, speed, frame };
@@ -419,7 +423,7 @@ export default function App() {
           "step",
           {
             ...params,
-            amount: angular ? angularStep / DEG : linearStep / 1000,
+            amount,
           },
           id,
         )
@@ -945,18 +949,10 @@ export default function App() {
                     <input
                       aria-label="平移步长 mm"
                       type="number"
-                      min="0.1"
-                      max="10"
-                      step="0.1"
+                      min="0"
+                      step="any"
                       value={linearStep}
-                      onChange={(e) =>
-                        setLinearStep(
-                          Math.max(
-                            0.1,
-                            Math.min(10, Number(e.target.value) || 0.1),
-                          ),
-                        )
-                      }
+                      onChange={(e) => setLinearStep(Number(e.target.value))}
                     />
                   </label>
                 )}
@@ -967,18 +963,10 @@ export default function App() {
                   <input
                     aria-label="角度步长 度"
                     type="number"
-                    min="0.1"
-                    max="5"
-                    step="0.1"
+                    min="0"
+                    step="any"
                     value={angularStep}
-                    onChange={(e) =>
-                      setAngularStep(
-                        Math.max(
-                          0.1,
-                          Math.min(5, Number(e.target.value) || 0.1),
-                        ),
-                      )
-                    }
+                    onChange={(e) => setAngularStep(Number(e.target.value))}
                   />
                 </label>
               </>
@@ -1194,7 +1182,6 @@ export default function App() {
           side={safetyDevice.side}
           port={safetyDevice.port}
           view={view}
-          now={now}
           stoppingFrom={safetyStopGeneration}
           enablePending={!!enablePending}
           motionPending={!!motionPending}
@@ -1206,7 +1193,6 @@ export default function App() {
   );
 }
 type ParkingPose = { joints: JointPositions; savedAt: number };
-const RETURN_MAX_DEGREES = Math.floor(0.2 * DEG * 100) / 100;
 function readParkingPose(key: string): {
   pose: ParkingPose | null;
   error: string;
@@ -1240,7 +1226,6 @@ function ParkingDialog({
   side,
   port,
   view,
-  now,
   stoppingFrom,
   enablePending,
   motionPending,
@@ -1250,7 +1235,6 @@ function ParkingDialog({
   side: Side;
   port: string;
   view: View;
-  now: number;
   stoppingFrom: number | null;
   enablePending: boolean;
   motionPending: boolean;
@@ -1277,7 +1261,7 @@ function ParkingDialog({
     view.online &&
     matchedDevice &&
     !["disconnected", "connecting", "closing"].includes(s.phase);
-  const fresh = connected && hasFreshFeedback(view, now);
+  const hasFeedback = connected && hasJointFeedback(view);
   const moving =
     view.online &&
     (!!s.action || motionPending || ["moving", "stopping"].includes(s.phase));
@@ -1285,18 +1269,9 @@ function ParkingDialog({
     view.online && stoppingFrom !== null && s.generation === stoppingFrom;
   const enabling = enablePending || s.phase === "enabling";
   const saveAllowed =
-    fresh && !moving && !waitingForStop && !enabling && !pending;
+    hasFeedback && !moving && !waitingForStop && !enabling && !pending;
   const validSpeed =
-    speed.trim() !== "" &&
-    Number.isFinite(Number(speed)) &&
-    Number(speed) > 0 &&
-    Number(speed) <= RETURN_MAX_DEGREES;
-  const overTravel =
-    fresh &&
-    !!stored.pose &&
-    stored.pose.joints.some(
-      (q, index) => Math.abs(q - s.joints[index].q!) > Math.PI * 2,
-    );
+    speed.trim() !== "" && Number.isFinite(Number(speed)) && Number(speed) > 0;
   const returnReason = !port
     ? "请先选择串口。"
     : !stored.pose
@@ -1313,13 +1288,11 @@ function ParkingDialog({
                 ? "请等待使能完成。"
                 : !s.enabled || s.phase !== "ready"
                   ? "需要使能就绪后返回。"
-                  : !fresh
-                    ? "需要完整、新鲜的七轴反馈。"
-                    : overTravel
-                      ? "返回行程超过单轴一圈。"
-                      : !validSpeed
-                        ? `速度须大于 0，且不超过 ${RETURN_MAX_DEGREES}°/s。`
-                        : "";
+                  : !hasFeedback
+                    ? "需要完整、有效的七轴反馈。"
+                    : !validSpeed
+                      ? "速度须为有限正数。"
+                      : "";
   const releaseAllowed =
     !pending &&
     !moving &&
@@ -1352,7 +1325,7 @@ function ParkingDialog({
       !port ||
       snapshot.side !== side ||
       snapshot.port !== port ||
-      !hasFreshFeedback(current) ||
+      !hasJointFeedback(current) ||
       snapshot.action ||
       motionPending ||
       ["moving", "stopping", "enabling"].includes(snapshot.phase) ||
@@ -1549,15 +1522,13 @@ function ParkingDialog({
             <input
               id="parking-speed"
               type="number"
-              min="0.1"
-              max={RETURN_MAX_DEGREES}
-              step="0.5"
+              min="0"
+              step="any"
               value={speed}
               disabled={!!pending}
               onChange={(event) => setSpeed(event.target.value)}
             />
             <span>°/s</span>
-            <small>最高 {RETURN_MAX_DEGREES}°/s</small>
           </label>
           {returnReason && !pending && (
             <p className="parking-hint">{returnReason}</p>
