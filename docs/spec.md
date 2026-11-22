@@ -64,7 +64,7 @@ Tauri 命令只向打包的主窗口开放，不授权远程页面。开发与�
 
 窗口最小尺寸为 800×600。控制页同时显示连接、七轴反馈、3D、末端坐标和点动；日志默认收起。点动面板的“参数”按钮打开伺服调试弹窗，控制页保持原有设置与 3D 视角。“接口”页包含接入信息、接口参考和请求结果，顶部“日志”页提供完整日志与筛选。各页面保留停止按钮，切走控制页时结束连续点动。布局测量结果见测试记录。
 
-“日志”页分为事件和采样。采样默认 10 秒，可选 1–20 秒；端口已连接时可开始，无需控制权或使能。界面显示“控制参考 · 实际发送 · 关节反馈”、采样状态、样本/写入/待写/丢弃/错误数，完成或失败后可下载 JSON，写入中暂不可下载。“停止采样”只结束记录，工作台停止按钮继续负责取消机械臂动作。
+控制页 3D 标题栏直接提供录制时长、录制/停止和“记录”按钮；“记录”打开最近录制与下载弹窗，不切页。录制默认 10 秒，可选 1–20 秒；端口已连接时可开始，无需控制权或使能。界面显示“控制参考 · 实际发送 · 关节反馈”、采样状态、样本/写入/待写/丢弃/错误数，完成或失败后可下载 JSON，写入中暂不可下载。“停止录制”只结束记录，工作台停止按钮继续负责取消机械臂动作。
 
 伺服调试弹窗提供全局摩擦开关及 J1..J7 的阻尼、速度前馈权重和摩擦参数草稿，可恢复基线、显式应用或复制 JSON。关闭并重开保留本次连接的草稿和上次编辑位置，连接变化时重置草稿。打开弹窗结束按住连续点动；停止按钮持续可用，Esc 停止并关闭，Tab 焦点在弹窗内循环，关闭后返回入口按钮。编辑与恢复基线只更新草稿；取得控制权、连接就绪且无动作后才能应用。连接、断开均恢复后端基线，参数不自动持久化。
 
@@ -150,7 +150,7 @@ Tauri 命令只向打包的主窗口开放，不授权远程页面。开发与�
 | src-tauri/src/server.rs                                              | HTTP/WS、序列化、会话与请求映射                          | 网络连接与慢消费者处理；日志查询移交 spawn_blocking        |
 | src-tauri/src/journal.rs                                             | SQLite 结构化事件、只读查询与原子统计                    | 队列单次尝试取锁、专用 writer、事务/重试/保留与 checkpoint |
 | src-tauri/src/trace.rs                                               | 有界短时采样、采样汇总与读取                             | 预分配队列、独立 SQLite writer、保留与采样计数             |
-| src/App.tsx、PanelLayout.tsx、RobotScene.tsx、TracePanel.tsx、ServoPanel.tsx、api.ts | 工作台、面板尺寸、三维渲染、采样、伺服调试、单一本机客户端         | 不拥有设备运动状态                                         |
+| src/App.tsx、PanelLayout.tsx、RobotScene.tsx、TracePanel.tsx、LogsPanel.tsx、ServoPanel.tsx、api.ts | 工作台、面板尺寸、三维渲染、采样、伺服调试、单一本机客户端         | 不拥有设备运动状态                                         |
 
 同一 Rust 应用里，串口与控制用专用线程，网络使用异步运行时，渲染在 WebView。命令交接有界，状态发送采用最新快照；慢 UI/订阅者不能阻塞电机循环。
 
@@ -166,6 +166,8 @@ arm 独占求解 seed、上个已接受参考和当前目标。kinematics 只计
 
 保留最近 100000 条事件，清理和 checkpoint 均在 writer 执行。`recent` 是阻塞只读接口，server 必须使用 spawn_blocking；按 id 降序、limit 最多 500。`shutdown(timeout)` 仅供应用关闭协调线程有界等待，超时返回失败并请求后台停止；不承诺强制中断 OS 调用，Drop 不阻塞。
 
+日志页读取 SQLite 历史，重启后保留，按 25/50/100 条分页并搜索全库。第一页每 2 秒刷新，翻页沿用 `through_id` 固定记录范围；新增日志不会推移旧页，最近 100000 条保留上限仍生效。时间同时显示日期，分页栏总数与本次运行写入数分开。
+
 短时采样单独存放在 `events.sqlite3.traces.sqlite3`，保留最近 10 次，每次最多接纳前 100000 次样本提交尝试。预分配队列容量为 4096，内联完整伺服配置后样本存储约 5 MiB（不含 writer/SQLite 开销）；生产者使用 `Mutex.try_lock`，竞争或满队列时立即丢弃并计数，路径中无等待、SQL、JSON 编码或分配。独立 writer 轮询并取出数据后执行序列化与 SQLite 写入。采样的 `accepted/written/pending/dropped/errors` 按次统计，与事件 `journal` 统计分开。
 
 ## 6. 本机接口 v1
@@ -179,6 +181,7 @@ arm 独占求解 seed、上个已接受参考和当前目标。kinematics 只计
 | POST /v1/control      | acquire / renew / release                                                                                                     | 控制模块决定后返回结果；控制者获得私有租约凭据          |
 | POST /v1/commands     | connect / disconnect / enable / disable / clear_fault / configure_tcp / configure_servo / jog_start / jog_update / step / return_to_pose / stop | 请求入队不等于被控制器接受或设备执行完成                |
 | GET /v1/logs?limit=50 | 最近结构化事件                                                                                                                | 按 id 降序，最多 500 条；阻塞读通过 spawn_blocking 执行 |
+| GET /v1/logs/page     | 持久化日志搜索与分页；page/page_size/search/through_id                                                                         | 200 {items,page,page_size,total,total_pages,through_id}；spawn_blocking 只读事务 |
 | GET /v1/traces        | 最近采样汇总                                                                                                                  | 默认 limit=20，实际限制到 1..10                         |
 | POST /v1/traces       | 开始短时观察，duration_ms 默认 10000、范围 1000..20000                                                                        | 200 TraceSummary；需要已有端口连接，无需租约            |
 | POST /v1/traces/stop  | 结束当前采样                                                                                                                  | 200 TraceSummary 或 null；不取消机械臂动作              |

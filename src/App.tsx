@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import RobotScene from "./RobotScene";
 import ApiPanel from "./ApiPanel";
 import TracePanel from "./TracePanel";
+import LogsPanel from "./LogsPanel";
 import ServoPanel from "./ServoPanel";
 import { PanelDivider, usePanelLayout } from "./PanelLayout";
 import {
@@ -69,8 +70,6 @@ function quaternion(values: number[]): [number, number, number, number] {
 export default function App() {
   const layout = usePanelLayout();
   const [page, setPage] = useState<Page>(currentPage);
-  const [logTab, setLogTab] = useState<"events" | "traces">("events");
-  const [logFilter, setLogFilter] = useState("");
   const [view, setView] = useState<View>(api.view);
   const [now, setNow] = useState(performance.now());
   const [side, setSide] = useState<Side>("right");
@@ -462,14 +461,6 @@ export default function App() {
       ? result?.message
       : "");
   const error = view.error || fault;
-  const shownLogs =
-    page === "logs"
-      ? view.logs.filter((log) =>
-          `${log.source} ${log.code} ${log.message} ${log.request_id ?? ""}`
-            .toLowerCase()
-            .includes(logFilter.toLowerCase()),
-        )
-      : view.logs;
   return (
     <div
       className="workbench"
@@ -707,6 +698,11 @@ export default function App() {
           <div className="panel scene-panel">
             <div className="panel-heading">
               <h2>{modelSide === "right" ? "右臂" : "左臂"}</h2>
+              <TracePanel
+                online={view.online}
+                connected={connected}
+                visible={page === "control"}
+              />
             </div>
             <RobotScene
               side={modelSide}
@@ -1023,50 +1019,7 @@ export default function App() {
       >
         <div className="logs-heading">
           <h2>日志</h2>
-          {page === "logs" && (
-            <div
-              className="logs-view-tabs"
-              role="tablist"
-              aria-label="日志类型"
-              onKeyDown={(event) => {
-                const next =
-                  event.key === "Home"
-                    ? "events"
-                    : event.key === "End"
-                      ? "traces"
-                      : ["ArrowLeft", "ArrowRight"].includes(event.key)
-                        ? logTab === "events"
-                          ? "traces"
-                          : "events"
-                        : null;
-                if (next === null) return;
-                event.preventDefault();
-                setLogTab(next);
-                document.getElementById(`log-tab-${next}`)?.focus();
-              }}
-            >
-              {(["events", "traces"] as const).map((tab) => (
-                <button
-                  key={tab}
-                  type="button"
-                  id={`log-tab-${tab}`}
-                  role="tab"
-                  aria-selected={logTab === tab}
-                  aria-controls={
-                    tab === "events" ? "logs-scroll" : "trace-panel"
-                  }
-                  tabIndex={logTab === tab ? 0 : -1}
-                  onClick={() => setLogTab(tab)}
-                >
-                  {tab === "events" ? "事件" : "采样"}
-                </button>
-              ))}
-            </div>
-          )}
-          <div
-            className="journal-counts"
-            hidden={page === "logs" && logTab === "traces"}
-          >
+          <div className="journal-counts">
             {!s.journal.healthy && <span className="warning">写入异常</span>}
             <span>
               本次写入 <b>{s.journal.written}</b>
@@ -1078,18 +1031,6 @@ export default function App() {
               丢弃 <b>{s.journal.dropped}</b>
             </span>
           </div>
-          {page === "logs" && logTab === "events" && (
-            <label className="log-filter">
-              <span>筛选</span>
-              <input
-                type="search"
-                aria-label="筛选日志"
-                placeholder="来源、编号或内容"
-                value={logFilter}
-                onChange={(event) => setLogFilter(event.target.value)}
-              />
-            </label>
-          )}
           <span className="endpoint" title={view.baseUrl}>
             {view.baseUrl || "服务未连接"}
           </span>
@@ -1115,53 +1056,38 @@ export default function App() {
             </button>
           )}
         </div>
-        {page === "logs" && logTab === "traces" ? (
-          <TracePanel online={view.online} connected={connected} />
-        ) : (
-          <div
-            className="logs-scroll"
-            id="logs-scroll"
-            role={page === "logs" ? "tabpanel" : undefined}
-            aria-labelledby={page === "logs" ? "log-tab-events" : undefined}
-          >
-            {shownLogs.length ? (
-              <table>
-                {page === "logs" && (
-                  <thead>
-                    <tr>
-                      <th>时间</th>
-                      <th>级别</th>
-                      <th>来源</th>
-                      <th>编号</th>
-                      <th>内容</th>
-                    </tr>
-                  </thead>
-                )}
-                <tbody>
-                  {shownLogs.map((log) => (
-                    <tr key={log.id}>
-                      <td>
-                        {new Date(log.ts_ms).toLocaleTimeString("zh-CN", {
-                          hour12: false,
-                        })}
-                      </td>
-                      <td className={`log-level ${log.level.toLowerCase()}`}>
-                        {log.level}
-                      </td>
-                      <td>{log.source}</td>
-                      <td title={log.code}>{log.code}</td>
-                      <td title={log.message}>{log.message}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            ) : (
-              <div className="logs-empty">
-                {logFilter && page === "logs" ? "没有匹配的日志" : "暂无日志"}
-              </div>
-            )}
-          </div>
-        )}
+        <div
+          className="logs-scroll"
+          id="logs-scroll"
+          hidden={page !== "control"}
+        >
+          {view.logs.length ? (
+            <table>
+              <tbody>
+                {view.logs.map((log) => (
+                  <tr key={log.id}>
+                    <td>
+                      {new Date(log.ts_ms).toLocaleTimeString("zh-CN", {
+                        hour12: false,
+                      })}
+                    </td>
+                    <td className={`log-level ${log.level.toLowerCase()}`}>
+                      {log.level}
+                    </td>
+                    <td>{log.source}</td>
+                    <td title={log.code}>{log.code}</td>
+                    <td title={log.message}>{log.message}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <div className="logs-empty">暂无日志</div>
+          )}
+        </div>
+        <div className="log-history-container" hidden={page !== "logs"}>
+          <LogsPanel online={view.online} active={page === "logs"} />
+        </div>
       </section>
       <ServoPanel
         key={

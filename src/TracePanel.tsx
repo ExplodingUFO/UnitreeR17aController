@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { api, type TraceSummary } from "./api";
 
 const statusLabels: Record<TraceSummary["status"], string> = {
@@ -21,10 +22,13 @@ const errorText = (error: unknown) =>
 export default function TracePanel({
   online,
   connected,
+  visible,
 }: {
   online: boolean;
   connected: boolean;
+  visible: boolean;
 }) {
+  const [open, setOpen] = useState(false);
   const [duration, setDuration] = useState("10");
   const [traces, setTraces] = useState<TraceSummary[]>([]);
   const [listState, setListState] = useState<"loading" | "ready" | "error">(
@@ -40,6 +44,21 @@ export default function TracePanel({
   const actionRequest = useRef<AbortController | null>(null);
   const downloadRequest = useRef<AbortController | null>(null);
   const downloadUrls = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  const dialog = useRef<HTMLElement>(null);
+  const historyButton = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    if (!visible) setOpen(false);
+  }, [visible]);
+
+  useEffect(() => {
+    if (!open) return;
+    dialog.current?.querySelector<HTMLButtonElement>("button")?.focus();
+    const trigger = historyButton.current;
+    return () => {
+      if (trigger?.getClientRects().length) trigger.focus();
+    };
+  }, [open]);
 
   useEffect(() => {
     if (!online) return;
@@ -190,22 +209,27 @@ export default function TracePanel({
     }
   };
 
+  const status = !online
+    ? "服务未连接"
+    : recording
+      ? "正在录制"
+      : active && traces.some((trace) => trace.status === "writing")
+        ? "写入中"
+        : !connected
+          ? "端口未连接"
+          : "录制就绪";
+
   return (
-    <div
-      className="trace-panel"
-      id="trace-panel"
-      role="tabpanel"
-      aria-labelledby="log-tab-traces"
-    >
+    <div className="trace-controls">
       <form
         className="trace-toolbar"
+        aria-label="采样录制"
         onSubmit={(event) => {
           event.preventDefault();
-          void changeTrace("start");
+          void changeTrace(recording ? "stop" : "start");
         }}
       >
         <label className="trace-duration" htmlFor="trace-duration">
-          采样时长
           <input
             id="trace-duration"
             type="number"
@@ -214,170 +238,246 @@ export default function TracePanel({
             step="1"
             required
             value={duration}
-            aria-describedby="trace-duration-hint"
+            aria-label="录制时长，秒"
+            title="1–20 秒"
             aria-invalid={!validDuration}
+            disabled={active || !!busy}
             onChange={(event) => setDuration(event.target.value)}
           />
-          秒
+          <span>秒</span>
         </label>
-        <span className="trace-duration-hint" id="trace-duration-hint">
-          1–20 秒
-        </span>
         <button
           type="submit"
-          className="primary"
-          disabled={!canStart}
-          aria-busy={busy === "start"}
-          title={
-            !connected
-              ? "先连接端口"
-              : active
-                ? "等待当前采样写入结束"
-                : undefined
-          }
+          className="trace-toggle"
+          data-recording={recording}
+          disabled={recording ? !canStop : !canStart}
+          aria-busy={busy !== null}
+          aria-label={recording ? "停止录制" : "开始录制"}
+          title={status}
         >
-          {busy === "start" ? "开始中…" : "开始采样"}
+          <span className="trace-indicator" aria-hidden="true" />
+          {busy ? "处理中" : recording ? "停止" : active ? "写入中" : "录制"}
         </button>
         <button
+          ref={historyButton}
           type="button"
-          disabled={!canStop}
-          aria-busy={busy === "stop"}
-          onClick={() => void changeTrace("stop")}
+          className="trace-history-button"
+          aria-label="录制记录"
+          aria-haspopup="dialog"
+          aria-expanded={open}
+          aria-controls="trace-dialog"
+          onClick={() => setOpen(true)}
         >
-          {busy === "stop" ? "停止采样中…" : "停止采样"}
+          记录
         </button>
-        <span className="trace-connection" role="status">
-          {!online ? "服务未连接" : !connected ? "端口未连接" : "端口已连接"}
-        </span>
       </form>
-      <p className="trace-note">控制参考 · 实际发送 · 关节反馈</p>
-      {online && listError && (
-        <p className="trace-error" role="alert">
-          最近采样读取失败：{listError}
-          {traces.length > 0 && "；以下保留上次结果"}
-        </p>
+      {!open && (actionError || (online && listError)) && (
+        <div className="trace-inline-error" role="alert">
+          <button type="button" onClick={() => setOpen(true)}>
+            {actionError || `录制记录读取失败：${listError}`}
+          </button>
+        </div>
       )}
-      {actionError && (
-        <p className="trace-error" role="alert">
-          {actionError}
-        </p>
-      )}
-      {notice && (
-        <p className="trace-note" role="status">
-          {notice}
-        </p>
-      )}
-      <div className="trace-list-heading">
-        <h3 id="trace-list-title">最近采样</h3>
-        <span>
-          {!online
-            ? traces.length
-              ? "上次结果"
-              : "服务未连接"
-            : listState === "loading"
-              ? "读取中…"
-              : `${traces.length} 次`}
-        </span>
-      </div>
-      <div className="trace-list" aria-labelledby="trace-list-title">
-        {traces.length ? (
-          <table className="trace-table">
-            <colgroup>
-              <col />
-              <col className="trace-col-duration" />
-              <col className="trace-col-status" />
-              {Array.from({ length: 5 }, (_, index) => (
-                <col key={index} className="trace-col-count" />
-              ))}
-              <col className="trace-col-download" />
-            </colgroup>
-            <thead>
-              <tr>
-                <th scope="col">开始 / 设备</th>
-                <th scope="col">时长</th>
-                <th scope="col">状态</th>
-                <th scope="col">样本</th>
-                <th scope="col">已写入</th>
-                <th scope="col">待写</th>
-                <th scope="col">丢弃</th>
-                <th scope="col">错误</th>
-                <th scope="col">文件</th>
-              </tr>
-            </thead>
-            <tbody>
-              {traces.map((trace) => {
-                const incomplete =
-                  trace.status === "complete" &&
-                  (trace.pending > 0 ||
-                    trace.errors > 0 ||
-                    trace.written < trace.accepted);
-                const terminal = ["complete", "failed"].includes(trace.status);
-                const device = `${trace.side === "right" ? "右臂" : trace.side === "left" ? "左臂" : trace.side} · ${trace.port ?? "未指定端口"}`;
-                return (
-                  <tr key={trace.id}>
-                    <td title={`采样 ${trace.id}`}>
-                      <time
-                        dateTime={new Date(trace.started_at_ms).toISOString()}
-                        title={new Date(trace.started_at_ms).toLocaleString(
-                          "zh-CN",
-                          { hour12: false },
-                        )}
-                      >
-                        {timeFormat.format(trace.started_at_ms)}
-                      </time>
-                      <small className="trace-device" title={device}>
-                        {device}
-                      </small>
-                    </td>
-                    <td>{trace.duration_ms / 1000} 秒</td>
-                    <td>
-                      <span
-                        className="trace-status"
-                        data-status={incomplete ? "failed" : trace.status}
-                        title={trace.status}
-                      >
-                        {incomplete
-                          ? "写入异常"
-                          : (statusLabels[trace.status] ?? trace.status)}
-                      </span>
-                    </td>
-                    <td>{trace.accepted}</td>
-                    <td>{trace.written}</td>
-                    <td>{trace.pending}</td>
-                    <td className={trace.dropped > 0 ? "warning" : undefined}>
-                      {trace.dropped}
-                    </td>
-                    <td className={trace.errors > 0 ? "danger" : undefined}>
-                      {trace.errors}
-                    </td>
-                    <td>
-                      <button
-                        type="button"
-                        disabled={!online || !terminal || downloading !== null}
-                        aria-busy={downloading === trace.id}
-                        title={!terminal ? "采样与写入结束后可下载" : undefined}
-                        onClick={() => void download(trace)}
-                      >
-                        {downloading === trace.id ? "下载中…" : "下载 JSON"}
-                      </button>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        ) : (
-          <div className="logs-empty">
-            {!online
-              ? "连接服务后查看最近采样"
-              : listState === "loading"
-                ? "正在读取采样记录…"
-                : listState === "error"
-                  ? "暂时无法读取采样记录"
-                  : "暂无采样，连接端口后可开始"}
-          </div>
+      {open &&
+        createPortal(
+          <div
+            className="modal-backdrop trace-backdrop"
+            onClick={(event) => {
+              if (event.target === event.currentTarget) setOpen(false);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") setOpen(false);
+              if (event.key !== "Tab") return;
+              const controls = Array.from(
+                dialog.current?.querySelectorAll<HTMLElement>(
+                  'button:not(:disabled), input:not(:disabled), [tabindex="0"]',
+                ) ?? [],
+              );
+              const first = controls[0];
+              const last = controls[controls.length - 1];
+              if (event.shiftKey && document.activeElement === first) {
+                event.preventDefault();
+                last?.focus();
+              } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault();
+                first?.focus();
+              }
+            }}
+          >
+            <section
+              ref={dialog}
+              className="panel trace-panel"
+              id="trace-dialog"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="trace-title"
+            >
+              <div className="panel-heading">
+                <h2 id="trace-title">录制记录</h2>
+                <span className="trace-dialog-status" role="status">
+                  {status}
+                </span>
+                <button
+                  type="button"
+                  aria-label="关闭录制记录"
+                  onClick={() => setOpen(false)}
+                >
+                  ×
+                </button>
+              </div>
+              <p className="trace-note">控制参考 · 实际发送 · 关节反馈</p>
+              {online && listError && (
+                <p className="trace-error" role="alert">
+                  录制记录读取失败：{listError}
+                </p>
+              )}
+              {actionError && (
+                <p className="trace-error" role="alert">
+                  {actionError}
+                </p>
+              )}
+              {notice && (
+                <p className="trace-note" role="status">
+                  {notice}
+                </p>
+              )}
+              <div className="trace-list-heading">
+                <h3 id="trace-list-title">最近 10 次</h3>
+                <span>
+                  {!online
+                    ? traces.length
+                      ? "上次结果"
+                      : "服务未连接"
+                    : listState === "loading"
+                      ? "读取中…"
+                      : `${traces.length} 次`}
+                </span>
+              </div>
+              <div className="trace-list" aria-labelledby="trace-list-title">
+                {traces.length ? (
+                  <table className="trace-table">
+                    <colgroup>
+                      <col />
+                      <col className="trace-col-duration" />
+                      <col className="trace-col-status" />
+                      {Array.from({ length: 5 }, (_, index) => (
+                        <col key={index} className="trace-col-count" />
+                      ))}
+                      <col className="trace-col-download" />
+                    </colgroup>
+                    <thead>
+                      <tr>
+                        <th scope="col">开始 / 设备</th>
+                        <th scope="col">时长</th>
+                        <th scope="col">状态</th>
+                        <th scope="col">样本</th>
+                        <th scope="col">已写入</th>
+                        <th scope="col">待写</th>
+                        <th scope="col">丢弃</th>
+                        <th scope="col">错误</th>
+                        <th scope="col">文件</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {traces.map((trace) => {
+                        const incomplete =
+                          trace.status === "complete" &&
+                          (trace.pending > 0 ||
+                            trace.errors > 0 ||
+                            trace.written < trace.accepted);
+                        const terminal = ["complete", "failed"].includes(
+                          trace.status,
+                        );
+                        const device = `${trace.side === "right" ? "右臂" : trace.side === "left" ? "左臂" : trace.side} · ${trace.port ?? "未指定端口"}`;
+                        return (
+                          <tr key={trace.id}>
+                            <td title={`采样 ${trace.id}`}>
+                              <time
+                                dateTime={new Date(
+                                  trace.started_at_ms,
+                                ).toISOString()}
+                                title={new Date(
+                                  trace.started_at_ms,
+                                ).toLocaleString("zh-CN", { hour12: false })}
+                              >
+                                {timeFormat.format(trace.started_at_ms)}
+                              </time>
+                              <small className="trace-device" title={device}>
+                                {device}
+                              </small>
+                            </td>
+                            <td>{trace.duration_ms / 1000} 秒</td>
+                            <td>
+                              <span
+                                className="trace-status"
+                                data-status={
+                                  incomplete ? "failed" : trace.status
+                                }
+                                title={trace.status}
+                              >
+                                {incomplete
+                                  ? "写入异常"
+                                  : (statusLabels[trace.status] ??
+                                    trace.status)}
+                              </span>
+                            </td>
+                            <td>{trace.accepted}</td>
+                            <td>{trace.written}</td>
+                            <td>{trace.pending}</td>
+                            <td
+                              className={
+                                trace.dropped > 0 ? "warning" : undefined
+                              }
+                            >
+                              {trace.dropped}
+                            </td>
+                            <td
+                              className={
+                                trace.errors > 0 ? "danger" : undefined
+                              }
+                            >
+                              {trace.errors}
+                            </td>
+                            <td>
+                              <button
+                                type="button"
+                                disabled={
+                                  !online || !terminal || downloading !== null
+                                }
+                                aria-busy={downloading === trace.id}
+                                title={
+                                  !terminal
+                                    ? "采样与写入结束后可下载"
+                                    : undefined
+                                }
+                                onClick={() => void download(trace)}
+                              >
+                                {downloading === trace.id
+                                  ? "下载中…"
+                                  : "下载 JSON"}
+                              </button>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                ) : (
+                  <div className="logs-empty">
+                    {!online
+                      ? "连接服务后查看最近采样"
+                      : listState === "loading"
+                        ? "正在读取采样记录…"
+                        : listState === "error"
+                          ? "暂时无法读取采样记录"
+                          : "暂无录制记录"}
+                  </div>
+                )}
+              </div>
+            </section>
+          </div>,
+          document.body,
         )}
-      </div>
     </div>
   );
 }

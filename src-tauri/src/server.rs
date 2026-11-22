@@ -1,6 +1,6 @@
 use crate::{
     arm::{ApiError, ArmHandle, CommandRequest, ControlRequest},
-    journal::{Journal, LogRecord, TraceSummary},
+    journal::{Journal, LogPage, LogPageQuery, LogRecord, TraceSummary},
     protocol,
 };
 use axum::{
@@ -113,6 +113,7 @@ async fn launch_at(
         .route("/v1/control", post(control))
         .route("/v1/commands", post(command))
         .route("/v1/logs", get(logs))
+        .route("/v1/logs/page", get(log_page))
         .route("/v1/traces", post(trace_start).get(traces))
         .route("/v1/traces/stop", post(trace_stop))
         .route("/v1/traces/{id}", get(trace_read))
@@ -239,6 +240,24 @@ async fn logs(
         .map_err(|_| ApiError::new("journal_unavailable", "日志查询失败"))?
         .map(Json)
         .map_err(|_| ApiError::new("journal_unavailable", "日志暂不可读"))
+}
+
+async fn log_page(
+    State(state): State<ApiState>,
+    query: Result<Query<LogPageQuery>, QueryRejection>,
+) -> Result<Json<LogPage>, ApiError> {
+    let Query(query) = query.map_err(|_| ApiError::new("invalid_log_query", "日志查询参数无效"))?;
+    tokio::task::spawn_blocking(move || state.journal.page(query))
+        .await
+        .map_err(|_| ApiError::new("journal_unavailable", "日志查询失败"))?
+        .map(Json)
+        .map_err(|error| {
+            if error == "invalid_log_query" {
+                ApiError::new("invalid_log_query", "日志查询参数无效")
+            } else {
+                ApiError::new("journal_unavailable", "日志暂不可读")
+            }
+        })
 }
 
 #[derive(Default, Deserialize)]
@@ -433,6 +452,276 @@ async fn stream(mut socket: WebSocket, state: ApiState) {
 mod tests {
     use super::*;
     use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn log_page_http_auth_query_snapshot_and_legacy_reads_do_not_issue_commands() {
+        fn page_url(base: &str, query: &[(&str, &str)]) -> reqwest::Url {
+            let mut url = reqwest::Url::parse(&format!("{base}/v1/logs/page")).unwrap();
+            url.query_pairs_mut().extend_pairs(query.iter().copied());
+            url
+        }
+
+        async fn page(
+            client: &reqwest::Client,
+            base: &str,
+            token: &str,
+            query: &[(&str, &str)],
+        ) -> LogPage {
+            let response = client
+                .get(page_url(base, query))
+                .bearer_auth(token)
+                .header(header::ORIGIN, "http://localhost:1420")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+                "http://localhost:1420"
+            );
+            response.json().await.unwrap()
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let journal = Journal::start(directory.path().join("events.db")).unwrap();
+        // Retry only rejected fixture submissions, preserving production try_lock behavior.
+        tokio::time::timeout(Duration::from_secs(8), async {
+            for i in 0..123 {
+                loop {
+                    let dropped = journal.stats().dropped;
+                    let message = if i == 0 {
+                        "old event 50%_literal 界".into()
+                    } else {
+                        format!("event {i}")
+                    };
+                    journal.log("info", "page-fixture", "event", &message, None);
+                    if journal.stats().dropped == dropped {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+            while journal.stats().written != 123 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("log fixtures did not commit");
+        let arm = ArmHandle::spawn(journal.clone()).unwrap();
+        let token = "log-page-secret";
+        let server = launch_at(
+            arm.clone(),
+            journal.clone(),
+            token.into(),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await
+        .unwrap();
+        let base = server.base_url();
+        let client = reqwest::Client::new();
+        let before = serde_json::to_value(arm.snapshot()).unwrap();
+        for path in ["/v1/logs", "/v1/logs/page", "/v1/logs/page?through_id=-1"] {
+            for auth in [None, Some("wrong-key")] {
+                let mut request = client.get(format!("{base}{path}"));
+                if let Some(auth) = auth {
+                    request = request.bearer_auth(auth);
+                }
+                let response = request.send().await.unwrap();
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                assert_eq!(
+                    response.json::<serde_json::Value>().await.unwrap()["code"],
+                    "unauthorized"
+                );
+            }
+            let response = client
+                .get(format!("{base}{path}"))
+                .bearer_auth(token)
+                .header(header::ORIGIN, "https://unrelated.example")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(
+                response.json::<serde_json::Value>().await.unwrap()["code"],
+                "forbidden_origin"
+            );
+        }
+        for (name, value) in [
+            ("page", "bad".to_owned()),
+            ("page", "-1".to_owned()),
+            ("page", "4294967296".to_owned()),
+            ("page_size", "bad".to_owned()),
+            ("page_size", "-1".to_owned()),
+            ("through_id", "-1".to_owned()),
+            ("through_id", "bad".to_owned()),
+            ("through_id", "9223372036854775808".to_owned()),
+            ("search", "x".repeat(513)),
+            ("search", "界".repeat(171)),
+        ] {
+            let response = client
+                .get(page_url(&base, &[(name, value.as_str())]))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "query {name}");
+            let error: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(error["code"], "invalid_log_query");
+            assert!(error["message"].is_string());
+        }
+        let first = page(&client, &base, token, &[]).await;
+        assert_eq!(
+            (first.page, first.page_size, first.items.len()),
+            (1, 50, 50)
+        );
+        assert!(first.total >= 123);
+        assert!(first.items.windows(2).all(|r| r[0].id > r[1].id));
+        let legacy: serde_json::Value = client
+            .get(format!("{base}/v1/logs"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(legacy.is_array());
+        assert_eq!(legacy, serde_json::to_value(&first.items).unwrap());
+        for (limit, expected) in [("3", 3), ("0", 1), ("4294967295", first.total as usize)] {
+            let legacy: Vec<LogRecord> = client
+                .get(format!("{base}/v1/logs?limit={limit}"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(legacy.len(), expected);
+        }
+        let through = first.through_id.to_string();
+        let second = page(
+            &client,
+            &base,
+            token,
+            &[
+                ("page", "2"),
+                ("search", "page-fixture"),
+                ("through_id", &through),
+            ],
+        )
+        .await;
+        assert_eq!(
+            (
+                second.page,
+                second.total,
+                second.total_pages,
+                second.items.len()
+            ),
+            (2, 123, 3, 50)
+        );
+        let last = page(
+            &client,
+            &base,
+            token,
+            &[
+                ("page", "4294967295"),
+                ("search", "page-fixture"),
+                ("through_id", &through),
+            ],
+        )
+        .await;
+        assert_eq!((last.page, last.items.len()), (3, 23));
+        assert_eq!(
+            last.items.last().unwrap().message,
+            "old event 50%_literal 界"
+        );
+        let smallest = page(&client, &base, token, &[("page", "0"), ("page_size", "0")]).await;
+        assert_eq!(
+            (smallest.page, smallest.page_size, smallest.items.len()),
+            (1, 1, 1)
+        );
+        let largest = page(&client, &base, token, &[("page_size", "4294967295")]).await;
+        assert_eq!(
+            (largest.page_size, largest.items.len()),
+            (500, first.total as usize)
+        );
+        let literal = page(&client, &base, token, &[("search", "50%_LITERAL")]).await;
+        assert_eq!((literal.total, literal.items.len()), (1, 1));
+        assert_eq!(literal.items[0].id, 1);
+        let boundary = format!("{}xx", "界".repeat(170));
+        let empty = page(&client, &base, token, &[("search", &boundary)]).await;
+        assert_eq!((empty.page, empty.total, empty.total_pages), (1, 0, 1));
+        assert!(empty.items.is_empty());
+        let empty = page(&client, &base, token, &[("through_id", "0")]).await;
+        assert_eq!(
+            (empty.total, empty.total_pages, empty.through_id),
+            (0, 1, 0)
+        );
+        assert!(empty.items.is_empty());
+
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let dropped = journal.stats().dropped;
+                journal.log("info", "page-fixture", "new", "after snapshot", None);
+                if journal.stats().dropped == dropped {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            while journal.stats().pending != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("new log did not commit");
+        let fixed = page(
+            &client,
+            &base,
+            token,
+            &[
+                ("page", "2"),
+                ("search", "page-fixture"),
+                ("through_id", &through),
+            ],
+        )
+        .await;
+        assert_eq!(fixed.total, 123);
+        assert_eq!(
+            serde_json::to_value(&fixed.items).unwrap(),
+            serde_json::to_value(&second.items).unwrap()
+        );
+        let latest = page(
+            &client,
+            &base,
+            token,
+            &[
+                ("search", "page-fixture"),
+                ("through_id", "9223372036854775807"),
+            ],
+        )
+        .await;
+        assert_eq!(latest.total, 124);
+        assert_eq!(latest.items[0].message, "after snapshot");
+        assert!(latest.through_id > first.through_id);
+        let after = serde_json::to_value(arm.snapshot()).unwrap();
+        for key in [
+            "generation",
+            "phase",
+            "side",
+            "port",
+            "enabled",
+            "owner",
+            "action",
+            "last_result",
+            "results",
+        ] {
+            assert_eq!(before[key], after[key], "log query changed {key}");
+        }
+        assert!(arm.shutdown(Duration::from_millis(500)));
+        server.shutdown().await;
+        assert!(journal.shutdown(Duration::from_secs(2)));
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn authenticated_http_ws_and_sqlite_share_real_controller_state() {

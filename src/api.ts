@@ -177,6 +177,20 @@ export interface Log {
   message: string;
   request_id: string | null;
 }
+export interface LogPageQuery {
+  page: number;
+  page_size: number;
+  search: string;
+  through_id?: number;
+}
+export interface LogPage {
+  items: Log[];
+  page: number;
+  page_size: number;
+  total: number;
+  total_pages: number;
+  through_id: number;
+}
 export interface TraceSummary {
   id: string;
   started_at_ms: number;
@@ -424,6 +438,18 @@ class DesktopApi {
     } catch (error) {
       throw new Error(this.errorMessage(error));
     }
+  }
+  async readLogsPage(query: LogPageQuery, signal?: AbortSignal) {
+    const params = new URLSearchParams({
+      page: String(query.page),
+      page_size: String(query.page_size),
+      search: query.search,
+    });
+    if (query.through_id !== undefined)
+      params.set("through_id", String(query.through_id));
+    return this.request<LogPage>(`/v1/logs/page?${params}`, undefined, {
+      signal,
+    });
   }
   async startTrace(durationMs = 10000, signal?: AbortSignal) {
     return this.request<TraceSummary>(

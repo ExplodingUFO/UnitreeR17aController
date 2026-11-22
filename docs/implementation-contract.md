@@ -1,6 +1,6 @@
 # API 接入说明
 
-本文对应当前桌面软件的实现，说明请求、返回值、状态订阅和动作确认方式。更新日期：2026-11-21。机器可读定义见 [OpenAPI 3.1](openapi.json)。
+本文对应当前桌面软件的实现，说明请求、返回值、状态订阅和动作确认方式。更新日期：2026-11-22。机器可读定义见 [OpenAPI 3.1](openapi.json)。
 
 ## 1. 连接与认证
 
@@ -28,6 +28,7 @@
 | `POST /v1/commands`     | `CommandRequest`              | `202 {request_id,status:"queued"}` | 提交设备或动作请求       |
 | `GET /v1/events`        | WebSocket 升级后发送认证首帧  | `101`，随后推送 `StateEvent`       | 订阅完整状态快照         |
 | `GET /v1/logs?limit=50` | 可选条数                      | `200 LogRecord[]`                  | 查询 SQLite 中最近的日志 |
+| `GET /v1/logs/page`     | 分页、搜索与记录范围          | `200 LogPage`                      | 查询持久化日志历史       |
 | `GET /v1/traces`        | 可选 `limit`                  | `200 TraceSummary[]`               | 查询最近采样             |
 | `POST /v1/traces`       | `{duration_ms?:number\|null}` | `200 TraceSummary`                 | 开始短时采样             |
 | `POST /v1/traces/stop`  | 无                            | `200 TraceSummary\|null`           | 结束当前采样             |
@@ -477,6 +478,47 @@ TCP 未设置或控制反馈无效时，`tcp:null`。`action.mode` 为 `continuo
 
 `journal.pending` 表示已接收但尚未写入的记录，`written` 表示本次运行成功提交的数量；`dropped` 统计队列竞争、锁损坏、满队列、关闭后提交或退出时放弃的记录；`errors` 统计数据库操作失败。事件提交只尝试一次取得预分配队列的锁，失败立即返回；后台轮询取出数据后执行 SQL。计数均针对本次应用运行，不等同于数据库总行数。查询使用独立阻塞任务，不在控制线程执行。
 
+### 历史日志分页
+
+`GET /v1/logs/page` 返回完整数据库中的历史记录，无需取得控制权。日志存放在应用日志目录的 `events.sqlite3`，退出后保留，仍按最近 100000 条清理。
+
+| 查询参数 | 类型与默认值 | 规则 |
+| --- | --- | --- |
+| `page` | u32，默认 1 | 0 按 1，超过末页时返回末页 |
+| `page_size` | u32，默认 50 | 限制到 1..500，0 按 1 |
+| `search` | string，默认空串 | UTF-8 最多 512 字节；在级别、来源、编号、内容和请求 ID 中搜索字面子串；ASCII 不区分大小写 |
+| `through_id` | 可选 i64 | 非负；省略时取当前最大 ID，传入时只查询不大于该 ID 的记录；0 表示空范围 |
+
+```http
+GET /v1/logs/page?page=2&page_size=50&through_id=123
+Authorization: Bearer <token>
+```
+
+```json
+{
+  "items": [{
+    "id": 73,
+    "ts_ms": 1794268800000,
+    "level": "info",
+    "source": "app",
+    "code": "started",
+    "message": "控制工作台已启动",
+    "request_id": null
+  }],
+  "page": 2,
+  "page_size": 50,
+  "total": 123,
+  "total_pages": 3,
+  "through_id": 123
+}
+```
+
+示例 `items` 只列一条；实际返回该页全部记录，顺序为 `id` 降序。`total` 是当前搜索与 ID 范围内的总条数；空结果仍返回 `page:1,total_pages:1,items:[]`。最大 ID、总数与本页记录在同一只读事务中读取。
+
+首屏省略 `through_id`。后续翻页沿用响应中的值，新增日志不会推移历史页；现有保留上限仍会清理最早记录。刷新最新记录或更换搜索条件时省略此值。超过当前最大值的 `through_id` 会缩到当前最大值。
+
+参数格式、负数、整数溢出、过长搜索返回 `400 {"code":"invalid_log_query","message":"日志查询参数无效"}`。数据库不可读返回 `503 journal_unavailable`。旧的 `/v1/logs?limit=50` 继续返回数组。
+
 ### 9.1 短时采样接口
 
 全部采样路由沿用 Bearer 与 Origin 校验，无需 `client_id`、`lease_id` 或 `generation`。开始只观察现有连接，不申请控制权、打开串口、使能或启动动作。开始要求状态中已有 `port`，且 `phase` 不为 `disconnected/connecting/closing`；否则返回 `400 not_connected`。停止采样不取消机械臂动作，也不改变控制权。
@@ -612,7 +654,7 @@ CLI 原有输出字段保留，新增 `tuning`：`servo_batches_with_tuning/serv
 | 末端平移与旋转 | 在当前有效 TCP 下分别检查基座/工具坐标与六个轴；对照所选路径、实际跟随和停止过程。               |
 | 收纳返回       | 使用已有机械支撑处记录的收纳位；检查返回到位和稳定确认，取消后保持连接，不继续计划中的断开。     |
 
-每次先在“日志 → 采样”开始 10 秒记录，再从控制页手动执行场景，保留一段停止后的反馈。动作由工作台停止按钮取消；“停止采样”只结束记录。等待状态离开 `writing`，检查 `written=accepted`、`pending=0` 和丢弃/错误计数后下载；有数据损失时保留该记录，比较时标明缺口。对每个文件运行分析命令，再结合实际观察和已有事件日志判断下一次要测的条件。新轨迹、低速抖动改善、负载下跟随与实际 jerk 的验收结果分别记录。
+每次先在控制页设置 10 秒并点击“录制”，再手动执行场景，保留一段停止后的反馈。动作由工作台停止按钮取消；“停止录制”只结束记录。等待状态离开 `writing`，检查 `written=accepted`、`pending=0` 和丢弃/错误计数后下载；有数据损失时保留该记录，比较时标明缺口。对每个文件运行分析命令，再结合实际观察和已有事件日志判断下一次要测的条件。新轨迹、低速抖动改善、负载下跟随与实际 jerk 的验收结果分别记录。
 
 伺服参数按以下顺序做对照，保持相同初始姿态、TCP、轴、速度与负载，每次只修改一项并保存对应采样：
 
@@ -632,7 +674,7 @@ CLI 原有输出字段保留，新增 `tuning`：`servo_batches_with_tuning/serv
 
 | HTTP 状态 | 典型 `code`                                                                                                                                                        | 处理方式                                 |
 | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------- |
-| 400       | `invalid_request`、`invalid_client`、`invalid_action`、`ports_failed`、`invalid_trace_request`、`invalid_trace_duration`、`invalid_trace_context`、`not_connected` | 修正输入或检查当前连接                   |
+| 400       | `invalid_request`、`invalid_client`、`invalid_action`、`ports_failed`、`invalid_trace_request`、`invalid_trace_duration`、`invalid_trace_context`、`invalid_log_query`、`not_connected` | 修正输入或检查当前连接                   |
 | 401       | `unauthorized`                                                                                                                                                     | 使用本次应用启动后的令牌                 |
 | 403       | `forbidden_origin`                                                                                                                                                 | 检查浏览器来源                           |
 | 404       | `trace_not_found`                                                                                                                                                  | 采样 ID 无效、不存在或已被保留清理       |
@@ -641,7 +683,7 @@ CLI 原有输出字段保留，新增 `tuning`：`servo_batches_with_tuning/serv
 | 503       | `closing`、`journal_unavailable`、`trace_unavailable`                                                                                                              | 应用退出或存储当前不可读写               |
 | 504       | `timeout`                                                                                                                                                          | 控制权请求等待超时；先读取状态           |
 
-控制权和命令接口的 JSON 解析与类型错误由 HTTP 框架直接返回纯文本：格式错误 400、超大请求体 413、缺少或错误的 JSON Content-Type 415、字段缺失或类型/枚举错误 422。日志查询参数格式错误同样返回 400 纯文本。采样开始的 JSON 提取错误和采样查询参数错误统一返回 `400` JSON `invalid_trace_request`；有效整数但时长超出范围返回 `invalid_trace_duration`。调用方先判断 HTTP 状态和 Content-Type，再解析错误内容。
+控制权和命令接口的 JSON 解析与类型错误由 HTTP 框架直接返回纯文本：格式错误 400、超大请求体 413、缺少或错误的 JSON Content-Type 415、字段缺失或类型/枚举错误 422。旧日志接口的查询参数格式错误返回 400 纯文本；`/v1/logs/page` 统一返回 `400` JSON `invalid_log_query`。采样开始的 JSON 提取错误和采样查询参数错误统一返回 `400` JSON `invalid_trace_request`；有效整数但时长超出范围返回 `invalid_trace_duration`。调用方先判断 HTTP 状态和 Content-Type，再解析错误内容。
 
 `POST /v1/commands` 的业务校验在入队后完成。例如控制权不符，通常是 **202 入队后出现 `rejected/not_owner`**，而非该请求直接返回 409。
 

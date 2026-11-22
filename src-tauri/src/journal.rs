@@ -46,6 +46,36 @@ pub struct LogRecord {
     pub request_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LogPageQuery {
+    pub page: u32,
+    pub page_size: u32,
+    pub search: String,
+    pub through_id: Option<i64>,
+}
+
+impl Default for LogPageQuery {
+    fn default() -> Self {
+        Self {
+            page: 1,
+            page_size: 50,
+            search: String::new(),
+            through_id: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LogPage {
+    pub items: Vec<LogRecord>,
+    pub page: u32,
+    pub page_size: u32,
+    pub total: u64,
+    pub total_pages: u32,
+    pub through_id: i64,
+}
+
 struct State {
     queue: Mutex<VecDeque<LogRecord>>,
     // One atomic admission gate orders close against producers already in flight.
@@ -224,20 +254,73 @@ impl Journal {
             "SELECT id,ts_ms,level,source,code,message,request_id FROM events ORDER BY id DESC LIMIT ?1"
         ).map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map([limit], |r| {
-                Ok(LogRecord {
-                    id: r.get(0)?,
-                    ts_ms: r.get(1)?,
-                    level: r.get(2)?,
-                    source: r.get(3)?,
-                    code: r.get(4)?,
-                    message: r.get(5)?,
-                    request_id: r.get(6)?,
-                })
-            })
+            .query_map([limit], log_record_from_row)
             .map_err(|e| e.to_string())?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| e.to_string())
+    }
+
+    /// Blocking read; HTTP callers must use spawn_blocking. Reuse through_id to
+    /// keep subsequent pages fixed against new inserts (the retention cap still applies).
+    pub fn page(&self, query: LogPageQuery) -> Result<LogPage, String> {
+        if query.through_id.is_some_and(|id| id < 0) || query.search.len() > 512 {
+            return Err("invalid_log_query".into());
+        }
+        let page_size = query.page_size.clamp(1, 500);
+        let search = query.search.to_ascii_lowercase();
+        let mut conn = Connection::open_with_flags(
+            &self.0.path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| format!("open journal reader: {e}"))?;
+        conn.busy_timeout(BUSY).map_err(|e| e.to_string())?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        // The first SELECT establishes the same SQLite snapshot for MAX/COUNT/items.
+        let max_id: i64 = tx
+            .query_row("SELECT COALESCE(MAX(id),0) FROM events", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        let through_id = query.through_id.unwrap_or(max_id).min(max_id);
+        // instr performs literal substring matching, including %, _ and backslashes.
+        let filter = "?1 > 0 AND id <= ?1 AND (?2 = ''
+            OR instr(lower(level),?2) > 0 OR instr(lower(source),?2) > 0
+            OR instr(lower(code),?2) > 0 OR instr(lower(message),?2) > 0
+            OR instr(lower(request_id),?2) > 0)";
+        let total: u64 = tx
+            .query_row(
+                &format!("SELECT COUNT(*) FROM events WHERE {filter}"),
+                params![through_id, search],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(|e| e.to_string())? as u64;
+        let total_pages = total
+            .div_ceil(u64::from(page_size))
+            .clamp(1, u64::from(u32::MAX)) as u32;
+        let page = query.page.max(1).min(total_pages);
+        let offset = i64::from(page - 1) * i64::from(page_size);
+        let items = {
+            let mut stmt = tx
+                .prepare(&format!(
+                    "SELECT id,ts_ms,level,source,code,message,request_id FROM events
+                     WHERE {filter} ORDER BY id DESC LIMIT ?3 OFFSET ?4"
+                ))
+                .map_err(|e| e.to_string())?;
+            stmt.query_map(
+                params![through_id, search, page_size, offset],
+                log_record_from_row,
+            )
+            .map_err(|e| e.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| e.to_string())?
+        };
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(LogPage {
+            items,
+            page,
+            page_size,
+            total,
+            total_pages,
+            through_id,
+        })
     }
 
     /// Application-close coordination only. True means every accepted event/sample
@@ -259,6 +342,18 @@ impl Journal {
         }
         !s.abort.load(Ordering::Acquire) && self.0.traces.clean()
     }
+}
+
+fn log_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LogRecord> {
+    Ok(LogRecord {
+        id: row.get(0)?,
+        ts_ms: row.get(1)?,
+        level: row.get(2)?,
+        source: row.get(3)?,
+        code: row.get(4)?,
+        message: row.get(5)?,
+        request_id: row.get(6)?,
+    })
 }
 
 fn capped(value: &str, max: usize) -> String {
@@ -533,6 +628,270 @@ mod tests {
         assert_eq!(stats.written + stats.dropped + stats.pending, submitted);
         assert_eq!(reopened.recent(1).unwrap()[0].message, "new session");
         assert!(reopened.recent(0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn paged_history_survives_reopen_and_new_inserts_do_not_move_snapshot() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.sqlite3");
+        let journal = Journal::start(path.clone()).unwrap();
+        for i in 0..123 {
+            log_until_queued(&journal, || {
+                journal.log("info", "history", "event", &format!("event {i}"), None);
+            });
+        }
+        assert!(journal.shutdown(Duration::from_secs(8)));
+        drop(journal);
+        let journal = Journal::start(path).unwrap();
+        wait_for(|| journal.stats().healthy);
+
+        let first = journal.page(LogPageQuery::default()).unwrap();
+        assert_eq!(
+            (first.page, first.page_size, first.total, first.total_pages),
+            (1, 50, 123, 3)
+        );
+        assert_eq!(first.through_id, 123);
+        assert_eq!(first.items.len(), 50);
+        assert_eq!(first.items[0].message, "event 122");
+        assert_eq!(first.items[49].message, "event 73");
+        let ids = |page: &LogPage| page.items.iter().map(|r| r.id).collect::<Vec<_>>();
+        let second = journal
+            .page(LogPageQuery {
+                page: 2,
+                through_id: Some(first.through_id),
+                ..LogPageQuery::default()
+            })
+            .unwrap();
+        let last = journal
+            .page(LogPageQuery {
+                page: u32::MAX,
+                through_id: Some(first.through_id),
+                ..LogPageQuery::default()
+            })
+            .unwrap();
+        assert_eq!((last.page, last.items.len()), (3, 23));
+        let all: Vec<_> = ids(&first)
+            .into_iter()
+            .chain(ids(&second))
+            .chain(ids(&last))
+            .collect();
+        assert_eq!(all, (1..=123).rev().collect::<Vec<_>>());
+        let normalized = journal
+            .page(LogPageQuery {
+                page: 0,
+                ..LogPageQuery::default()
+            })
+            .unwrap();
+        assert_eq!(normalized.page, 1);
+        assert_eq!(ids(&normalized), ids(&first));
+        let smallest = journal
+            .page(LogPageQuery {
+                page: u32::MAX,
+                page_size: 0,
+                ..LogPageQuery::default()
+            })
+            .unwrap();
+        assert_eq!(
+            (smallest.page, smallest.page_size, smallest.total_pages),
+            (123, 1, 123)
+        );
+        assert_eq!(ids(&smallest), vec![1]);
+        let largest = journal
+            .page(LogPageQuery {
+                page: u32::MAX,
+                page_size: u32::MAX,
+                ..LogPageQuery::default()
+            })
+            .unwrap();
+        assert_eq!(
+            (
+                largest.page,
+                largest.page_size,
+                largest.items.len(),
+                largest.total_pages
+            ),
+            (1, 500, 123, 1)
+        );
+
+        for i in 0..7 {
+            log_until_queued(&journal, || {
+                journal.log("info", "history", "new", &format!("new {i}"), None);
+            });
+        }
+        wait_for(|| journal.stats().written == 7);
+        let fixed = journal
+            .page(LogPageQuery {
+                page: 2,
+                through_id: Some(first.through_id),
+                ..LogPageQuery::default()
+            })
+            .unwrap();
+        assert_eq!(
+            (fixed.total, fixed.total_pages, fixed.through_id),
+            (123, 3, 123)
+        );
+        assert_eq!(ids(&fixed), ids(&second));
+        let current = journal.page(LogPageQuery::default()).unwrap();
+        assert_eq!(
+            (current.total, current.through_id, current.items[0].id),
+            (130, 130, 130)
+        );
+        let clamped = journal
+            .page(LogPageQuery {
+                through_id: Some(i64::MAX),
+                ..LogPageQuery::default()
+            })
+            .unwrap();
+        assert_eq!((clamped.through_id, clamped.total), (130, 130));
+        let empty_snapshot = journal
+            .page(LogPageQuery {
+                page: u32::MAX,
+                through_id: Some(0),
+                ..LogPageQuery::default()
+            })
+            .unwrap();
+        assert_eq!(
+            (
+                empty_snapshot.page,
+                empty_snapshot.total,
+                empty_snapshot.total_pages,
+                empty_snapshot.through_id
+            ),
+            (1, 0, 1, 0)
+        );
+        assert!(empty_snapshot.items.is_empty());
+        let roundtrip: LogPage =
+            serde_json::from_value(serde_json::to_value(&fixed).unwrap()).unwrap();
+        assert_eq!(ids(&roundtrip), ids(&fixed));
+        assert!(journal.shutdown(Duration::from_secs(8)));
+    }
+
+    #[test]
+    fn page_search_matches_all_fields_and_treats_sql_metacharacters_literally() {
+        let dir = tempdir().unwrap();
+        let journal = Journal::start(dir.path().join("events.db")).unwrap();
+        for (level, source, code, message, request_id) in [
+            ("NeedLE", "app", "event", "normal", None),
+            ("info", "prefix-NEEDLE-suffix", "event", "normal", None),
+            ("info", "app", "Needle-event", "normal", None),
+            ("info", "app", "event", "contains NEEDLE", None),
+            ("info", "app", "event", "normal", Some("req-NeEdLe-1")),
+            ("info", "app", "event", "literal 50%_\\'界", None),
+            ("info", "app", "event", "literal 50xxX\\'界", None),
+        ] {
+            log_until_queued(&journal, || {
+                journal.log(level, source, code, message, request_id)
+            });
+        }
+        assert!(journal.shutdown(Duration::from_secs(8)));
+        for (search, expected) in [
+            ("nEeDlE", vec![5, 4, 3, 2, 1]),
+            ("req-needle", vec![5]),
+            ("50%_", vec![6]),
+            ("%", vec![6]),
+            ("_", vec![6]),
+            ("\\'界", vec![7, 6]),
+            ("' OR 1=1 --", vec![]),
+        ] {
+            let result = journal
+                .page(LogPageQuery {
+                    search: search.into(),
+                    ..LogPageQuery::default()
+                })
+                .unwrap();
+            assert_eq!(result.total, expected.len() as u64, "search {search:?}");
+            assert_eq!(
+                result.items.iter().map(|r| r.id).collect::<Vec<_>>(),
+                expected,
+                "search {search:?}"
+            );
+            assert_eq!(result.through_id, 7);
+            assert_eq!(result.total_pages, 1);
+        }
+        let filtered_page = journal
+            .page(LogPageQuery {
+                page: 2,
+                page_size: 2,
+                search: "needle".into(),
+                ..LogPageQuery::default()
+            })
+            .unwrap();
+        assert_eq!(
+            (
+                filtered_page.total,
+                filtered_page.total_pages,
+                filtered_page.page
+            ),
+            (5, 3, 2)
+        );
+        assert_eq!(
+            filtered_page.items.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![3, 2]
+        );
+        let missing = journal
+            .page(LogPageQuery {
+                page: u32::MAX,
+                search: "absent".into(),
+                ..LogPageQuery::default()
+            })
+            .unwrap();
+        assert_eq!(
+            (
+                missing.page,
+                missing.total,
+                missing.total_pages,
+                missing.through_id
+            ),
+            (1, 0, 1, 7)
+        );
+        assert!(missing.items.is_empty());
+    }
+
+    #[test]
+    fn page_defaults_empty_database_and_utf8_query_validation() {
+        let dir = tempdir().unwrap();
+        let journal = Journal::start(dir.path().join("events.db")).unwrap();
+        wait_for(|| journal.stats().healthy);
+        let defaults: LogPageQuery = serde_json::from_str("{}").unwrap();
+        assert_eq!((defaults.page, defaults.page_size), (1, 50));
+        assert!(defaults.search.is_empty());
+        assert_eq!(defaults.through_id, None);
+        let empty = journal.page(defaults).unwrap();
+        assert_eq!(
+            (
+                empty.page,
+                empty.page_size,
+                empty.total,
+                empty.total_pages,
+                empty.through_id
+            ),
+            (1, 50, 0, 1, 0)
+        );
+        assert!(empty.items.is_empty());
+        for query in [
+            LogPageQuery {
+                through_id: Some(-1),
+                ..LogPageQuery::default()
+            },
+            LogPageQuery {
+                search: "x".repeat(513),
+                ..LogPageQuery::default()
+            },
+            LogPageQuery {
+                search: "界".repeat(171),
+                ..LogPageQuery::default()
+            },
+        ] {
+            assert_eq!(journal.page(query).unwrap_err(), "invalid_log_query");
+        }
+        let boundary = journal
+            .page(LogPageQuery {
+                search: format!("{}xx", "界".repeat(170)),
+                ..LogPageQuery::default()
+            })
+            .unwrap();
+        assert!(boundary.items.is_empty());
+        assert!(journal.shutdown(Duration::from_secs(2)));
     }
 
     #[test]

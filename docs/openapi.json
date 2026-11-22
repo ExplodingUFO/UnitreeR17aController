@@ -778,6 +778,122 @@
         }
       }
     },
+    "/v1/logs/page": {
+      "get": {
+        "operationId": "getLogPage",
+        "tags": [
+          "日志"
+        ],
+        "summary": "搜索和分页读取历史日志",
+        "description": "日志跨应用重启保留。MAX(id)、总数及本页记录在同一只读 SQLite 事务内取得，按 id 降序返回；写入为异步，查询在独立阻塞任务中执行，不占用控制线程。第一页省略 through_id；翻页保持响应中的 through_id。无需控制权。",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "description": "u32，默认 1。0 按 1；超过末页时返回末页。",
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 1
+            },
+            "example": 1
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "description": "u32，默认 50。实际限制到 1..500；0 按 1。",
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "default": 50
+            },
+            "example": 50
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "required": false,
+            "description": "在 level/source/code/message/request_id 中搜索字面子串；ASCII 不区分大小写，% 和 _ 不作通配符。UTF-8 编码最多 512 字节。",
+            "schema": {
+              "type": "string",
+              "default": "",
+              "x-utf8-max-bytes": 512
+            },
+            "example": "control"
+          },
+          {
+            "name": "through_id",
+            "in": "query",
+            "required": false,
+            "description": "省略时取当前最大 ID；0 表示空范围；超过最大 ID 时缩到该值。后续翻页沿用响应值，新增日志不推移历史页；100000 条保留限制仍会清理旧记录。",
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0,
+              "maximum": 9223372036854775807
+            },
+            "example": 101
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "当前页与分页信息。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogPage"
+                },
+                "example": {
+                  "items": [
+                    {
+                      "id": 101,
+                      "ts_ms": 1794268800000,
+                      "level": "info",
+                      "source": "control",
+                      "code": "acquired",
+                      "message": "控制权已取得",
+                      "request_id": null
+                    }
+                  ],
+                  "page": 1,
+                  "page_size": 50,
+                  "total": 1,
+                  "total_pages": 1,
+                  "through_id": 101
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "查询类型、整数范围、through_id 或搜索字节长度无效。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "code": "invalid_log_query",
+                  "message": "日志查询参数无效"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenOrigin"
+          },
+          "503": {
+            "$ref": "#/components/responses/JournalUnavailable"
+          }
+        }
+      }
+    },
     "/v1/events": {
       "get": {
         "operationId": "subscribeState",
@@ -5351,6 +5467,73 @@
           "samples"
         ],
         "description": "采样汇总与数据。正在记录/写入时可读取已提交部分；完整性使用 trace.status 与各计数判断。最多保留 10 次采样，每次仅前 100000 次提交尝试可入队。"
+      },
+      "LogPage": {
+        "type": "object",
+        "description": "按 id 降序的持久化事件历史；空结果仍有 1 页。total 是搜索与 through_id 范围内的条数。",
+        "required": [
+          "items",
+          "page",
+          "page_size",
+          "total",
+          "total_pages",
+          "through_id"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "maxItems": 500,
+            "items": {
+              "$ref": "#/components/schemas/LogRecord"
+            }
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4294967295
+          },
+          "page_size": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 500
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 18446744073709551615
+          },
+          "total_pages": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4294967295
+          },
+          "through_id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "maximum": 9223372036854775807
+          }
+        },
+        "examples": [
+          {
+            "items": [
+              {
+                "id": 101,
+                "ts_ms": 1794268800000,
+                "level": "info",
+                "source": "control",
+                "code": "acquired",
+                "message": "控制权已取得",
+                "request_id": null
+              }
+            ],
+            "page": 1,
+            "page_size": 50,
+            "total": 1,
+            "total_pages": 1,
+            "through_id": 101
+          }
+        ]
       }
     },
     "responses": {
