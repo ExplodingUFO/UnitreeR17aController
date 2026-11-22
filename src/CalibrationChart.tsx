@@ -3,6 +3,7 @@ import type {
   CalibrationPoint,
   CalibrationReport,
   CalibrationTrial,
+  Space,
 } from "./api";
 
 const DEG = 180 / Math.PI;
@@ -18,11 +19,26 @@ const series = [
   { key: "feedback", label: "实测 feedback" },
 ] as const;
 type Series = (typeof series)[number]["key"];
-type Live = { id: string; axis: number; points: CalibrationPoint[] };
+type Live = {
+  id: string;
+  axis: number;
+  space?: Space;
+  points: CalibrationPoint[];
+};
 type Plot = { key: string; label: string; points: CalibrationPoint[] };
 
-export function calibrationTrials(report: CalibrationReport, axis: number) {
+export function calibrationTrials(
+  report: CalibrationReport,
+  axis: number,
+  space: Space = "joint",
+) {
   return report.trials.filter((trial) => {
+    const trialSpace =
+      trial.space ??
+      (trial.phase.startsWith("cartesian_") ? "cartesian" : "joint");
+    if (trialSpace !== space) return false;
+    // Cartesian motion-axis X/Y/Z is not a measured joint: all seven respond.
+    if (space === "cartesian") return true;
     const measuredAxis = trial.axis ?? report.settings.axis;
     return measuredAxis == null
       ? report.curves?.some(
@@ -36,8 +52,10 @@ export function calibrationTrialLabel(
   trial: CalibrationTrial,
   axis: number,
 ) {
+  if (trial.phase === "cartesian_before") return "末端动作 · 调整前";
+  if (trial.phase === "cartesian_after") return "末端动作 · 调整后";
   if (trial.phase === "baseline") return "基线";
-  if (trial.phase === "after") return "整体对比 after";
+  if (trial.phase === "after") return "调整后";
   if (trial.phase === "baseline_check") return "基线复测";
   if (trial.phase === "validation") return "验证";
   const config = trial.config.joints[axis],
@@ -69,21 +87,42 @@ export default function CalibrationChart({
       0,
   );
   const [metric, setMetric] = useState<Metric>("position");
-  const [mode, setMode] = useState<"full" | "compare">("full");
+  const hasCartesian = !!report?.trials.some(
+    (trial) =>
+      trial.space === "cartesian" || trial.phase.startsWith("cartesian_"),
+  );
+  const [scope, setScope] = useState<Space | "all">(
+    hasCartesian ? "cartesian" : "all",
+  );
+  const [mode, setMode] = useState<"full" | "compare">(
+    hasCartesian ? "compare" : "full",
+  );
   const [comparison, setComparison] = useState<number | null>(null);
   const [hover, setHover] = useState<{ plot: string; index: number } | null>(
     null,
   );
   const trials = useMemo(
-    () => (report ? calibrationTrials(report, axis) : []),
-    [report, axis],
+    () =>
+      report
+        ? calibrationTrials(
+            report,
+            axis,
+            scope === "cartesian" ? "cartesian" : "joint",
+          )
+        : [],
+    [report, axis, scope],
   );
   const baseline =
-    trials.find((trial) => trial.phase === "baseline") ?? trials[0];
+    trials.find(
+      (trial) =>
+        trial.phase ===
+        (scope === "cartesian" ? "cartesian_before" : "baseline"),
+    ) ?? trials[0];
   const alternatives = trials.filter((trial) => trial !== baseline);
   const choice = report?.choices?.find((item) => item.axis === axis);
   const selected =
     alternatives.find((trial) => trial.index === comparison) ??
+    alternatives.find((trial) => trial.phase === "cartesian_after") ??
     alternatives.find((trial) => trial.phase === "after") ??
     alternatives.find((trial) => trial.index === choice?.candidate_index) ??
     alternatives.at(-1);
@@ -93,8 +132,17 @@ export default function CalibrationChart({
       return [
         {
           key: "full",
-          label: live ? `实时全程 · 正在测试 J${live.axis + 1}` : "全程",
-          points: points ?? [],
+          label: live
+            ? `实时全程 · 正在测试 ${live.space === "cartesian" ? `末端 ${"XYZ"[live.axis]}` : `J${live.axis + 1}`}`
+            : scope === "cartesian"
+              ? "末端动作全程"
+              : scope === "joint"
+                ? "关节试验全程"
+                : "全程",
+          points: (points ?? []).filter(
+            (point) =>
+              !report || scope === "all" || (point.space ?? "joint") === scope,
+          ),
         },
       ];
     return [baseline, selected]
@@ -104,7 +152,17 @@ export default function CalibrationChart({
         label: calibrationTrialLabel(report, trial, axis),
         points: (points ?? []).filter((point) => point.trial === trial.index),
       }));
-  }, [report, live?.axis, mode, points, baseline, selected, axis]);
+  }, [
+    report,
+    live?.axis,
+    live?.space,
+    mode,
+    scope,
+    points,
+    baseline,
+    selected,
+    axis,
+  ]);
   const value = (point: CalibrationPoint, key: Series): number | null => {
     if (metric === "velocity") {
       if (key === "reference" || (key === "command" && point.command === null))
@@ -166,6 +224,31 @@ export default function CalibrationChart({
       data-mode={report ? mode : "full"}
       data-live-count={live?.points.length}
     >
+      {hasCartesian && (
+        <div className="calibration-space-tabs" aria-label="曲线动作类型">
+          {(
+            [
+              ["cartesian", "末端动作"],
+              ["joint", "关节试验"],
+              ["all", "完整测试"],
+            ] as const
+          ).map(([key, label]) => (
+            <button
+              key={key}
+              aria-pressed={scope === key}
+              onClick={() => {
+                setScope(key);
+                setComparison(null);
+                setHover(null);
+                setMode(key === "all" ? "full" : "compare");
+              }}
+            >
+              {label}
+            </button>
+          ))}
+          <span>每个关节均记录实测响应</span>
+        </div>
+      )}
       <div className="calibration-chart-controls">
         <div className="calibration-axis-tabs" aria-label="曲线关节">
           {Array.from({ length: 7 }, (_, index) => (
@@ -206,7 +289,11 @@ export default function CalibrationChart({
           }}
         >
           <option value="full">全程</option>
-          {report && <option value="compare">基线 / after 对比</option>}
+          {report && (
+            <option value="compare">
+              {scope === "cartesian" ? "末端调整前 / 后" : "基线 / 候选对比"}
+            </option>
+          )}
         </select>
       </div>
       {hasCurves ? (
@@ -413,7 +500,10 @@ export default function CalibrationChart({
                         {focused ? (
                           <>
                             <span>
-                              t {focused.t_ms} ms · 测试 J{focused.axis + 1}
+                              t {focused.t_ms} ms · 测试{" "}
+                              {focused.space === "cartesian"
+                                ? `末端 ${"XYZ"[focused.axis]}`
+                                : `J${focused.axis + 1}`}
                             </span>
                             {series.map(({ key }) => (
                               <span key={key} data-series={key}>
@@ -447,7 +537,9 @@ export default function CalibrationChart({
           <p className="calibration-note">
             {mode === "compare" && report
               ? "两轮按首个采样对齐，时间刻度保留原始值，纵轴相同。"
-              : "全程包含其他关节测试时的本轴响应；时间为测试原始时间。"}
+              : scope === "cartesian"
+                ? "末端动作包含七轴的耦合响应；时间为测试原始时间。"
+                : "全程包含其他关节测试时的本轴响应；时间为测试原始时间。"}
             {metric === "velocity"
               ? "未单独记录参考速度。"
               : metric === "error"

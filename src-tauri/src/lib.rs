@@ -1,5 +1,6 @@
 mod arm;
 mod calibration;
+mod calibration_path;
 mod journal;
 mod kinematics;
 mod protocol;

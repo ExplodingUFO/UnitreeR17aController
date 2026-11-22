@@ -33,6 +33,7 @@
 | `POST /v1/traces`       | `{duration_ms?:number\|null}` | `200 TraceSummary`                 | 开始短时采样             |
 | `POST /v1/traces/stop`  | 无                            | `200 TraceSummary\|null`           | 结束当前采样             |
 | `GET /v1/traces/{id}`   | 可选 `download/attachment`    | `200 TraceRecording`               | 读取或下载采样 JSON      |
+| `POST /v1/calibrations/preview` | 幅度、速度、方向 | `200 CalibrationPreview` | 生成只读运动预览 |
 | `GET /v1/calibrations?limit=20` | 可选条数 | `200 CalibrationReport[]` | 查询最近校准报告 |
 | `GET /v1/calibrations/{id}?points=3000` | 报告 ID、绘图点数 | `200 CalibrationReport` | 读取校准报告及绘图曲线 |
 
@@ -348,7 +349,29 @@ J1 正向连续点动，速度 0.1 rad/s：
 
 ### 5.10 低速稳定性校准
 
-连接、取得控制权并使能后，提交 `calibrate_start`。没有其他动作即可开始，不需要额外积累静止窗口，实测速度噪声不会阻止启动。省略 `settings` 时执行默认的七轴程序：
+桌面先生成轨迹预览，由使用者确认运动范围后启动。预览只计算几何，不申请控制权或下发动作；启动仍使用普通命令的控制权、generation 与停止处理。没有额外的静止观察窗口。
+
+**预览**：`POST /v1/calibrations/preview`，请求可为 `{}`，或：
+
+```json
+{ "amplitude": 0.05, "speed": 0.01, "axes": [0, 1, 2] }
+```
+
+| 字段 | 默认 | 范围与单位 |
+| --- | --- | --- |
+| `amplitude` | 0.05 | 单向 20..100 mm，API 使用 m；默认正负各 50 mm |
+| `speed` | 0.01 | 5..13.5 mm/s，API 使用 m/s |
+| `axes` | [0,1,2] | 基座 X/Y/Z；重复值合并 |
+
+预览使用当前指令保持位置和当前 TCP，沿各方向生成正向、反向、回原位片段。保持 TCP 姿态，连续求解关节构型；不足整段时保留可达行程。返回 `program` 与 `points`：
+
+- `program`：side、origin（七轴 rad）、tcp（Link7→TCP）、amplitude、speed、joint_excursion（默认 16°，目标 ±8°）、segments。
+- `segments[]`：axis（0..2）、offset（相对原始 TCP 的绝对带符号偏移，m）。其他分量仍以原位为准。
+- `points[]`：joints（七轴 rad）、tcp（基座坐标 XYZ，m）、segment、space、axis。space 为 cartesian、joint 或 joint_return；points 同时包含末端路线、冗余自由度回原位和全部关节试验。
+
+前端使用 points 显示路线、计划姿态及整臂包络，实际行程以生成结果为准。预览在工作线程计算，不占用控制周期；生成预览不改变参数或使能状态。
+
+**确认启动**：把收到的 `program` 原样放入 `settings.cartesian`，提交普通命令：
 
 ```json
 {
@@ -356,68 +379,82 @@ J1 正向连续点动，速度 0.1 rad/s：
   "client_id": "example-service",
   "lease_id": "11111111-1111-4111-8111-111111111111",
   "generation": 5,
-  "kind": "calibrate_start"
+  "kind": "calibrate_start",
+  "settings": { "cartesian": {
+      "side": "right", "origin": [0.3,0.7,1.1,0.9,-0.4,0.2,-0.3],
+      "tcp": {"translation":[0,0,0],"rotation":[0,0,0,1]},
+      "amplitude": 0.05, "speed": 0.01, "joint_excursion": 0.2792526803190927,
+      "segments": [{"axis":0,"offset":0.05},{"axis":0,"offset":-0.05},{"axis":0,"offset":0}]
+    } }
 }
 ```
 
-程序保存当前保持目标作为原位，先以起始参数依次测试 J1..J7。每轴在原位 ±2° 往返并回到原位，分 1°/s、2°/s 两档，共六段。随后选择误差较大的两轴，分别试验 Fc=0.1 Nm、Fc=0.2 Nm 和起始速度前馈的 75%；最后合并优选参数，对全部已测轴再测一轮。Kp/Kd 始终保持起始值。参考和实测位置均限制在起始姿态各轴 ±4° 范围内；超出范围停止本轮。测试沿用关节速度、加速度、jerk 约束以及设备故障和停止处理。
+示例只展示格式；实际使用刚收到的 program，保留其原位、TCP 与可达行程。连接的臂、TCP 或起始保持姿态明显变化时，返回 `stale_preview`，重新生成预览；浮点 JSON 往返误差不会使预览失效。
 
-API 可选 `settings` 用于指定单轴或缩小试验；桌面使用默认程序，无参数表单。字段可单独省略：
+程序顺序：
 
-| 字段 | 默认 | 单位与范围 |
+1. 按预览的末端三向路线记录七轴基线。
+2. 以原位为中心逐轴 ±8° 往返，两档速度默认 2°/s、4°/s，测量关节跟随。
+3. 在误差较大的两轴分别比较 Fc=0.1/0.2 Nm 与起始速度前馈的 75%，合并优选参数。
+4. 执行同一条末端路线，测量补偿后七轴响应；再回到原始关节姿态、恢复起始参数。
+
+Kp/Kd 保持起始值。推荐只涉及平滑摩擦与速度前馈，末端前后测量用于比较整臂跟随。无末端路线的纯关节模式仍支持；它使用关节复测。没有改善也正常完成并保留数据。
+
+`settings` 字段可单独省略。省略 cartesian 时为纯关节模式；完整省略 settings 的现有 API 仍可用：
+
+| 字段 | 默认 | 范围 |
 | --- | --- | --- |
-| `axis` | null，全部七轴 | 指定 0..6 时只测该轴 |
-| `excursion` | 0.06981317007977318（4°） | rad，1°..10°；允许相对偏移，目标取一半 |
-| `speed` | 0.017453292519943295（1°/s） | rad/s，0.005..0.04；第二档为两倍 |
-| `max_friction` | 0.2 | Nm，0..2；Fc 取一半及全部，0 跳过摩擦候选 |
+| `axis` | null，七轴 | 0..6 指定单轴；末端程序测试七轴 |
+| `excursion` | 0.2792526803190927（16°） | rad，1°..30°，目标取一半；末端程序采用 program.joint_excursion |
+| `speed` | 0.03490658503988659（2°/s） | rad/s，0.005..0.08，第二档两倍 |
+| `max_friction` | 0.2 | Nm，0..2，Fc 取一半及全部，0 跳过摩擦候选 |
+| `cartesian` | null | 已预览的 CartesianProgram |
 
-参数候选各自与原始配置比较，不同时搜索摩擦与速度前馈。原始摩擦开关关闭时，试验先清除休眠系数再打开开关，避免改变其他轴的有效摩擦输出。测量用新位置反馈与成功发送参考的 100 ms 位移窗口计算速度误差；无可配对发送时使用控制参考。不对微秒级接收间隔差分，也不把长缺口拼接成完整窗口。
-
-选择依据是相对起始值的速度误差与位置误差，权重分别为 0.6 和 0.4；综合误差降低即可进入复测，没有 15% 改善或最少运动秒数的额外门槛。结果分别保留两项变化，数据不足或没有改善也会正常完成测试并保留曲线。
-
-HTTP `202 queued` 后，按启动请求 ID 查看结果及 `Snapshot.calibration`。后端自行执行片段；调用方只需续期控制权，不发送 `jog_update`。配置和片段结束会更新 `generation`。
+测试沿用已有运动学、速度/加速度/jerk、停止和设备故障处理。片段完成看生成的参考轨迹，不用原始反馈速度或另设的位置静止窗决定下一步。HTTP `202 queued` 后按请求 ID 查看结果及 `Snapshot.calibration`；后端自行推进，客户端只需续期控制权，不发送逐段点动。
 
 | 状态字段 | 含义 |
 | --- | --- |
-| `id` / `request_id` | 报告 ID / 启动请求 ID |
+| `id` / `request_id` | 报告 / 启动请求 ID |
 | `state` | running、stopping、completed、cancelled、failed |
-| `stage` | baseline、candidate、validation（合并参数复测）、restoring、done |
-| `axis` | 当前测试的关节，0..6 |
-| `trial_index/trial_count` | 从 0 开始的组进度；后续试验由测量选择，总数会调整 |
-| `leg_index/leg_count` | 当前组的片段进度，每组 6 段 |
-| `progress` | 0..1；终态看 state/report |
-| `live` | 当前一个曲线采样点，运行时可用于预览；终态省略 |
-| `report` | 运行时 null；结束后为报告摘要，curves 为空，sample_count 保留原始总数 |
+| `stage` | cartesian_before、baseline、candidate、cartesian_after、validation（纯关节复测）、restoring、done |
+| `space` / `axis` | 当前阶段为 joint 或 cartesian；axis 为 J1..J7 或基座 XYZ 的零起始索引 |
+| `trial_index/trial_count` | 组进度，候选由实测选择，总数会调整 |
+| `leg_index/leg_count` | 当前组片段进度 |
+| `progress` | 0..1，终态以 state/report 判断 |
+| `live` | 运行中的最近一个曲线点，终态省略 |
+| `report` | 终态摘要，curves 为空，sample_count 保留原始总数 |
 
-完整报告新增 `choices`、`sample_count`、`curves`。`trials[]` 的 `axis` 为测试关节，旧报告可为 null；`phase` 为 baseline、candidate、after，历史报告还可含 baseline_check/validation。每轮 `metrics` 包括 windows、valid_ms、velocity_rms（rad/s）、tracking_rms/tracking_peak/other_peak（rad）。`choices[]` 记录各轴 baseline_index、candidate_index、after_index，以及 velocity_change、tracking_change；相对变化为 `1 - after/before`，正值表示误差降低。
+`trials[]` 含 space、phase、axis、config、metrics 与 metrics_by_joint。关节试验的 metrics 为该轴统计；末端试验 axis=null、metrics=null，metrics_by_joint 按 J1..J7 保存七项统计。窗口数 windows、有效时长 valid_ms、速度误差 RMS velocity_rms（rad/s）、位置 RMS/峰值 tracking_rms/tracking_peak（rad），other_peak 为其他轴相对原位偏移。历史试验仍可有 baseline_check/validation 阶段。
 
-`outcome` 为 improved、unchanged、cancelled 或 failed，旧报告还可含 insufficient。`recommended` 为完整 ServoTuning 或 null；`improvement` 为合并参数复测的综合误差相对降低比例，不是所有单项指标的改善率。正常完成总是先回到原位、恢复起始参数，并继续使能；没有改善仍是 completed。停止会取消剩余动作、按原停止过程减速并恢复参数，不再自动回原位。故障不自动重新使能。
+候选按相对基线的速度误差 0.6、位置误差 0.4 综合比较，没有固定改善百分比门槛。末端程序用末端复测的七轴综合指标给出结论。`choices[]` 保存所选候选索引及单项相对变化；`recommended` 为完整 ServoTuning 或 null，`improvement` 为综合指标变化，不能替代各轴位置和速度对比。
 
-每 20 ms 记录一次七轴曲线，最多 90000 点。所有数组按 J1..J7 排列：
+**曲线**每 20 ms 记录七轴数据，最多 90000 点。所有数组为 J1..J7：
 
-| `curves[]` 字段 | 含义与单位 |
+| 字段 | 含义 |
 | --- | --- |
-| `t_ms` | 相对测试开始时间，ms |
-| `trial` / `axis` | 当前试验索引 / 本轮运动轴；可据此观察其他轴的联动波动 |
+| `t_ms` | 距测试开始的主机时间，ms |
+| `trial` / `space` / `axis` | 试验及运动空间/轴；其他六轴仍完整采样 |
 | `reference` | 控制参考位置，rad |
-| `command` | 最近成功写完整批的发送目标位置，rad；尚无记录时 null |
-| `feedback` | 最近七轴实测位置，rad |
-| `velocity` | 最近成功发送的未缩放轨迹速度，rad/s；无记录时为控制参考速度 |
+| `command` | 最近成功发送整批目标，rad；无记录时 null |
+| `feedback` | 缓存实测位置，rad |
+| `velocity` | 成功发送的未缩放轨迹速度，rad/s；无记录时使用控制参考 |
 | `feedback_velocity` | 原始回传速度，rad/s |
-| `feedback_age_ms` | 各轴反馈距本点的时间，ms |
+| `feedback_age_ms` | 各轴反馈年龄，ms |
 | `command_at_ms` | 该批发送完成的相对时间，ms；无记录时 null |
 
-这些是主机时刻的观测，保留反馈年龄与发送时间供区分来源；不是设备端同步采样。旧 JSON 没有曲线时显示统计对比，不补造时间点。
+时间为主机观测，发送和反馈各自保留时效。旧报告只有统计时展示指标，不生成时间曲线。
 
-有推荐时，用最新 `generation` 提交 `kind:"calibrate_apply", calibration_id:"..."`。只应用当前连接最近完成的报告；手工更改过伺服配置或已经应用过的结果不会再次覆盖当前参数。应用沿用普通伺服配置的连接、控制权与空闲要求，不检查之前的 TCP 或测试姿态。TCP 变化不使关节补偿结果失效。
+**应用**：用最新 generation 提交 `kind:"calibrate_apply", calibration_id:"..."`。只应用当前连接最近完成且含推荐的报告；手工改过伺服配置或已应用的结果不重复覆盖。沿用普通参数应用的连接、控制权和空闲要求。结果界面列出具体轴、参数原值/推荐值及末端同轨迹前后表现。
 
-报告元数据和曲线分别存入 events.sqlite3 的 calibrations、calibration_curves 表，同一事务保存，保留最近 100 份。控制线程只采样和尝试队列提交；JSON 编码与 SQL 在写入线程执行，不等待磁盘。未入队报告保留补投，开始下一次测试不等待数据库。历史与当前状态仅带摘要，完整曲线按需读取：
+正常完成回原位并恢复原参数；停止取消后续动作、按原停止流程减速并恢复参数，不继续回原位。关闭弹窗可重新查看进度，Esc 请求停止。故障不自动重新使能。
 
-- `GET /v1/calibrations?limit=20`：最近摘要，limit 限制到 1..100。
-- `GET /v1/calibrations/{id}?points=3000`：默认约 3000 个真实采样点，保留每段端点，不插值；端点本身超过预算时可以超出点数。`points=0` 返回全部。
-- `GET /v1/calibrations/{id}?download=true`：完整 JSON 附件，忽略 points。
+**保存与读取**：完整结果在发布 completed 前即保留于本机内存，详情、下载和历史可立即读到；SQLite 编码、写入及重试仍在写入线程，不阻塞控制。元数据与曲线同事务保存，保留最近 100 份，重启后读取数据库。内部完整结果不会重复进入 HTTP/WS 状态 JSON。
 
-读取、抽取绘图点和编码都在 `spawn_blocking` 中执行。未找到返回 `404 calibration_not_found`；新完成报告尚未入库时可稍后重读。历史报告可以查看、导入和下载，重启后不自动取得应用资格。操作与测试见[校准试用流程](low-speed-calibration-test-plan.md)。
+- `GET /v1/calibrations?limit=20`：摘要，limit 1..100，合并刚完成结果。
+- `GET /v1/calibrations/{id}?points=3000`：默认约 3000 个真实点，保留段端点和七轴位置/速度误差极值；points=0 返回全部。
+- `GET /v1/calibrations/{id}?download=true`：完整 JSON 附件。
+
+读取、绘图点抽取和编码使用工作线程。未知历史 ID 返回 `404 calibration_not_found`；写盘尚未完成不会让当前结果返回 404。历史可查看、导入和下载，重启后不自动取得应用资格。操作与试用见[校准流程](low-speed-calibration-test-plan.md)。
 
 ## 6. 命令输出与执行结果
 

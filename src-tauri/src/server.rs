@@ -81,7 +81,7 @@ pub async fn launch(
     .await
 }
 
-async fn launch_at(
+pub(crate) async fn launch_at(
     arm: ArmHandle,
     journal: Journal,
     token: String,
@@ -115,6 +115,7 @@ async fn launch_at(
         .route("/v1/logs", get(logs))
         .route("/v1/logs/page", get(log_page))
         .route("/v1/calibrations", get(calibrations))
+        .route("/v1/calibrations/preview", post(calibration_preview))
         .route("/v1/calibrations/{id}", get(calibration))
         .route("/v1/traces", post(trace_start).get(traces))
         .route("/v1/traces/stop", post(trace_stop))
@@ -275,7 +276,13 @@ async fn calibrations(
         query.map_err(|_| ApiError::new("invalid_calibration", "校准查询参数无效"))?;
     let limit = query.limit.unwrap_or(20).clamp(1, 100) as usize;
     let body = tokio::task::spawn_blocking(move || {
-        let reports = state.journal.calibrations(limit)?;
+        let mut reports = state.journal.calibrations(limit)?;
+        if let Some(latest) = state.arm.snapshot().calibration_report {
+            reports.retain(|report| report.id != latest.id);
+            reports.push(latest.summary());
+            reports.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms).then(b.id.cmp(&a.id)));
+            reports.truncate(limit);
+        }
         serde_json::to_vec(&reports).map_err(|e| e.to_string())
     })
     .await
@@ -297,6 +304,41 @@ struct CalibrationQuery {
     download: Option<bool>,
 }
 
+async fn calibration_preview(
+    State(state): State<ApiState>,
+    Json(request): Json<crate::calibration_path::PreviewRequest>,
+) -> Result<Response, ApiError> {
+    let snapshot = state.arm.snapshot();
+    if snapshot.port.is_none() {
+        return Err(ApiError::new("not_connected", "请先连接机械臂"));
+    }
+    let tcp = snapshot
+        .tcp_transform
+        .ok_or_else(|| ApiError::new("tcp_missing", "请先设置 TCP"))?;
+    let body = tokio::task::spawn_blocking(move || {
+        let model = crate::kinematics::Kinematics::load(&snapshot.side)?;
+        let preview = crate::calibration_path::preview(
+            &model,
+            &snapshot.side,
+            snapshot.reference,
+            tcp,
+            request,
+        )?;
+        serde_json::to_vec(&preview).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| ApiError::new("preview_failed", "轨迹预览未完成"))?
+    .map_err(|e| ApiError::new("preview_failed", e))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response())
+}
+
 async fn calibration(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -305,11 +347,16 @@ async fn calibration(
     let Query(query) =
         query.map_err(|_| ApiError::new("invalid_calibration", "校准查询参数无效"))?;
     tokio::task::spawn_blocking(move || {
-        let report = state
-            .journal
-            .calibration(&id)
-            .map_err(|_| ApiError::new("journal_unavailable", "校准记录暂不可读"))?
-            .ok_or_else(|| ApiError::new("calibration_not_found", "校准记录不存在"))?;
+        let snapshot = state.arm.snapshot();
+        let report = if let Some(report) = snapshot.calibration_report.filter(|r| r.id == id) {
+            (*report).clone()
+        } else {
+            state
+                .journal
+                .calibration(&id)
+                .map_err(|_| ApiError::new("journal_unavailable", "校准记录暂不可读"))?
+                .ok_or_else(|| ApiError::new("calibration_not_found", "校准记录不存在"))?
+        };
         let download = query.download.unwrap_or(false);
         let report = if download {
             report
@@ -556,6 +603,7 @@ mod tests {
                 excursion: 0.1,
                 speed: 0.02,
                 max_friction: 0.1,
+                cartesian: None,
             },
             center_reference: [0.0; 7],
             center_measured: [0.0; 7],
@@ -568,6 +616,7 @@ mod tests {
             curves: Arc::new(
                 (0..sample_count)
                     .map(|i| crate::calibration::Point {
+                        space: "joint".into(),
                         t_ms: i as u32 * 20,
                         trial: usize::from(i >= sample_count / 2),
                         axis: 1,

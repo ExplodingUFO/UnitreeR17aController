@@ -53,6 +53,32 @@ export interface CalibrationSettings {
   excursion: number;
   speed: number;
   max_friction: number;
+  cartesian?: CartesianProgram | null;
+}
+export interface CalibrationPreviewRequest {
+  amplitude: number;
+  speed: number;
+  axes: number[];
+}
+export interface CartesianProgram {
+  side: Side;
+  origin: JointPositions;
+  tcp: Pose;
+  amplitude: number;
+  speed: number;
+  joint_excursion: number;
+  segments: { axis: number; offset: number }[];
+}
+export interface PreviewPoint {
+  joints: JointPositions;
+  tcp: [number, number, number];
+  segment: number;
+  space: string;
+  axis: number;
+}
+export interface CalibrationPreview {
+  program: CartesianProgram;
+  points: PreviewPoint[];
 }
 export interface CalibrationMetrics {
   windows: number;
@@ -68,11 +94,14 @@ export interface CalibrationTrial {
   axis?: number | null;
   config: ServoTuning;
   metrics: CalibrationMetrics | null;
+  space?: Space;
+  metrics_by_joint?: (CalibrationMetrics | null)[] | null;
 }
 export interface CalibrationPoint {
   t_ms: number;
   trial: number;
   axis: number;
+  space?: Space;
   reference: JointPositions;
   command: JointPositions | null;
   feedback: JointPositions;
@@ -119,9 +148,12 @@ export interface CalibrationStatus {
     | "baseline_check"
     | "validation"
     | "after"
+    | "cartesian_before"
+    | "cartesian_after"
     | "restoring"
     | "done";
   axis: number;
+  space?: Space;
   trial_index: number;
   trial_count: number;
   leg_index: number;
@@ -245,7 +277,11 @@ export function parseCalibrationReport(value: unknown): CalibrationReport {
         typeof trial.phase === "string" &&
         (trial.axis == null || validAxis(trial.axis)) &&
         isServoTuning(trial.config) &&
-        validMetrics(trial.metrics),
+        validMetrics(trial.metrics) &&
+        (trial.metrics_by_joint == null ||
+          (Array.isArray(trial.metrics_by_joint) &&
+            trial.metrics_by_joint.length === 7 &&
+            trial.metrics_by_joint.every(validMetrics))),
     ) ||
     !["improved", "unchanged", "insufficient", "cancelled", "failed"].includes(
       report.outcome,
@@ -301,7 +337,7 @@ export type Action = {
 } & (
   | { space: Space; mode: "continuous" | "step"; axis: number }
   | { space: "joint"; mode: "return"; axis: null }
-  | { space: "joint"; mode: "calibration"; axis: number }
+  | { space: Space; mode: "calibration"; axis: number }
 );
 export interface Snapshot {
   seq: number;
@@ -421,7 +457,7 @@ export type Operation =
   | ({ kind: "return_to_pose" } & ReturnToPoseArguments)
   | { kind: "configure_tcp"; tcp: Pose }
   | { kind: "configure_servo"; config: ServoTuning }
-  | { kind: "calibrate_start"; settings?: CalibrationSettings }
+  | { kind: "calibrate_start"; settings?: Partial<CalibrationSettings> }
   | { kind: "calibrate_apply"; calibration_id: string }
   | ({
       kind: "jog_start";
@@ -670,6 +706,32 @@ class DesktopApi {
       { signal },
     );
     return reports.map(parseCalibrationReport);
+  }
+  async previewCalibration(
+    request: CalibrationPreviewRequest,
+    signal?: AbortSignal,
+  ) {
+    const preview = await this.request<CalibrationPreview>(
+      "/v1/calibrations/preview",
+      request,
+      { signal },
+    );
+    if (
+      !preview?.program ||
+      !isJointPositions(preview.program.origin) ||
+      !Number.isFinite(preview.program.joint_excursion) ||
+      !Array.isArray(preview.points) ||
+      preview.points.length < 2 ||
+      !preview.points.every(
+        (point) =>
+          isJointPositions(point.joints) &&
+          point.tcp?.length === 3 &&
+          point.tcp.every(Number.isFinite) &&
+          typeof point.space === "string",
+      )
+    )
+      throw new Error("预览数据不完整，请重新生成");
+    return preview;
   }
   async readCalibration(id: string, signal?: AbortSignal, points = 3000) {
     return parseCalibrationReport(

@@ -815,6 +815,7 @@ mod tests {
         report.curves = Arc::new(
             (0..samples)
                 .map(|i| crate::calibration::Point {
+                    space: "joint".into(),
                     t_ms: i as u32 * 20,
                     trial: usize::from(i >= samples / 2),
                     axis: 2,

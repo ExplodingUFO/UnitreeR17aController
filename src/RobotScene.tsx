@@ -2,12 +2,20 @@ import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import URDFLoader, { type URDFRobot } from "urdf-loader";
-import type { Joint, Side } from "./api";
+import type { CalibrationPreview, Joint, Side } from "./api";
+export interface PreviewEnvelope {
+  min: number[];
+  max: number[];
+  size: number[];
+}
 interface Props {
   side: Side;
   joints: Joint[];
   valid: boolean;
   source: string;
+  preview?: CalibrationPreview | null;
+  previewProgress?: number;
+  onPreviewEnvelope?: (envelope: PreviewEnvelope | null) => void;
 }
 interface ModelSpec {
   joint_names: string[];
@@ -16,21 +24,45 @@ interface ModelSpec {
   urdf: string;
 }
 function disposeObject(object: THREE.Object3D) {
+  const geometries = new Set<THREE.BufferGeometry>();
+  const materials = new Set<THREE.Material>();
   object.traverse((child) => {
     const mesh = child as THREE.Mesh;
-    if (mesh.geometry) mesh.geometry.dispose();
+    if (mesh.geometry) geometries.add(mesh.geometry);
     if (mesh.material) {
-      const materials = Array.isArray(mesh.material)
+      const owned = Array.isArray(mesh.material)
         ? mesh.material
         : [mesh.material];
-      materials.forEach((m) => m.dispose());
+      owned.forEach((m) => materials.add(m));
     }
   });
+  geometries.forEach((geometry) => geometry.dispose());
+  materials.forEach((material) => material.dispose());
 }
-export default function RobotScene({ side, joints, valid, source }: Props) {
+export default function RobotScene({
+  side,
+  joints,
+  valid,
+  source,
+  preview,
+  previewProgress = 0,
+  onPreviewEnvelope,
+}: Props) {
   const container = useRef<HTMLDivElement>(null);
-  const current = useRef({ joints, valid });
-  current.current = { joints, valid };
+  const current = useRef({
+    joints,
+    valid,
+    preview,
+    previewProgress,
+    onPreviewEnvelope,
+  });
+  current.current = {
+    joints,
+    valid,
+    preview,
+    previewProgress,
+    onPreviewEnvelope,
+  };
   const reset = useRef<() => void>(() => {});
   const [error, setError] = useState("");
   useEffect(() => {
@@ -46,13 +78,20 @@ export default function RobotScene({ side, joints, valid, source }: Props) {
     setError("");
     let disposed = false;
     let robot: URDFRobot | undefined;
+    let planned: URDFRobot | undefined;
     let spec: ModelSpec | undefined;
+    let modelReady = false;
+    let builtPreview: CalibrationPreview | null | undefined;
     let lastValid = false;
     const theme = getComputedStyle(document.documentElement);
     const themeColor = (token: string) =>
       new THREE.Color(theme.getPropertyValue(token).trim());
     const referenceColor = themeColor("--scene-model-reference");
+    const plannedColor = themeColor("--color-focus");
+    const jointPathColor = themeColor("--color-warning");
     const scene = new THREE.Scene();
+    const overlay = new THREE.Group();
+    scene.add(overlay);
     scene.background = themeColor("--scene-background");
     const camera = new THREE.PerspectiveCamera(38, 1, 0.005, 100);
     // URDF remains Z-up; rotate only the world-view helper coordinate convention.
@@ -128,6 +167,17 @@ export default function RobotScene({ side, joints, valid, source }: Props) {
         };
         manager.onLoad = () => {
           if (!disposed && robot) {
+            modelReady = true;
+            const state = current.current;
+            if (state.valid)
+              spec!.joint_names.forEach((name, index) => {
+                const q = (
+                  state.joints.find((joint) => joint.name === name) ??
+                  state.joints[index]
+                )?.q;
+                if (q != null) robot!.setJointValue(name, q);
+              });
+            robot.updateMatrixWorld(true);
             const box = new THREE.Box3().setFromObject(robot);
             if (!box.isEmpty()) {
               center = box.getCenter(new THREE.Vector3());
@@ -168,8 +218,162 @@ export default function RobotScene({ side, joints, valid, source }: Props) {
         if (!disposed) setError(e.message);
       });
     renderer.setAnimationLoop(() => {
+      const state = current.current;
+      if (modelReady && robot && spec && builtPreview !== state.preview) {
+        disposeObject(overlay);
+        overlay.clear();
+        builtPreview = state.preview;
+        if (planned) planned.visible = !!state.preview;
+        if (state.preview) {
+          if (!planned) {
+            planned = robot.clone() as URDFRobot;
+            // Object3D.clone shares mesh resources: own every ghost material.
+            // Geometry is immutable and disposed once with the complete scene.
+            planned.traverse((object) => {
+              const mesh = object as THREE.Mesh;
+              if (!mesh.material) return;
+              const tint = (material: THREE.Material) => {
+                const clone = material.clone();
+                if ("color" in clone)
+                  (clone as THREE.MeshStandardMaterial).color.copy(
+                    plannedColor,
+                  );
+                clone.transparent = true;
+                clone.opacity = 0.32;
+                clone.depthWrite = false;
+                return clone;
+              };
+              mesh.material = Array.isArray(mesh.material)
+                ? mesh.material.map(tint)
+                : tint(mesh.material);
+              mesh.renderOrder = 2;
+            });
+            scene.add(planned);
+          }
+          const envelope = new THREE.Box3();
+          const { points } = state.preview;
+          // Include every supplied pose, including all seven joint trials.
+          for (const point of points) {
+            spec.joint_names.forEach((name, axis) =>
+              planned!.setJointValue(name, point.joints[axis]),
+            );
+            planned.updateMatrixWorld(true);
+            envelope.expandByObject(planned);
+          }
+          for (const space of ["cartesian", "joint"] as const) {
+            const positions: THREE.Vector3[] = [];
+            // Separate line segments prevent a fictitious connection between programmes.
+            for (let index = 1; index < points.length; index++) {
+              const from = points[index - 1],
+                to = points[index];
+              if (
+                (from.space === "cartesian" ? "cartesian" : "joint") ===
+                  space &&
+                (to.space === "cartesian" ? "cartesian" : "joint") === space
+              )
+                positions.push(
+                  new THREE.Vector3(...from.tcp),
+                  new THREE.Vector3(...to.tcp),
+                );
+            }
+            const line = new THREE.LineSegments(
+              new THREE.BufferGeometry().setFromPoints(positions),
+              new THREE.LineBasicMaterial({
+                color: space === "cartesian" ? plannedColor : jointPathColor,
+                depthTest: false,
+                transparent: true,
+                opacity: 0.9,
+              }),
+            );
+            line.name = `preview-path-${space}`;
+            line.renderOrder = 3;
+            overlay.add(line);
+          }
+          const tcpMarker = new THREE.Mesh(
+            new THREE.SphereGeometry(0.004, 12, 8),
+            new THREE.MeshBasicMaterial({
+              color: plannedColor,
+              depthTest: false,
+            }),
+          );
+          tcpMarker.name = "preview-tcp";
+          tcpMarker.renderOrder = 4;
+          overlay.add(tcpMarker);
+          if (!envelope.isEmpty()) {
+            const box = new THREE.Box3Helper(envelope, plannedColor);
+            box.name = "preview-arm-envelope";
+            const boxMaterials = Array.isArray(box.material)
+              ? box.material
+              : [box.material];
+            boxMaterials.forEach((material) => {
+              material.transparent = true;
+              material.opacity = 0.45;
+              material.depthWrite = false;
+            });
+            overlay.add(box);
+            state.onPreviewEnvelope?.({
+              min: envelope.min.toArray(),
+              max: envelope.max.toArray(),
+              size: envelope.getSize(new THREE.Vector3()).toArray(),
+            });
+            const frame = envelope.clone();
+            points.forEach((point) =>
+              frame.expandByPoint(new THREE.Vector3(...point.tcp)),
+            );
+            center = frame.getCenter(new THREE.Vector3());
+            distance = Math.max(
+              frame.getSize(new THREE.Vector3()).length() * 1.05,
+              0.45,
+            );
+            resetCamera();
+            element.dataset.envelope = JSON.stringify({
+              min: envelope.min.toArray(),
+              max: envelope.max.toArray(),
+            });
+          }
+          element.dataset.previewPoints = String(points.length);
+          element.dataset.cartesianSegments = String(
+            overlay.getObjectByName("preview-path-cartesian") &&
+              points.filter((point) => point.space === "cartesian").length,
+          );
+          element.dataset.jointPoints = String(
+            points.filter((point) => point.space !== "cartesian").length,
+          );
+        } else {
+          state.onPreviewEnvelope?.(null);
+          delete element.dataset.envelope;
+          delete element.dataset.previewPoints;
+          delete element.dataset.cartesianSegments;
+          delete element.dataset.jointPoints;
+        }
+      }
+      if (planned && state.preview) {
+        const points = state.preview.points;
+        const at = Math.min(
+          points.length - 1,
+          Math.max(0, state.previewProgress) * (points.length - 1),
+        );
+        const from = points[Math.floor(at)],
+          to = points[Math.min(points.length - 1, Math.floor(at) + 1)];
+        if (from && to && spec) {
+          spec.joint_names.forEach((name, axis) =>
+            planned!.setJointValue(
+              name,
+              THREE.MathUtils.lerp(from.joints[axis], to.joints[axis], at % 1),
+            ),
+          );
+          element.dataset.plannedJoints = JSON.stringify(
+            spec.joint_names.map((name) => planned!.joints[name].jointValue[0]),
+          );
+          const tcpMarker = overlay.getObjectByName("preview-tcp");
+          tcpMarker?.position.lerpVectors(
+            new THREE.Vector3(...from.tcp),
+            new THREE.Vector3(...to.tcp),
+            at % 1,
+          );
+        }
+      }
       if (robot && spec) {
-        const state = current.current;
         if (state.valid) {
           const values: Record<string, number> = {};
           spec.joint_names.forEach((name, index) => {
@@ -180,6 +384,9 @@ export default function RobotScene({ side, joints, valid, source }: Props) {
           });
           robot.setJointValues(values);
         }
+        element.dataset.actualJoints = JSON.stringify(
+          spec.joint_names.map((name) => robot!.joints[name].jointValue[0]),
+        );
         if (lastValid !== state.valid || !robot.userData.colored) {
           robot.traverse((object) => {
             const mesh = object as THREE.Mesh;
@@ -221,7 +428,7 @@ export default function RobotScene({ side, joints, valid, source }: Props) {
     };
   }, [side]);
   return (
-    <div className="scene">
+    <div className="scene" data-preview={!!preview}>
       <div className="scene-canvas" ref={container} />
       <div className="scene-toolbar">
         <span className="source-badge" role="status">
@@ -238,6 +445,14 @@ export default function RobotScene({ side, joints, valid, source }: Props) {
       {error && (
         <div className="scene-error" role="status">
           {error}
+        </div>
+      )}
+      {preview && (
+        <div className="scene-preview-legend" aria-label="预览图例">
+          <span data-kind="actual">实测</span>
+          <span data-kind="planned">计划 / 全臂包络</span>
+          <span data-kind="cartesian">TCP · 末端动作</span>
+          <span data-kind="joint">TCP · 七轴试验</span>
         </div>
       )}
     </div>

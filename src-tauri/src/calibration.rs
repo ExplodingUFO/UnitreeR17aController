@@ -2,6 +2,7 @@
 
 use crate::tuning::ServoTuning;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -11,15 +12,17 @@ pub struct Settings {
     pub excursion: f64,
     pub speed: f64,
     pub max_friction: f64,
+    pub cartesian: Option<Arc<crate::calibration_path::CartesianProgram>>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             axis: None,
-            excursion: 4.0f64.to_radians(),
-            speed: 1.0f64.to_radians(),
+            excursion: 16.0f64.to_radians(),
+            speed: 2.0f64.to_radians(),
             max_friction: 0.2,
+            cartesian: None,
         }
     }
 }
@@ -34,9 +37,9 @@ fn validate_settings(settings: &Settings) -> Result<(), String> {
             "excursion",
             settings.excursion,
             1.0f64.to_radians(),
-            10.0f64.to_radians().max(0.1745329252),
+            30.0f64.to_radians(),
         ),
-        ("speed", settings.speed, 0.005, 0.04),
+        ("speed", settings.speed, 0.005, 0.08),
         ("max_friction", settings.max_friction, 0.0, 2.0),
     ] {
         if !value.is_finite() || !(min..=max).contains(&value) {
@@ -48,6 +51,18 @@ fn validate_settings(settings: &Settings) -> Result<(), String> {
 
 pub fn validate(settings: &Settings, baseline: &ServoTuning) -> Result<(), String> {
     validate_settings(settings)?;
+    if let Some(path) = &settings.cartesian
+        && (path.origin.iter().any(|v| !v.is_finite())
+            || !path.amplitude.is_finite()
+            || !(0.02..=0.1).contains(&path.amplitude)
+            || !path.speed.is_finite()
+            || !(0.005..=0.0135).contains(&path.speed)
+            || path.segments.iter().any(|s| {
+                s.axis > 2 || !s.offset.is_finite() || s.offset.abs() > path.amplitude + 1e-9
+            }))
+    {
+        return Err("末端测试轨迹参数无效".into());
+    }
     baseline.validate()
 }
 
@@ -271,6 +286,14 @@ pub struct Trial {
     pub axis: Option<usize>,
     pub config: ServoTuning,
     pub metrics: Option<Metrics>,
+    #[serde(default = "joint_space")]
+    pub space: String,
+    #[serde(default)]
+    pub metrics_by_joint: Option<Vec<Option<Metrics>>>,
+}
+
+fn joint_space() -> String {
+    "joint".into()
 }
 
 fn metrics_valid(metrics: &Metrics) -> bool {
@@ -343,6 +366,8 @@ pub struct Point {
     pub feedback_velocity: [f64; 7],
     pub feedback_age_ms: [u16; 7],
     pub command_at_ms: Option<u32>,
+    #[serde(default = "joint_space")]
+    pub space: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -389,8 +414,8 @@ impl Report {
         }
     }
 
-    /// Select real samples without interpolation. Every contiguous trial/axis
-    /// segment keeps its endpoints, even when those alone exceed max_points.
+    /// Select real samples without interpolation. Keep each segment's endpoints
+    /// and per-bucket extrema of all joints' position/velocity tracking errors.
     /// A zero budget returns all samples with an O(1) clone of their Arc.
     pub fn for_plot(&self, max_points: usize) -> Self {
         if max_points == 0 || self.curves.len() <= max_points {
@@ -424,10 +449,8 @@ impl Report {
             interiors_left -= interior;
             extras_left -= extra;
             curves.push(self.curves[start].clone());
-            for slot in 1..=extra {
-                let offset =
-                    (slot as u128 * (end - start - 1) as u128 / (extra + 1) as u128) as usize;
-                curves.push(self.curves[start + offset].clone());
+            for index in plot_indices(&self.curves, start, end, extra) {
+                curves.push(self.curves[index].clone());
             }
             if end > start + 1 {
                 curves.push(self.curves[end - 1].clone());
@@ -438,6 +461,42 @@ impl Report {
             ..self.clone()
         }
     }
+}
+
+fn plot_indices(points: &[Point], start: usize, end: usize, extra: usize) -> Vec<usize> {
+    let mut selected = BTreeSet::new();
+    let interior = (end - start).saturating_sub(2);
+    let buckets = extra / 28;
+    for bucket in 0..buckets {
+        let from = start + 1 + bucket * interior / buckets;
+        let to = start + 1 + (bucket + 1) * interior / buckets;
+        for axis in 0..7 {
+            for velocity in [false, true] {
+                let value = |index: usize| {
+                    let p = &points[index];
+                    if velocity {
+                        p.feedback_velocity[axis] - p.velocity[axis]
+                    } else {
+                        p.feedback[axis] - p.command.as_ref().unwrap_or(&p.reference)[axis]
+                    }
+                };
+                if let Some(min) = (from..to).min_by(|a, b| value(*a).total_cmp(&value(*b))) {
+                    selected.insert(min);
+                }
+                if let Some(max) = (from..to).max_by(|a, b| value(*a).total_cmp(&value(*b))) {
+                    selected.insert(max);
+                }
+            }
+        }
+    }
+    for slot in 1..=extra {
+        if selected.len() == extra {
+            break;
+        }
+        let offset = (slot as u128 * (end - start - 1) as u128 / (extra + 1) as u128) as usize;
+        selected.insert(start + offset);
+    }
+    selected.into_iter().collect()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -455,6 +514,8 @@ pub struct Status {
     pub report: Option<Report>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live: Option<Point>,
+    #[serde(default = "joint_space")]
+    pub space: String,
 }
 
 #[cfg(test)]
@@ -473,8 +534,8 @@ mod tests {
     fn defaults_select_all_axes_with_a_small_six_leg_programme_for_each() {
         let settings: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.axis, None);
-        close(settings.excursion, 4.0f64.to_radians());
-        close(settings.speed, 1.0f64.to_radians());
+        close(settings.excursion, 16.0f64.to_radians());
+        close(settings.speed, 2.0f64.to_radians());
         close(settings.max_friction, 0.2);
         assert!(validate(&settings, &ServoTuning::default()).is_ok());
         let center = [0.5, -0.4, 0.3, -0.2, 0.1, -0.0, 0.7];
@@ -482,8 +543,8 @@ mod tests {
             let programme = legs(&settings, axis, center);
             assert_eq!(programme.len(), 6);
             for (index, leg) in programme.iter().enumerate() {
-                let offset = [2.0f64.to_radians(), -2.0f64.to_radians(), 0.0][index % 3];
-                close(leg.speed, (1 + index / 3) as f64 * 1.0f64.to_radians());
+                let offset = [8.0f64.to_radians(), -8.0f64.to_radians(), 0.0][index % 3];
+                close(leg.speed, (1 + index / 3) as f64 * 2.0f64.to_radians());
                 close(leg.target[axis], center[axis] + offset);
                 for other in (0..7).filter(|other| *other != axis) {
                     assert_eq!(leg.target[other].to_bits(), center[other].to_bits());
@@ -854,6 +915,8 @@ mod tests {
     fn trial(index: usize, velocity_rms: f64, tracking_rms: f64) -> Trial {
         Trial {
             index,
+            space: "joint".into(),
+            metrics_by_joint: None,
             phase: if index == 0 { "baseline" } else { "candidate" }.into(),
             axis: Some(3),
             config: ServoTuning::default(),
@@ -1013,6 +1076,7 @@ mod tests {
     fn curve_point(t_ms: u32, trial: usize, axis: usize) -> Point {
         let reference = std::array::from_fn(|joint| t_ms as f64 * 0.00002 + joint as f64 * 0.01);
         Point {
+            space: "joint".into(),
             t_ms,
             trial,
             axis,
@@ -1122,6 +1186,24 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn plotted_long_records_preserve_passive_joint_jitter_peaks() {
+        let mut points: Vec<_> = (0..2000).map(|i| curve_point(i * 20, 0, 3)).collect();
+        for p in &mut points {
+            p.feedback = p.reference;
+            p.feedback_velocity = p.velocity;
+        }
+        points[139].feedback[6] += 0.03;
+        points[823].feedback[6] -= 0.02;
+        points[1537].feedback_velocity[1] += 0.4;
+        let plotted = report(points).for_plot(200);
+        for index in [139, 823, 1537] {
+            assert!(
+                plotted.curves.iter().any(|p| p.t_ms == index * 20),
+                "passive joint peak {index} disappeared from the plot"
+            );
+        }
+    }
 
     #[test]
     fn legacy_json_without_new_fields_and_with_numeric_axis_still_loads() {
@@ -1162,6 +1244,7 @@ mod tests {
         assert_eq!(encoded["curves"][0]["command"], Value::Null);
         assert_eq!(encoded["choices"][0]["after_index"], json!(2));
         let mut status = Status {
+            space: "joint".into(),
             id: report.id.clone(),
             request_id: report.request_id.clone(),
             state: "completed".into(),

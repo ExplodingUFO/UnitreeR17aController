@@ -651,9 +651,77 @@
                     "client_id": "example-service",
                     "lease_id": "11111111-1111-4111-8111-111111111111",
                     "generation": 4,
-                    "kind": "calibrate_start"
+                    "kind": "calibrate_start",
+                    "settings": {
+                      "cartesian": {
+                        "side": "right",
+                        "origin": [
+                          0.3,
+                          0.7,
+                          1.1,
+                          0.9,
+                          -0.4,
+                          0.2,
+                          -0.3
+                        ],
+                        "tcp": {
+                          "translation": [
+                            0.025,
+                            -0.015,
+                            0.1
+                          ],
+                          "rotation": [
+                            0.0,
+                            0.0,
+                            0.0,
+                            1.0
+                          ]
+                        },
+                        "amplitude": 0.05,
+                        "speed": 0.01,
+                        "joint_excursion": 0.2792526803190927,
+                        "segments": [
+                          {
+                            "axis": 0,
+                            "offset": 0.049999048060747064
+                          },
+                          {
+                            "axis": 0,
+                            "offset": -0.04999924846884174
+                          },
+                          {
+                            "axis": 0,
+                            "offset": 0.0
+                          },
+                          {
+                            "axis": 1,
+                            "offset": 0.049999056551896084
+                          },
+                          {
+                            "axis": 1,
+                            "offset": -0.04999925497333496
+                          },
+                          {
+                            "axis": 1,
+                            "offset": 0.0
+                          },
+                          {
+                            "axis": 2,
+                            "offset": 0.04999906620535449
+                          },
+                          {
+                            "axis": 2,
+                            "offset": -0.04999922933326709
+                          },
+                          {
+                            "axis": 2,
+                            "offset": 0.0
+                          }
+                        ]
+                      }
+                    }
                   },
-                  "summary": "启动默认七轴低速测试"
+                  "summary": "确认已预览的末端与关节试验"
                 },
                 "calibrate_apply": {
                   "value": {
@@ -2006,7 +2074,7 @@
         ],
         "responses": {
           "200": {
-            "description": "默认约3000个真实点，保留段端点，不插值；download=true返回所有点和附件头。sample_count保留原始总数。",
+            "description": "默认约3000真实点，保留段端点及七轴误差极值后补均匀点；download=true完整附件。刚完成结果不等待SQL提交。",
             "content": {
               "application/json": {
                 "schema": {
@@ -2166,6 +2234,254 @@
           },
           "503": {
             "$ref": "#/components/responses/JournalUnavailable"
+          }
+        },
+        "description": "优先读取本次已完成的完整内存结果，写盘未完成也可查看、下载；其余ID读SQLite。未知ID返回404。"
+      }
+    },
+    "/v1/calibrations/preview": {
+      "post": {
+        "operationId": "previewCalibration",
+        "tags": [
+          "校准"
+        ],
+        "summary": "生成末端及关节运动预览，不下发动作",
+        "description": "从当前保持指令与TCP计算。返回可达末端路线以及全部关节±8°姿态。工作线程计算，不修改控制权、使能或参数。实际行程以program.segments为准。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CalibrationPreviewRequest"
+              },
+              "examples": {
+                "default": {
+                  "value": {}
+                },
+                "xyz50mm": {
+                  "value": {
+                    "amplitude": 0.05,
+                    "speed": 0.01,
+                    "axes": [
+                      0,
+                      1,
+                      2
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "几何预览。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CalibrationPreview"
+                },
+                "example": {
+                  "program": {
+                    "side": "right",
+                    "origin": [
+                      0.3,
+                      0.7,
+                      1.1,
+                      0.9,
+                      -0.4,
+                      0.2,
+                      -0.3
+                    ],
+                    "tcp": {
+                      "translation": [
+                        0.025,
+                        -0.015,
+                        0.1
+                      ],
+                      "rotation": [
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0
+                      ]
+                    },
+                    "amplitude": 0.05,
+                    "speed": 0.01,
+                    "joint_excursion": 0.2792526803190927,
+                    "segments": [
+                      {
+                        "axis": 0,
+                        "offset": 0.049999048060747064
+                      },
+                      {
+                        "axis": 0,
+                        "offset": -0.04999924846884174
+                      },
+                      {
+                        "axis": 0,
+                        "offset": 0.0
+                      },
+                      {
+                        "axis": 1,
+                        "offset": 0.049999056551896084
+                      },
+                      {
+                        "axis": 1,
+                        "offset": -0.04999925497333496
+                      },
+                      {
+                        "axis": 1,
+                        "offset": 0.0
+                      },
+                      {
+                        "axis": 2,
+                        "offset": 0.04999906620535449
+                      },
+                      {
+                        "axis": 2,
+                        "offset": -0.04999922933326709
+                      },
+                      {
+                        "axis": 2,
+                        "offset": 0.0
+                      }
+                    ]
+                  },
+                  "points": [
+                    {
+                      "joints": [
+                        0.3,
+                        0.7,
+                        1.1,
+                        0.9,
+                        -0.4,
+                        0.2,
+                        -0.3
+                      ],
+                      "tcp": [
+                        0.16066829881553443,
+                        -0.09034619083225098,
+                        0.17514881233964943
+                      ],
+                      "segment": 0,
+                      "space": "cartesian",
+                      "axis": 0
+                    },
+                    {
+                      "joints": [
+                        0.3247388790451326,
+                        0.757930926624494,
+                        1.001786232318326,
+                        1.098527642438808,
+                        -0.3061488549819603,
+                        0.02953262647141774,
+                        -0.28453416096909007
+                      ],
+                      "tcp": [
+                        0.16066527662352315,
+                        -0.09034592148024663,
+                        0.2244337842419732
+                      ],
+                      "segment": 6,
+                      "space": "cartesian",
+                      "axis": 2
+                    },
+                    {
+                      "joints": [
+                        0.3,
+                        0.7,
+                        1.1,
+                        0.9,
+                        -0.4,
+                        0.2,
+                        -0.3
+                      ],
+                      "tcp": [
+                        0.16066829881553443,
+                        -0.09034619083225098,
+                        0.17514881233964943
+                      ],
+                      "segment": 29,
+                      "space": "joint",
+                      "axis": 6
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "轨迹预览未完成",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "code": "preview_failed",
+                  "message": "轨迹预览未完成"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "访问令牌无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "code": "unauthorized",
+                  "message": "访问令牌无效"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "请求来源不允许",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "example": {
+                  "code": "forbidden_origin",
+                  "message": "请求来源不允许"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "请求体超过16KiB。",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "需要application/json。",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "字段类型无效。",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           }
         }
       }
@@ -5989,16 +6305,16 @@
           "excursion": {
             "type": "number",
             "minimum": 0.017453292519943295,
-            "maximum": 0.1745329252,
-            "description": "相对最大位移，rad，1°..10°；目标取一半。最大值兼容十位小数的10°换算。",
-            "default": 0.06981317007977318
+            "maximum": 0.5235987755982988,
+            "description": "关节允许偏移参数，rad，1°..30°，目标一半；cartesian程序采用program.joint_excursion。",
+            "default": 0.2792526803190927
           },
           "speed": {
             "type": "number",
             "minimum": 0.005,
-            "maximum": 0.04,
-            "description": "慢档rad/s，快档为两倍。",
-            "default": 0.017453292519943295
+            "maximum": 0.08,
+            "description": "关节慢档rad/s，默认2°/s，快档两倍。",
+            "default": 0.03490658503988659
           },
           "max_friction": {
             "type": "number",
@@ -6006,21 +6322,94 @@
             "maximum": 2,
             "description": "Fc 试验上限，Nm；候选取一半及全部，0 跳过摩擦候选。",
             "default": 0.2
+          },
+          "cartesian": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CartesianProgram"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
         "examples": [
           {},
           {
-            "axis": null,
-            "excursion": 0.06981317007977318,
-            "speed": 0.017453292519943295,
-            "max_friction": 0.2
+            "cartesian": {
+              "side": "right",
+              "origin": [
+                0.3,
+                0.7,
+                1.1,
+                0.9,
+                -0.4,
+                0.2,
+                -0.3
+              ],
+              "tcp": {
+                "translation": [
+                  0.025,
+                  -0.015,
+                  0.1
+                ],
+                "rotation": [
+                  0.0,
+                  0.0,
+                  0.0,
+                  1.0
+                ]
+              },
+              "amplitude": 0.05,
+              "speed": 0.01,
+              "joint_excursion": 0.2792526803190927,
+              "segments": [
+                {
+                  "axis": 0,
+                  "offset": 0.049999048060747064
+                },
+                {
+                  "axis": 0,
+                  "offset": -0.04999924846884174
+                },
+                {
+                  "axis": 0,
+                  "offset": 0.0
+                },
+                {
+                  "axis": 1,
+                  "offset": 0.049999056551896084
+                },
+                {
+                  "axis": 1,
+                  "offset": -0.04999925497333496
+                },
+                {
+                  "axis": 1,
+                  "offset": 0.0
+                },
+                {
+                  "axis": 2,
+                  "offset": 0.04999906620535449
+                },
+                {
+                  "axis": 2,
+                  "offset": -0.04999922933326709
+                },
+                {
+                  "axis": 2,
+                  "offset": 0.0
+                }
+              ]
+            }
           },
           {
             "axis": 3
           }
         ],
-        "description": "字段可省略，缺省执行七轴固定程序；输入仍沿用软件运动范围。默认目标为起始保持姿态各轴 ±2°，实际允许偏移 ±4°。"
+        "description": "可省略字段。纯关节模式默认七轴±8°、两档2/4°/s；cartesian提供已预览的末端程序，桌面先预览再确认。"
       },
       "CalibrationMetrics": {
         "type": "object",
@@ -6070,7 +6459,9 @@
               "candidate",
               "after",
               "baseline_check",
-              "validation"
+              "validation",
+              "cartesian_before",
+              "cartesian_after"
             ],
             "description": "当前程序使用 baseline/candidate/after；其余值用于读取历史报告。"
           },
@@ -6095,6 +6486,37 @@
             "minimum": 0,
             "maximum": 6,
             "description": "本轮运动关节；旧报告未记录时为 null。"
+          },
+          "space": {
+            "type": "string",
+            "enum": [
+              "joint",
+              "cartesian"
+            ],
+            "default": "joint"
+          },
+          "metrics_by_joint": {
+            "anyOf": [
+              {
+                "type": "array",
+                "minItems": 7,
+                "maxItems": 7,
+                "items": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/CalibrationMetrics"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "末端试验按J1..J7统计；此时axis和metrics为null。关节试验为null。"
           }
         },
         "required": [
@@ -6215,7 +6637,7 @@
             "items": {
               "$ref": "#/components/schemas/CalibrationPoint"
             },
-            "description": "时间曲线。状态流和历史列表为空；详情默认抽取真实采样，下载返回全部。旧报告没有逐时刻数据时为空。"
+            "description": "真实时间曲线，状态流/历史为空。详情保留各轴位置与速度误差极值作绘图抽取；下载返回全部。"
           }
         },
         "required": [
@@ -6341,7 +6763,7 @@
             "curves": []
           }
         ],
-        "description": "校准报告，正常无改善仍为完成测量。摘要不带曲线，详细读取和下载带曲线。正常结束恢复起始参数，推荐须显式应用。"
+        "description": "报告含明确的参数前后值、关节候选统计和同末端路线的七轴前后统计。Kp/Kd保持不变。完成状态发布前即支持当前结果读取，SQLite异步保存。"
       },
       "CalibrationStatus": {
         "type": "object",
@@ -6370,14 +6792,17 @@
               "baseline_check",
               "validation",
               "restoring",
-              "done"
+              "done",
+              "cartesian_before",
+              "cartesian_after"
             ],
             "description": "合并参数复测在状态中标为 validation，对应 trials.phase=after。"
           },
           "axis": {
             "type": "integer",
             "minimum": 0,
-            "maximum": 6
+            "maximum": 6,
+            "description": "当前阶段的运动轴，关节或基座XYZ索引。"
           },
           "trial_index": {
             "type": "integer",
@@ -6421,6 +6846,14 @@
               }
             ],
             "description": "运行中的最近曲线点，终态省略；完整曲线由详情读取。"
+          },
+          "space": {
+            "type": "string",
+            "enum": [
+              "joint",
+              "cartesian"
+            ],
+            "default": "joint"
           }
         },
         "required": [
@@ -6459,24 +6892,89 @@
             ]
           }
         ],
-        "description": "连接、使能、持有控制权且没有其他动作时启动。无需额外静止窗口，不按反馈dq拒绝。保存当前保持目标为原位；基线扫七轴，误差较大的两轴分别试摩擦/速度前馈，再合并复测。固定Kp/Kd，完成回原位恢复起始配置。stop等取消后续动作。",
+        "description": "连接、使能、控制权及空闲要求沿用运动接口，无静止观察。桌面先用只读preview生成programme，确认后通过settings.cartesian提交；先末端基线，再七轴±8°比较Fc/速度前馈，最后同末端路线复测。Kp/Kd不变。正常结束回原位并恢复参数。没有cartesian时为纯关节模式。",
         "examples": [
           {
             "request_id": "req-calibration-001",
             "client_id": "example-service",
             "lease_id": "11111111-1111-4111-8111-111111111111",
             "generation": 4,
-            "kind": "calibrate_start"
+            "kind": "calibrate_start",
+            "settings": {
+              "cartesian": {
+                "side": "right",
+                "origin": [
+                  0.3,
+                  0.7,
+                  1.1,
+                  0.9,
+                  -0.4,
+                  0.2,
+                  -0.3
+                ],
+                "tcp": {
+                  "translation": [
+                    0.025,
+                    -0.015,
+                    0.1
+                  ],
+                  "rotation": [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                  ]
+                },
+                "amplitude": 0.05,
+                "speed": 0.01,
+                "joint_excursion": 0.2792526803190927,
+                "segments": [
+                  {
+                    "axis": 0,
+                    "offset": 0.049999048060747064
+                  },
+                  {
+                    "axis": 0,
+                    "offset": -0.04999924846884174
+                  },
+                  {
+                    "axis": 0,
+                    "offset": 0.0
+                  },
+                  {
+                    "axis": 1,
+                    "offset": 0.049999056551896084
+                  },
+                  {
+                    "axis": 1,
+                    "offset": -0.04999925497333496
+                  },
+                  {
+                    "axis": 1,
+                    "offset": 0.0
+                  },
+                  {
+                    "axis": 2,
+                    "offset": 0.04999906620535449
+                  },
+                  {
+                    "axis": 2,
+                    "offset": -0.04999922933326709
+                  },
+                  {
+                    "axis": 2,
+                    "offset": 0.0
+                  }
+                ]
+              }
+            }
           },
           {
-            "request_id": "req-calibration-single",
+            "request_id": "req-calibration-001",
             "client_id": "example-service",
             "lease_id": "11111111-1111-4111-8111-111111111111",
             "generation": 4,
-            "kind": "calibrate_start",
-            "settings": {
-              "axis": 3
-            }
+            "kind": "calibrate_start"
           }
         ]
       },
@@ -6532,7 +7030,7 @@
             "type": "integer",
             "minimum": 0,
             "maximum": 6,
-            "description": "本轮运动轴，其他轴数据也完整记录。"
+            "description": "运动轴：joint为0..6，cartesian为基座XYZ 0..2；所有七轴数据始终完整记录。"
           },
           "reference": {
             "type": "array",
@@ -6605,6 +7103,14 @@
             "minimum": 0,
             "maximum": 4294967295,
             "description": "该批发送完成时间，相对测试开始，ms；尚无记录时 null。"
+          },
+          "space": {
+            "type": "string",
+            "enum": [
+              "joint",
+              "cartesian"
+            ],
+            "default": "joint"
           }
         },
         "description": "每20ms观察一次的主机时序数据，包含所有七轴。保留各来源时间，不表示设备同步采样。",
@@ -6679,7 +7185,8 @@
               3,
               2
             ],
-            "command_at_ms": 1019
+            "command_at_ms": 1019,
+            "space": "joint"
           }
         ]
       },
@@ -6732,6 +7239,396 @@
             "after_index": 16,
             "velocity_change": 0.04,
             "tracking_change": 0.38
+          }
+        ]
+      },
+      "CalibrationPreviewRequest": {
+        "type": "object",
+        "properties": {
+          "amplitude": {
+            "type": "number",
+            "minimum": 0.02,
+            "maximum": 0.1,
+            "default": 0.05,
+            "description": "基座各方向的单向幅度，m；默认正负各50mm。"
+          },
+          "speed": {
+            "type": "number",
+            "minimum": 0.005,
+            "maximum": 0.0135,
+            "default": 0.01,
+            "description": "末端峰值速度，m/s。"
+          },
+          "axes": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 2
+            },
+            "default": [
+              0,
+              1,
+              2
+            ],
+            "description": "基座XYZ索引；重复值合并。"
+          }
+        },
+        "required": [],
+        "description": "只读预览请求；省略字段使用默认值。",
+        "examples": [
+          {},
+          {
+            "amplitude": 0.05,
+            "speed": 0.01,
+            "axes": [
+              0,
+              1,
+              2
+            ]
+          }
+        ]
+      },
+      "CartesianSegment": {
+        "type": "object",
+        "properties": {
+          "axis": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2
+          },
+          "offset": {
+            "type": "number",
+            "minimum": -0.1,
+            "maximum": 0.1,
+            "description": "相对原始TCP的绝对带符号偏移，m；实际值不超过program.amplitude。"
+          }
+        },
+        "required": [
+          "axis",
+          "offset"
+        ],
+        "description": "一个基座轴上的目标；其他平移分量及工具方向保持原位。"
+      },
+      "CartesianProgram": {
+        "type": "object",
+        "properties": {
+          "side": {
+            "type": "string",
+            "enum": [
+              "left",
+              "right"
+            ]
+          },
+          "origin": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "预览时的原始保持目标，rad，J1..J7。"
+          },
+          "tcp": {
+            "$ref": "#/components/schemas/Pose"
+          },
+          "amplitude": {
+            "type": "number",
+            "minimum": 0.02,
+            "maximum": 0.1
+          },
+          "speed": {
+            "type": "number",
+            "minimum": 0.005,
+            "maximum": 0.0135
+          },
+          "joint_excursion": {
+            "type": "number",
+            "minimum": 0.017453292519943295,
+            "maximum": 0.5235987755982988,
+            "default": 0.2792526803190927,
+            "description": "完整关节偏移范围，rad，目标为正负一半；预览默认16°，目标±8°。"
+          },
+          "segments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CartesianSegment"
+            },
+            "description": "每轴按正向、反向、原位排列。可达不足时缩短实际偏移；无可达末端方向时为空，仍可预览关节程序。"
+          }
+        },
+        "required": [
+          "side",
+          "origin",
+          "tcp",
+          "amplitude",
+          "speed",
+          "segments"
+        ],
+        "description": "把刚收到的program用于确认启动，保留原位、TCP及实际行程。",
+        "examples": [
+          {
+            "side": "right",
+            "origin": [
+              0.3,
+              0.7,
+              1.1,
+              0.9,
+              -0.4,
+              0.2,
+              -0.3
+            ],
+            "tcp": {
+              "translation": [
+                0.025,
+                -0.015,
+                0.1
+              ],
+              "rotation": [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            },
+            "amplitude": 0.05,
+            "speed": 0.01,
+            "joint_excursion": 0.2792526803190927,
+            "segments": [
+              {
+                "axis": 0,
+                "offset": 0.049999048060747064
+              },
+              {
+                "axis": 0,
+                "offset": -0.04999924846884174
+              },
+              {
+                "axis": 0,
+                "offset": 0.0
+              },
+              {
+                "axis": 1,
+                "offset": 0.049999056551896084
+              },
+              {
+                "axis": 1,
+                "offset": -0.04999925497333496
+              },
+              {
+                "axis": 1,
+                "offset": 0.0
+              },
+              {
+                "axis": 2,
+                "offset": 0.04999906620535449
+              },
+              {
+                "axis": 2,
+                "offset": -0.04999922933326709
+              },
+              {
+                "axis": 2,
+                "offset": 0.0
+              }
+            ]
+          }
+        ]
+      },
+      "CalibrationPreviewPoint": {
+        "type": "object",
+        "properties": {
+          "joints": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "计划关节姿态，rad。"
+          },
+          "tcp": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3,
+            "description": "对应TCP基座坐标，m。"
+          },
+          "segment": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "space": {
+            "type": "string",
+            "enum": [
+              "cartesian",
+              "joint",
+              "joint_return"
+            ]
+          },
+          "axis": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 6,
+            "description": "末端点为XYZ索引，关节点为J1..J7索引。"
+          }
+        },
+        "required": [
+          "joints",
+          "tcp",
+          "segment",
+          "space",
+          "axis"
+        ],
+        "description": "几何预览点，包含末端路径、关节试验和回原位。点序不代表控制时序。"
+      },
+      "CalibrationPreview": {
+        "type": "object",
+        "properties": {
+          "program": {
+            "$ref": "#/components/schemas/CartesianProgram"
+          },
+          "points": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CalibrationPreviewPoint"
+            }
+          }
+        },
+        "required": [
+          "program",
+          "points"
+        ],
+        "description": "整个测试的几何预览，前端显示TCP路线、计划姿态及整臂包络；不触发运动。",
+        "examples": [
+          {
+            "program": {
+              "side": "right",
+              "origin": [
+                0.3,
+                0.7,
+                1.1,
+                0.9,
+                -0.4,
+                0.2,
+                -0.3
+              ],
+              "tcp": {
+                "translation": [
+                  0.025,
+                  -0.015,
+                  0.1
+                ],
+                "rotation": [
+                  0.0,
+                  0.0,
+                  0.0,
+                  1.0
+                ]
+              },
+              "amplitude": 0.05,
+              "speed": 0.01,
+              "joint_excursion": 0.2792526803190927,
+              "segments": [
+                {
+                  "axis": 0,
+                  "offset": 0.049999048060747064
+                },
+                {
+                  "axis": 0,
+                  "offset": -0.04999924846884174
+                },
+                {
+                  "axis": 0,
+                  "offset": 0.0
+                },
+                {
+                  "axis": 1,
+                  "offset": 0.049999056551896084
+                },
+                {
+                  "axis": 1,
+                  "offset": -0.04999925497333496
+                },
+                {
+                  "axis": 1,
+                  "offset": 0.0
+                },
+                {
+                  "axis": 2,
+                  "offset": 0.04999906620535449
+                },
+                {
+                  "axis": 2,
+                  "offset": -0.04999922933326709
+                },
+                {
+                  "axis": 2,
+                  "offset": 0.0
+                }
+              ]
+            },
+            "points": [
+              {
+                "joints": [
+                  0.3,
+                  0.7,
+                  1.1,
+                  0.9,
+                  -0.4,
+                  0.2,
+                  -0.3
+                ],
+                "tcp": [
+                  0.16066829881553443,
+                  -0.09034619083225098,
+                  0.17514881233964943
+                ],
+                "segment": 0,
+                "space": "cartesian",
+                "axis": 0
+              },
+              {
+                "joints": [
+                  0.3247388790451326,
+                  0.757930926624494,
+                  1.001786232318326,
+                  1.098527642438808,
+                  -0.3061488549819603,
+                  0.02953262647141774,
+                  -0.28453416096909007
+                ],
+                "tcp": [
+                  0.16066527662352315,
+                  -0.09034592148024663,
+                  0.2244337842419732
+                ],
+                "segment": 6,
+                "space": "cartesian",
+                "axis": 2
+              },
+              {
+                "joints": [
+                  0.3,
+                  0.7,
+                  1.1,
+                  0.9,
+                  -0.4,
+                  0.2,
+                  -0.3
+                ],
+                "tcp": [
+                  0.16066829881553443,
+                  -0.09034619083225098,
+                  0.17514881233964943
+                ],
+                "segment": 29,
+                "space": "joint",
+                "axis": 6
+              }
+            ]
           }
         ]
       }

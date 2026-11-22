@@ -133,6 +133,10 @@ pub struct Snapshot {
     pub servo_tuning: ServoTuning,
     pub servo_tuning_revision: u64,
     pub calibration: Option<CalibrationStatus>,
+    #[serde(skip)]
+    pub(crate) calibration_report: Option<Arc<CalibrationReport>>,
+    #[serde(skip)]
+    pub(crate) reference: [f64; 7],
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -495,15 +499,33 @@ struct CalibrationPlan {
     phase: String,
     axis: usize,
     config: ServoTuning,
+    cartesian: bool,
+}
+#[derive(Clone)]
+enum CalibrationLeg {
+    Joint(Leg),
+    Cartesian {
+        axis: usize,
+        offset: f64,
+        speed: f64,
+    },
+}
+impl CalibrationLeg {
+    fn speed(&self) -> f64 {
+        match self {
+            Self::Joint(leg) => leg.speed,
+            Self::Cartesian { speed, .. } => *speed,
+        }
+    }
 }
 struct CalibrationRun {
     report: CalibrationReport,
     queue: Vec<CalibrationPlan>,
-    legs: Vec<Leg>,
+    legs: Vec<CalibrationLeg>,
     trial: usize,
     leg: usize,
     step: CalibrationStep,
-    collector: Collector,
+    collectors: [Collector; 7],
     started: Instant,
     deadline: Instant,
     observed: Option<Instant>,
@@ -517,7 +539,42 @@ struct CalibrationRun {
 }
 impl CalibrationRun {
     fn axis(&self) -> usize {
-        self.queue[self.trial.min(self.queue.len() - 1)].axis
+        if let Some(CalibrationLeg::Cartesian { axis, .. }) = self.legs.get(self.leg) {
+            *axis
+        } else {
+            self.queue[self.trial.min(self.queue.len() - 1)].axis
+        }
+    }
+    fn cartesian(&self) -> bool {
+        self.queue[self.trial.min(self.queue.len() - 1)].cartesian
+    }
+    fn make_legs(&self) -> Vec<CalibrationLeg> {
+        if self.cartesian() {
+            let program = self.report.settings.cartesian.as_ref().unwrap();
+            let mut legs: Vec<_> = program
+                .segments
+                .iter()
+                .map(|segment| CalibrationLeg::Cartesian {
+                    axis: segment.axis,
+                    offset: segment.offset,
+                    speed: program.speed,
+                })
+                .collect();
+            legs.push(CalibrationLeg::Joint(Leg {
+                target: program.origin,
+                speed: self.report.settings.speed,
+            }));
+            legs
+        } else {
+            calibration::legs(
+                &self.report.settings,
+                self.queue[self.trial].axis,
+                self.report.center_reference,
+            )
+            .into_iter()
+            .map(CalibrationLeg::Joint)
+            .collect()
+        }
     }
 }
 fn calibration_reference(sent: &VecDeque<SentReference>, at: Instant) -> Option<SentReference> {
@@ -555,6 +612,7 @@ struct Core {
     motion: Option<Motion>,
     calibration: Option<CalibrationRun>,
     calibration_result: Option<CalibrationStatus>,
+    last_calibration_report: Option<Arc<CalibrationReport>>,
     calibration_apply_revision: Option<u64>,
     pending_calibration_report: VecDeque<CalibrationReport>,
     stopping: bool,
@@ -610,6 +668,7 @@ impl Core {
             motion: None,
             calibration: None,
             calibration_result: None,
+            last_calibration_report: None,
             calibration_apply_revision: None,
             pending_calibration_report: VecDeque::new(),
             stopping: false,
@@ -1163,26 +1222,80 @@ impl Core {
     fn begin_calibration(
         &mut self,
         id: &str,
-        settings: CalibrationSettings,
+        mut settings: CalibrationSettings,
         now: Instant,
     ) -> Result<(), ApiError> {
-        calibration::validate(&settings, &self.servo_tuning)
-            .map_err(|e| ApiError::new("invalid_calibration", e))?;
         self.flush_calibration_report();
         let anchor = self.motion_anchor(now)?;
         let measured = self.measured(now)?;
+        if let Some(program) = &settings.cartesian {
+            self.model
+                .as_ref()
+                .unwrap()
+                .fk(&program.origin, &program.tcp)
+                .map_err(|e| ApiError::new("invalid_calibration", e))?;
+            if program.side != self.side
+                || self.tcp.is_none_or(|tcp| {
+                    kinematics::pose_error(&tcp, &program.tcp)
+                        .iter()
+                        .any(|v| v.abs() > 1e-6)
+                })
+                || (0..7).any(|i| (program.origin[i] - anchor[i]).abs() > 0.03)
+            {
+                return Err(ApiError::new(
+                    "stale_preview",
+                    "姿态或 TCP 已变化，请更新轨迹预览",
+                ));
+            }
+            settings.excursion = program.joint_excursion;
+            settings.axis = None;
+        }
+        calibration::validate(&settings, &self.servo_tuning)
+            .map_err(|e| ApiError::new("invalid_calibration", e))?;
         let axes = settings
             .axis
             .map_or_else(|| (0..7).collect::<Vec<_>>(), |axis| vec![axis]);
-        let queue = axes
+        let mut queue: Vec<_> = axes
             .iter()
             .map(|axis| CalibrationPlan {
                 phase: "baseline".into(),
                 axis: *axis,
                 config: self.servo_tuning,
+                cartesian: false,
             })
             .collect();
         let first = axes[0];
+        if settings
+            .cartesian
+            .as_ref()
+            .is_some_and(|p| !p.segments.is_empty())
+        {
+            queue.insert(
+                0,
+                CalibrationPlan {
+                    phase: "cartesian_before".into(),
+                    axis: 0,
+                    config: self.servo_tuning,
+                    cartesian: true,
+                },
+            );
+        }
+        let legs = if let Some(program) = &settings.cartesian {
+            program
+                .segments
+                .iter()
+                .map(|s| CalibrationLeg::Cartesian {
+                    axis: s.axis,
+                    offset: s.offset,
+                    speed: program.speed,
+                })
+                .collect()
+        } else {
+            calibration::legs(&settings, first, anchor)
+                .into_iter()
+                .map(CalibrationLeg::Joint)
+                .collect()
+        };
         self.calibration = Some(CalibrationRun {
             report: CalibrationReport {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -1212,11 +1325,11 @@ impl Core {
                 message: "测试完成，参数保持原样".into(),
             },
             queue,
-            legs: calibration::legs(&settings, first, anchor),
+            legs,
             trial: 0,
             leg: 0,
             step: CalibrationStep::Configure,
-            collector: Collector::new(first, measured),
+            collectors: std::array::from_fn(|axis| Collector::new(axis, measured)),
             started: now,
             deadline: now + Duration::from_secs(2),
             observed: None,
@@ -1244,7 +1357,18 @@ impl Core {
         let total = if run.after_added {
             run.queue.len()
         } else {
-            (axes * 2 + axes.min(2) * 3).max(run.queue.len())
+            (if run
+                .report
+                .settings
+                .cartesian
+                .as_ref()
+                .is_some_and(|p| !p.segments.is_empty())
+            {
+                axes + axes.min(2) * 3 + 2
+            } else {
+                axes * 2 + axes.min(2) * 3
+            })
+            .max(run.queue.len())
         };
         let phase = &run.queue[run.trial.min(run.queue.len() - 1)].phase;
         CalibrationStatus {
@@ -1269,6 +1393,12 @@ impl Core {
                 .min(0.99),
             report: None,
             live: run.points.last().cloned(),
+            space: if run.cartesian() {
+                "cartesian"
+            } else {
+                "joint"
+            }
+            .into(),
         }
     }
     fn finish_calibration(&mut self, mut run: CalibrationRun) {
@@ -1276,6 +1406,7 @@ impl Core {
         run.report.sample_count = run.points.len();
         run.report.curves = Arc::new(run.points);
         let report = run.report;
+        self.last_calibration_report = Some(Arc::new(report.clone()));
         let state = match report.outcome.as_str() {
             "cancelled" => "cancelled",
             "failed" => "failed",
@@ -1302,6 +1433,7 @@ impl Core {
             progress: 1.0,
             report: Some(report.summary()),
             live: None,
+            space: "joint".into(),
         });
         // Normally the previous report was admitted during the next control tick.
         // Keep a completed report available in the UI even if storage is unavailable.
@@ -1362,6 +1494,7 @@ impl Core {
                             phase: "candidate".into(),
                             axis,
                             config,
+                            cartesian: false,
                         });
                     }
                 }
@@ -1426,11 +1559,29 @@ impl Core {
             }
             if !run.report.choices.is_empty() {
                 run.proposed = Some(proposed);
+            }
+            if run
+                .report
+                .settings
+                .cartesian
+                .as_ref()
+                .is_some_and(|p| !p.segments.is_empty())
+            {
+                run.queue.push(CalibrationPlan {
+                    phase: "cartesian_after".into(),
+                    axis: 0,
+                    config: run.proposed.unwrap_or(run.report.baseline),
+                    cartesian: true,
+                });
+                return;
+            }
+            if run.proposed.is_some() {
                 for trial in run.report.trials.iter().filter(|t| t.phase == "baseline") {
                     run.queue.push(CalibrationPlan {
                         phase: "after".into(),
                         axis: trial.axis.unwrap_or(0),
                         config: proposed,
+                        cartesian: false,
                     });
                 }
                 return;
@@ -1438,6 +1589,25 @@ impl Core {
         }
         let mut before_total = 0.0;
         let mut after_total = 0.0;
+        if let (Some(before), Some(after)) = (
+            run.report
+                .trials
+                .iter()
+                .find(|t| t.phase == "cartesian_before")
+                .and_then(|t| t.metrics_by_joint.as_ref()),
+            run.report
+                .trials
+                .iter()
+                .find(|t| t.phase == "cartesian_after")
+                .and_then(|t| t.metrics_by_joint.as_ref()),
+        ) {
+            for (b, a) in before.iter().zip(after) {
+                if let (Some(b), Some(a)) = (b, a) {
+                    before_total += calibration::score(b, b);
+                    after_total += calibration::score(b, a);
+                }
+            }
+        }
         for after in run.report.trials.iter().filter(|t| t.phase == "after") {
             if let Some(before) = run
                 .report
@@ -1475,7 +1645,7 @@ impl Core {
                 }
             }
         }
-        if before_total > 0.0 && after_total < before_total {
+        if run.proposed.is_some() && before_total > 0.0 && after_total < before_total {
             run.report.recommended = run.proposed;
             run.report.improvement = Some((before_total - after_total) / before_total);
             run.report.outcome = "improved".into();
@@ -1544,6 +1714,9 @@ impl Core {
                         .as_millis()
                         .min(u32::MAX as u128) as u32
                 }),
+                space: run.report.trials[run.trial.min(run.report.trials.len() - 1)]
+                    .space
+                    .clone(),
             });
         }
         if matches!(run.step, CalibrationStep::Moving) {
@@ -1557,13 +1730,19 @@ impl Core {
                 if let Ok(q) = self.measured(now) {
                     let sent = calibration_reference(&run.sent, at);
                     let moving = self.motion.is_some()
-                        && self.velocity[axis].abs() >= run.legs[run.leg].speed * 0.2;
-                    run.collector.observe(
-                        at.saturating_duration_since(run.started).as_micros() as u64,
-                        sent.map_or(self.reference, |s| s.q),
-                        q,
-                        moving,
-                    );
+                        && if run.cartesian() {
+                            self.velocity.iter().any(|v| v.abs() >= 0.0005)
+                        } else {
+                            self.velocity[axis].abs() >= run.legs[run.leg].speed() * 0.2
+                        };
+                    for collector in &mut run.collectors {
+                        collector.observe(
+                            at.saturating_duration_since(run.started).as_micros() as u64,
+                            sent.map_or(self.reference, |s| s.q),
+                            q,
+                            moving,
+                        );
+                    }
                 }
             }
         }
@@ -1589,17 +1768,18 @@ impl Core {
                     Ok(()) => {
                         run.report.trials.push(Trial {
                             index: run.trial,
-                            axis: Some(axis),
+                            axis: (!plan.cartesian).then_some(axis),
                             phase: plan.phase.clone(),
                             config,
                             metrics: None,
+                            space: if plan.cartesian { "cartesian" } else { "joint" }.into(),
+                            metrics_by_joint: None,
                         });
-                        run.legs = calibration::legs(
-                            &run.report.settings,
-                            axis,
-                            run.report.center_reference,
-                        );
-                        run.collector = Collector::new(axis, run.report.center_measured);
+                        run.leg = 0;
+                        run.legs = run.make_legs();
+                        run.collectors = std::array::from_fn(|axis| {
+                            Collector::new(axis, run.report.center_measured)
+                        });
                         run.leg = 0;
                         run.step = CalibrationStep::Move;
                         run.deadline = now + Duration::from_secs(2);
@@ -1611,9 +1791,39 @@ impl Core {
                 }
             }
             CalibrationStep::Move => {
-                let leg = &run.legs[run.leg];
+                let leg = run.legs[run.leg].clone();
                 let id = format!("cal:{}:{}:{}", run.report.id, run.trial, run.leg);
-                match self.begin_return(&id, leg.target, leg.speed, false, now) {
+                let started = match leg {
+                    CalibrationLeg::Joint(leg) => {
+                        self.begin_return(&id, leg.target, leg.speed, false, now)
+                    }
+                    CalibrationLeg::Cartesian {
+                        axis,
+                        offset,
+                        speed,
+                    } => {
+                        let program = run.report.settings.cartesian.as_ref().unwrap();
+                        let model = self.model.as_ref().unwrap();
+                        let origin = model.fk(&program.origin, &program.tcp).unwrap();
+                        let current = model.fk(&self.reference, &program.tcp).unwrap();
+                        let distance =
+                            origin.translation[axis] + offset - current.translation[axis];
+                        self.begin(
+                            &id,
+                            Space::Cartesian,
+                            axis,
+                            if distance >= 0.0 { 1 } else { -1 },
+                            speed,
+                            Frame::Base,
+                            true,
+                            distance.abs().max(1e-7),
+                            None,
+                            0,
+                            now,
+                        )
+                    }
+                };
+                match started {
                     Ok(()) => {
                         self.motion.as_mut().unwrap().calibration = true;
                         run.step = CalibrationStep::Moving;
@@ -1624,17 +1834,25 @@ impl Core {
             }
             CalibrationStep::Moving => {
                 if self.motion.is_none() && !self.stopping {
-                    run.collector.observe(
-                        now.saturating_duration_since(run.started).as_micros() as u64,
-                        self.reference,
-                        self.measured(now).unwrap_or(run.report.center_measured),
-                        false,
-                    );
+                    for collector in &mut run.collectors {
+                        collector.observe(
+                            now.saturating_duration_since(run.started).as_micros() as u64,
+                            self.reference,
+                            self.measured(now).unwrap_or(run.report.center_measured),
+                            false,
+                        );
+                    }
                     run.leg += 1;
                     run.step = CalibrationStep::Move;
                     run.deadline = now + Duration::from_secs(2);
                     if run.leg == run.legs.len() {
-                        run.report.trials[run.trial].metrics = run.collector.finish();
+                        if run.cartesian() {
+                            run.report.trials[run.trial].metrics_by_joint =
+                                Some(run.collectors.iter().map(Collector::finish).collect());
+                        } else {
+                            run.report.trials[run.trial].metrics =
+                                run.collectors[run.queue[run.trial].axis].finish();
+                        }
                         run.trial += 1;
                         run.step = CalibrationStep::Configure;
                         if run.trial == run.queue.len() {
@@ -2039,26 +2257,6 @@ impl Core {
     }
     fn advance(&mut self, now: Instant, dt: f64) {
         self.flush_calibration_report();
-        if let Some(run) = self.calibration.as_ref()
-            && !run.cancelled
-        {
-            let invalid = self.measured(now).map(|q| {
-                (0..7).any(|i| {
-                    let limit = run.report.settings.excursion;
-                    (q[i] - run.report.center_measured[i]).abs() > limit
-                        || (self.reference[i] - run.report.center_reference[i]).abs() > limit
-                })
-            });
-            match invalid {
-                Ok(false) => {}
-                Ok(true) => self.end_motion(
-                    "failed",
-                    "calibration_range",
-                    "校准运动超出设定范围，已停止",
-                ),
-                Err(e) => self.fault(&e.code, e.message),
-            }
-        }
         self.advance_motion(now, dt);
         self.advance_calibration(now);
     }
@@ -2177,12 +2375,13 @@ impl Core {
                     })
             }
         };
-        let needs_measured_position = !matches!(
-            mode,
-            MotionMode::Return {
-                disconnect_after: false
-            }
-        );
+        let needs_measured_position = !motion.calibration
+            && !matches!(
+                mode,
+                MotionMode::Return {
+                    disconnect_after: false
+                }
+            );
         let at_target = mode.timed()
             && t >= 1.0
             && within_target(&self.reference)
@@ -2295,7 +2494,7 @@ impl Core {
         if self
             .motion
             .as_ref()
-            .is_some_and(|m| m.mode.timed() && elapsed > m.duration + 3.0)
+            .is_some_and(|m| !m.calibration && m.mode.timed() && elapsed > m.duration + 3.0)
         {
             self.end_motion("failed", "target_timeout", "目标到达超时");
         }
@@ -2760,7 +2959,11 @@ impl Core {
                 .as_ref()
                 .map(|run| ActionSnapshot {
                     request_id: run.report.request_id.clone(),
-                    space: Space::Joint,
+                    space: if run.cartesian() {
+                        Space::Cartesian
+                    } else {
+                        Space::Joint
+                    },
                     mode: "calibration".into(),
                     axis: Some(run.axis()),
                     progress: self.calibration_snapshot(run).progress,
@@ -2797,6 +3000,8 @@ impl Core {
                 .as_ref()
                 .map(|run| self.calibration_snapshot(run))
                 .or_else(|| self.calibration_result.clone()),
+            calibration_report: self.last_calibration_report.clone(),
+            reference: self.reference,
         }
     }
 }
@@ -3628,6 +3833,7 @@ mod tests {
             excursion: 0.1,
             speed: 0.02,
             max_friction: 0.1,
+            cartesian: None,
         }
     }
     #[test]
@@ -3922,7 +4128,7 @@ mod tests {
             assert!(core.error.is_none());
             assert!(
                 (0..7)
-                    .all(|i| (core.reference[i] - center[i]).abs() <= 4.0_f64.to_radians() + 1e-6)
+                    .all(|i| (core.reference[i] - center[i]).abs() <= 16.0_f64.to_radians() + 1e-6)
             );
             if core.calibration.is_none() {
                 break;
@@ -3972,6 +4178,271 @@ mod tests {
         assert!(stored.curves.iter().any(|point| {
             (point.command.unwrap()[point.axis] - point.feedback[point.axis]).abs() > 0.0001
         }));
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_calibration_can_be_read_and_downloaded_while_sqlite_is_busy() {
+        let origin = Instant::now();
+        let (mut core, _dir, sent) = calibration_fixture(origin);
+        let journal = core.journal.clone();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !journal.stats().healthy {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let db = rusqlite::Connection::open(_dir.path().join("events.sqlite3")).unwrap();
+        db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        calibration_request(
+            &mut core,
+            "finish-before-commit",
+            Operation::CalibrateStart {
+                settings: calibration_settings(),
+            },
+            origin,
+        );
+        for tick in 1..90_000 {
+            let now = origin + Duration::from_millis(tick * 10);
+            calibration_tick(&mut core, &sent, now, origin, true);
+            if core.calibration.is_none() {
+                break;
+            }
+        }
+        let result = core.calibration_result.as_ref().unwrap();
+        assert_eq!(result.state, "completed");
+        let id = result.id.clone();
+        let count = result.report.as_ref().unwrap().sample_count;
+        assert!(journal.calibration(&id).unwrap().is_none());
+        let arm = ArmHandle::spawn_core(core).unwrap();
+        let server = crate::server::launch_at(
+            arm.clone(),
+            journal.clone(),
+            "finished-report-test".into(),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await
+        .unwrap();
+        let client = reqwest::Client::new();
+        let history: serde_json::Value = client
+            .get(format!("{}/v1/calibrations", server.base_url()))
+            .bearer_auth("finished-report-test")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(history[0]["id"], id);
+        let before_preview = arm.snapshot();
+        let preview: crate::calibration_path::CalibrationPreview = client
+            .post(format!("{}/v1/calibrations/preview", server.base_url()))
+            .bearer_auth("finished-report-test")
+            .json(&serde_json::json!({"amplitude":0.05}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(preview.program.amplitude, 0.05);
+        assert!(!preview.points.is_empty());
+        assert!(
+            arm.snapshot().action.is_none(),
+            "preview must not start a move"
+        );
+        assert_eq!(arm.snapshot().generation, before_preview.generation);
+        for query in ["?points=3000", "?download=true"] {
+            let response = client
+                .get(format!("{}/v1/calibrations/{id}{query}", server.base_url()))
+                .bearer_auth("finished-report-test")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::OK,
+                "completed report must be readable before disk commit"
+            );
+            let report: CalibrationReport = response.json().await.unwrap();
+            assert_eq!(report.id, id);
+            assert_eq!(report.sample_count, count);
+            assert!(!report.curves.is_empty());
+            if query.contains("download") {
+                assert_eq!(report.curves.len(), count);
+            }
+        }
+        db.execute_batch("ROLLBACK").unwrap();
+        server.shutdown().await;
+        assert!(arm.shutdown(Duration::from_secs(2)));
+        assert!(journal.shutdown(Duration::from_secs(3)));
+        assert_eq!(
+            journal.calibration(&id).unwrap().unwrap().curves.len(),
+            count
+        );
+        let reopened = Journal::start(_dir.path().join("events.sqlite3")).unwrap();
+        let fresh_arm = ArmHandle::spawn(reopened.clone()).unwrap();
+        let fresh_server = crate::server::launch_at(
+            fresh_arm.clone(),
+            reopened.clone(),
+            "reopened-test".into(),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await
+        .unwrap();
+        let persisted: CalibrationReport = client
+            .get(format!(
+                "{}/v1/calibrations/{id}?download=true",
+                fresh_server.base_url()
+            ))
+            .bearer_auth("reopened-test")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(persisted.curves.len(), count);
+        fresh_server.shutdown().await;
+        assert!(fresh_arm.shutdown(Duration::from_secs(1)));
+        assert!(reopened.shutdown(Duration::from_secs(2)));
+    }
+    #[test]
+    fn previewed_cartesian_calibration_executes_before_and_after_and_records_every_joint() {
+        let origin = Instant::now();
+        let (mut core, _dir, sent) = calibration_fixture(origin);
+        core.reference = [0.3, 0.7, 1.1, 0.9, -0.4, 0.2, -0.3];
+        core.tcp.as_mut().unwrap().translation = [0.025, -0.015, 0.1];
+        core.tcp.as_mut().unwrap().rotation = [
+            0.09879603932153468,
+            -0.148194058982302,
+            0.19759207864306935,
+            0.9639684818261637,
+        ];
+        calibration_tick(&mut core, &sent, origin, origin, false);
+        let preview = crate::calibration_path::preview(
+            core.model.as_ref().unwrap(),
+            &core.side,
+            core.reference,
+            core.tcp.unwrap(),
+            crate::calibration_path::PreviewRequest::default(),
+        )
+        .unwrap();
+        let program = preview.program.clone();
+        let center = core
+            .model
+            .as_ref()
+            .unwrap()
+            .fk(&program.origin, &program.tcp)
+            .unwrap();
+        let baseline = core.servo_tuning;
+        calibration_request(
+            &mut core,
+            "cartesian-program",
+            serde_json::from_str(&serde_json::json!({"kind":"calibrate_start","settings":{"cartesian":program,"max_friction":0.0}}).to_string()).unwrap(),
+            origin,
+        );
+        assert!(core.calibration.is_some(), "{:?}", core.results.front());
+        let mut low = [[0.0_f64; 3]; 2];
+        let mut high = low;
+        for tick in 1..250_000 {
+            let now = origin + Duration::from_millis(tick * 10);
+            calibration_tick(&mut core, &sent, now, origin, false);
+            assert!(core.error.is_none(), "{:?}", core.error);
+            if let Some(run) = &core.calibration {
+                assert!(!run.cancelled, "{}", run.report.message);
+                if run.cartesian()
+                    && core
+                        .motion
+                        .as_ref()
+                        .is_some_and(|m| m.space == Space::Cartesian)
+                {
+                    let stage = usize::from(run.queue[run.trial].phase == "cartesian_after");
+                    let pose = core
+                        .model
+                        .as_ref()
+                        .unwrap()
+                        .fk(&core.reference, &program.tcp)
+                        .unwrap();
+                    for i in 0..3 {
+                        let d = pose.translation[i] - center.translation[i];
+                        low[stage][i] = low[stage][i].min(d);
+                        high[stage][i] = high[stage][i].max(d);
+                    }
+                    let e = kinematics::pose_error(&center, &pose);
+                    assert!(e[3..].iter().all(|x| x.abs() < 0.003));
+                }
+            } else {
+                break;
+            }
+        }
+        assert!(core.calibration.is_none(), "programme did not finish");
+        let status = core.calibration_result.as_ref().unwrap();
+        assert_eq!(
+            status.state,
+            "completed",
+            "{}",
+            status.report.as_ref().unwrap().message
+        );
+        for stage in 0..2 {
+            for axis in 0..3 {
+                let expected_low = program
+                    .segments
+                    .iter()
+                    .filter(|s| s.axis == axis)
+                    .map(|s| s.offset)
+                    .fold(0.0_f64, f64::min);
+                let expected_high = program
+                    .segments
+                    .iter()
+                    .filter(|s| s.axis == axis)
+                    .map(|s| s.offset)
+                    .fold(0.0_f64, f64::max);
+                assert!(
+                    low[stage][axis] <= expected_low + 0.003,
+                    "{stage} {axis}: {:?}",
+                    low[stage]
+                );
+                assert!(
+                    high[stage][axis] >= expected_high - 0.003,
+                    "{stage} {axis}: {:?}",
+                    high[stage]
+                );
+            }
+        }
+        let full = core.last_calibration_report.as_ref().unwrap();
+        for phase in ["cartesian_before", "cartesian_after"] {
+            let trial = full.trials.iter().find(|t| t.phase == phase).unwrap();
+            assert_eq!(trial.space, "cartesian");
+            let metrics = trial.metrics_by_joint.as_ref().unwrap();
+            assert_eq!(metrics.len(), 7);
+            assert!(metrics.iter().all(Option::is_some));
+        }
+        assert!(
+            full.curves
+                .iter()
+                .filter(|p| p.space == "cartesian")
+                .count()
+                > 1000
+        );
+        assert!(
+            full.curves
+                .iter()
+                .all(|p| full.trials.get(p.trial).is_some())
+        );
+        assert_eq!(core.servo_tuning, baseline);
+        assert!((0..7).all(|i| (core.reference[i] - program.origin[i]).abs() < 0.02));
+        let json = serde_json::to_value(core.snapshot(Instant::now())).unwrap();
+        assert!(json.get("calibration_report").is_none());
+        assert!(json.get("reference").is_none());
+        assert!(
+            json["calibration"]["report"]["curves"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(core.journal.shutdown(Duration::from_secs(5)));
     }
     #[test]
     fn calibration_repeats_candidate_then_restores_and_requires_explicit_apply() {
@@ -4176,6 +4647,7 @@ mod tests {
                                 excursion,
                                 speed,
                                 max_friction: 0.1,
+                                cartesian: None,
                             },
                         },
                         origin,
