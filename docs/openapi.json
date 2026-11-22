@@ -276,7 +276,17 @@
                     ]
                   },
                   "servo_tuning_revision": 1,
-                  "calibration": null
+                  "calibration": null,
+                  "calibration_readiness": {
+                    "state": "unavailable",
+                    "code": "not_connected",
+                    "message": "请先连接机械臂",
+                    "joint": null,
+                    "observed_ms": 0,
+                    "required_ms": 300,
+                    "position_span": null,
+                    "position_limit": 0.001
+                  }
                 }
               }
             }
@@ -1137,7 +1147,17 @@
                   ]
                 },
                 "servo_tuning_revision": 1,
-                "calibration": null
+                "calibration": null,
+                "calibration_readiness": {
+                  "state": "unavailable",
+                  "code": "not_connected",
+                  "message": "请先连接机械臂",
+                  "joint": null,
+                  "observed_ms": 0,
+                  "required_ms": 300,
+                  "position_span": null,
+                  "position_limit": 0.001
+                }
               }
             }
           },
@@ -4114,6 +4134,9 @@
                 "type": "null"
               }
             ]
+          },
+          "calibration_readiness": {
+            "$ref": "#/components/schemas/CalibrationReadiness"
           }
         },
         "required": [
@@ -4137,7 +4160,8 @@
           "communication",
           "servo_tuning",
           "servo_tuning_revision",
-          "calibration"
+          "calibration",
+          "calibration_readiness"
         ],
         "description": "完整状态；所有键均存在，可选值用 null。tcp 是实测关节计算的基座 → TCP；未设置 TCP 或反馈无效时为 null。",
         "examples": [
@@ -4310,7 +4334,17 @@
               ]
             },
             "servo_tuning_revision": 1,
-            "calibration": null
+            "calibration": null,
+            "calibration_readiness": {
+              "state": "unavailable",
+              "code": "not_connected",
+              "message": "请先连接机械臂",
+              "joint": null,
+              "observed_ms": 0,
+              "required_ms": 300,
+              "position_span": null,
+              "position_limit": 0.001
+            }
           }
         ]
       },
@@ -4501,7 +4535,17 @@
                 ]
               },
               "servo_tuning_revision": 1,
-              "calibration": null
+              "calibration": null,
+              "calibration_readiness": {
+                "state": "unavailable",
+                "code": "not_connected",
+                "message": "请先连接机械臂",
+                "joint": null,
+                "observed_ms": 0,
+                "required_ms": 300,
+                "position_span": null,
+                "position_limit": 0.001
+              }
             }
           }
         ]
@@ -6411,6 +6455,90 @@
             "generation": 4,
             "kind": "calibrate_apply",
             "calibration_id": "33333333-3333-4333-8333-333333333333"
+          }
+        ]
+      },
+      "CalibrationReadiness": {
+        "type": "object",
+        "description": "由七轴新到达位置反馈与控制状态计算的校准准备状态；不改变反馈或自动提交动作。",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "ready",
+              "settling",
+              "moving",
+              "unavailable"
+            ]
+          },
+          "code": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "joint": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 6,
+            "description": "位置波动最大或缺少有效观测的关节，0..6；不是选定测试轴。"
+          },
+          "observed_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 300
+          },
+          "required_ms": {
+            "type": "integer",
+            "const": 300
+          },
+          "position_span": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "有效观测窗内七轴最大位置峰峰值，rad；无有效观测为null。"
+          },
+          "position_limit": {
+            "type": "number",
+            "const": 0.001,
+            "description": "静止确认的软件位置跨度阈值，rad。"
+          }
+        },
+        "required": [
+          "state",
+          "code",
+          "message",
+          "joint",
+          "observed_ms",
+          "required_ms",
+          "position_span",
+          "position_limit"
+        ],
+        "examples": [
+          {
+            "state": "ready",
+            "code": "ready",
+            "message": "位置已稳定，可以开始校准",
+            "joint": 5,
+            "observed_ms": 300,
+            "required_ms": 300,
+            "position_span": 0.00012,
+            "position_limit": 0.001
+          },
+          {
+            "state": "unavailable",
+            "code": "not_connected",
+            "message": "请先连接机械臂",
+            "joint": null,
+            "observed_ms": 0,
+            "required_ms": 300,
+            "position_span": null,
+            "position_limit": 0.001
           }
         ]
       }

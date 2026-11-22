@@ -47,7 +47,11 @@ type Eligibility = {
   revision: number;
   tcp: string;
 };
-type Feedback = { text: string; tone: "error" | "info" | "success" };
+type Feedback = {
+  text: string;
+  tone: "error" | "info" | "success";
+  code?: string;
+};
 const RAD = Math.PI / 180;
 const stages: Record<CalibrationStatus["stage"], string> = {
   baseline: "测量基线",
@@ -276,6 +280,8 @@ export default function CalibrationPanel({
 }: CalibrationPanelProps) {
   const s = view.snapshot;
   const status = s.calibration;
+  const readiness = s.calibration_readiness;
+  const feedbackFresh = hasFreshFeedback(view);
   const connection = `${view.baseUrl}:${view.connectionEpoch ?? 0}:${s.side}:${s.port ?? ""}:${["disconnected", "connecting", "closing"].includes(s.phase) ? "detached" : "attached"}`;
   const tcp = JSON.stringify(s.tcp_transform);
   const [page, setPage] = useState<Page>("settings");
@@ -337,7 +343,7 @@ export default function CalibrationPanel({
   const currentAxis = calibrationActive
     ? (status?.axis ?? s.action?.axis ?? draft.axis)
     : draft.axis;
-  const center = s.joints[currentAxis]?.q;
+  const center = feedbackFresh ? s.joints[currentAxis]?.q : null;
   const excursion = settings?.excursion;
   const completedKey =
     status && terminal(status) ? `${status.id}:${status.state}` : "";
@@ -422,11 +428,18 @@ export default function CalibrationPanel({
   useEffect(() => {
     const request = pendingRef.current;
     if (!request) return;
-    const fail = (text: string, invalidate = true) => {
+    const fail = (text: string, invalidate = true, code?: string) => {
       if (invalidate) invalidated.current.add(request.id);
       setPending(null);
-      if (request.kind === "start") setRun(null);
-      setFeedback({ text, tone: "error" });
+      if (request.kind === "start") {
+        setRun(null);
+        setPage("settings");
+      }
+      setFeedback({
+        text,
+        code,
+        tone: code === "motion_busy" ? "info" : "error",
+      });
     };
     if (!view.online || request.connection !== connection) {
       fail("连接已变化，请求未确认");
@@ -443,11 +456,20 @@ export default function CalibrationPanel({
       request.kind === "start" ? "calibrate_start" : "calibrate_apply";
     const matchingStatus =
       request.kind === "start" && status?.request_id === request.id;
+    // The first matching snapshot may already contain the terminal task.
+    // That confirms admission even when intermediate accepted frames were missed.
+    if (matchingStatus && terminal(status)) {
+      setPending(null);
+      setRun({ id: request.id, connection, state: "terminal" });
+      setFeedback(null);
+      setPage("result");
+      return;
+    }
     if (result && !["accepted", "completed"].includes(result.status)) {
       fail(
-        [result.code, result.message].filter(Boolean).join(" · ") ||
-          "请求未接受",
+        result.message || "请求未接受",
         false,
+        result.status === "rejected" ? result.code : undefined,
       );
       return;
     }
@@ -704,22 +726,66 @@ export default function CalibrationPanel({
     };
   }, []);
 
-  const startReason =
+  const preparationBlock =
     !view.online || ["disconnected", "connecting", "closing"].includes(s.phase)
       ? "未连接"
       : !view.hasControl
         ? "未取得控制权"
-        : s.phase === "fault"
+        : s.phase === "fault" || s.error
           ? s.error?.message || "故障"
           : !s.enabled
             ? "未使能"
             : s.phase !== "ready" || s.action || calibrationActive
-              ? "等待机械臂静止"
-              : !hasFreshFeedback(view)
+              ? "等待当前动作结束"
+              : !feedbackFresh
                 ? "等待新鲜的七轴反馈"
-                : busy
-                  ? "等待当前请求完成"
-                  : "";
+                : "";
+  const preparationTitle =
+    (preparationBlock &&
+      (s.phase === "fault" || s.error
+        ? "准备异常"
+        : view.online && view.hasControl && readiness?.code === "motion_busy"
+          ? "检测中"
+          : preparationBlock)) ||
+    (readiness
+      ? {
+          ready: "可开始",
+          settling: "检测中",
+          moving: "待停稳",
+          unavailable:
+            readiness.code === "motion_busy" ? "检测中" : "暂不可开始",
+        }[readiness.state]
+      : "等待准备状态");
+  const unavailableReason =
+    view.online && view.hasControl && readiness?.state === "unavailable"
+      ? readiness.message
+      : "";
+  const preparationMessage =
+    s.error?.message ||
+    unavailableReason ||
+    (preparationBlock
+      ? "准备条件恢复后会重新检测。"
+      : readiness?.message || "等待准备状态，确认后请手动开始。");
+  const startReason =
+    (preparationBlock && (unavailableReason || preparationBlock)) ||
+    (busy ? "等待当前请求完成" : "") ||
+    (readiness?.state === "ready"
+      ? ""
+      : readiness?.message || preparationTitle);
+  const observing =
+    !preparationBlock &&
+    !!readiness &&
+    ["ready", "settling", "moving"].includes(readiness.state);
+  const requiredMs =
+    readiness && readiness.required_ms > 0 ? readiness.required_ms : 300;
+  const observedMs = observing
+    ? Math.min(requiredMs, Math.max(0, readiness.observed_ms))
+    : 0;
+  const preparationTone =
+    s.error || view.error || readiness?.code === "fault" ? "error" : "info";
+  // A refused start is never queued for retry. Follow live preparation state
+  // instead of keeping that temporary refusal on screen after it recovers.
+  const currentFeedback = feedback?.code === "motion_busy" ? null : feedback;
   const validation = !settings
     ? "最大位移 1–10°，速度 0.2865–2.2918°/s，补偿上限 0–2 Nm"
     : "";
@@ -729,27 +795,22 @@ export default function CalibrationPanel({
         eligibility.id !== liveReport.id ||
         eligibility.connection !== connection
       ? "此报告不属于当前连接的校准"
-      : !view.online
-        ? "未连接"
-        : !view.hasControl
-          ? "未取得控制权"
-          : s.action ||
-              calibrationActive ||
-              !["ready", "disabled"].includes(s.phase) ||
-              stopPending
-            ? "等待机械臂静止"
-            : !hasFreshFeedback(view)
-              ? "等待新鲜的七轴反馈"
-              : tcp !== eligibility.tcp
-                ? "工具配置已变化"
-                : appliedReport === liveReport.id
-                  ? "推荐参数已应用"
-                  : s.servo_tuning_revision !== eligibility.revision ||
-                      !sameServoTuning(s.servo_tuning, liveReport.baseline)
-                    ? "起始参数已变化，请重新校准"
-                    : pending
-                      ? "等待当前请求完成"
-                      : "";
+      : preparationBlock
+        ? unavailableReason || preparationBlock
+        : readiness?.state !== "ready"
+          ? readiness?.message || preparationTitle
+          : stopPending
+            ? "等待停止确认"
+            : tcp !== eligibility.tcp
+              ? "工具配置已变化"
+              : appliedReport === liveReport.id
+                ? "推荐参数已应用"
+                : s.servo_tuning_revision !== eligibility.revision ||
+                    !sameServoTuning(s.servo_tuning, liveReport.baseline)
+                  ? "起始参数已变化，请重新校准"
+                  : pending
+                    ? "等待当前请求完成"
+                    : "";
 
   function stop() {
     const current = runRef.current;
@@ -839,14 +900,9 @@ export default function CalibrationPanel({
             setPage("settings");
           }
           setFeedback({
-            text: [
-              error.status !== null ? `HTTP ${error.status}` : "",
-              error.code,
-              error.message,
-            ]
-              .filter(Boolean)
-              .join(" · "),
-            tone: "error",
+            text: error.message,
+            code: error.code ?? undefined,
+            tone: error.code === "motion_busy" ? "info" : "error",
           });
           return;
         }
@@ -885,13 +941,14 @@ export default function CalibrationPanel({
       ? historyDetail
       : shownHistory.find((report) => report.id === selectedId);
   const footerFeedback =
-    feedback?.text ||
+    s.error?.message ||
+    view.error ||
+    currentFeedback?.text ||
     (page === "settings"
       ? validation || startReason
       : page === "result" && liveReport?.recommended
         ? applyReason
         : "") ||
-    s.error?.message ||
     (page === "settings"
       ? "完成后恢复起始参数，推荐值需手动应用。"
       : "关闭窗口后可从参数入口继续查看。");
@@ -1028,41 +1085,95 @@ export default function CalibrationPanel({
                   固定阻尼，比较摩擦补偿与速度前馈。
                 </p>
               </div>
-              <div className="calibration-range">
-                <small>J{currentAxis + 1} 当前实测中心</small>
-                <strong>
-                  {degrees(center)}
-                  <span>°</span>
-                </strong>
-                <div className="calibration-range-track">
-                  <span />
-                  <i />
-                </div>
-                <div className="calibration-range-limits">
-                  <span>
-                    {excursion != null ? `−${degrees(excursion, 1)}` : "—"}°
-                  </span>
-                  <span>
-                    {excursion != null ? `+${degrees(excursion, 1)}` : "—"}°
-                  </span>
-                </div>
-                <p>目标取最大位移的一半；实际偏移相对起始实测计算。</p>
-                <dl>
-                  <div>
-                    <dt>目标偏移</dt>
-                    <dd>
-                      {excursion != null
-                        ? `±${degrees(excursion / 2, 1)}°`
-                        : "—"}
-                    </dd>
+              <div className="calibration-context">
+                <section
+                  className="calibration-readiness"
+                  aria-label="校准准备状态"
+                  data-state={
+                    preparationBlock
+                      ? "unavailable"
+                      : (readiness?.state ?? "unavailable")
+                  }
+                  data-tone={preparationTone}
+                >
+                  <div className="calibration-readiness-heading">
+                    <small>开始前检查</small>
+                    <strong role="status">{preparationTitle}</strong>
                   </div>
-                  <div>
-                    <dt>实测偏移上限</dt>
-                    <dd>
-                      {excursion != null ? `±${degrees(excursion, 1)}°` : "—"}
-                    </dd>
+                  <p>{preparationMessage}</p>
+                  <progress
+                    className="calibration-progress"
+                    aria-label="静止确认进度"
+                    max={requiredMs}
+                    value={observedMs}
+                  />
+                  <div className="calibration-readiness-time">
+                    <span>
+                      {readiness
+                        ? `${Math.round(observedMs)} / ${requiredMs} ms`
+                        : "尚无准备数据"}
+                    </span>
+                    <span>需连续静止</span>
                   </div>
-                </dl>
+                  <dl>
+                    <div>
+                      <dt>
+                        {observing && readiness.joint != null
+                          ? `最大波动 J${readiness.joint + 1}`
+                          : "最大位置波动"}
+                      </dt>
+                      <dd>
+                        {degrees(observing ? readiness.position_span : null, 3)}
+                        °
+                        <small>
+                          {" "}
+                          / {degrees(readiness?.position_limit, 3)}°
+                        </small>
+                      </dd>
+                    </div>
+                  </dl>
+                </section>
+                <div className="calibration-range">
+                  <div className="calibration-range-heading">
+                    <small>
+                      J{currentAxis + 1}{" "}
+                      {feedbackFresh ? "当前实测" : "实测反馈不可用"}
+                    </small>
+                    <strong>
+                      {degrees(center)}
+                      <span>°</span>
+                    </strong>
+                  </div>
+                  <div className="calibration-range-track">
+                    <span />
+                    <i />
+                  </div>
+                  <div className="calibration-range-limits">
+                    <span>
+                      {excursion != null ? `−${degrees(excursion, 1)}` : "—"}°
+                    </span>
+                    <span>
+                      {excursion != null ? `+${degrees(excursion, 1)}` : "—"}°
+                    </span>
+                  </div>
+                  <p>目标相对发送参考；实际位移相对起始实测。</p>
+                  <dl>
+                    <div>
+                      <dt>目标偏移</dt>
+                      <dd>
+                        {excursion != null
+                          ? `±${degrees(excursion / 2, 1)}°`
+                          : "—"}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>实测偏移上限</dt>
+                      <dd>
+                        {excursion != null ? `±${degrees(excursion, 1)}°` : "—"}
+                      </dd>
+                    </div>
+                  </dl>
+                </div>
               </div>
             </div>
           )}
@@ -1239,10 +1350,18 @@ export default function CalibrationPanel({
           <span
             id="calibration-feedback"
             data-tone={
-              feedback?.tone ??
-              (validation && page === "settings" ? "error" : "info")
+              s.error || view.error
+                ? "error"
+                : (currentFeedback?.tone ??
+                  (validation && page === "settings"
+                    ? "error"
+                    : preparationTone))
             }
-            role={feedback?.tone === "error" ? "alert" : "status"}
+            role={
+              s.error || view.error || currentFeedback?.tone === "error"
+                ? "alert"
+                : "status"
+            }
           >
             {footerFeedback}
           </span>

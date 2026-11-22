@@ -104,6 +104,16 @@ export interface CalibrationStatus {
   progress: number;
   report: CalibrationReport | null;
 }
+export interface CalibrationReadiness {
+  state: "ready" | "settling" | "moving" | "unavailable";
+  code: string;
+  message: string;
+  joint: number | null;
+  observed_ms: number;
+  required_ms: number;
+  position_span: number | null;
+  position_limit: number;
+}
 export const SERVO_TUNING_RANGES = {
   kd: [0, 30],
   velocity_ff: [0, 1],
@@ -209,6 +219,7 @@ export interface Snapshot {
   feedback_age_ms: number | null;
   action: Action | null;
   calibration?: CalibrationStatus | null;
+  calibration_readiness?: CalibrationReadiness | null;
   last_result: Result | null;
   results: Result[];
   error: { code: string; message: string } | null;
@@ -347,6 +358,7 @@ export const emptySnapshot: Snapshot = {
   feedback_age_ms: null,
   action: null,
   calibration: null,
+  calibration_readiness: null,
   last_result: null,
   results: [],
   error: null,
@@ -616,6 +628,7 @@ class DesktopApi {
       ...snapshot,
       servo_tuning: snapshot.servo_tuning ?? createServoTuning(),
       servo_tuning_revision: snapshot.servo_tuning_revision ?? 0,
+      calibration_readiness: snapshot.calibration_readiness ?? null,
     };
     if (this.calibrationRequest) {
       const id = this.calibrationRequest.id;

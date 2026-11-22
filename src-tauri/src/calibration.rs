@@ -2,6 +2,162 @@
 
 use crate::tuning::ServoTuning;
 use serde::{Deserialize, Serialize};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
+
+const STILL_WINDOW: Duration = Duration::from_millis(300);
+const STILL_MAX_GAP: Duration = Duration::from_millis(100);
+const STILL_CAPACITY: usize = 128;
+const STILL_POSITION_LIMIT: f64 = 0.001;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Readiness {
+    pub state: &'static str,
+    pub code: String,
+    pub message: String,
+    pub joint: Option<usize>,
+    pub observed_ms: u64,
+    pub required_ms: u64,
+    pub position_span: Option<f64>,
+    pub position_limit: f64,
+}
+
+impl Readiness {
+    pub fn unavailable(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            state: "unavailable",
+            code: code.into(),
+            message: message.into(),
+            joint: None,
+            observed_ms: 0,
+            required_ms: STILL_WINDOW.as_millis() as u64,
+            position_span: None,
+            position_limit: STILL_POSITION_LIMIT,
+        }
+    }
+    pub fn ready(&self) -> bool {
+        self.state == "ready"
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PositionObservation {
+    at: Instant,
+    q: f64,
+}
+
+/// Bounded position history for every received joint, not UI/control snapshots.
+/// This observes holding stability; it never filters or modifies device feedback.
+pub struct Stillness {
+    joints: [VecDeque<PositionObservation>; 7],
+}
+
+impl Default for Stillness {
+    fn default() -> Self {
+        Self {
+            joints: std::array::from_fn(|_| VecDeque::with_capacity(STILL_CAPACITY)),
+        }
+    }
+}
+
+impl Stillness {
+    pub fn clear(&mut self) {
+        for joint in &mut self.joints {
+            joint.clear();
+        }
+    }
+    pub fn observe(&mut self, joint: usize, q: f64, at: Instant) {
+        let Some(history) = self.joints.get_mut(joint) else {
+            return;
+        };
+        if !q.is_finite() {
+            history.clear();
+            return;
+        }
+        if history
+            .back()
+            .is_some_and(|last| at <= last.at || at.duration_since(last.at) > STILL_MAX_GAP)
+        {
+            history.clear();
+        }
+        if history.len() == STILL_CAPACITY {
+            history.pop_front();
+        }
+        history.push_back(PositionObservation { at, q });
+        if let Some(cutoff) = at.checked_sub(STILL_WINDOW) {
+            // Keep the sample at/before the beginning: shorter coverage cannot
+            // pass merely because the retained samples have a small span.
+            while history.len() > 1 && history.get(1).is_some_and(|sample| sample.at <= cutoff) {
+                history.pop_front();
+            }
+        }
+    }
+    pub fn status(&self, now: Instant) -> Readiness {
+        let mut result = Readiness::unavailable("feedback_missing", "等待七轴位置反馈");
+        let mut observed_ms = u64::MAX;
+        let mut worst = (0usize, 0.0_f64);
+        for (joint, history) in self.joints.iter().enumerate() {
+            let Some(last) = history.back() else {
+                result.joint = Some(joint);
+                result.message = format!("等待 J{} 位置反馈", joint + 1);
+                return result;
+            };
+            if now
+                .checked_duration_since(last.at)
+                .is_none_or(|age| age > STILL_MAX_GAP)
+            {
+                result.code = "feedback_stale".into();
+                result.joint = Some(joint);
+                result.message = format!("等待 J{} 最新位置反馈", joint + 1);
+                return result;
+            }
+            let first = history.front().unwrap();
+            observed_ms = observed_ms.min(
+                last.at
+                    .duration_since(first.at)
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64,
+            );
+            let (low, high) = history
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), sample| {
+                    (low.min(sample.q), high.max(sample.q))
+                });
+            let span = high - low;
+            if !span.is_finite() {
+                result.code = "invalid_feedback".into();
+                result.message = format!("J{} 位置反馈无效", joint + 1);
+                result.joint = Some(joint);
+                return result;
+            }
+            if span > worst.1 {
+                worst = (joint, span);
+            }
+        }
+        result.observed_ms = observed_ms.min(result.required_ms);
+        result.joint = Some(worst.0);
+        result.position_span = Some(worst.1);
+        if worst.1 > STILL_POSITION_LIMIT {
+            result.state = "moving";
+            result.code = "position_moving".into();
+            result.message = format!("J{} 位置仍在变化，等待停稳", worst.0 + 1);
+        } else if observed_ms < result.required_ms {
+            result.state = "settling";
+            result.code = "observing".into();
+            result.message = format!(
+                "正在确认静止（{} / {} ms）",
+                result.observed_ms, result.required_ms
+            );
+        } else {
+            result.state = "ready";
+            result.code = "ready".into();
+            result.message = "位置已稳定，可以开始校准".into();
+        }
+        result
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
@@ -368,6 +524,127 @@ pub struct Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn observe_hold(detector: &mut Stillness, origin: Instant, start: u64, end: u64) {
+        for tick in start..=end {
+            for joint in 0..7 {
+                let q = joint as f64 * 0.1 + if tick % 2 == 0 { 0.00006 } else { -0.00006 };
+                detector.observe(joint, q, origin + Duration::from_millis(tick * 10));
+            }
+        }
+    }
+
+    #[test]
+    fn stillness_requires_a_fresh_window_for_every_axis() {
+        let origin = Instant::now();
+        let mut detector = Stillness::default();
+        assert!(!detector.status(origin).ready());
+        observe_hold(&mut detector, origin, 0, 29);
+        let waiting = detector.status(origin + Duration::from_millis(290));
+        assert_eq!(waiting.state, "settling");
+        assert_eq!(waiting.observed_ms, 290);
+        observe_hold(&mut detector, origin, 30, 30);
+        assert!(detector.status(origin + Duration::from_millis(300)).ready());
+        assert!(!detector.status(origin + Duration::from_millis(401)).ready());
+    }
+
+    #[test]
+    fn stillness_rejects_drift_and_a_recovered_spike_in_the_window() {
+        let origin = Instant::now();
+        let mut detector = Stillness::default();
+        for tick in 0..=40 {
+            for joint in 0..7 {
+                detector.observe(
+                    joint,
+                    if joint == 2 {
+                        tick as f64 * 0.00005
+                    } else {
+                        0.0
+                    },
+                    origin + Duration::from_millis(tick * 10),
+                );
+            }
+        }
+        let moving = detector.status(origin + Duration::from_millis(400));
+        assert_eq!(moving.state, "moving");
+        assert_eq!(moving.joint, Some(2));
+        assert!(moving.position_span.unwrap() > moving.position_limit);
+        detector.clear();
+        observe_hold(&mut detector, origin, 0, 40);
+        detector.observe(5, 0.51, origin + Duration::from_millis(401));
+        detector.observe(5, 0.5, origin + Duration::from_millis(402));
+        assert_eq!(
+            detector.status(origin + Duration::from_millis(402)).state,
+            "moving"
+        );
+        observe_hold(&mut detector, origin, 41, 72);
+        assert!(detector.status(origin + Duration::from_millis(720)).ready());
+    }
+
+    #[test]
+    fn stillness_never_bridges_a_gap_or_a_clock_discontinuity() {
+        let origin = Instant::now();
+        for discontinuity in [
+            Duration::from_millis(400),
+            Duration::from_millis(390),
+            Duration::from_millis(501),
+        ] {
+            let mut detector = Stillness::default();
+            observe_hold(&mut detector, origin, 0, 40);
+            detector.observe(4, 0.4, origin + discontinuity);
+            assert!(!detector.status(origin + discontinuity).ready());
+        }
+    }
+
+    #[test]
+    fn stillness_invalid_or_missing_axis_cannot_be_hidden_by_other_axes() {
+        let origin = Instant::now();
+        let mut detector = Stillness::default();
+        observe_hold(&mut detector, origin, 0, 40);
+        detector.observe(3, f64::NAN, origin + Duration::from_millis(401));
+        assert!(!detector.status(origin + Duration::from_millis(401)).ready());
+        detector.observe(3, 0.3, origin + Duration::from_millis(402));
+        assert!(!detector.status(origin + Duration::from_millis(402)).ready());
+        detector.clear();
+        observe_hold(&mut detector, origin, 0, 40);
+        for tick in 41..=55 {
+            for joint in 0..6 {
+                detector.observe(
+                    joint,
+                    joint as f64 * 0.1,
+                    origin + Duration::from_millis(tick * 10),
+                );
+            }
+        }
+        let stale = detector.status(origin + Duration::from_millis(550));
+        assert_eq!(stale.code, "feedback_stale");
+        assert_eq!(stale.joint, Some(6));
+    }
+
+    #[test]
+    fn stillness_history_is_bounded_and_clear_removes_old_evidence() {
+        let origin = Instant::now();
+        let mut detector = Stillness::default();
+        for tick in 0..2000 {
+            for joint in 0..7 {
+                detector.observe(joint, 0.0, origin + Duration::from_micros(tick));
+            }
+        }
+        for joint in &detector.joints {
+            assert!(joint.len() <= STILL_CAPACITY);
+            assert_eq!(joint.capacity(), STILL_CAPACITY);
+        }
+        assert!(
+            !detector
+                .status(origin + Duration::from_micros(1999))
+                .ready()
+        );
+        detector.clear();
+        observe_hold(&mut detector, origin, 0, 40);
+        assert!(detector.status(origin + Duration::from_millis(400)).ready());
+        detector.clear();
+        assert!(!detector.status(origin + Duration::from_millis(400)).ready());
+    }
     use serde_json::{Value, json};
 
     fn settings() -> Settings {

@@ -469,9 +469,16 @@ export default function App() {
       setTcpOpen(false);
     });
   const result = s.last_result;
+  const resolvedMotionBusy =
+    result?.status === "rejected" &&
+    result.code === "motion_busy" &&
+    s.calibration_readiness?.state === "ready" &&
+    s.phase === "ready" &&
+    !s.action;
   const fault =
     s.error?.message ||
-    (["failed", "rejected"].includes(result?.status ?? "")
+    (!resolvedMotionBusy &&
+    ["failed", "rejected"].includes(result?.status ?? "")
       ? result?.message
       : "");
   const error = view.error || fault;

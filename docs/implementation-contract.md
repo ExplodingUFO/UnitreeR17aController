@@ -348,7 +348,7 @@ J1 正向连续点动，速度 0.1 rad/s：
 
 ### 5.10 低速稳定性校准
 
-先连接、取得控制权并使能，等待七轴静止及成功发送的静止目标。`calibrate_start` 是主动运动命令。一次只测试一个关节，其他关节保持参考；测试中拒绝其他运动、TCP 与伺服配置变更。
+先连接、取得控制权并使能，等待 `calibration_readiness.state:"ready"` 和成功发送的静止目标。`calibrate_start` 是主动运动命令。一次只测试一个关节，其他关节保持参考；测试中拒绝其他运动、TCP 与伺服配置变更。
 
 ```json
 {
@@ -372,6 +372,12 @@ J1 正向连续点动，速度 0.1 rad/s：
 | `excursion` | rad，1°..10° | 相对起始位置允许的偏移；目标取参考中心 ±半个此值，最后回到中心 |
 | `speed` | rad/s，0.005..0.04 | 低档峰值速度上限；第二档为两倍；小位移的实际峰值由导数约束降低 |
 | `max_friction` | Nm，0..2 | 选定轴的库仑摩擦及摩擦输出试验上限；0 跳过摩擦候选 |
+
+`Snapshot.calibration_readiness` 直接提供准备情况：state 为 ready、settling、moving 或 unavailable；message 为当前原因；joint 为波动最大或缺少观测的关节（0..6/null）；observed_ms / required_ms 为确认进度；position_span / position_limit 为位置峰峰值及阈值（rad）。
+
+静止确认使用各轴新到达的位置历史：连续覆盖 300 ms，每轴窗内位置跨度不超过 0.001 rad，数据间隔和最新样本年龄不超过 100 ms。缺轴、非有限反馈、重复/倒退时间和长缺口会使相应观测重新积累。单包 dq 幅值不再单独否决静止；反馈与速度字段保留原值。启动及应用还检查控制权、使能、发送目标与上下文，不提供跳过检查的命令。条件未满足时返回 motion_busy 等对应结果，调用方应观察新状态后手动重试，不排队自动启动。
+
+校准内部往返的到位确认也使用位置观测，保留原有到位、减速和 200 ms 停驻规则；普通收纳到位断开的判定保持原样。
 
 每组配置执行两档速度的六段往返。全部 Kp/Kd 保持起始值，候选分别试验选定轴的半上限/全上限 Coulomb 系数，以及起始速度前馈的 75%；不同时搜索二者。关闭摩擦但其他轴留有非零系数时拒绝启动，避免打开全局开关改变其他轴的有效行为。
 
@@ -469,6 +475,7 @@ HTTP 返回 `202 queued` 后，读取匹配请求的结果和 `Snapshot.calibrat
 | `feedback_age_ms`         | u64 或 null                    | 已有反馈中最大的接收年龄                           |
 | `action`                  | object 或 null                 | 当前动作：`request_id,space,mode,axis,progress`    |
 | `calibration` | `CalibrationStatus` 或 null | 当前校准或最近一次结果，见 5.10 |
+| `calibration_readiness` | `CalibrationReadiness` | 位置静止确认进度和阻止开始的具体原因，见 5.10 |
 | `last_result` / `results` | `CommandResult` 或 null / 数组 | 最新一条结果 / 最近结果                            |
 | `error`                   | `{code,message}` 或 null       | 当前故障                                           |
 | `journal`                 | object                         | `pending,written,dropped,errors,healthy`           |
