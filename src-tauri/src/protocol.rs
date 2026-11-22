@@ -816,6 +816,9 @@ pub struct SentReference {
     pub epoch: u64,
     pub q: [f64; 7],
     pub dq: [f64; 7],
+    /// A stale/invalid source retained the last successful position with zero
+    /// trajectory velocity; the original program's acceleration no longer applies.
+    pub fallback_hold: bool,
 }
 impl Committed {
     fn direct(at: Instant, values: [Setpoint; 7]) -> Self {
@@ -1203,6 +1206,7 @@ impl BusHandle {
                                         epoch: _source.epoch,
                                         q: prepared.values.map(|s| s.q),
                                         dq: prepared.motion_velocity,
+                                        fallback_hold: prepared.rejection.is_some(),
                                     });
                                 sent_tx.send_replace(sent_reference);
                                 if let Some(reason) = prepared.rejection
@@ -1933,6 +1937,85 @@ mod tests {
             .unwrap();
         assert!(direct.values.iter().all(|s| s.mode == DriveMode::Disabled));
         assert!(direct.timing.is_none());
+    }
+
+    #[test]
+    fn teaching_absolute_sources_keep_gravity_and_damping_through_gain_changes_and_wire_encoding() {
+        let origin = Instant::now();
+        let model = crate::kinematics::Kinematics::load("right").unwrap();
+        let calibration = calibrations("right").unwrap();
+        let initial = [0.3, 0.7, 1.1, 0.9, -0.4, 0.2, -0.3];
+        let mut guidance = crate::teaching::Guidance::new(initial, 0.4);
+        guidance.set_drag(true, initial, 0.0);
+        let mut committed = None;
+        let mut last = None;
+        for tick in 0..=150 {
+            let t = tick as f64 * 0.01;
+            let mut actual = initial;
+            actual[1] += 0.05 * t.min(1.0);
+            if tick == 100 {
+                guidance.set_drag(false, actual, t);
+            }
+            let target = guidance.sample(t, actual);
+            let gravity = model.gravity(&target.q).unwrap();
+            let values = std::array::from_fn(|i| Setpoint {
+                mode: DriveMode::Servo,
+                q: target.q[i],
+                dq: 0.0,
+                tau: gravity[i],
+                kp: 60.0 * target.stiffness,
+                kd: 10.0,
+            });
+            let at = origin + Duration::from_millis(tick * 10);
+            let mut reference = Reference::joint(at, target.q, [0.0; 7], [0.0; 7], 1, 0);
+            reference.sampling = crate::reference::Sampling::Absolute;
+            let published = PublishedSetpoints {
+                values,
+                seq: tick,
+                reference: Some(reference),
+            };
+            let prepared = published.prepare(at, committed).unwrap();
+            assert_eq!(
+                prepared.values.map(|s| s.q),
+                target.q,
+                "old send integration must not pin hand guidance to its initial position"
+            );
+            assert!(
+                prepared
+                    .values
+                    .iter()
+                    .all(|s| s.mode == DriveMode::Servo && s.kd == 10.0)
+            );
+            assert_eq!(prepared.values.map(|s| s.tau), gravity);
+            assert!(gravity.iter().any(|tau| tau.abs() > 0.1));
+            for (i, s) in prepared.values.into_iter().enumerate() {
+                let packet = encode(i as u8, calibration[i].command(s)).unwrap();
+                assert_eq!(packet.len(), COMMAND_LEN);
+            }
+            committed = Some(Committed {
+                at,
+                values: prepared.values,
+                motion_velocity: prepared.motion_velocity,
+                gravity,
+            });
+            last = Some(published);
+        }
+        let committed = committed.unwrap();
+        let held = last
+            .unwrap()
+            .prepare(
+                committed.at + crate::reference::MAX_REFERENCE_AGE + Duration::from_millis(1),
+                Some(committed),
+            )
+            .unwrap();
+        assert_eq!(held.rejection, Some(SampleStatus::Stale));
+        assert_eq!(held.values.map(|s| s.tau), committed.values.map(|s| s.tau));
+        assert!(
+            held.values
+                .iter()
+                .all(|s| s.mode == DriveMode::Servo && s.kp == 60.0 && s.kd == 10.0)
+        );
+        assert_ne!(held.values.map(|s| s.q), initial);
     }
 
     #[test]

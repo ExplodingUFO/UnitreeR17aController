@@ -1,7 +1,8 @@
 use crate::{
-    arm::{ApiError, ArmHandle, CommandRequest, ControlRequest},
+    arm::{ApiError, ArmHandle, CommandRequest, ControlRequest, Operation, Snapshot},
     journal::{Journal, LogPage, LogPageQuery, LogRecord, TraceSummary},
     protocol,
+    teaching::{self, PlaybackOptions, Program, Trajectory},
 };
 use axum::{
     Json, Router,
@@ -18,6 +19,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::{
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -119,6 +121,9 @@ pub(crate) async fn launch_at(
         .route("/v1/calibrations", get(calibrations))
         .route("/v1/calibrations/preview", post(calibration_preview))
         .route("/v1/calibrations/{id}", get(calibration))
+        .route("/v1/teachings", get(teachings))
+        .route("/v1/teachings/{id}", get(teaching_read))
+        .route("/v1/teachings/{id}/preview", post(teaching_preview))
         .route("/v1/traces", post(trace_start).get(traces))
         .route("/v1/traces/stop", post(trace_stop))
         .route("/v1/traces/{id}", get(trace_read))
@@ -189,7 +194,7 @@ impl IntoResponse for ApiError {
             "unauthorized" => StatusCode::UNAUTHORIZED,
             "forbidden_origin" => StatusCode::FORBIDDEN,
             "queue_full" | "too_many_connections" => StatusCode::TOO_MANY_REQUESTS,
-            "closing" | "journal_unavailable" | "trace_unavailable" => {
+            "closing" | "journal_unavailable" | "trace_unavailable" | "teaching_unavailable" => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             "timeout" => StatusCode::GATEWAY_TIMEOUT,
@@ -197,7 +202,9 @@ impl IntoResponse for ApiError {
                 StatusCode::CONFLICT
             }
             "trace_capacity" => StatusCode::TOO_MANY_REQUESTS,
-            "trace_not_found" | "calibration_not_found" => StatusCode::NOT_FOUND,
+            "trace_not_found" | "calibration_not_found" | "teaching_not_found" => {
+                StatusCode::NOT_FOUND
+            }
             _ => StatusCode::BAD_REQUEST,
         };
         (status, Json(self)).into_response()
@@ -221,8 +228,28 @@ async fn control(
 }
 async fn command(
     State(state): State<ApiState>,
-    Json(request): Json<CommandRequest>,
+    Json(mut request): Json<CommandRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    if let Operation::TeachReplay {
+        trajectory_id,
+        options,
+    } = &request.operation
+    {
+        let trajectory_id = trajectory_id.clone();
+        let options = *options;
+        let snapshot = state.arm.snapshot();
+        let journal = state.journal.clone();
+        let (program, _) = tokio::task::spawn_blocking(move || {
+            teaching_program(&journal, &snapshot, &trajectory_id, options)
+        })
+        .await
+        .map_err(|_| ApiError::new("teaching_preparation_failed", "示教轨迹准备未完成"))??;
+        // Preserve the submitted generation and credentials. Core performs its
+        // normal stale-context/ownership checks after this asynchronous preparation.
+        request.operation = Operation::TeachingPrepared {
+            program: Arc::new(program),
+        };
+    }
     let request_id = request.request_id.clone();
     state.arm.command(request)?;
     Ok((
@@ -398,6 +425,172 @@ async fn calibration(
     })
     .await
     .map_err(|_| ApiError::new("journal_unavailable", "校准记录读取失败"))?
+}
+
+fn read_teaching(journal: &Journal, snapshot: &Snapshot, id: &str) -> Result<Trajectory, ApiError> {
+    if let Some(capture) = snapshot
+        .teaching_capture
+        .iter()
+        .chain(snapshot.teaching_pending.iter().rev())
+        .find(|capture| capture.summary.id == id)
+    {
+        return Ok(capture.trajectory());
+    }
+    journal
+        .teaching(id)
+        .map_err(|_| ApiError::new("teaching_unavailable", "示教记录暂不可读"))?
+        .ok_or_else(|| ApiError::new("teaching_not_found", "示教轨迹不存在"))
+}
+
+/// Disk reads, capture flattening, model loading and planning all run off-thread.
+fn teaching_program(
+    journal: &Journal,
+    snapshot: &Snapshot,
+    id: &str,
+    options: PlaybackOptions,
+) -> Result<(Program, crate::kinematics::Kinematics), ApiError> {
+    let trajectory = read_teaching(journal, snapshot, id)?;
+    if trajectory.summary.side != snapshot.side {
+        return Err(ApiError::new(
+            "teaching_side_mismatch",
+            "示教轨迹与当前机械臂侧不一致",
+        ));
+    }
+    let model = crate::kinematics::Kinematics::load(&snapshot.side)
+        .map_err(|e| ApiError::new("teaching_preparation_failed", e))?;
+    let program = teaching::plan(
+        &trajectory,
+        snapshot.reference,
+        &model,
+        snapshot.motion_tuning,
+        options,
+    )
+    .map_err(|e| ApiError::new("teaching_preparation_failed", e))?;
+    Ok((program, model))
+}
+
+fn teaching_summaries(
+    journal: &Journal,
+    snapshot: &Snapshot,
+) -> Result<Vec<teaching::Summary>, ApiError> {
+    let mut summaries: HashMap<_, _> = journal
+        .teachings()
+        .map_err(|_| ApiError::new("teaching_unavailable", "示教记录暂不可读"))?
+        .into_iter()
+        .map(|summary| (summary.id.clone(), summary))
+        .collect();
+    for capture in &snapshot.teaching_pending {
+        summaries.insert(capture.summary.id.clone(), capture.summary.clone());
+    }
+    let latest = snapshot
+        .teaching_capture
+        .as_ref()
+        .map(|capture| capture.summary.clone())
+        .or_else(|| snapshot.latest_teaching.clone());
+    if let Some(latest) = latest {
+        summaries.insert(latest.id.clone(), latest);
+    }
+    let mut summaries: Vec<_> = summaries.into_values().collect();
+    summaries.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms).then(b.id.cmp(&a.id)));
+    Ok(summaries)
+}
+
+async fn teachings(State(state): State<ApiState>) -> Result<Response, ApiError> {
+    let snapshot = state.arm.snapshot();
+    let body = tokio::task::spawn_blocking(move || {
+        let summaries = teaching_summaries(&state.journal, &snapshot)?;
+        serde_json::to_vec(&summaries)
+            .map_err(|_| ApiError::new("teaching_unavailable", "示教记录编码失败"))
+    })
+    .await
+    .map_err(|_| ApiError::new("teaching_unavailable", "示教记录读取未完成"))??;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response())
+}
+
+#[derive(Default, Deserialize)]
+struct TeachingQuery {
+    download: Option<bool>,
+}
+
+async fn teaching_read(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    query: Result<Query<TeachingQuery>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(query) =
+        query.map_err(|_| ApiError::new("invalid_teaching_request", "示教查询参数无效"))?;
+    let snapshot = state.arm.snapshot();
+    tokio::task::spawn_blocking(move || {
+        let trajectory = read_teaching(&state.journal, &snapshot, &id)?;
+        let body = serde_json::to_vec(&trajectory)
+            .map_err(|_| ApiError::new("teaching_unavailable", "示教记录编码失败"))?;
+        let mut response = (
+            [
+                (header::CONTENT_TYPE, "application/json"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            body,
+        )
+            .into_response();
+        if query.download.unwrap_or(false) {
+            let filename: String = trajectory
+                .summary
+                .id
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            response.headers_mut().insert(
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"teaching-{filename}.json\"")
+                    .parse()
+                    .map_err(|_| ApiError::new("teaching_unavailable", "示教附件编码失败"))?,
+            );
+        }
+        Ok(response)
+    })
+    .await
+    .map_err(|_| ApiError::new("teaching_unavailable", "示教记录读取未完成"))?
+}
+
+async fn teaching_preview(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    request: Result<Json<PlaybackOptions>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(options) =
+        request.map_err(|_| ApiError::new("invalid_teaching_request", "示教回放参数无效"))?;
+    let snapshot = state.arm.snapshot();
+    let body = tokio::task::spawn_blocking(move || {
+        let (program, model) = teaching_program(&state.journal, &snapshot, &id, options)?;
+        let preview = program
+            .preview(&model)
+            .map_err(|e| ApiError::new("preview_failed", e))?;
+        serde_json::to_vec(&preview)
+            .map_err(|_| ApiError::new("preview_failed", "示教预览编码失败"))
+    })
+    .await
+    .map_err(|_| ApiError::new("preview_failed", "示教轨迹预览未完成"))??;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response())
 }
 
 #[derive(Default, Deserialize)]
@@ -589,6 +782,658 @@ async fn stream(mut socket: WebSocket, state: ApiState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::teaching::Capture;
+
+    fn teaching_capture(id: &str, side: &str) -> Capture {
+        let mut recorder = teaching::Recorder::new(teaching::Summary {
+            id: id.into(),
+            name: "示教保存与回放".into(),
+            created_at_ms: 1000,
+            side: side.into(),
+            tcp: crate::kinematics::Pose {
+                translation: [0.01, 0.02, 0.03],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            },
+            duration_ms: 0,
+            sample_count: 0,
+            outcome: String::new(),
+        });
+        for i in 0..21 {
+            recorder.push(teaching::Point {
+                t_ms: i * 50,
+                q: [0.1 + i as f64 / 1024.0, 0.2, 0.1, 0.3, 0.1, 0.05, 0.1],
+            });
+        }
+        recorder.finish("completed")
+    }
+
+    async fn admit_teaching(journal: &Journal, capture: &Capture) {
+        let journal = journal.clone();
+        let capture = capture.clone();
+        tokio::task::spawn_blocking(move || {
+            let start = std::time::Instant::now();
+            while !journal.record_teaching(&capture) {
+                assert!(start.elapsed() < Duration::from_secs(8));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            while !journal
+                .teaching(&capture.summary.id)
+                .is_ok_and(|t| t.is_some())
+            {
+                assert!(start.elapsed() < Duration::from_secs(8));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teaching_http_auth_download_and_preview_are_read_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = Journal::start(directory.path().join("events.db")).unwrap();
+        let capture = teaching_capture("saved-teaching", "right");
+        admit_teaching(&journal, &capture).await;
+        let other_side = teaching_capture("other-side", "left");
+        admit_teaching(&journal, &other_side).await;
+        let arm = ArmHandle::spawn(journal.clone()).unwrap();
+        let token = "teaching-read-only-secret";
+        let server = launch_at(
+            arm.clone(),
+            journal.clone(),
+            token.into(),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await
+        .unwrap();
+        let base = server.base_url();
+        let client = reqwest::Client::new();
+        for (method, path) in [
+            (Method::GET, "/v1/teachings"),
+            (Method::GET, "/v1/teachings/saved-teaching"),
+            (Method::GET, "/v1/teachings/saved-teaching?download=true"),
+            (Method::POST, "/v1/teachings/saved-teaching/preview"),
+        ] {
+            let response = client
+                .request(method.clone(), format!("{base}{path}"))
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let response = client
+                .request(method, format!("{base}{path}"))
+                .bearer_auth(token)
+                .header(header::ORIGIN, "https://unrelated.example")
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        let before = serde_json::to_value(arm.snapshot()).unwrap();
+        let response = client
+            .get(format!("{base}/v1/teachings"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let summaries: Vec<teaching::Summary> = response.json().await.unwrap();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].id, "saved-teaching");
+        assert_eq!(summaries[0].sample_count, 21);
+        for query in ["", "?download=true"] {
+            let response = client
+                .get(format!("{base}/v1/teachings/saved-teaching{query}"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            if !query.is_empty() {
+                assert_eq!(
+                    response.headers()[header::CONTENT_DISPOSITION],
+                    "attachment; filename=\"teaching-saved-teaching.json\""
+                );
+            }
+            let text = response.text().await.unwrap();
+            assert!(!text.contains(token));
+            assert!(!text.contains("lease_id"));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                serde_json::to_value(capture.trajectory()).unwrap()
+            );
+        }
+        for options in [
+            serde_json::json!({}),
+            serde_json::json!({"speed_scale": 2.5, "smoothing_s": 0.08}),
+        ] {
+            let response = client
+                .post(format!("{base}/v1/teachings/saved-teaching/preview"))
+                .bearer_auth(token)
+                .json(&options)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let preview: serde_json::Value = response.json().await.unwrap();
+            assert_eq!(preview["trajectory_id"], capture.summary.id);
+            assert_eq!(preview["side"], "right");
+            assert_eq!(
+                preview["tcp"],
+                serde_json::to_value(capture.summary.tcp).unwrap()
+            );
+            assert!(preview["approach_duration_ms"].as_f64().unwrap() > 0.0);
+            assert!(
+                preview["duration_ms"].as_f64().unwrap()
+                    > preview["approach_duration_ms"].as_f64().unwrap()
+            );
+            assert_eq!(
+                preview["requested_speed_scale"],
+                options
+                    .get("speed_scale")
+                    .cloned()
+                    .unwrap_or(serde_json::json!(1.0))
+            );
+            let points = preview["points"].as_array().unwrap();
+            assert_eq!(points[0]["phase"], "approach");
+            assert!(points.iter().any(|point| point["phase"] == "path"));
+            let joints: [f64; 7] =
+                serde_json::from_value(points.last().unwrap()["joints"].clone()).unwrap();
+            let model = crate::kinematics::Kinematics::load("right").unwrap();
+            let tcp = model.fk(&joints, &capture.summary.tcp).unwrap();
+            let actual: [f64; 3] =
+                serde_json::from_value(points.last().unwrap()["tcp"].clone()).unwrap();
+            for (expected, actual) in tcp.translation.into_iter().zip(actual) {
+                assert!((expected - actual).abs() < 1e-10);
+            }
+        }
+        for (path, body, status) in [
+            (
+                "saved-teaching",
+                serde_json::json!({"speed_scale":0}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "saved-teaching",
+                serde_json::json!({"smoothing_s":-1}),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "saved-teaching",
+                serde_json::json!({"speed_scale":"fast"}),
+                StatusCode::BAD_REQUEST,
+            ),
+            ("missing", serde_json::json!({}), StatusCode::NOT_FOUND),
+            ("other-side", serde_json::json!({}), StatusCode::BAD_REQUEST),
+        ] {
+            let response = client
+                .post(format!("{base}/v1/teachings/{path}/preview"))
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert!(response.json::<serde_json::Value>().await.unwrap()["code"].is_string());
+        }
+        let response = client
+            .get(format!("{base}/v1/teachings/missing"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = client
+            .get(format!("{base}/v1/teachings/saved-teaching?download=bad"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let after: serde_json::Value = client
+            .get(format!("{base}/v1/state"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        for key in [
+            "generation",
+            "phase",
+            "side",
+            "port",
+            "enabled",
+            "owner",
+            "action",
+            "last_result",
+            "results",
+            "tcp",
+            "tcp_transform",
+            "servo_tuning",
+            "motion_tuning",
+            "calibration",
+            "teaching",
+            "latest_teaching",
+        ] {
+            assert_eq!(before[key], after[key], "teaching read changed {key}");
+        }
+        assert!(
+            after["joints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|j| j["q"].is_null())
+        );
+        assert!(after.get("teaching_capture").is_none());
+        assert!(after.get("teaching_pending").is_none());
+        assert!(after.get("reference").is_none());
+        assert!(arm.shutdown(Duration::from_millis(500)));
+        server.shutdown().await;
+        assert!(journal.shutdown(Duration::from_secs(2)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teaching_http_keeps_all_admitted_captures_visible_while_sqlite_is_busy() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.db");
+        let journal = Journal::start(path.clone()).unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while !journal.stats().healthy {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let locker = rusqlite::Connection::open(&path).unwrap();
+        locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let captures =
+            ["earlier-a", "earlier-b", "latest-c"].map(|id| teaching_capture(id, "right"));
+        for capture in &captures {
+            admit_teaching(&journal, capture).await;
+        }
+        let arm = ArmHandle::spawn(journal.clone()).unwrap();
+        let token = "busy-teaching-cache";
+        let server = launch_at(
+            arm.clone(),
+            journal.clone(),
+            token.into(),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await
+        .unwrap();
+        let base = server.base_url();
+        let client = reqwest::Client::new();
+        let before = arm.snapshot();
+        let summaries: Vec<teaching::Summary> = client
+            .get(format!("{base}/v1/teachings"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(summaries.len(), 3);
+        for capture in &captures {
+            let id = &capture.summary.id;
+            assert!(summaries.iter().any(|summary| &summary.id == id));
+            let response = client
+                .get(format!("{base}/v1/teachings/{id}?download=true"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let trajectory: Trajectory = response.json().await.unwrap();
+            assert_eq!(trajectory, capture.trajectory());
+            let response = client
+                .post(format!("{base}/v1/teachings/{id}/preview"))
+                .bearer_auth(token)
+                .json(&PlaybackOptions::default())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let preview: teaching::Preview = response.json().await.unwrap();
+            assert_eq!(&preview.trajectory_id, id);
+            assert!(preview.points.iter().any(|point| point.phase == "path"));
+        }
+        let stored: i64 = locker
+            .query_row("SELECT COUNT(*) FROM teachings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored, 0);
+        let after = arm.snapshot();
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(after.phase, before.phase);
+        assert_eq!(after.enabled, before.enabled);
+        assert_eq!(after.port, before.port);
+        assert!(after.action.is_none());
+        assert!(after.last_result.is_none());
+        locker.execute_batch("ROLLBACK").unwrap();
+        assert!(arm.shutdown(Duration::from_millis(500)));
+        server.shutdown().await;
+        assert!(journal.shutdown(Duration::from_secs(2)));
+        drop(journal);
+        let reopened = Journal::start(path).unwrap();
+        for capture in &captures {
+            assert_eq!(
+                reopened.teaching(&capture.summary.id).unwrap().unwrap(),
+                capture.trajectory()
+            );
+        }
+        assert_eq!(reopened.teachings().unwrap().len(), 3);
+        assert!(reopened.shutdown(Duration::from_secs(2)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teaching_replay_preparation_preserves_generation_and_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = Journal::start(directory.path().join("events.db")).unwrap();
+        let capture = teaching_capture("replay-command", "right");
+        admit_teaching(&journal, &capture).await;
+        let arm = ArmHandle::spawn(journal.clone()).unwrap();
+        let token = "replay-preparation";
+        let server = launch_at(
+            arm.clone(),
+            journal.clone(),
+            token.into(),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await
+        .unwrap();
+        let base = server.base_url();
+        let client = reqwest::Client::new();
+        let owner: serde_json::Value = client
+            .post(format!("{base}/v1/control"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"action":"acquire", "client_id":"replay-owner"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let lease = owner["lease_id"].as_str().unwrap();
+        let generation = owner["generation"].as_u64().unwrap();
+        for (id, client_id, lease_id, submitted_generation, expected_code) in [
+            (
+                "stale-prepared",
+                "replay-owner",
+                lease,
+                generation + 1,
+                "stale_context",
+            ),
+            (
+                "wrong-client",
+                "other-owner",
+                lease,
+                generation,
+                "not_owner",
+            ),
+            (
+                "wrong-lease",
+                "replay-owner",
+                "incorrect-lease",
+                generation,
+                "not_owner",
+            ),
+            (
+                "prepared-disconnected",
+                "replay-owner",
+                lease,
+                generation,
+                "not_ready",
+            ),
+        ] {
+            let response = client.post(format!("{base}/v1/commands")).bearer_auth(token).json(&serde_json::json!({
+                "request_id":id, "client_id":client_id, "lease_id":lease_id, "generation":submitted_generation,
+                "kind":"teach_replay", "trajectory_id":capture.summary.id, "speed_scale":1.25
+            })).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            assert_eq!(
+                response.json::<serde_json::Value>().await.unwrap()["request_id"],
+                id
+            );
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(result) = arm.snapshot().results.iter().find(|r| r.request_id == id)
+                    {
+                        break result.clone();
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(result.status, "rejected");
+            assert_eq!(result.code, expected_code);
+        }
+        let response = client.post(format!("{base}/v1/commands")).bearer_auth(token).json(&serde_json::json!({
+            "request_id":"injected-program", "client_id":"replay-owner", "lease_id":lease, "generation":generation,
+            "kind":"teaching_prepared", "program":{}
+        })).send().await.unwrap();
+        assert!(!response.status().is_success());
+        let snapshot = arm.snapshot();
+        assert_eq!(snapshot.generation, generation);
+        assert!(snapshot.port.is_none());
+        assert!(!snapshot.enabled);
+        assert!(snapshot.action.is_none());
+        assert!(snapshot.teaching.is_none());
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!json.contains(lease));
+        assert!(!json.contains(token));
+        assert!(arm.shutdown(Duration::from_millis(500)));
+        server.shutdown().await;
+        assert!(journal.shutdown(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn teaching_all_admitted_and_core_pending_captures_are_readable_and_plannable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.db");
+        let journal = Journal::start(path.clone()).unwrap();
+        let start = std::time::Instant::now();
+        while !journal.stats().healthy {
+            assert!(start.elapsed() < Duration::from_secs(8));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let locker = rusqlite::Connection::open(&path).unwrap();
+        locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let captures: Vec<_> = [
+            "in-flight",
+            "queued-a",
+            "queued-b",
+            "core-pending-a",
+            "core-pending-b",
+        ]
+        .into_iter()
+        .map(|id| teaching_capture(id, "right"))
+        .collect();
+        for capture in &captures[..3] {
+            while !journal.record_teaching(capture) {
+                assert!(start.elapsed() < Duration::from_secs(8));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let persisted: i64 = locker
+            .query_row("SELECT COUNT(*) FROM teachings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(persisted, 0);
+        let arm = ArmHandle::spawn(journal.clone()).unwrap();
+        let before = serde_json::to_value(arm.snapshot()).unwrap();
+        let mut snapshot = arm.snapshot();
+        snapshot.latest_teaching = Some(captures[2].summary.clone());
+        snapshot.teaching_capture = Some(Arc::new(captures[2].clone()));
+        snapshot.teaching_pending = captures[3..].iter().cloned().map(Arc::new).collect();
+        let summaries = teaching_summaries(&journal, &snapshot).unwrap();
+        assert_eq!(summaries.len(), 5);
+        for capture in &captures {
+            assert!(
+                summaries
+                    .iter()
+                    .any(|summary| summary.id == capture.summary.id)
+            );
+            let trajectory = read_teaching(&journal, &snapshot, &capture.summary.id).unwrap();
+            assert_eq!(
+                serde_json::to_value(trajectory).unwrap(),
+                serde_json::to_value(capture.trajectory()).unwrap()
+            );
+            let (program, model) = teaching_program(
+                &journal,
+                &snapshot,
+                &capture.summary.id,
+                PlaybackOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(program.trajectory_id(), capture.summary.id);
+            assert!(
+                program
+                    .preview(&model)
+                    .unwrap()
+                    .points
+                    .iter()
+                    .any(|point| point.phase == "path")
+            );
+        }
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert!(json.get("teaching_pending").is_none());
+        let after = serde_json::to_value(arm.snapshot()).unwrap();
+        for key in [
+            "generation",
+            "phase",
+            "port",
+            "enabled",
+            "action",
+            "teaching",
+            "latest_teaching",
+            "last_result",
+        ] {
+            assert_eq!(before[key], after[key]);
+        }
+        locker.execute_batch("ROLLBACK").unwrap();
+        for capture in &captures[3..] {
+            while !journal.record_teaching(capture) {
+                assert!(start.elapsed() < Duration::from_secs(8));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(arm.shutdown(Duration::from_millis(500)));
+        assert!(journal.shutdown(Duration::from_secs(2)));
+        let summaries = teaching_summaries(&journal, &snapshot).unwrap();
+        assert_eq!(
+            summaries.len(),
+            5,
+            "committed capture must not be duplicated"
+        );
+        drop(journal);
+        let reopened = Journal::start(path).unwrap();
+        snapshot.latest_teaching = None;
+        snapshot.teaching_capture = None;
+        snapshot.teaching_pending.clear();
+        assert_eq!(teaching_summaries(&reopened, &snapshot).unwrap().len(), 5);
+        for capture in &captures {
+            assert_eq!(
+                read_teaching(&reopened, &snapshot, &capture.summary.id).unwrap(),
+                capture.trajectory()
+            );
+            assert!(
+                teaching_program(
+                    &reopened,
+                    &snapshot,
+                    &capture.summary.id,
+                    PlaybackOptions::default()
+                )
+                .is_ok()
+            );
+        }
+        assert!(reopened.shutdown(Duration::from_secs(2)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teaching_legacy_http_reads_preserve_schema_and_old_state_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy.db");
+        let journal = Journal::start(path.clone()).unwrap();
+        admit_teaching(&journal, &teaching_capture("before-legacy", "right")).await;
+        assert!(journal.shutdown(Duration::from_secs(2)));
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch("DROP TABLE teaching_points; DROP TABLE teachings")
+            .unwrap();
+        let before: i64 = conn
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        let arm = ArmHandle::spawn(journal.clone()).unwrap();
+        let token = "legacy-teaching";
+        let server = launch_at(
+            arm.clone(),
+            journal.clone(),
+            token.into(),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await
+        .unwrap();
+        let client = reqwest::Client::new();
+        let base = server.base_url();
+        let response = client
+            .get(format!("{base}/v1/teachings"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!([])
+        );
+        let response = client
+            .get(format!("{base}/v1/teachings/missing"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let state: serde_json::Value = client
+            .get(format!("{base}/v1/state"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(state["phase"], "disconnected");
+        for key in [
+            "generation",
+            "joints",
+            "owner",
+            "action",
+            "tcp",
+            "tcp_transform",
+            "servo_tuning",
+            "motion_tuning",
+            "calibration",
+            "journal",
+            "communication",
+        ] {
+            assert!(state.get(key).is_some(), "missing legacy state field {key}");
+        }
+        assert!(state["teaching"].is_null());
+        assert!(state["latest_teaching"].is_null());
+        let after: i64 = conn
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, after);
+        assert!(arm.shutdown(Duration::from_millis(500)));
+        server.shutdown().await;
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resource_limits_accept_formatted_calibration_commands() {

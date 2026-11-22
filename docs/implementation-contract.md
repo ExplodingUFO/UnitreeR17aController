@@ -36,6 +36,9 @@
 | `POST /v1/calibrations/preview`         | 幅度、速度、方向              | `200 CalibrationPreview`           | 生成只读运动预览         |
 | `GET /v1/calibrations?limit=20`         | 可选条数                      | `200 CalibrationReport[]`          | 查询最近校准报告         |
 | `GET /v1/calibrations/{id}?points=3000` | 报告 ID、绘图点数             | `200 CalibrationReport`            | 读取校准报告及绘图曲线   |
+| `GET /v1/teachings`                     | 无                            | `200 TeachingSummary[]`            | 查询已保存示教轨迹       |
+| `GET /v1/teachings/{id}`                | 可选 `download=true`          | `200 TeachingTrajectory`           | 读取或下载完整示教 JSON  |
+| `POST /v1/teachings/{id}/preview`       | `TeachingPlaybackOptions`     | `200 TeachingPreview`              | 只读规划接近与回放路径   |
 
 普通 HTTP 返回值直接使用表中的结构，没有统一的 `data` 包装。只有 WebSocket 状态消息使用 `{type:"state",data:Snapshot}`。
 
@@ -120,23 +123,27 @@
 
 ### 5.2 操作参数与确认条件
 
-| `kind`             | 附加输入                                              | 确认方式                                                                                    |
-| ------------------ | ----------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `connect`          | `port:string`，`side:"left"\|"right"`                 | 请求被接受后，等待 `phase:"disabled"`，七轴反馈齐全且新鲜                                   |
-| `disconnect`       | `allow_release?:boolean`                              | `phase:"disconnected"`、`port:null`                                                         |
-| `enable`           | 无                                                    | 该请求 `completed/enabled`，`enabled:true`、`phase:"ready"`                                 |
-| `disable`          | `allow_release?:boolean`                              | 请求被接受且 `enabled:false`；若已有故障，`phase` 仍可为 `fault`                            |
-| `clear_fault`      | 无                                                    | 该请求 `completed/cleared`，`error:null`、`enabled:false`                                   |
-| `configure_tcp`    | `tcp:Pose`                                            | 请求被接受，`tcp_configured:true`，`tcp_transform` 与归一化后的输入一致                     |
-| `configure_servo`  | `config:ServoTuning`（完整七轴配置）                  | `accepted/configure_servo`，快照配置及版本更新；不产生独立 completed                        |
-| `configure_motion` | `config:MotionTuning`                                 | `accepted/configure_motion`，快照运动设置与 generation 更新                                 |
-| `calibrate_start`  | `settings:CalibrationSettings`                        | 接受后跟踪 `calibration`；结束返回 completed、cancelled 或 failed，code 为 calibration_done |
-| `calibrate_apply`  | `calibration_id:string`                               | `accepted/calibrate_apply`，配置及版本与推荐一致                                            |
-| `jog_start`        | `space,axis,direction,speed,frame?,ttl_ms?,input_seq` | 请求被接受且 `action.request_id` 等于本次 `request_id`                                      |
-| `jog_update`       | `action_id,input_seq,ttl_ms?`                         | 成功更新不产生 `accepted` 记录；按当前动作与后续状态判断                                    |
-| `step`             | `space,axis,direction,amount,speed,frame?`            | 该请求 `completed/completed`                                                                |
-| `return_to_pose`   | `joints:[number;7],speed,disconnect_after?:boolean`   | 该请求 `completed/returned`（继续保持）或 `completed/parked`（已断开）                      |
-| `stop`             | 无                                                    | 原动作收到 `cancelled`、`action:null`，等待 `stopping` 结束                                 |
+| `kind`             | 附加输入                                                       | 确认方式                                                                                    |
+| ------------------ | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `connect`          | `port:string`，`side:"left"\|"right"`                          | 请求被接受后，等待 `phase:"disabled"`，七轴反馈齐全且新鲜                                   |
+| `disconnect`       | `allow_release?:boolean`                                       | `phase:"disconnected"`、`port:null`                                                         |
+| `enable`           | 无                                                             | 该请求 `completed/enabled`，`enabled:true`、`phase:"ready"`                                 |
+| `disable`          | `allow_release?:boolean`                                       | 请求被接受且 `enabled:false`；若已有故障，`phase` 仍可为 `fault`                            |
+| `clear_fault`      | 无                                                             | 该请求 `completed/cleared`，`error:null`、`enabled:false`                                   |
+| `configure_tcp`    | `tcp:Pose`                                                     | 请求被接受，`tcp_configured:true`，`tcp_transform` 与归一化后的输入一致                     |
+| `configure_servo`  | `config:ServoTuning`（完整七轴配置）                           | `accepted/configure_servo`，快照配置及版本更新；不产生独立 completed                        |
+| `configure_motion` | `config:MotionTuning`                                          | `accepted/configure_motion`，快照运动设置与 generation 更新                                 |
+| `calibrate_start`  | `settings:CalibrationSettings`                                 | 接受后跟踪 `calibration`；结束返回 completed、cancelled 或 failed，code 为 calibration_done |
+| `calibrate_apply`  | `calibration_id:string`                                        | `accepted/calibrate_apply`，配置及版本与推荐一致                                            |
+| `teach_start`      | `name?:string,transition_s?:number`                            | `accepted/teach_start`，`phase:"teaching"`，`teaching.recording:true`                       |
+| `teach_drag`       | `pressed:boolean,input_seq:u64,ttl_ms?:u64`                    | 按住/释放切换产生 `accepted/teach_drag`；重复续输入不逐次产生结果，按 `teaching.state` 判断 |
+| `teach_finish`     | 无                                                             | 平滑恢复保持后 `completed/teaching_saved`，`teaching:null`，`latest_teaching` 更新          |
+| `teach_replay`     | `trajectory_id:string,speed_scale?:number,smoothing_s?:number` | 准备后入队，接受后跟踪 `teaching`；正常结束为 `completed/replayed` 并保持末点               |
+| `jog_start`        | `space,axis,direction,speed,frame?,ttl_ms?,input_seq`          | 请求被接受且 `action.request_id` 等于本次 `request_id`                                      |
+| `jog_update`       | `action_id,input_seq,ttl_ms?`                                  | 成功更新不产生 `accepted` 记录；按当前动作与后续状态判断                                    |
+| `step`             | `space,axis,direction,amount,speed,frame?`                     | 该请求 `completed/completed`                                                                |
+| `return_to_pose`   | `joints:[number;7],speed,disconnect_after?:boolean`            | 该请求 `completed/returned`（继续保持）或 `completed/parked`（已断开）                      |
+| `stop`             | 无                                                             | 原动作收到 `cancelled`、`action:null`，等待 `stopping` 结束                                 |
 
 `connect.port` 使用枚举返回的 `name`，非空。串口当前使用 6,000,000 波特率。更换串口或左右臂前先断开连接；切换左右臂会清除已设置的 TCP。
 
@@ -166,7 +173,7 @@
 
 ### 5.4 完整请求示例
 
-下列标识与 `generation` 为示例值，实际调用使用本次会话返回的数据。全部十二种命令的完整输入见 [OpenAPI](openapi.json) 的 `POST /v1/commands` 示例。
+下列标识与 `generation` 为示例值，实际调用使用本次会话返回的数据。全部命令的完整输入见 [OpenAPI](openapi.json) 的 `POST /v1/commands` 示例。
 
 连接右臂：
 
@@ -582,9 +589,126 @@ Kp、Kd 和速度前馈权重在整个校准中保持起始值，不进行 PID �
 
 读取、绘图点抽取和编码使用工作线程。未知历史 ID 返回 `404 calibration_not_found`；写盘尚未完成不会让当前结果返回 404。历史可查看、导入和下载，重启后不自动取得应用资格。操作与试用见[校准流程](low-speed-calibration-test-plan.md)。发送时间对齐、轨迹、采样及本轮辨识补偿尚未真机验证。
 
+### 5.11 拖动示教
+
+示教沿用本机 Bearer/Origin 认证。历史、详情、下载与预览只读，无需运动租约；四种示教命令仍使用公共请求字段、当前控制权与 generation。录制和回放与点动、校准互斥，运动入口继续检查使能、反馈及 TCP。操作与离线验收见[示教操作与测试](teaching-test-plan.md)。
+
+**录制与保持**：控制页“示教”弹窗开始录制后，按住按钮或空格进入拖动，松开时保持当时的实测位置。位置刚度在 `transition_s` 内平滑切换，正常切换保留伺服模式、模型重力补偿和当前阻尼。释放、失焦、隐藏、指针取消均结束按住；关闭、Esc、卸载或输入链路失效经结束/停止流程处理，不留下后台拖动。
+
+| 命令字段                     | 默认 | 要求                                                                               |
+| ---------------------------- | ---- | ---------------------------------------------------------------------------------- |
+| `teach_start.name`           | `""` | string；空白名称由后端命名为“示教轨迹”                                             |
+| `teach_start.transition_s`   | 0.4  | 有限正数，s，拖动/保持切换时间                                                     |
+| `teach_drag.pressed`         | 必填 | boolean；true 持续拖动，false 恢复保持                                             |
+| `teach_drag.input_seq`       | 必填 | u64；同一录制内递增，较旧或相同序号不覆盖已处理的新输入                            |
+| `teach_drag.ttl_ms`          | 150  | 按住输入的正整数有效期，ms，从后端接收时算起，排队不延长；到期恢复保持，不自动失能 |
+| `teach_replay.trajectory_id` | 必填 | 已保存轨迹 ID，可读取尚未提交 SQLite 的最新完整录制                                |
+| `teach_replay.speed_scale`   | 1    | 有限正数；请求倍速，实际结果见预览                                                 |
+| `teach_replay.smoothing_s`   | 0.12 | 有限非负数，s；0 有效                                                              |
+
+桌面按住期间每 100 ms 发送一次 `teach_drag`，使用 TTL 350 ms 和严格递增序号；释放发送更大的序号及 `pressed:false`，不再续发。租约续期独立进行。`teach_start` 接受和录制结束会推进 generation，后续命令须重新读取快照。
+
+以下为同一流程的请求格式，标识和 generation 均为示例，实际使用每一步确认后取得的上下文：
+
+```json
+{
+  "request_id": "req-teach-start-001",
+  "client_id": "example-service",
+  "lease_id": "11111111-1111-4111-8111-111111111111",
+  "generation": 5,
+  "kind": "teach_start",
+  "name": "装配路径",
+  "transition_s": 0.4
+}
+```
+
+```json
+{
+  "request_id": "req-teach-press-001",
+  "client_id": "example-service",
+  "lease_id": "11111111-1111-4111-8111-111111111111",
+  "generation": 6,
+  "kind": "teach_drag",
+  "pressed": true,
+  "input_seq": 1,
+  "ttl_ms": 350
+}
+```
+
+松开使用新的 `request_id`、更大的 `input_seq` 和 `pressed:false`；完成录制提交：
+
+```json
+{
+  "request_id": "req-teach-finish-001",
+  "client_id": "example-service",
+  "lease_id": "11111111-1111-4111-8111-111111111111",
+  "generation": 6,
+  "kind": "teach_finish"
+}
+```
+
+**保存与读取**：每个点为 `{t_ms:u64,q:[number;7]}`，分别表示相对录制开始的单调主机毫秒和 J1..J7 实测位置（rad），保持段也录制。控制周期采用分块追加，不截断样本、不全量重采样或序列化。结束形成完整内存录制并发布 `latest_teaching`；`teaching_saved` 不表示 SQLite 事务已经提交。worker 在后台展开、编码并同事务写入摘要和全部点，队列受阻时控制线程保留补投。用户轨迹不受校准报告保留数量影响。
+
+`GET /v1/teachings` 返回按 `created_at_ms`、`id` 降序排列的摘要，并按 ID 合并最新内存录制；详情与下载也优先读取相同 ID 的内存录制，因此无需等数据库提交。`GET /v1/teachings/{id}?download=true` 只增加 `Content-Disposition: attachment; filename="teaching-<id>.json"`，JSON 结构相同；文件名中除 ASCII 字母、数字、`-`、`_` 外的字符替换为下划线。读取和预览均返回 `Cache-Control:no-store`。
+
+| `TeachingSummary` 字段         | 类型 / 含义                                     |
+| ------------------------------ | ----------------------------------------------- |
+| `id` / `name`                  | string，轨迹 ID / 名称                          |
+| `created_at_ms`                | i64，创建时的 Unix 毫秒                         |
+| `side` / `tcp`                 | left 或 right / `Pose`；录制时的 Link7→TCP      |
+| `duration_ms` / `sample_count` | u64 / 非负整数；录制时长 / 全部点数             |
+| `outcome`                      | string，结束原因，如 completed、stopped、failed |
+
+`TeachingTrajectory` 在摘要的同一层增加 `points:TeachingPoint[]`，没有 `summary` 或 `data` 包装；下载包含全部录制点，详细示例见 OpenAPI。
+
+**预览与回放**：`POST /v1/teachings/{id}/preview` 请求可为 `{}`，或 `{"speed_scale":1.5,"smoothing_s":0.12}`。读取、平滑、重定时及逐点 FK 在工作线程执行，不改变控制权、generation、配置或动作。当前侧别必须与录制相同；预览包含从当前指令保持位置接近首点及完整录制路径，使用真实机械臂模型和录制 TCP。
+
+| `TeachingPreview` 字段                            | 类型 / 含义                                                                                                                   |
+| ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `trajectory_id` / `side` / `tcp`                  | 轨迹 ID / 左右臂 / 录制 TCP                                                                                                   |
+| `origin`                                          | 七轴起始指令位置，rad                                                                                                         |
+| `duration_ms` / `approach_duration_ms`            | 有限非负 number，ms；包含接近的总时长 / 接近时长                                                                              |
+| `requested_speed_scale` / `effective_speed_scale` | 有限正 number，请求 / 规划实际倍速                                                                                            |
+| `points[]`                                        | `{t_ms,joints:[number;7],tcp:[number;3],phase}`；时间相对程序开始，关节为 rad，TCP 为基座 XYZ（m），phase 为 approach 或 path |
+
+3D 区分接近/录制路线并显示整臂连杆扫掠，支持按阶段播放与拖动；曲线分别显示录制实测、平滑重定时后的规划指令和本次回放反馈。预览与状态反馈曲线不代替实际发送记录，后者仍由既有短时采样读取。
+
+回放仅提交轨迹 ID 和选项，不上传预览点或内部执行程序：
+
+```json
+{
+  "request_id": "req-teach-replay-001",
+  "client_id": "example-service",
+  "lease_id": "11111111-1111-4111-8111-111111111111",
+  "generation": 7,
+  "kind": "teach_replay",
+  "trajectory_id": "44444444-4444-4444-8444-444444444444",
+  "speed_scale": 1.5,
+  "smoothing_s": 0.12
+}
+```
+
+服务端在入队前通过 worker 读取和准备程序，保留调用方原 `generation` 与租约。准备失败可直接返回 JSON 400，轨迹不存在为 404，存储不可读为 503；成功入队后仍可能异步 `rejected/not_owner`、`stale_context` 或 `motion_busy`。准备期间上下文变化不会被服务端自动修正，外部也不能提交内部 `teaching_prepared`。
+
+回放按当前运动设置与模型速度约束重定时，不另加倍速、幅度、时长或样本数量上限；实际倍速和总时长以规划为准。执行从当前有效运动起点重新接近首点，再输出整条路径的 `q/dq/ddq`，复用现有发送取样、伺服补偿、TCP、停止和收纳流程，不重放原始扭矩。正常完成保持末点；停止取消余下轨迹，不自动返回首点或收纳。
+
+`Snapshot.teaching` 为当前录制/回放状态，无会话时为 null；`latest_teaching` 为最近完整录制摘要，尚无记录时为 null。状态只带摘要，完整点通过详情读取。
+
+| `TeachingStatus` 字段 | 含义                                                                    |
+| --------------------- | ----------------------------------------------------------------------- |
+| `id` / `request_id`   | 当前轨迹 ID / 启动录制或回放的请求 ID                                   |
+| `state`               | holding、entering、dragging、leaving、finishing、approaching、replaying |
+| `recording`           | true 为录制含结束过渡，false 为回放                                     |
+| `sample_count`        | 当前录制点数；回放为 0                                                  |
+| `duration_ms`         | 录制已采集时长或回放计划总时长，u64 ms                                  |
+| `progress`            | 0..1；录制为 0，回放为包含接近的时间进度，终态以请求结果判断            |
+| `trajectory_id`       | string 或 null，关联保存的轨迹 ID                                       |
+
+录制时 `phase:"teaching"`、`action.mode:"teaching"`；回放时 `phase:"moving"`、`action.mode:"replay"`。两者 `action.space:"joint"`、`axis:null`。保存完成后 `teaching:null`，启动与结束请求产生 `completed/teaching_saved`；被停止的录制以相应 cancelled/failed 结果保存已有点。回放正常结束为 `completed/replayed`，取消或故障沿用现有结果语义。
+
 ## 6. 命令输出与执行结果
 
-提交成功立即返回：
+请求成功入队后返回；`teach_replay` 先等待后台准备完成：
 
 ```json
 { "request_id": "req-step-001", "status": "queued" }
@@ -639,22 +763,25 @@ Kp、Kd 和速度前馈权重在整个校准中保持起始值，不进行 PID �
 | `feedback_age_ms`         | u64 或 null                    | 已有反馈中最大的接收年龄                              |
 | `action`                  | object 或 null                 | 当前动作：`request_id,space,mode,axis,progress`       |
 | `calibration`             | `CalibrationStatus` 或 null    | 当前校准或最近一次结果，见 5.10                       |
+| `teaching`                | `TeachingStatus` 或 null       | 当前录制/回放状态，见 5.11                            |
+| `latest_teaching`         | `TeachingSummary` 或 null      | 最近完整示教摘要；SQLite 提交前即可读取完整轨迹       |
 | `last_result` / `results` | `CommandResult` 或 null / 数组 | 最新一条结果 / 最近结果                               |
 | `error`                   | `{code,message}` 或 null       | 当前故障                                              |
 | `journal`                 | object                         | `pending,written,dropped,errors,healthy`              |
 | `communication`           | object                         | `received,crc_errors,timeouts`，本次运行的通信计数    |
 
-| `phase`        | 含义                     |
-| -------------- | ------------------------ |
-| `disconnected` | 未连接                   |
-| `connecting`   | 串口已打开，等待反馈     |
-| `disabled`     | 已连接，未使能           |
-| `enabling`     | 已发送使能，等待反馈确认 |
-| `ready`        | 已使能，可以接受动作     |
-| `moving`       | 动作执行中               |
-| `stopping`     | 减速停止中               |
-| `fault`        | 存在需要清除的故障       |
-| `closing`      | 应用正在退出             |
+| `phase`        | 含义                          |
+| -------------- | ----------------------------- |
+| `disconnected` | 未连接                        |
+| `connecting`   | 串口已打开，等待反馈          |
+| `disabled`     | 已连接，未使能                |
+| `enabling`     | 已发送使能，等待反馈确认      |
+| `teaching`     | 示教录制、拖动/保持与结束过渡 |
+| `ready`        | 已使能，可以接受动作          |
+| `moving`       | 动作执行中                    |
+| `stopping`     | 减速停止中                    |
+| `fault`        | 存在需要清除的故障            |
+| `closing`      | 应用正在退出                  |
 
 `JointSnapshot` 字段如下：
 
@@ -670,7 +797,7 @@ Kp、Kd 和速度前馈权重在整个校准中保持起始值，不进行 PID �
 
 从未收到的反馈为 `null`。反馈过期后，关节数值保留最后一次测量，`age_ms` 继续增长。控制使用的七轴反馈需全部存在、单轴年龄不超过 200 ms，不再附加七轴接收跨度门槛。仅检查 `feedback_age_ms` 不能证明七轴已经齐全。
 
-TCP 未设置或控制反馈无效时，`tcp:null`。`action.mode` 为 `continuous`、`step`、`return` 或 `calibration`，`progress` 范围 0..1。`seq` 和 `generation` 不跨应用重启保存；重新连接应用后重新读取状态。快照通常约 30 Hz 更新，状态变化时也可提前发布。HTTP 返回缓存中的最近快照，调用方还需考虑接收后经过的时间。
+TCP 未设置或控制反馈无效时，`tcp:null`。`action.mode` 为 `continuous`、`step`、`return`、`calibration`、`teaching` 或 `replay`，收纳、示教与回放的 `axis:null`，`progress` 范围 0..1。`seq` 和 `generation` 不跨应用重启保存；重新连接应用后重新读取状态。快照通常约 30 Hz 更新，状态变化时也可提前发布。HTTP 返回缓存中的最近快照，调用方还需考虑接收后经过的时间。
 
 完整的未连接状态示例和嵌套类型见 [OpenAPI](openapi.json) 的 `Snapshot` 与 `GET /v1/state` 示例。
 
@@ -927,9 +1054,13 @@ CLI 原有输出字段保留，新增 `tuning`：`servo_batches_with_tuning/serv
 | 503       | `closing`、`journal_unavailable`、`trace_unavailable`                                                                                                                                   | 应用退出或存储当前不可读写               |
 | 504       | `timeout`                                                                                                                                                                               | 控制权请求等待超时；先读取状态           |
 
+示教还可能返回 `400 invalid_teaching_request/teaching_side_mismatch/teaching_preparation_failed/preview_failed`、`404 teaching_not_found`、`503 teaching_unavailable`。预览 JSON 提取错误（含格式、类型、Content-Type 与体积错误）统一转为 `400 invalid_teaching_request` JSON；详情查询参数错误同样返回该 code。`teach_replay` 使用普通命令 JSON 提取行为，但准备失败可在 202 前返回上述 JSON 错误。
+
 控制权和命令接口的 JSON 解析与类型错误由 HTTP 框架直接返回纯文本：格式错误 400、超大请求体 413、缺少或错误的 JSON Content-Type 415、字段缺失或类型/枚举错误 422。旧日志接口的查询参数格式错误返回 400 纯文本；`/v1/logs/page` 统一返回 `400` JSON `invalid_log_query`。采样开始的 JSON 提取错误和采样查询参数错误统一返回 `400` JSON `invalid_trace_request`；有效整数但时长超出范围返回 `invalid_trace_duration`。调用方先判断 HTTP 状态和 Content-Type，再解析错误内容。
 
 `POST /v1/commands` 的业务校验在入队后完成。例如控制权不符，通常是 **202 入队后出现 `rejected/not_owner`**，而非该请求直接返回 409。
+
+示教录制的参数、阶段或会话校验可异步返回 `invalid_teaching`、`no_teaching`，回放程序的控制线程复核可返回 `invalid_trajectory`；回放入队前的准备错误见上文。程序仍按字符串 code 分支处理。
 
 | 异步结果或故障中的 `code`                                                                                                        | 含义与处理                                                        |
 | -------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
@@ -976,7 +1107,7 @@ Tauri 仅向主窗口提供三个命令：
 
 ## 12. 模块对应关系
 
-控制状态集中在 `arm.rs`；`protocol.rs` 处理通信与标定；`kinematics.rs` 处理当前模型与局部运动学，`trajectory.rs` 提供共享导数窗口和有界求解，`tuning.rs` 提供完整伺服配置校验与无状态前馈计算，`friction.rs` 负责基于真实样本的双向模型拟合；`server.rs` 提供本机接口；`lib.rs` 管理 Tauri 生命周期；`journal.rs` 处理事件持久化并提供采样入口，`trace.rs` 管理短时采样。前端位于 `src`，模型与标定位于 `resources`。
+控制状态集中在 `arm.rs`；`protocol.rs` 处理通信与标定；`kinematics.rs` 处理当前模型与局部运动学，`trajectory.rs` 提供共享导数窗口和有界求解，`tuning.rs` 提供完整伺服配置校验与无状态前馈计算，`friction.rs` 负责基于真实样本的双向模型拟合，`teaching.rs` 负责示教录制、刚度过渡与后台回放规划；`server.rs` 提供本机接口；`lib.rs` 管理 Tauri 生命周期；`journal.rs` 处理事件与示教持久化并提供采样入口，`trace.rs` 管理短时采样。前端位于 `src`，模型与标定位于 `resources`。
 
 ### protocol.rs
 
@@ -1020,6 +1151,10 @@ Tauri 仅向主窗口提供三个命令：
 
 提供 `MotionTuning`、`velocity_window`、`integrate` 和七变量盒约束的 `bounded_quadratic`。动态窗口由前一速度、加速度、目标、限制与实际 `dt` 计算；关节与末端求解使用相同导数约束。默认值为 1 rad/s、0.60 rad/s²、6 rad/s³；模型各轴额定速度单独读取，数值输入显式传入，可独立测试。
 
+### teaching.rs
+
+定义 `Point`、`Summary`、摘要展开的 `Trajectory`、低成本共享的 `Capture`、`PlaybackOptions`、`Preview` 与 `PreviewPoint`。`Recorder::push(Point)` 按小块常数时间追加，`finish(outcome)` 生成共享录制；`Capture::trajectory()` 的全量展开在工作线程调用。`Guidance` 按当前实测位置和相对秒数完成拖动/保持的连续过渡。`plan(trajectory,origin,model,motion,options)` 在后台生成可共享 `Program`，其 `sample(t)` 返回七轴 `q/dq/ddq`，`preview(model)` 计算接近与完整路径的真实 TCP/关节序列；`rebase_approach(origin)` 在接受回放时更新起点。该模块只做纯 Rust 数据与数值计算，不访问串口或 SQLite。
+
 ### journal.rs
 
 使用 rusqlite 0.41.1（bundled），只在专用 writer 线程使用写连接。`Journal` 可 Clone，`Journal::start(path:PathBuf)->Result<Self,String>`、`log(&self,level:&str,source:&str,code:&str,message:&str,request_id:Option<&str>)` 构造字段长度有界的字符串记录，再以 `Mutex.try_lock` 单次尝试提交到容量 1024 的预分配队列；竞争、锁损坏或满队列立即丢弃，不等待锁、队列或数据库。`stats()->JournalStats {pending,written,dropped,errors,healthy}` 仅原子读取。
@@ -1031,6 +1166,8 @@ Tauri 仅向主窗口提供三个命令：
 `trace_start(duration_ms,side,port)`、`trace_stop()`、`trace_list(limit)`、`trace_read(id)` 提供采样管理与读取，server 放到 `spawn_blocking`。`sample(at:Instant,data:TraceData)` 提交固定大小数据；采样有独立队列、writer、数据库与按次统计。
 
 报告使用独立容量 8 的有界队列，`record_calibration(&Report)` 单次尝试锁，仅接纳后克隆；JSON 与事务在 writer 内。控制器保留一份未接纳报告，下周期补投。关闭时先结束控制，再由关闭线程有界补投，随后刷新事件与报告。读取与历史清理不在控制线程执行。
+
+`record_teaching(&Capture)->bool` 单次尝试锁并共享录制，不在控制线程展开或编码；失败由控制器保留补投。writer 同事务保存示教摘要与全部点，不对用户轨迹自动清理。`teachings()->Result<Vec<Summary>,String>` 与 `teaching(id)->Result<Option<Trajectory>,String>` 为阻塞只读接口，server 放到工作线程；尚未写入的最新完整录制通过快照内部共享对象提供读取，该对象不进入公开 JSON。
 
 ### trace.rs
 

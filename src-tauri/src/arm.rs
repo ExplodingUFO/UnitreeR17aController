@@ -13,7 +13,11 @@ use crate::{
         MotionLimits, Pose, SmoothingState, StepInput,
     },
     protocol::{BusError, BusHandle, DriveMode, Feedback, SentReference, Setpoint},
-    reference::{CartesianGuard, Reference},
+    reference::{CartesianGuard, Reference, Sampling},
+    teaching::{
+        self, Capture as TeachingCapture, Guidance, PlaybackOptions, Program as TeachingProgram,
+        Recorder as TeachingRecorder, Summary as TeachingSummary,
+    },
     trajectory::{self, MotionTuning},
     tuning::ServoTuning,
 };
@@ -60,6 +64,7 @@ pub enum Phase {
     Connecting,
     Disabled,
     Enabling,
+    Teaching,
     Ready,
     Moving,
     Stopping,
@@ -129,6 +134,12 @@ pub struct Snapshot {
     pub servo_tuning_revision: u64,
     pub calibration: Option<CalibrationStatus>,
     pub motion_tuning: MotionTuning,
+    pub teaching: Option<TeachingStatus>,
+    pub latest_teaching: Option<TeachingSummary>,
+    #[serde(skip)]
+    pub(crate) teaching_capture: Option<Arc<TeachingCapture>>,
+    #[serde(skip)]
+    pub(crate) teaching_pending: Vec<Arc<TeachingCapture>>,
     #[serde(skip)]
     pub(crate) calibration_report: Option<Arc<CalibrationReport>>,
     #[serde(skip)]
@@ -202,6 +213,30 @@ pub enum Operation {
     CalibrateApply {
         calibration_id: String,
     },
+    TeachStart {
+        #[serde(default)]
+        name: String,
+        #[serde(default = "default_teaching_transition")]
+        transition_s: f64,
+    },
+    TeachDrag {
+        pressed: bool,
+        input_seq: u64,
+        #[serde(default = "default_ttl")]
+        ttl_ms: u64,
+    },
+    TeachFinish,
+    TeachReplay {
+        trajectory_id: String,
+        #[serde(flatten)]
+        options: PlaybackOptions,
+    },
+    /// The HTTP worker supplies validated, precomputed paths. It cannot be
+    /// deserialized from a client's command body.
+    #[serde(skip)]
+    TeachingPrepared {
+        program: Arc<TeachingProgram>,
+    },
     JogStart {
         space: Space,
         axis: usize,
@@ -249,6 +284,10 @@ impl Operation {
             Self::ConfigureMotion { .. } => "configure_motion",
             Self::CalibrateStart { .. } => "calibrate_start",
             Self::CalibrateApply { .. } => "calibrate_apply",
+            Self::TeachStart { .. } => "teach_start",
+            Self::TeachDrag { .. } => "teach_drag",
+            Self::TeachFinish => "teach_finish",
+            Self::TeachReplay { .. } | Self::TeachingPrepared { .. } => "teach_replay",
             Self::JogStart { .. } => "jog_start",
             Self::JogUpdate { .. } => "jog_update",
             Self::Step { .. } => "step",
@@ -268,6 +307,18 @@ enum Work {
     Command(CommandRequest, Instant),
 }
 
+fn default_teaching_transition() -> f64 {
+    0.4
+}
+
+pub use crate::teaching::Status as TeachingStatus;
+
+#[derive(Default)]
+struct PendingRecords {
+    calibrations: VecDeque<CalibrationReport>,
+    teachings: VecDeque<Arc<TeachingCapture>>,
+}
+
 #[derive(Clone)]
 pub struct ArmHandle {
     ordinary: Sender<Work>,
@@ -278,7 +329,7 @@ pub struct ArmHandle {
     reference_epoch: Arc<AtomicU64>,
     stop_reason: Arc<Mutex<Option<String>>>,
     shutdown: Arc<AtomicBool>,
-    finished: Receiver<VecDeque<CalibrationReport>>,
+    finished: Receiver<PendingRecords>,
     journal: Journal,
     state: watch::Receiver<Snapshot>,
 }
@@ -360,9 +411,21 @@ impl ArmHandle {
         };
         // Motion and device I/O have ended. Only this close coordinator may wait
         // for report admission, before the journal itself is asked to flush.
-        for report in pending_reports {
+        for report in pending_reports.calibrations {
             loop {
                 if self.journal.record_calibration(&report) {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return false;
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+        }
+        for capture in pending_reports.teachings {
+            loop {
+                if self.journal.record_teaching(&capture) {
                     break;
                 }
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -489,6 +552,24 @@ struct Motion {
     input_seq: u64,
 }
 
+struct TeachingRun {
+    id: String,
+    request_id: String,
+    started: Instant,
+    guidance: Guidance,
+    recorder: TeachingRecorder,
+    pressed: bool,
+    input_seq: Option<u64>,
+    deadline: Option<Instant>,
+    finish: Option<(Vec<String>, String)>,
+}
+
+struct TeachingReplay {
+    request_id: String,
+    started: Instant,
+    program: Arc<TeachingProgram>,
+}
+
 #[derive(Clone, Copy)]
 enum CalibrationStep {
     Configure,
@@ -607,6 +688,13 @@ struct Core {
     calibration_result: Option<CalibrationStatus>,
     last_calibration_report: Option<Arc<CalibrationReport>>,
     pending_calibration_report: VecDeque<CalibrationReport>,
+    teaching: Option<TeachingRun>,
+    replay: Option<TeachingReplay>,
+    last_teaching: Option<Arc<TeachingCapture>>,
+    pending_teachings: VecDeque<Arc<TeachingCapture>>,
+    /// A measured-position hold must not be integrated from an older command.
+    absolute_hold: bool,
+    teaching_stiffness: f64,
     stopping: bool,
     generation: u64,
     seq: u64,
@@ -663,6 +751,12 @@ impl Core {
             calibration_result: None,
             last_calibration_report: None,
             pending_calibration_report: VecDeque::new(),
+            teaching: None,
+            replay: None,
+            last_teaching: None,
+            pending_teachings: VecDeque::new(),
+            absolute_hold: false,
+            teaching_stiffness: 1.0,
             stopping: false,
             generation: 1,
             seq: 0,
@@ -728,7 +822,9 @@ impl Core {
             Phase::Enabling
         } else if self.stopping {
             Phase::Stopping
-        } else if self.motion.is_some() || self.calibration.is_some() {
+        } else if self.teaching.is_some() {
+            Phase::Teaching
+        } else if self.motion.is_some() || self.calibration.is_some() || self.replay.is_some() {
             Phase::Moving
         } else if self.enabled {
             Phase::Ready
@@ -737,6 +833,42 @@ impl Core {
         };
     }
     fn end_motion(&mut self, status: &str, code: &str, message: &str) {
+        if self.teaching.is_some() {
+            let at = self.control_at.max(Instant::now());
+            let measured = self.measured(at).unwrap_or(self.reference);
+            self.finish_teaching_request(
+                None,
+                if status == "failed" {
+                    "failed"
+                } else {
+                    "stopped"
+                },
+                measured,
+                at,
+            );
+        }
+        if let Some(replay) = self.replay.take() {
+            // Brake from the last batch that actually reached the wire, including
+            // the playback derivatives at that send time.
+            if let Some(sent) = self.bus.as_ref().and_then(BusHandle::latest_reference) {
+                self.reference = sent.q;
+                self.velocity = sent.dq;
+                self.acceleration = if sent.fallback_hold {
+                    [0.0; 7]
+                } else {
+                    replay
+                        .program
+                        .sample(
+                            sent.at
+                                .saturating_duration_since(replay.started)
+                                .as_secs_f64(),
+                        )
+                        .ddq
+                };
+            }
+            self.absolute_hold = false;
+            self.record(&replay.request_id, status, code, message);
+        }
         if let Some(run) = self.calibration.as_mut()
             && !run.cancelled
         {
@@ -782,12 +914,18 @@ impl Core {
             .error
             .as_ref()
             .is_none_or(|e| e.code != code || e.message != message);
-        if self.motion.is_some() || self.enable_request.is_some() || self.calibration.is_some() {
+        if self.motion.is_some()
+            || self.enable_request.is_some()
+            || self.calibration.is_some()
+            || self.teaching.is_some()
+            || self.replay.is_some()
+        {
             self.end_motion("failed", code, &message);
         } else if changed {
             self.bump_generation();
         }
         self.enabled = false;
+        self.finish_teaching_disabled();
         self.reset_derivatives();
         self.stopping = false;
         self.error = Some(ApiError::new(code, message.clone()));
@@ -947,7 +1085,7 @@ impl Core {
         let outcome = self.apply(&id, request.operation, received, now);
         match outcome {
             Ok(()) => {
-                if operation != "jog_update" {
+                if operation != "jog_update" && operation != "teach_drag" {
                     self.record(&id, "accepted", operation, "操作已接受");
                 }
             }
@@ -961,6 +1099,26 @@ impl Core {
         received: Instant,
         now: Instant,
     ) -> Result<(), ApiError> {
+        if self.teaching.is_some()
+            && !matches!(
+                operation,
+                Operation::TeachDrag { .. }
+                    | Operation::TeachFinish
+                    | Operation::Stop
+                    | Operation::Disable { .. }
+                    | Operation::Disconnect { .. }
+            )
+        {
+            return Err(ApiError::new("motion_busy", "请先结束示教"));
+        }
+        if self.replay.is_some()
+            && !matches!(
+                operation,
+                Operation::Stop | Operation::Disable { .. } | Operation::Disconnect { .. }
+            )
+        {
+            return Err(ApiError::new("motion_busy", "轨迹正在重放"));
+        }
         if self.calibration.is_some()
             && !matches!(
                 operation,
@@ -1048,6 +1206,7 @@ impl Core {
                 self.require_release(allow_release)?;
                 self.end_motion("cancelled", "disabled", "设备已失能");
                 self.enabled = false;
+                self.finish_teaching_disabled();
                 self.restore_calibration_disabled();
                 self.reset_derivatives();
                 self.stopping = false;
@@ -1137,6 +1296,84 @@ impl Core {
             Operation::CalibrateApply { calibration_id } => {
                 self.apply_calibration(&calibration_id, now)?
             }
+            Operation::TeachStart { name, transition_s } => {
+                self.begin_teaching(id, name, transition_s, now)?;
+            }
+            Operation::TeachDrag {
+                pressed,
+                input_seq,
+                ttl_ms,
+            } => {
+                let measured = self.measured(now)?;
+                let deadline = if pressed {
+                    Some(input_deadline(received, ttl_ms, now)?)
+                } else {
+                    None
+                };
+                let run = self
+                    .teaching
+                    .as_mut()
+                    .ok_or_else(|| ApiError::new("no_teaching", "请先开始录制"))?;
+                if run.finish.is_some() {
+                    return Err(ApiError::new("no_teaching", "示教正在保存"));
+                }
+                if run.input_seq.is_some_and(|previous| input_seq <= previous) {
+                    return Ok(());
+                }
+                let changed = pressed != run.pressed;
+                run.input_seq = Some(input_seq);
+                run.pressed = pressed;
+                run.deadline = deadline;
+                run.guidance.set_drag(
+                    pressed,
+                    measured,
+                    now.saturating_duration_since(run.started).as_secs_f64(),
+                );
+                if changed {
+                    self.record(
+                        id,
+                        "accepted",
+                        "teach_drag",
+                        if pressed {
+                            "可以拖动"
+                        } else {
+                            "保持当前位置"
+                        },
+                    );
+                }
+            }
+            Operation::TeachFinish => {
+                let measured = self.measured(now)?;
+                if self.teaching.is_none() {
+                    return Err(ApiError::new("no_teaching", "示教已结束"));
+                }
+                self.finish_teaching_request(Some(id.into()), "completed", measured, now);
+            }
+            Operation::TeachReplay { .. } => {
+                return Err(ApiError::new("invalid_trajectory", "轨迹尚未准备"));
+            }
+            Operation::TeachingPrepared { mut program } => {
+                let anchor = self.motion_anchor(now)?;
+                if program.side() != self.side {
+                    return Err(ApiError::new(
+                        "invalid_trajectory",
+                        "轨迹与当前机械臂不一致",
+                    ));
+                }
+                Arc::make_mut(&mut program)
+                    .rebase_approach(anchor)
+                    .map_err(|e| ApiError::new("invalid_trajectory", e))?;
+                self.reference = anchor;
+                self.reset_derivatives();
+                self.absolute_hold = false;
+                self.replay = Some(TeachingReplay {
+                    request_id: id.into(),
+                    started: now,
+                    program,
+                });
+                self.bump_generation();
+                self.phase();
+            }
             Operation::JogStart {
                 space,
                 axis,
@@ -1204,6 +1441,230 @@ impl Core {
         }
         self.dirty = true;
         Ok(())
+    }
+
+    fn begin_teaching(
+        &mut self,
+        id: &str,
+        name: String,
+        transition_s: f64,
+        now: Instant,
+    ) -> Result<(), ApiError> {
+        let anchor = self.motion_anchor(now)?;
+        if !transition_s.is_finite() || transition_s <= 0.0 {
+            return Err(ApiError::new("invalid_teaching", "切换时间必须为正数"));
+        }
+        let measured = self.measured(now)?;
+        let trajectory_id = uuid::Uuid::new_v4().to_string();
+        let summary = TeachingSummary {
+            id: trajectory_id.clone(),
+            name: if name.trim().is_empty() {
+                "示教轨迹".into()
+            } else {
+                name
+            },
+            created_at_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(i64::MAX as u128) as i64,
+            side: self.side.clone(),
+            tcp: self.tcp.unwrap_or(Pose {
+                translation: [0.0; 3],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            }),
+            duration_ms: 0,
+            sample_count: 0,
+            outcome: "recording".into(),
+        };
+        let mut recorder = TeachingRecorder::new(summary);
+        recorder.push(teaching::Point {
+            t_ms: 0,
+            q: measured,
+        });
+        self.teaching = Some(TeachingRun {
+            id: trajectory_id,
+            request_id: id.into(),
+            started: now,
+            guidance: Guidance::new(anchor, transition_s),
+            recorder,
+            pressed: false,
+            input_seq: None,
+            deadline: None,
+            finish: None,
+        });
+        self.reference = anchor;
+        self.reset_derivatives();
+        self.absolute_hold = true;
+        self.teaching_stiffness = 1.0;
+        self.bump_generation();
+        self.phase();
+        Ok(())
+    }
+
+    fn finish_teaching_request(
+        &mut self,
+        request_id: Option<String>,
+        outcome: &str,
+        measured: [f64; 7],
+        now: Instant,
+    ) {
+        if let Some(run) = self.teaching.as_mut() {
+            if let Some((waiting, previous_outcome)) = run.finish.as_mut() {
+                if let Some(request_id) = request_id {
+                    waiting.push(request_id);
+                }
+                if outcome == "failed"
+                    || (*previous_outcome == "completed" && outcome != "completed")
+                {
+                    *previous_outcome = outcome.into();
+                }
+                return;
+            }
+            run.guidance.set_drag(
+                false,
+                measured,
+                now.saturating_duration_since(run.started).as_secs_f64(),
+            );
+            run.pressed = false;
+            run.deadline = None;
+            run.finish = Some((request_id.into_iter().collect(), outcome.into()));
+            self.dirty = true;
+        }
+    }
+
+    fn save_teaching(&mut self, run: TeachingRun) {
+        let (waiting, outcome) = run.finish.unwrap_or((Vec::new(), "stopped".into()));
+        let capture = Arc::new(run.recorder.finish(&outcome));
+        self.last_teaching = Some(capture.clone());
+        self.pending_teachings.push_back(capture);
+        self.flush_teaching_records();
+        let status = if outcome == "completed" {
+            "completed"
+        } else if outcome == "failed" {
+            "failed"
+        } else {
+            "cancelled"
+        };
+        let message = if status == "completed" {
+            "示教轨迹已保存"
+        } else {
+            "示教已结束，轨迹已保存"
+        };
+        self.record(&run.request_id, status, "teaching_saved", message);
+        for request in waiting {
+            self.record(&request, status, "teaching_saved", message);
+        }
+        self.teaching_stiffness = 1.0;
+        self.bump_generation();
+        self.phase();
+    }
+
+    fn finish_teaching_disabled(&mut self) {
+        if let Some(run) = self.teaching.take() {
+            self.save_teaching(run);
+        }
+        self.absolute_hold = false;
+        self.teaching_stiffness = 1.0;
+    }
+
+    fn flush_teaching_records(&mut self) {
+        if self
+            .pending_teachings
+            .front()
+            .is_some_and(|capture| self.journal.record_teaching(capture))
+        {
+            self.pending_teachings.pop_front();
+        }
+    }
+
+    fn advance_teaching(&mut self, measured: [f64; 7], now: Instant) {
+        let Some(run) = self.teaching.as_mut() else {
+            return;
+        };
+        let t = now.saturating_duration_since(run.started).as_secs_f64();
+        if run.deadline.is_some_and(|until| now >= until) {
+            run.deadline = None;
+            run.pressed = false;
+            run.guidance.set_drag(false, measured, t);
+        }
+        let sample = run.guidance.sample(t, measured);
+        self.reference = sample.q;
+        self.teaching_stiffness = sample.stiffness;
+        self.velocity = [0.0; 7];
+        self.acceleration = [0.0; 7];
+        self.jerk = [0.0; 7];
+        run.recorder.push(teaching::Point {
+            t_ms: now
+                .saturating_duration_since(run.started)
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+            q: measured,
+        });
+        if run.finish.is_some() && sample.settled && !sample.dragging {
+            let run = self.teaching.take().unwrap();
+            self.save_teaching(run);
+        }
+        self.dirty = true;
+    }
+
+    fn teaching_status(&self, now: Instant) -> Option<TeachingStatus> {
+        if let Some(run) = &self.teaching {
+            let measured = std::array::from_fn(|i| {
+                self.feedback[i]
+                    .as_ref()
+                    .map_or(self.reference[i], |s| s.value.q)
+            });
+            let sample = run.guidance.sample(
+                now.saturating_duration_since(run.started).as_secs_f64(),
+                measured,
+            );
+            return Some(TeachingStatus {
+                id: run.id.clone(),
+                request_id: run.request_id.clone(),
+                state: if run.finish.is_some() {
+                    "finishing"
+                } else if !sample.settled {
+                    if sample.dragging {
+                        "entering"
+                    } else {
+                        "leaving"
+                    }
+                } else if sample.dragging {
+                    "dragging"
+                } else {
+                    "holding"
+                }
+                .into(),
+                recording: true,
+                sample_count: run.recorder.sample_count(),
+                duration_ms: run.recorder.duration_ms(),
+                progress: 0.0,
+                trajectory_id: Some(run.id.clone()),
+            });
+        }
+        self.replay.as_ref().map(|run| {
+            let elapsed = now.saturating_duration_since(run.started).as_secs_f64();
+            TeachingStatus {
+                id: run.program.trajectory_id().into(),
+                request_id: run.request_id.clone(),
+                state: if elapsed < run.program.approach_duration() {
+                    "approaching"
+                } else {
+                    "replaying"
+                }
+                .into(),
+                recording: false,
+                sample_count: 0,
+                duration_ms: (run.program.duration() * 1000.0) as u64,
+                progress: if run.program.duration() == 0.0 {
+                    1.0
+                } else {
+                    (elapsed / run.program.duration()).clamp(0.0, 1.0)
+                },
+                trajectory_id: Some(run.program.trajectory_id().into()),
+            }
+        })
     }
     fn begin_calibration(
         &mut self,
@@ -1298,6 +1759,7 @@ impl Core {
         // Recording memory is bounded independently of movement duration.
         // Every trial/leg receives a share, including the final comparison.
         let recording_budget = 90_000;
+        self.absolute_hold = false;
         self.calibration = Some(CalibrationRun {
             original_motion,
             report: CalibrationReport {
@@ -2011,6 +2473,7 @@ impl Core {
     fn disconnect(&mut self) {
         self.end_motion("cancelled", "disconnected", "设备连接已断开");
         self.enabled = false;
+        self.finish_teaching_disabled();
         self.restore_calibration_disabled();
         self.reset_servo_tuning();
         self.reset_derivatives();
@@ -2031,7 +2494,11 @@ impl Core {
         if !self.enabled || self.error.is_some() {
             return Err(ApiError::new("not_ready", "设备尚未就绪"));
         }
-        if self.motion.is_some() || self.stopping {
+        if self.motion.is_some()
+            || self.stopping
+            || self.teaching.is_some()
+            || self.replay.is_some()
+        {
             return Err(ApiError::new("motion_busy", "当前动作尚未结束"));
         }
         let measured = self.measured(now)?;
@@ -2084,6 +2551,7 @@ impl Core {
         }
         self.reference = anchor;
         self.reset_derivatives();
+        self.absolute_hold = false;
         self.motion = Some(Motion {
             calibration: false,
             finishing: None,
@@ -2138,6 +2606,7 @@ impl Core {
         };
         self.reference = anchor;
         self.reset_derivatives();
+        self.absolute_hold = false;
         let mut target = anchor;
         let mut initial_pose = None;
         let mut target_pose = None;
@@ -2432,6 +2901,7 @@ impl Core {
     }
     fn advance(&mut self, now: Instant, dt: f64) {
         self.flush_calibration_report();
+        self.flush_teaching_records();
         self.advance_motion(now, dt);
         self.advance_calibration(now);
     }
@@ -2454,6 +2924,10 @@ impl Core {
             self.fault("control_timeout", "控制周期超时");
             return;
         }
+        if self.teaching.is_some() {
+            self.advance_teaching(measured, now);
+            return;
+        }
         if self
             .motion
             .as_ref()
@@ -2472,6 +2946,23 @@ impl Core {
                 self.phase();
                 self.dirty = true;
             }
+            return;
+        }
+        if let Some(replay) = self.replay.as_ref() {
+            let elapsed = now.saturating_duration_since(replay.started).as_secs_f64();
+            let sample = replay.program.sample(elapsed);
+            self.reference = sample.q;
+            self.velocity = sample.dq;
+            self.acceleration = sample.ddq;
+            if elapsed >= replay.program.duration() {
+                let replay = self.replay.take().unwrap();
+                self.reset_derivatives();
+                self.absolute_hold = true;
+                self.bump_generation();
+                self.record(&replay.request_id, "completed", "replayed", "轨迹重放完成");
+                self.phase();
+            }
+            self.dirty = true;
             return;
         }
         let Some(motion) = self.motion.as_ref() else {
@@ -2655,6 +3146,16 @@ impl Core {
         reference.joint_velocity = self.joint_speeds();
         reference.servo_tuning = self.servo_tuning;
         reference.tuning_revision = self.servo_tuning_revision;
+        reference.sampling = if let Some(replay) = &self.replay {
+            Sampling::Playback {
+                program: replay.program.clone(),
+                started: replay.started,
+            }
+        } else if self.absolute_hold {
+            Sampling::Absolute
+        } else {
+            Sampling::Integrated
+        };
         reference.stopping = self.stopping || self.stop_path.is_some();
         let motion = self.motion.as_ref();
         if let Some(motion) = motion {
@@ -2666,6 +3167,9 @@ impl Core {
                         .map_or(lease.expires, |until| until.min(lease.expires)),
                 );
             }
+        }
+        if self.replay.is_some() {
+            reference.valid_until = self.lease.as_ref().map(|lease| lease.expires);
         }
         reference.joint_goal = motion
             .filter(|m| m.space == Space::Joint && m.mode.timed())
@@ -2727,7 +3231,7 @@ impl Core {
             None,
         );
     }
-    fn poll(&mut self, now: Instant) {
+    fn desired_setpoints(&self) -> [Setpoint; 7] {
         let servo = self.enabled || self.enable_request.is_some();
         let gravity = if servo {
             self.model
@@ -2737,7 +3241,7 @@ impl Core {
         } else {
             [0.0; 7]
         };
-        let setpoints: [Setpoint; 7] = std::array::from_fn(|i| Setpoint {
+        std::array::from_fn(|i| Setpoint {
             mode: if self.clear_pending[i] {
                 DriveMode::ClearFault
             } else if servo {
@@ -2752,9 +3256,16 @@ impl Core {
             } else {
                 0.0
             },
-            kp: if servo { SERVO_KP } else { 0.0 },
+            kp: if servo {
+                SERVO_KP * self.teaching_stiffness
+            } else {
+                0.0
+            },
             kd: if servo { SERVO_KD } else { 0.0 },
-        });
+        })
+    }
+    fn poll(&mut self, now: Instant) {
+        let setpoints = self.desired_setpoints();
         let clearing = self.clear_pending.iter().any(|pending| *pending);
         let motion = self.motion.as_ref();
         self.journal.sample(
@@ -3128,6 +3639,20 @@ impl Core {
                             0.0
                         },
                     })
+                })
+                .or_else(|| {
+                    self.teaching_status(now).map(|status| ActionSnapshot {
+                        request_id: status.request_id,
+                        space: Space::Joint,
+                        mode: if status.recording {
+                            "teaching"
+                        } else {
+                            "replay"
+                        }
+                        .into(),
+                        axis: None,
+                        progress: status.progress,
+                    })
                 }),
             last_result: self.results.front().cloned(),
             results: self.results.iter().cloned().collect(),
@@ -3147,6 +3672,13 @@ impl Core {
                 .map(|run| self.calibration_snapshot(run))
                 .or_else(|| self.calibration_result.clone()),
             calibration_report: self.last_calibration_report.clone(),
+            teaching: self.teaching_status(now),
+            latest_teaching: self
+                .last_teaching
+                .as_ref()
+                .map(|capture| capture.summary.clone()),
+            teaching_capture: self.last_teaching.clone(),
+            teaching_pending: self.pending_teachings.iter().cloned().collect(),
             reference: self.reference,
         }
     }
@@ -3174,7 +3706,7 @@ fn run(
     stop_reason: Arc<Mutex<Option<String>>>,
     shutdown: Arc<AtomicBool>,
     state: watch::Sender<Snapshot>,
-) -> VecDeque<CalibrationReport> {
+) -> PendingRecords {
     let mut seen_epoch = 0;
     let mut last_control = Instant::now();
     let mut published = last_control;
@@ -3203,8 +3735,10 @@ fn run(
             core.end_motion("cancelled", "closing", "应用正在关闭");
             core.lease = None;
             core.enabled = false;
+            core.finish_teaching_disabled();
             core.restore_calibration_disabled();
             core.flush_calibration_report();
+            core.flush_teaching_records();
             core.send_disable();
             core.bus = None;
             core.phase = Phase::Closing;
@@ -3265,7 +3799,10 @@ fn run(
             std::thread::sleep(wait);
         }
     }
-    std::mem::take(&mut core.pending_calibration_report)
+    PendingRecords {
+        calibrations: std::mem::take(&mut core.pending_calibration_report),
+        teachings: std::mem::take(&mut core.pending_teachings),
+    }
 }
 
 #[cfg(test)]
@@ -3380,6 +3917,7 @@ mod tests {
             epoch: core.reference_version,
             q: held,
             dq: [0.0; 7],
+            fallback_hold: false,
         }));
         let mut config = ServoTuning::default();
         config.joints[0].velocity_ff = 0.0;
@@ -3671,6 +4209,7 @@ mod tests {
             epoch: core.reference_version,
             q,
             dq: [0.0; 7],
+            fallback_hold: false,
         }));
         let mut previous = Some(Previous {
             at: now,
@@ -3736,6 +4275,7 @@ mod tests {
                             epoch: source.epoch,
                             q: sample.q,
                             dq: sample.dq,
+                            fallback_hold: false,
                         }));
                     }
                     next_send += Duration::from_millis(10);
@@ -3924,6 +4464,640 @@ mod tests {
         (core, directory)
     }
 
+    fn teaching_tick(
+        core: &mut Core,
+        sent: &watch::Sender<Option<SentReference>>,
+        at: Instant,
+        actual: [f64; 7],
+    ) -> [Setpoint; 7] {
+        for (axis, q) in actual.into_iter().enumerate() {
+            let old = core.feedback[axis].as_ref().unwrap();
+            let dt = at.saturating_duration_since(old.at).as_secs_f64();
+            let mut value = old.value.clone();
+            value.dq = if dt > 0.0 { (q - value.q) / dt } else { 0.0 };
+            value.q = q;
+            core.accept_feedback(value, at);
+        }
+        core.advance(at, 0.01);
+        let previous = sent
+            .borrow()
+            .as_ref()
+            .map(|value| crate::reference::Previous {
+                at: value.at,
+                q: value.q,
+                dq: value.dq,
+            });
+        let sample = core.outgoing_reference().sample(at, previous).unwrap();
+        sent.send_replace(Some(SentReference {
+            at,
+            completed_at: at,
+            generation: core.generation,
+            epoch: core.reference_version,
+            q: sample.q,
+            dq: sample.dq,
+            fallback_hold: false,
+        }));
+        core.desired_setpoints()
+    }
+
+    #[test]
+    fn teaching_press_release_keeps_servo_gravity_and_holds_the_new_position() {
+        let origin = Instant::now();
+        let (mut core, _directory, sent) = calibration_fixture(origin);
+        let initial = core.reference;
+        let tcp = core.tcp;
+        let baseline = core.servo_tuning;
+        core.apply(
+            "teach",
+            Operation::TeachStart {
+                name: "弧线".into(),
+                transition_s: 0.4,
+            },
+            origin,
+            origin,
+        )
+        .unwrap();
+        core.apply(
+            "press",
+            Operation::TeachDrag {
+                pressed: true,
+                input_seq: 1,
+                ttl_ms: 5000,
+            },
+            origin,
+            origin,
+        )
+        .unwrap();
+        let mut last_kp = SERVO_KP;
+        let mut last_q = initial;
+        for tick in 1..=100 {
+            let mut actual = initial;
+            actual[1] += tick as f64 * 0.0005;
+            let values = teaching_tick(
+                &mut core,
+                &sent,
+                origin + Duration::from_millis(tick * 10),
+                actual,
+            );
+            assert!(
+                values
+                    .iter()
+                    .all(|s| s.mode == DriveMode::Servo && s.kd > 0.0)
+            );
+            assert!(
+                values.iter().any(|s| s.tau.abs() > 0.1),
+                "gravity must remain active while stiffness changes"
+            );
+            assert!(values[0].kp <= last_kp + 1e-10);
+            assert!((values[0].kp - last_kp).abs() < SERVO_KP * 0.05);
+            assert!((values[1].q - last_q[1]).abs() < 0.003);
+            last_q = values.map(|s| s.q);
+            last_kp = values[0].kp;
+        }
+        assert_eq!(last_kp, 0.0);
+        let release_at = origin + Duration::from_secs(1);
+        let released = core.measured(release_at).unwrap();
+        core.apply(
+            "release",
+            Operation::TeachDrag {
+                pressed: false,
+                input_seq: 2,
+                ttl_ms: 350,
+            },
+            release_at,
+            release_at,
+        )
+        .unwrap();
+        for tick in 101..=150 {
+            let values = teaching_tick(
+                &mut core,
+                &sent,
+                origin + Duration::from_millis(tick * 10),
+                released,
+            );
+            assert!(core.enabled);
+            assert!(values.iter().all(|s| s.mode == DriveMode::Servo));
+            assert!(values[0].kp >= last_kp - 1e-10);
+            assert!((values[0].kp - last_kp).abs() < SERVO_KP * 0.05);
+            last_kp = values[0].kp;
+        }
+        assert_eq!(last_kp, SERVO_KP);
+        assert_eq!(core.reference, released);
+        assert_ne!(core.reference, initial);
+        assert_eq!(core.tcp, tcp);
+        assert_eq!(core.servo_tuning, baseline);
+        let finish_at = origin + Duration::from_millis(1500);
+        core.apply("finish", Operation::TeachFinish, finish_at, finish_at)
+            .unwrap();
+        teaching_tick(
+            &mut core,
+            &sent,
+            finish_at + Duration::from_millis(10),
+            released,
+        );
+        assert!(core.teaching.is_none());
+        assert!(core.absolute_hold && core.enabled);
+        let capture = core.last_teaching.as_ref().unwrap();
+        assert_eq!(capture.summary.outcome, "completed");
+        assert!(capture.summary.sample_count >= 150);
+        let data = capture.trajectory();
+        assert_eq!(data.points.last().unwrap().q, released);
+        assert!(data.points.windows(2).all(|p| p[0].t_ms < p[1].t_ms));
+        assert!(
+            core.results
+                .iter()
+                .any(|r| r.request_id == "finish" && r.status == "completed")
+        );
+    }
+
+    #[test]
+    fn teaching_expiry_and_reordered_input_return_to_hold_without_restarting() {
+        let origin = Instant::now();
+        let (mut core, _directory, sent) = calibration_fixture(origin);
+        core.apply(
+            "teach",
+            Operation::TeachStart {
+                name: String::new(),
+                transition_s: 0.05,
+            },
+            origin,
+            origin,
+        )
+        .unwrap();
+        core.apply(
+            "press",
+            Operation::TeachDrag {
+                pressed: true,
+                input_seq: 10,
+                ttl_ms: 100,
+            },
+            origin,
+            origin,
+        )
+        .unwrap();
+        let mut actual = core.reference;
+        actual[0] += 0.02;
+        for tick in 1..=20 {
+            teaching_tick(
+                &mut core,
+                &sent,
+                origin + Duration::from_millis(tick * 10),
+                actual,
+            );
+        }
+        assert!(!core.teaching.as_ref().unwrap().pressed);
+        assert_eq!(core.teaching_stiffness, 1.0);
+        assert_eq!(core.reference, actual);
+        let at = origin + Duration::from_millis(200);
+        core.apply(
+            "released",
+            Operation::TeachDrag {
+                pressed: false,
+                input_seq: 12,
+                ttl_ms: 350,
+            },
+            at,
+            at,
+        )
+        .unwrap();
+        core.apply(
+            "oldpress",
+            Operation::TeachDrag {
+                pressed: true,
+                input_seq: 11,
+                ttl_ms: 350,
+            },
+            at,
+            at,
+        )
+        .unwrap();
+        assert!(!core.teaching.as_ref().unwrap().pressed);
+        core.end_motion("cancelled", "host_stop", "停止");
+        assert!(
+            core.apply(
+                "latepress",
+                Operation::TeachDrag {
+                    pressed: true,
+                    input_seq: 13,
+                    ttl_ms: 350
+                },
+                at,
+                at
+            )
+            .is_err()
+        );
+        teaching_tick(&mut core, &sent, at + Duration::from_millis(10), actual);
+        assert!(core.teaching.is_none());
+        assert!(core.enabled);
+        assert_eq!(core.reference, actual);
+        assert_eq!(
+            core.last_teaching.as_ref().unwrap().summary.outcome,
+            "stopped"
+        );
+    }
+
+    #[test]
+    fn teaching_finish_waiters_observe_stop_or_fault_before_the_hold_transition_finishes() {
+        for fault in [false, true] {
+            let origin = Instant::now();
+            let (mut core, _dir, sent) = calibration_fixture(origin);
+            let q = core.reference;
+            core.apply(
+                "teach",
+                Operation::TeachStart {
+                    name: String::new(),
+                    transition_s: 0.2,
+                },
+                origin,
+                origin,
+            )
+            .unwrap();
+            core.apply(
+                "press",
+                Operation::TeachDrag {
+                    pressed: true,
+                    input_seq: 1,
+                    ttl_ms: 5000,
+                },
+                origin,
+                origin,
+            )
+            .unwrap();
+            for tick in 1..=30 {
+                teaching_tick(
+                    &mut core,
+                    &sent,
+                    origin + Duration::from_millis(tick * 10),
+                    q,
+                );
+            }
+            let at = origin + Duration::from_millis(300);
+            for id in ["finish-a", "finish-b"] {
+                core.apply(id, Operation::TeachFinish, at, at).unwrap();
+            }
+            if fault {
+                core.fault("device_error", "simulated device fault");
+            } else {
+                core.end_motion("cancelled", "stopped", "停止");
+                for tick in 31..=60 {
+                    teaching_tick(
+                        &mut core,
+                        &sent,
+                        origin + Duration::from_millis(tick * 10),
+                        q,
+                    );
+                }
+            }
+            assert!(core.teaching.is_none());
+            assert_eq!(
+                core.last_teaching.as_ref().unwrap().summary.outcome,
+                if fault { "failed" } else { "stopped" }
+            );
+            for id in ["teach", "finish-a", "finish-b"] {
+                let result = core.results.iter().find(|r| r.request_id == id).unwrap();
+                assert_eq!(result.status, if fault { "failed" } else { "cancelled" });
+            }
+            assert_eq!(core.enabled, !fault);
+        }
+    }
+
+    #[test]
+    fn teaching_zero_duration_replay_has_finite_progress_and_fallback_stop_stays_at_rest() {
+        let origin = Instant::now();
+        let (mut core, _directory, sent) = calibration_fixture(origin);
+        let q = core.reference;
+        let one = teaching::Trajectory {
+            summary: TeachingSummary {
+                id: "pose".into(),
+                name: "示教姿态".into(),
+                created_at_ms: 0,
+                side: "right".into(),
+                tcp: core.tcp.unwrap(),
+                duration_ms: 0,
+                sample_count: 1,
+                outcome: "completed".into(),
+            },
+            points: vec![teaching::Point { t_ms: 0, q }],
+        };
+        let program = teaching::plan(
+            &one,
+            q,
+            core.model.as_ref().unwrap(),
+            core.motion_tuning,
+            PlaybackOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(program.duration(), 0.0);
+        core.apply(
+            "pose",
+            Operation::TeachingPrepared {
+                program: Arc::new(program),
+            },
+            origin,
+            origin,
+        )
+        .unwrap();
+        assert_eq!(core.snapshot(origin).teaching.unwrap().progress, 1.0);
+        assert!(
+            serde_json::to_value(core.snapshot(origin)).unwrap()["teaching"]["progress"]
+                .is_number()
+        );
+        teaching_tick(&mut core, &sent, origin + Duration::from_millis(10), q);
+        assert!(core.replay.is_none() && core.enabled);
+
+        // A sender fallback has zero actual trajectory velocity. Its abandoned
+        // playback's nonzero acceleration must not restart movement on Stop.
+        let trajectory = teaching::Trajectory {
+            summary: one.summary,
+            points: (0..101)
+                .map(|i| {
+                    let mut point = q;
+                    point[0] += 0.04 * (i as f64 / 100.0).powi(2);
+                    teaching::Point {
+                        t_ms: i * 20,
+                        q: point,
+                    }
+                })
+                .collect(),
+        };
+        let program = Arc::new(
+            teaching::plan(
+                &trajectory,
+                q,
+                core.model.as_ref().unwrap(),
+                core.motion_tuning,
+                PlaybackOptions::default(),
+            )
+            .unwrap(),
+        );
+        let (elapsed, sample) = (1..200)
+            .find_map(|i| {
+                let t = i as f64 * 0.01;
+                let s = program.sample(t);
+                s.ddq.iter().any(|a| a.abs() > 0.001).then_some((t, s))
+            })
+            .unwrap();
+        core.replay = Some(TeachingReplay {
+            request_id: "fallback".into(),
+            started: origin,
+            program,
+        });
+        core.reference = sample.q;
+        core.velocity = sample.dq;
+        core.acceleration = sample.ddq;
+        let at = origin + Duration::from_secs_f64(elapsed);
+        sent.send_replace(Some(SentReference {
+            at,
+            completed_at: at,
+            generation: core.generation,
+            epoch: core.reference_version,
+            q: sample.q,
+            dq: [0.0; 7],
+            fallback_hold: true,
+        }));
+        core.end_motion("cancelled", "stopped", "停止");
+        assert_eq!(core.velocity, [0.0; 7]);
+        assert_eq!(core.acceleration, [0.0; 7]);
+        assert!(!core.stopping);
+        assert_eq!(core.reference, sample.q);
+    }
+
+    #[test]
+    fn teaching_saved_replay_samples_send_time_stops_and_preserves_tcp() {
+        let origin = Instant::now();
+        let (mut core, _directory, sent) = calibration_fixture(origin);
+        let initial = core.reference;
+        let tcp = core.tcp.unwrap();
+        let summary = TeachingSummary {
+            id: "replay".into(),
+            name: "示教".into(),
+            created_at_ms: 0,
+            side: "right".into(),
+            tcp,
+            duration_ms: 2000,
+            sample_count: 101,
+            outcome: "completed".into(),
+        };
+        let trajectory = teaching::Trajectory {
+            summary,
+            points: (0..101)
+                .map(|i| {
+                    let mut q = initial;
+                    q[0] += 0.05 * (std::f64::consts::PI * i as f64 / 100.0).sin();
+                    teaching::Point { t_ms: i * 20, q }
+                })
+                .collect(),
+        };
+        let program = teaching::plan(
+            &trajectory,
+            initial,
+            core.model.as_ref().unwrap(),
+            core.motion_tuning,
+            PlaybackOptions::default(),
+        )
+        .unwrap();
+        core.apply(
+            "replay",
+            Operation::TeachingPrepared {
+                program: Arc::new(program),
+            },
+            origin,
+            origin,
+        )
+        .unwrap();
+        for tick in 1..=60 {
+            let actual = core.reference;
+            teaching_tick(
+                &mut core,
+                &sent,
+                origin + Duration::from_millis(tick * 10),
+                actual,
+            );
+        }
+        let at = origin + Duration::from_millis(600);
+        let outgoing = core.outgoing_reference();
+        let expected = core.replay.as_ref().unwrap().program.sample(0.607);
+        let sampled = outgoing
+            .sample(at + Duration::from_millis(7), None)
+            .unwrap();
+        assert_eq!(sampled.q, expected.q);
+        assert_eq!(sampled.dq, expected.dq);
+        assert!(core.velocity.iter().any(|v| v.abs() > 1e-6));
+        sent.send_replace(Some(SentReference {
+            at: at + Duration::from_millis(7),
+            completed_at: at + Duration::from_millis(7),
+            generation: core.generation,
+            epoch: core.reference_version,
+            q: sampled.q,
+            dq: sampled.dq,
+            fallback_hold: false,
+        }));
+        core.end_motion("cancelled", "stopped", "停止");
+        assert!(core.replay.is_none());
+        assert_eq!(core.reference, sampled.q);
+        assert_eq!(core.velocity, sampled.dq);
+        for tick in 61..=1000 {
+            let actual = core.reference;
+            teaching_tick(
+                &mut core,
+                &sent,
+                origin + Duration::from_millis(tick * 10),
+                actual,
+            );
+            if !core.stopping {
+                break;
+            }
+        }
+        assert!(!core.stopping && core.enabled);
+        assert_eq!(core.tcp, Some(tcp));
+        assert!(core.motion.is_none() && core.replay.is_none());
+        assert_eq!(
+            core.results
+                .iter()
+                .find(|r| r.request_id == "replay")
+                .unwrap()
+                .status,
+            "cancelled"
+        );
+        core.begin_return("park", initial, 0.1, false, core.control_at)
+            .unwrap();
+        assert!(matches!(
+            core.motion.as_ref().unwrap().mode,
+            MotionMode::Return {
+                disconnect_after: false
+            }
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teaching_finished_capture_is_readable_before_sqlite_commit_and_survives_restart() {
+        let origin = Instant::now();
+        let (mut core, directory, sent) = calibration_fixture(origin);
+        let journal = core.journal.clone();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !journal.stats().healthy {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let db = rusqlite::Connection::open(directory.path().join("events.sqlite3")).unwrap();
+        db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        core.apply(
+            "teach",
+            Operation::TeachStart {
+                name: "离线录制".into(),
+                transition_s: 0.05,
+            },
+            origin,
+            origin,
+        )
+        .unwrap();
+        core.apply(
+            "press",
+            Operation::TeachDrag {
+                pressed: true,
+                input_seq: 1,
+                ttl_ms: 5000,
+            },
+            origin,
+            origin,
+        )
+        .unwrap();
+        let initial = core.reference;
+        for tick in 1..=50 {
+            let mut q = initial;
+            q[0] += 0.0002 * tick as f64;
+            teaching_tick(
+                &mut core,
+                &sent,
+                origin + Duration::from_millis(tick * 10),
+                q,
+            );
+        }
+        let actual = core.measured(origin + Duration::from_millis(500)).unwrap();
+        core.apply(
+            "finish",
+            Operation::TeachFinish,
+            origin + Duration::from_millis(500),
+            origin + Duration::from_millis(500),
+        )
+        .unwrap();
+        for tick in 51..=60 {
+            teaching_tick(
+                &mut core,
+                &sent,
+                origin + Duration::from_millis(tick * 10),
+                actual,
+            );
+        }
+        assert!(core.teaching.is_none() && core.enabled);
+        let capture = core.last_teaching.as_ref().unwrap().clone();
+        let id = capture.summary.id.clone();
+        let committed: i64 = db
+            .query_row("SELECT count(*) FROM teachings WHERE id=?1", [&id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(committed, 0, "the write transaction is still held");
+        let _transmit_sink = core.bus.as_ref().unwrap().test_transmit_sink();
+        let arm = ArmHandle::spawn_core(core).unwrap();
+        let server = crate::server::launch_at(
+            arm.clone(),
+            journal.clone(),
+            "teaching-test".into(),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await
+        .unwrap();
+        let client = reqwest::Client::new();
+        let remote: teaching::Trajectory = client
+            .get(format!(
+                "{}/v1/teachings/{id}?download=true",
+                server.base_url()
+            ))
+            .bearer_auth("teaching-test")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(remote.summary.id, id);
+        assert_eq!(remote.summary.sample_count, capture.summary.sample_count);
+        assert_eq!(remote.points.last().unwrap().q, actual);
+        let preview: teaching::Preview = client
+            .post(format!("{}/v1/teachings/{id}/preview", server.base_url()))
+            .bearer_auth("teaching-test")
+            .json(&serde_json::json!({"speed_scale":2.0}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(!preview.points.is_empty());
+        assert!(arm.snapshot().action.is_none());
+        db.execute_batch("ROLLBACK").unwrap();
+        server.shutdown().await;
+        assert!(arm.shutdown(Duration::from_secs(2)));
+        assert!(journal.shutdown(Duration::from_secs(3)));
+        let reopened = Journal::start(directory.path().join("events.sqlite3")).unwrap();
+        let restored = reopened.teaching(&id).unwrap().unwrap();
+        let expected = capture.trajectory();
+        assert_eq!(restored.summary, expected.summary);
+        assert_eq!(restored.points.len(), expected.points.len());
+        for (restored, expected) in restored.points.iter().zip(&expected.points) {
+            assert_eq!(restored.t_ms, expected.t_ms);
+            for (a, b) in restored.q.into_iter().zip(expected.q) {
+                assert!((a - b).abs() <= 8.0 * f64::EPSILON * a.abs().max(b.abs()).max(1.0));
+            }
+        }
+        assert!(reopened.shutdown(Duration::from_secs(2)));
+    }
+
     #[test]
     fn independently_fresh_joint_samples_do_not_need_a_second_span_gate() {
         let now = Instant::now();
@@ -4053,6 +5227,7 @@ mod tests {
             epoch: core.reference_version,
             q: core.reference,
             dq: core.velocity,
+            fallback_hold: false,
         }));
         (core, directory, sent)
     }
@@ -4158,6 +5333,7 @@ mod tests {
                 epoch: core.reference_version,
                 q: core.reference,
                 dq: [0.0; 7],
+                fallback_hold: false,
             }));
         }
         calibration_request(
@@ -4207,6 +5383,7 @@ mod tests {
                 epoch: core.reference_version,
                 q: core.reference,
                 dq: [0.0; 7],
+                fallback_hold: false,
             }));
             let old_velocity_gate = core
                 .feedback
@@ -4253,6 +5430,7 @@ mod tests {
                 epoch: core.reference_version,
                 q: core.reference,
                 dq: [0.0; 7],
+                fallback_hold: false,
             }));
         }
         calibration_request(
@@ -4294,6 +5472,7 @@ mod tests {
                 epoch: core.reference_version,
                 q: core.reference,
                 dq: core.velocity,
+                fallback_hold: false,
             }));
             core.advance(now, 0.01);
             if core.motion.is_none() {
@@ -4317,6 +5496,7 @@ mod tests {
             epoch: 1,
             q: [value; 7],
             dq: [0.0; 7],
+            fallback_hold: false,
         };
         let sent = VecDeque::from([make(90, 93, 1.0), make(100, 103, 2.0)]);
         assert!(calibration_reference(&sent, origin + Duration::from_millis(92)).is_none());
@@ -4406,6 +5586,7 @@ mod tests {
             epoch: core.reference_version,
             q: core.reference,
             dq: core.velocity,
+            fallback_hold: false,
         }));
         core.advance(now, 0.01);
     }
@@ -4775,6 +5956,7 @@ mod tests {
             epoch: core.reference_version,
             q: anchor,
             dq: [0.0; 7],
+            fallback_hold: false,
         }));
         calibration_request(
             &mut core,

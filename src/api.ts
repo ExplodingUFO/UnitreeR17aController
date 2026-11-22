@@ -9,6 +9,7 @@ export type Phase =
   | "disabled"
   | "enabling"
   | "ready"
+  | "teaching"
   | "moving"
   | "stopping"
   | "fault"
@@ -107,6 +108,61 @@ export interface CalibrationPreview {
   program: CartesianProgram;
   points: PreviewPoint[];
   ranges?: { axis: number; negative: number; positive: number }[];
+}
+export interface TeachingPoint {
+  t_ms: number;
+  q: JointPositions;
+}
+export interface TeachingSummary {
+  id: string;
+  name: string;
+  created_at_ms: number;
+  side: Side;
+  tcp: Pose;
+  duration_ms: number;
+  sample_count: number;
+  outcome: string;
+}
+export interface TeachingTrajectory extends TeachingSummary {
+  points: TeachingPoint[];
+}
+export interface TeachingPlaybackOptions {
+  speed_scale: number;
+  smoothing_s: number;
+}
+export interface TeachingPreviewPoint {
+  t_ms: number;
+  joints: JointPositions;
+  tcp: [number, number, number];
+  phase: "approach" | "path";
+}
+export interface TeachingPreview {
+  trajectory_id: string;
+  side: Side;
+  tcp: Pose;
+  origin: JointPositions;
+  duration_ms: number;
+  approach_duration_ms: number;
+  requested_speed_scale: number;
+  effective_speed_scale: number;
+  points: TeachingPreviewPoint[];
+}
+export interface TeachingStatus {
+  id: string;
+  request_id: string;
+  state:
+    | "holding"
+    | "dragging"
+    | "entering"
+    | "leaving"
+    | "finishing"
+    | "replaying"
+    | "approaching";
+  recording: boolean;
+  sample_count: number;
+  duration_ms: number;
+  progress: number;
+  trajectory_id: string | null;
 }
 export interface CalibrationMetrics {
   windows: number;
@@ -486,6 +542,7 @@ export type Action = {
 } & (
   | { space: Space; mode: "continuous" | "step"; axis: number }
   | { space: "joint"; mode: "return"; axis: null }
+  | { space: "joint"; mode: "teaching" | "replay"; axis: null }
   | { space: Space; mode: "calibration"; axis: number }
 );
 export interface Snapshot {
@@ -506,6 +563,8 @@ export interface Snapshot {
   feedback_age_ms: number | null;
   action: Action | null;
   calibration?: CalibrationStatus | null;
+  teaching?: TeachingStatus | null;
+  latest_teaching?: TeachingSummary | null;
   last_result: Result | null;
   results: Result[];
   error: { code: string; message: string } | null;
@@ -610,6 +669,10 @@ export type Operation =
   | { kind: "configure_motion"; config: MotionTuning }
   | { kind: "calibrate_start"; settings?: Partial<CalibrationSettings> }
   | { kind: "calibrate_apply"; calibration_id: string }
+  | { kind: "teach_start"; name?: string; transition_s?: number }
+  | { kind: "teach_drag"; pressed: boolean; input_seq: number; ttl_ms?: number }
+  | { kind: "teach_finish" }
+  | ({ kind: "teach_replay"; trajectory_id: string } & TeachingPlaybackOptions)
   | ({
       kind: "jog_start";
       input_seq: number;
@@ -646,6 +709,8 @@ export const emptySnapshot: Snapshot = {
   feedback_age_ms: null,
   action: null,
   calibration: null,
+  teaching: null,
+  latest_teaching: null,
   last_result: null,
   results: [],
   error: null,
@@ -691,6 +756,22 @@ class DesktopApi {
   private polling = false;
   private cancelReturn: (() => void) | null = null;
   private calibrationRequest: { id: string; pending: boolean } | null = null;
+  private teachingRequest: {
+    id: string;
+    generation: number;
+    pending: boolean;
+  } | null = null;
+  private teachingDrag: {
+    generation: number;
+    connection: number;
+    session: string;
+    pressed: boolean;
+    confirmedSeq: number;
+    requests: Set<AbortController>;
+    timer: ReturnType<typeof setInterval> | null;
+  } | null = null;
+  private teachingInputSeq = 0;
+  private teachingStopEpoch = 0;
   view: View = {
     snapshot: emptySnapshot,
     connectionEpoch: 0,
@@ -754,11 +835,20 @@ class DesktopApi {
   private async request<T>(
     path: string,
     body?: unknown,
-    options: { signal?: AbortSignal; download?: boolean } = {},
+    options: {
+      signal?: AbortSignal;
+      download?: boolean;
+      timeoutMs?: number | null;
+    } = {},
   ): Promise<T> {
     if (!this.session) throw new Error("未连接");
     try {
-      const timeout = AbortSignal.timeout(options.download ? 20000 : 4000);
+      const timeout =
+        options.timeoutMs === null
+          ? undefined
+          : AbortSignal.timeout(
+              options.timeoutMs ?? (options.download ? 20000 : 4000),
+            );
       const response = await fetch(
         `${this.session.base_url.replace(/\/$/, "")}${path}`,
         {
@@ -768,9 +858,10 @@ class DesktopApi {
             ...(body ? { "Content-Type": "application/json" } : {}),
           },
           body: body ? JSON.stringify(body) : undefined,
-          signal: options.signal
-            ? AbortSignal.any([options.signal, timeout])
-            : timeout,
+          signal:
+            options.signal && timeout
+              ? AbortSignal.any([options.signal, timeout])
+              : (options.signal ?? timeout),
         },
       );
       if (response.ok && options.download) return (await response.blob()) as T;
@@ -851,6 +942,42 @@ class DesktopApi {
     );
     return reports.map(parseCalibrationReport);
   }
+  async listTeachings(signal?: AbortSignal) {
+    const saved = await this.request<TeachingSummary[]>(
+      "/v1/teachings",
+      undefined,
+      { signal, timeoutMs: null },
+    );
+    const latest = this.view.snapshot.latest_teaching;
+    return latest
+      ? [latest, ...saved.filter((item) => item.id !== latest.id)]
+      : saved;
+  }
+  async readTeaching(id: string, signal?: AbortSignal) {
+    return this.request<TeachingTrajectory>(
+      `/v1/teachings/${encodeURIComponent(id)}`,
+      undefined,
+      { signal, timeoutMs: null },
+    );
+  }
+  async previewTeaching(
+    id: string,
+    options: TeachingPlaybackOptions,
+    signal?: AbortSignal,
+  ) {
+    return this.request<TeachingPreview>(
+      `/v1/teachings/${encodeURIComponent(id)}/preview`,
+      options,
+      { signal, timeoutMs: null },
+    );
+  }
+  async downloadTeaching(id: string, signal?: AbortSignal) {
+    return this.request<Blob>(
+      `/v1/teachings/${encodeURIComponent(id)}?download=true`,
+      undefined,
+      { signal, download: true, timeoutMs: null },
+    );
+  }
   async previewCalibration(
     request: CalibrationPreviewRequest,
     signal?: AbortSignal,
@@ -921,7 +1048,11 @@ class DesktopApi {
       this.pollTimer = setInterval(() => void this.poll(), 1500);
   }
   dispose() {
-    if (this.cancelReturn || this.hasLocalCalibration())
+    if (
+      this.cancelReturn ||
+      this.hasLocalCalibration() ||
+      this.hasLocalTeaching()
+    )
       void this.hostStop("desktop_disposed").catch((error) => this.fail(error));
     this.stopped = true;
     this.clearJog();
@@ -961,6 +1092,36 @@ class DesktopApi {
       )
         this.calibrationRequest.pending = false;
     }
+    if (this.teachingRequest) {
+      const request = this.teachingRequest;
+      const result =
+        snapshot.results?.find((item) => item.request_id === request.id) ??
+        (snapshot.last_result?.request_id === request.id
+          ? snapshot.last_result
+          : null);
+      if (snapshot.teaching?.request_id === request.id) {
+        request.pending = false;
+        request.generation = snapshot.generation;
+      } else if (
+        connectionChanged ||
+        (result && result.status !== "accepted") ||
+        snapshot.generation !== request.generation
+      ) {
+        this.teachingRequest = null;
+      }
+    }
+    if (
+      this.teachingDrag &&
+      (connectionChanged ||
+        snapshot.generation !== this.teachingDrag.generation ||
+        !snapshot.teaching?.recording ||
+        snapshot.teaching.state === "finishing" ||
+        snapshot.teaching.id !== this.teachingDrag.session ||
+        !snapshot.enabled)
+    )
+      void this.releaseTeachingDrag("teaching_context_changed").catch((error) =>
+        this.fail(error),
+      );
     if (this.lease && snapshot.owner?.client_id !== "desktop")
       this.dropLease(false);
     if (
@@ -1004,7 +1165,10 @@ class DesktopApi {
     ws.onclose = () => {
       if (this.socket !== ws) return;
       const active =
-        !!this.jog || !!this.cancelReturn || this.hasLocalCalibration();
+        !!this.jog ||
+        !!this.cancelReturn ||
+        this.hasLocalCalibration() ||
+        this.hasLocalTeaching();
       this.clearJog();
       this.dropLease(false);
       this.publish({ online: false, hasControl: false });
@@ -1044,7 +1208,8 @@ class DesktopApi {
     if (action === "release") {
       this.leaseEpoch++;
       if (this.renewTimer) clearTimeout(this.renewTimer);
-      if (this.hasLocalCalibration()) await this.hostStop("release_control");
+      if (this.hasLocalCalibration() || this.hasLocalTeaching())
+        await this.hostStop("release_control");
       else await this.cancelJog("release_control");
     }
     const epoch = this.leaseEpoch;
@@ -1078,7 +1243,8 @@ class DesktopApi {
       await this.control("renew");
     } catch (e) {
       if (epoch === this.leaseEpoch) {
-        const calibrationActive = this.hasLocalCalibration();
+        const calibrationActive =
+          this.hasLocalCalibration() || this.hasLocalTeaching();
         this.dropLease();
         if (calibrationActive)
           await this.hostStop("renew_failed").catch(() => {});
@@ -1094,6 +1260,7 @@ class DesktopApi {
     params: Record<string, unknown> = {},
     requestId: string = crypto.randomUUID(),
     generation = this.view.snapshot.generation,
+    signal?: AbortSignal,
   ) {
     if (!this.view.online)
       throw new ApiError("未连接", null, "not_connected", true);
@@ -1101,15 +1268,21 @@ class DesktopApi {
       throw new ApiError("未持有控制权", null, "no_control", true);
     if (kind === "calibrate_start")
       this.calibrationRequest = { id: requestId, pending: true };
+    if (kind === "teach_start" || kind === "teach_replay")
+      this.teachingRequest = { id: requestId, generation, pending: true };
     try {
-      return await this.request<CommandAck>("/v1/commands", {
-        ...params,
-        kind,
-        request_id: requestId,
-        client_id: "desktop",
-        lease_id: this.lease,
-        generation,
-      });
+      return await this.request<CommandAck>(
+        "/v1/commands",
+        {
+          ...params,
+          kind,
+          request_id: requestId,
+          client_id: "desktop",
+          lease_id: this.lease,
+          generation,
+        },
+        kind.startsWith("teach_") ? { signal, timeoutMs: null } : { signal },
+      );
     } catch (error) {
       if (
         error instanceof ApiError &&
@@ -1118,6 +1291,13 @@ class DesktopApi {
         this.calibrationRequest.pending
       )
         this.calibrationRequest = null;
+      if (
+        error instanceof ApiError &&
+        error.notQueued &&
+        this.teachingRequest?.id === requestId &&
+        this.teachingRequest.pending
+      )
+        this.teachingRequest = null;
       throw error;
     }
   }
@@ -1398,7 +1578,129 @@ class DesktopApi {
       return ["running", "stopping"].includes(s.calibration.state);
     return request.pending && this.view.hasControl;
   }
+  private hasLocalTeaching() {
+    if (this.teachingDrag) return true;
+    const request = this.teachingRequest;
+    if (!request) return false;
+    return (
+      this.view.snapshot.teaching?.request_id === request.id ||
+      (request.pending && this.view.hasControl)
+    );
+  }
+  pressTeachingDrag() {
+    if (this.teachingDrag?.pressed) return;
+    const view = this.view;
+    const teaching = view.snapshot.teaching;
+    if (
+      !view.online ||
+      !view.hasControl ||
+      !view.snapshot.enabled ||
+      !teaching?.recording ||
+      teaching.state === "finishing"
+    )
+      return;
+    const input = {
+      generation: view.snapshot.generation,
+      connection: view.connectionEpoch ?? 0,
+      session: teaching.id,
+      pressed: true,
+      confirmedSeq: 0,
+      requests: new Set<AbortController>(),
+      timer: null as ReturnType<typeof setInterval> | null,
+    };
+    this.teachingDrag = input;
+    const renew = () => {
+      const current = this.view;
+      if (
+        this.teachingDrag !== input ||
+        !input.pressed ||
+        current.snapshot.generation !== input.generation ||
+        (current.connectionEpoch ?? 0) !== input.connection ||
+        current.snapshot.teaching?.id !== input.session
+      )
+        return;
+      // Reserve at intent creation. Core rejects an older sequence even if its
+      // HTTP request reaches the queue after a release or a fresh press.
+      const sequence = ++this.teachingInputSeq;
+      const controller = new AbortController();
+      input.requests.add(controller);
+      void this.command(
+        "teach_drag",
+        { pressed: true, input_seq: sequence, ttl_ms: 350 },
+        crypto.randomUUID(),
+        input.generation,
+        controller.signal,
+      )
+        .then(() => {
+          input.confirmedSeq = Math.max(input.confirmedSeq, sequence);
+        })
+        .catch((error) => {
+          if (
+            this.teachingDrag !== input ||
+            !input.pressed ||
+            sequence < input.confirmedSeq
+          )
+            return;
+          this.fail(error);
+          void this.hostStop("teaching_drag_failed").catch((e) => this.fail(e));
+        })
+        .finally(() => {
+          input.requests.delete(controller);
+        });
+    };
+    renew();
+    input.timer = setInterval(renew, 100);
+  }
+  private sendTeachingRelease() {
+    const input = this.teachingDrag;
+    if (input) {
+      input.pressed = false;
+      if (input.timer) clearInterval(input.timer);
+      input.timer = null;
+      this.teachingDrag = null;
+      input.requests.forEach((controller) => controller.abort());
+      input.requests.clear();
+    }
+    const teaching = this.view.snapshot.teaching;
+    const generation =
+      input?.generation ??
+      (teaching?.recording
+        ? this.view.snapshot.generation
+        : this.teachingRequest?.generation);
+    if (generation === undefined) return Promise.resolve();
+    return this.command(
+      "teach_drag",
+      { pressed: false, input_seq: ++this.teachingInputSeq, ttl_ms: 350 },
+      crypto.randomUUID(),
+      generation,
+    ).then(() => {});
+  }
+  async releaseTeachingDrag(reason = "teaching_released") {
+    const stopEpoch = this.teachingStopEpoch;
+    const generation =
+      this.teachingDrag?.generation ?? this.view.snapshot.generation;
+    const release = this.sendTeachingRelease();
+    const sequence = this.teachingInputSeq;
+    try {
+      await release;
+    } catch (error) {
+      if (
+        stopEpoch !== this.teachingStopEpoch ||
+        generation !== this.view.snapshot.generation ||
+        sequence !== this.teachingInputSeq ||
+        this.view.snapshot.teaching?.state === "finishing"
+      )
+        return;
+      this.fail(error);
+      await this.hostStop(reason);
+    }
+  }
   async hostStop(reason = "unspecified") {
+    this.teachingStopEpoch++;
+    // Clear the hold timer synchronously, before invoking the desktop stop path.
+    const release = this.sendTeachingRelease();
+    void release.catch(() => {});
+    this.teachingRequest = null;
     this.clearJog();
     this.calibrationRequest = null;
     this.cancelReturn?.();

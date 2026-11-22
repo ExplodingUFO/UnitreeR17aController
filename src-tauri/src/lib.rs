@@ -9,6 +9,7 @@ mod reference;
 #[cfg(test)]
 mod send_replay;
 mod server;
+mod teaching;
 mod trace;
 mod trajectory;
 mod tuning;

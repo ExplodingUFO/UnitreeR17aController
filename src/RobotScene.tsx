@@ -1,11 +1,17 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { Line2 } from "three/addons/lines/Line2.js";
 import { LineGeometry } from "three/addons/lines/LineGeometry.js";
 import { LineMaterial } from "three/addons/lines/LineMaterial.js";
 import URDFLoader, { type URDFRobot } from "urdf-loader";
-import type { CalibrationPreview, Joint, PreviewPoint, Side } from "./api";
+import type {
+  CalibrationPreview,
+  Joint,
+  PreviewPoint,
+  Side,
+  TeachingPreview,
+} from "./api";
 export interface PreviewEnvelope {
   min: number[];
   max: number[];
@@ -14,19 +20,41 @@ export interface PreviewEnvelope {
 export type PreviewStage =
   | "xyz"
   | "return"
+  | `teaching:${"approach" | "path" | "all"}`
   | `cartesian:${number}`
   | `joint:${number}`;
-export function stagePoints(preview: CalibrationPreview, stage: PreviewStage) {
-  return preview.points.filter((point) =>
-    stage === "xyz"
-      ? point.space === "cartesian"
-      : stage === "return"
-        ? point.space === "joint_return"
-        : stage.startsWith("cartesian:")
-          ? point.space === "cartesian" &&
-            point.axis === Number(stage.split(":")[1])
-          : point.space === "joint" &&
-            point.axis === Number(stage.split(":")[1]),
+type ScenePoint = PreviewPoint & { t_ms?: number };
+type ScenePreview = { points: ScenePoint[] };
+function scenePreview(preview: ScenePreview | TeachingPreview): ScenePreview {
+  return "trajectory_id" in preview
+    ? {
+        points: preview.points.map((point) => ({
+          ...point,
+          space: `teaching_${point.phase}`,
+          axis: 0,
+          segment: point.phase === "approach" ? 0 : 1,
+        })),
+      }
+    : preview;
+}
+export function stagePoints(
+  preview: ScenePreview | TeachingPreview,
+  stage: PreviewStage,
+) {
+  return scenePreview(preview).points.filter((point) =>
+    stage.startsWith("teaching:")
+      ? stage === "teaching:all"
+        ? point.space.startsWith("teaching_")
+        : point.space === `teaching_${stage.split(":")[1]}`
+      : stage === "xyz"
+        ? point.space === "cartesian"
+        : stage === "return"
+          ? point.space === "joint_return"
+          : stage.startsWith("cartesian:")
+            ? point.space === "cartesian" &&
+              point.axis === Number(stage.split(":")[1])
+            : point.space === "joint" &&
+              point.axis === Number(stage.split(":")[1]),
   );
 }
 interface Props {
@@ -34,7 +62,7 @@ interface Props {
   joints: Joint[];
   valid: boolean;
   source: string;
-  preview?: CalibrationPreview | null;
+  preview?: CalibrationPreview | TeachingPreview | null;
   previewProgress?: number;
   previewStage?: PreviewStage;
   onPreviewEnvelope?: (envelope: PreviewEnvelope | null) => void;
@@ -48,6 +76,15 @@ const AXIS_COLORS = [0xff7478, 0x52e6a4, 0x65baff];
 const JOINT_COLORS = [
   0xffc567, 0xc7a0ff, 0xff8cce, 0xffd168, 0xe5df75, 0x9eb1ff, 0xffa179,
 ];
+function pathColor(point: PreviewPoint) {
+  return point.space === "teaching_approach"
+    ? 0xe8c18f
+    : point.space === "teaching_path"
+      ? 0x7ceaff
+      : point.space === "cartesian"
+        ? AXIS_COLORS[point.axis]
+        : JOINT_COLORS[point.axis];
+}
 // URDFRobot.clone shares immutable geometry. A removed preview owns its materials,
 // paths and sweep surfaces, but must never dispose the loaded robot's geometry.
 function disposeObject(
@@ -97,11 +134,17 @@ export default function RobotScene({
   joints,
   valid,
   source,
-  preview,
+  preview: suppliedPreview,
   previewProgress = 0,
   previewStage = "cartesian:0",
   onPreviewEnvelope,
 }: Props) {
+  const preview = useMemo(
+    () => (suppliedPreview ? scenePreview(suppliedPreview) : suppliedPreview),
+    [suppliedPreview],
+  );
+  const teachingPreview =
+    !!suppliedPreview && "trajectory_id" in suppliedPreview;
   const container = useRef<HTMLDivElement>(null);
   const labels = useRef<HTMLDivElement>(null);
   const ruler = useRef<HTMLDivElement>(null);
@@ -143,10 +186,10 @@ export default function RobotScene({
     let planned: URDFRobot | undefined;
     let spec: ModelSpec | undefined;
     let modelReady = false;
-    let builtPreview: CalibrationPreview | null | undefined;
+    let builtPreview: ScenePreview | null | undefined;
     let builtStage: PreviewStage | undefined;
     let cachedEnvelope: THREE.Box3 | undefined;
-    let selected: PreviewPoint[] = [];
+    let selected: ScenePoint[] = [];
     const sharedGeometry = new Set<THREE.BufferGeometry>();
     const lineMaterials: LineMaterial[] = [];
     const endpointLabels: {
@@ -410,11 +453,7 @@ export default function RobotScene({
           const poses = keyPoses(selected);
           poses.forEach((point, index) => {
             const ghost = cloneModel(
-              new THREE.Color(
-                point.space === "cartesian"
-                  ? AXIS_COLORS[point.axis]
-                  : JOINT_COLORS[point.axis],
-              ),
+              new THREE.Color(pathColor(point)),
               0.2 + index * 0.015,
             );
             ghost.name = `preview-key-pose-${index}`;
@@ -422,7 +461,7 @@ export default function RobotScene({
             overlay.add(ghost);
           });
           // Split at real stage/segment boundaries, never invent inter-stage paths.
-          const chunks: PreviewPoint[][] = [];
+          const chunks: ScenePoint[][] = [];
           for (const point of selected) {
             const previous = chunks.at(-1)?.at(-1);
             if (
@@ -437,12 +476,13 @@ export default function RobotScene({
           let arrowCount = 0,
             sweepCount = 0;
           chunks.forEach((chunk) => {
-            const color =
-              chunk[0].space === "cartesian"
-                ? AXIS_COLORS[chunk[0].axis]
-                : JOINT_COLORS[chunk[0].axis];
+            const color = pathColor(chunk[0]);
             const path = chunk.map((point) => new THREE.Vector3(...point.tcp));
-            const line = addLine(path, color, 4.5);
+            const line = addLine(
+              path,
+              color,
+              chunk[0].space === "teaching_approach" ? 3 : 4.5,
+            );
             if (line)
               line.name = `preview-path-${chunk[0].space}-${chunk[0].axis}-${chunk[0].segment}`;
             if (path.length > 1) {
@@ -571,7 +611,15 @@ export default function RobotScene({
               });
             }
           });
-          if (!cartesianAxes.length && selected.length > 1) {
+          if (selected[0].space.startsWith("teaching_")) {
+            [selected[0], selected.at(-1)!].forEach((point, index) =>
+              endpoints.push({
+                point,
+                label: index === 0 ? "起点" : "终点",
+                color: pathColor(point),
+              }),
+            );
+          } else if (!cartesianAxes.length && selected.length > 1) {
             const origin = new THREE.Vector3(...state.preview.points[0].tcp);
             const extrema = [...selected].sort(
               (a, b) =>
@@ -643,6 +691,13 @@ export default function RobotScene({
           element.dataset.pathWidth = "4.5";
           element.dataset.arrows = String(arrowCount);
           element.dataset.linkTraces = String(sweepCount);
+          element.dataset.approachPoints = String(
+            selected.filter((point) => point.space === "teaching_approach")
+              .length,
+          );
+          element.dataset.taughtPoints = String(
+            selected.filter((point) => point.space === "teaching_path").length,
+          );
           element.dataset.cartesianSegments = String(
             selected.filter((point) => point.space === "cartesian").length,
           );
@@ -659,6 +714,8 @@ export default function RobotScene({
             "keyPoses",
             "arrows",
             "linkTraces",
+            "approachPoints",
+            "taughtPoints",
             "plannedJoints",
           ])
             delete element.dataset[key];
@@ -668,16 +725,36 @@ export default function RobotScene({
       if (box) box.visible = state.showBox;
       element.dataset.aabb = String(!!box?.visible);
       if (planned && selected.length && spec) {
-        const at =
+        let at =
           THREE.MathUtils.clamp(state.previewProgress, 0, 1) *
           (selected.length - 1);
+        const firstTime = selected[0].t_ms;
+        const lastTime = selected.at(-1)!.t_ms;
+        if (firstTime !== undefined && lastTime !== undefined) {
+          const time = THREE.MathUtils.lerp(
+            firstTime,
+            lastTime,
+            THREE.MathUtils.clamp(state.previewProgress, 0, 1),
+          );
+          let low = 0,
+            high = selected.length - 1;
+          while (low < high) {
+            const middle = Math.ceil((low + high) / 2);
+            if (selected[middle].t_ms! <= time) low = middle;
+            else high = middle - 1;
+          }
+          const next = Math.min(low + 1, selected.length - 1);
+          const span = selected[next].t_ms! - selected[low].t_ms!;
+          at = low + (span > 0 ? (time - selected[low].t_ms!) / span : 0);
+        }
         const from = selected[Math.floor(at)],
           to = selected[Math.min(selected.length - 1, Math.floor(at) + 1)];
         // Stage transitions are discrete; interpolation only belongs to one path.
         const blend =
-          from.space === to.space &&
-          from.axis === to.axis &&
-          from.segment === to.segment
+          from.space.startsWith("teaching_") ||
+          (from.space === to.space &&
+            from.axis === to.axis &&
+            from.segment === to.segment)
             ? at % 1
             : 0;
         spec.joint_names.forEach((name, axis) =>
@@ -835,6 +912,12 @@ export default function RobotScene({
           <span data-kind="actual">实测</span>
           <span data-kind="planned">选中姿态</span>
           <span data-kind="sweep">关键姿态</span>
+          {teachingPreview && (
+            <>
+              <span data-kind="approach">接近</span>
+              <span data-kind="path">录制路径</span>
+            </>
+          )}
           <span data-kind="elbow">肘轨迹</span>
           <span data-kind="wrist">腕轨迹</span>
           <label>

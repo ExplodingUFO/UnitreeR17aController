@@ -6,6 +6,7 @@ import TracePanel from "./TracePanel";
 import LogsPanel from "./LogsPanel";
 import ServoPanel from "./ServoPanel";
 import CalibrationPanel from "./CalibrationPanel";
+import TeachingPanel from "./TeachingPanel";
 import { PanelDivider, usePanelLayout } from "./PanelLayout";
 import {
   api,
@@ -36,6 +37,7 @@ const phaseLabels: Record<Phase, string> = {
   disabled: "未使能",
   enabling: "使能中",
   ready: "就绪",
+  teaching: "示教中",
   moving: "运动中",
   stopping: "停止中",
   fault: "故障",
@@ -88,6 +90,7 @@ export default function App() {
   const [tcpOpen, setTcpOpen] = useState(false);
   const [servoOpen, setServoOpen] = useState(false);
   const [calibrationOpen, setCalibrationOpen] = useState(false);
+  const [teachingOpen, setTeachingOpen] = useState(false);
   const [tcpFields, setTcpFields] = useState(["0", "0", "0", "0", "0", "0"]);
   const [interfaceOpen, setInterfaceOpen] = useState(false);
   const [safetyIntent, setSafetyIntent] = useState<SafetyIntent | null>(null);
@@ -333,6 +336,7 @@ export default function App() {
     setTcpOpen(false);
     setServoOpen(false);
     setCalibrationOpen(false);
+    setTeachingOpen(false);
     setInterfaceOpen(false);
     setSafetyIntent(intent);
   };
@@ -357,6 +361,14 @@ export default function App() {
     setInterfaceOpen(false);
     setServoOpen(true);
   };
+  const openTeaching = () => {
+    cancel("teaching_dialog");
+    setTcpOpen(false);
+    setInterfaceOpen(false);
+    setServoOpen(false);
+    setCalibrationOpen(false);
+    setTeachingOpen(true);
+  };
   const openCalibration = () => {
     cancel("calibration_dialog");
     setTcpOpen(false);
@@ -370,6 +382,7 @@ export default function App() {
     setTcpOpen(false);
     setServoOpen(false);
     setCalibrationOpen(false);
+    setTeachingOpen(false);
     setInterfaceOpen(false);
     setPage(next);
     location.hash = next;
@@ -384,6 +397,7 @@ export default function App() {
       setTcpOpen(false);
       setServoOpen(false);
       setCalibrationOpen(false);
+      setTeachingOpen(false);
       setInterfaceOpen(false);
       setPage(currentPage());
     };
@@ -594,6 +608,15 @@ export default function App() {
         <section className="panel left-panel" id="device-panel">
           <div className="panel-heading">
             <h2>连接</h2>
+            <button
+              type="button"
+              aria-haspopup="dialog"
+              aria-controls="teaching-dialog"
+              aria-expanded={teachingOpen}
+              onClick={openTeaching}
+            >
+              示教
+            </button>
             <button
               type="button"
               aria-haspopup="dialog"
@@ -1107,6 +1130,13 @@ export default function App() {
         view={view}
         open={calibrationOpen}
         onClose={() => setCalibrationOpen(false)}
+        onStop={stop}
+      />
+      <TeachingPanel
+        view={view}
+        open={teachingOpen}
+        blocked={busy || enableInProgress || !!motionPending || !!safetyIntent}
+        onClose={() => setTeachingOpen(false)}
         onStop={stop}
       />
       {tcpOpen && (

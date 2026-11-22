@@ -3,7 +3,11 @@
 //! Queue admission tries a mutex once; contention and overflow count as drops.
 //! Disk readers must run within `server`'s spawn_blocking boundary.
 pub use crate::trace::{TraceData, TraceRecording, TraceSummary};
-use crate::{calibration::Report, trace::Recorder};
+use crate::{
+    calibration::Report,
+    teaching::{Capture, Summary as TeachingSummary, Trajectory},
+    trace::Recorder,
+};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -19,6 +23,7 @@ use std::{
 
 const CAPACITY: usize = 1024;
 const CALIBRATION_CAPACITY: usize = 8;
+const TEACHING_CAPACITY: usize = 8;
 const BATCH_SIZE: usize = 128;
 const CLOSED: usize = 1 << (usize::BITS - 1);
 const POLL: Duration = Duration::from_millis(10);
@@ -77,9 +82,26 @@ pub struct LogPage {
     pub through_id: i64,
 }
 
+struct TeachingQueue {
+    queue: VecDeque<Arc<Capture>>,
+    // Includes the writer's in-flight capture. Keep each admission distinct so
+    // committing an older upsert cannot remove a newer capture with the same ID.
+    uncommitted: Vec<Arc<Capture>>,
+}
+
+impl Default for TeachingQueue {
+    fn default() -> Self {
+        Self {
+            queue: VecDeque::with_capacity(TEACHING_CAPACITY),
+            uncommitted: Vec::with_capacity(TEACHING_CAPACITY + 1),
+        }
+    }
+}
+
 struct State {
     queue: Mutex<VecDeque<LogRecord>>,
     calibrations: Mutex<VecDeque<Report>>,
+    teachings: Mutex<TeachingQueue>,
     // One atomic admission gate orders close against producers already in flight.
     gate: AtomicUsize,
     pending: AtomicU64,
@@ -89,6 +111,11 @@ struct State {
     calibration_pending: AtomicU64,
     calibration_dropped: AtomicU64,
     calibration_errors: AtomicU64,
+    teaching_pending: AtomicU64,
+    teaching_dropped: AtomicU64,
+    teaching_errors: AtomicU64,
+    #[cfg(test)]
+    pause_retirement: AtomicBool,
     healthy: AtomicBool,
     abort: AtomicBool,
     done: AtomicBool,
@@ -99,6 +126,7 @@ impl Default for State {
         Self {
             queue: Mutex::new(VecDeque::with_capacity(CAPACITY)),
             calibrations: Mutex::new(VecDeque::with_capacity(CALIBRATION_CAPACITY)),
+            teachings: Mutex::new(TeachingQueue::default()),
             gate: AtomicUsize::new(0),
             pending: AtomicU64::new(0),
             written: AtomicU64::new(0),
@@ -107,6 +135,11 @@ impl Default for State {
             calibration_pending: AtomicU64::new(0),
             calibration_dropped: AtomicU64::new(0),
             calibration_errors: AtomicU64::new(0),
+            teaching_pending: AtomicU64::new(0),
+            teaching_dropped: AtomicU64::new(0),
+            teaching_errors: AtomicU64::new(0),
+            #[cfg(test)]
+            pause_retirement: AtomicBool::new(false),
             healthy: AtomicBool::new(false),
             abort: AtomicBool::new(false),
             done: AtomicBool::new(false),
@@ -229,6 +262,165 @@ impl Journal {
         s.calibration_pending.fetch_add(1, Ordering::Relaxed);
         queue.push_back(owned);
         true
+    }
+
+    /// One try-lock and a cheap shared capture clone; no flattening, SQL or wakeup.
+    /// Rejected captures remain with the controller for retry. Teaching accounting
+    /// is independent of event counts and uses the same atomic close/admission gate.
+    pub fn record_teaching(&self, capture: &Capture) -> bool {
+        let s = &self.0.state;
+        let previous = s.gate.fetch_add(1, Ordering::SeqCst);
+        let _admission = Admission(&s.gate);
+        if previous & CLOSED != 0 {
+            s.teaching_dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let Ok(mut queue) = s.teachings.try_lock() else {
+            s.teaching_dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        if queue.queue.len() >= TEACHING_CAPACITY {
+            s.teaching_dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let owned = Arc::new(capture.clone());
+        s.teaching_pending.fetch_add(1, Ordering::Relaxed);
+        queue.uncommitted.push(owned.clone());
+        queue.queue.push_back(owned);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_teaching_queue_locked<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _queue = self
+            .0
+            .state
+            .teachings
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        f()
+    }
+
+    /// Blocking summary-only read. User recordings have no automatic retention.
+    /// A database predating teaching support has an empty teaching history.
+    pub fn teachings(&self) -> Result<Vec<TeachingSummary>, String> {
+        // Snapshot cache ownership before opening SQLite: a commit and cache
+        // removal between these reads must not make an admitted capture vanish.
+        let captures = self
+            .0
+            .state
+            .teachings
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .uncommitted
+            .clone();
+        let mut summaries: Vec<TeachingSummary> = Vec::new();
+        for capture in captures.iter().rev() {
+            if !summaries
+                .iter()
+                .any(|summary| summary.id == capture.summary.id)
+            {
+                summaries.push(capture.summary.clone());
+            }
+        }
+        let stored = self.stored_teachings()?;
+        let cached_count = summaries.len();
+        for summary in stored {
+            if !summaries[..cached_count]
+                .iter()
+                .any(|cached| cached.id == summary.id)
+            {
+                summaries.push(summary);
+            }
+        }
+        summaries.sort_by(|a, b| b.created_at_ms.cmp(&a.created_at_ms).then(b.id.cmp(&a.id)));
+        Ok(summaries)
+    }
+
+    fn stored_teachings(&self) -> Result<Vec<TeachingSummary>, String> {
+        let Some(conn) = self.teaching_reader()? else {
+            return Ok(Vec::new());
+        };
+        if !teaching_table_exists(&conn)? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = conn
+            .prepare("SELECT payloadJSON FROM teachings ORDER BY created_at_ms DESC,id DESC")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        rows.map(|row| {
+            let payload = row.map_err(|e| e.to_string())?;
+            serde_json::from_str(&payload).map_err(|e| format!("read teaching summary: {e}"))
+        })
+        .collect()
+    }
+
+    /// Blocking read. A transaction keeps the summary and points on one commit.
+    /// HTTP readers flatten any uncommitted in-memory capture off-thread instead.
+    pub fn teaching(&self, id: &str) -> Result<Option<Trajectory>, String> {
+        let capture = self
+            .0
+            .state
+            .teachings
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .uncommitted
+            .iter()
+            .rev()
+            .find(|capture| capture.summary.id == id)
+            .cloned();
+        if let Some(capture) = capture {
+            return Ok(Some(capture.trajectory()));
+        }
+        let Some(mut conn) = self.teaching_reader()? else {
+            return Ok(None);
+        };
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        if !teaching_table_exists(&tx)? {
+            return Ok(None);
+        }
+        let payload: Option<String> = tx
+            .query_row(
+                "SELECT payloadJSON FROM teachings WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        let points: String = tx
+            .query_row(
+                "SELECT payloadJSON FROM teaching_points WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(Some(Trajectory {
+            summary: serde_json::from_str(&payload)
+                .map_err(|e| format!("read teaching summary: {e}"))?,
+            points: serde_json::from_str(&points)
+                .map_err(|e| format!("read teaching points: {e}"))?,
+        }))
+    }
+
+    fn teaching_reader(&self) -> Result<Option<Connection>, String> {
+        // Startup creates the database asynchronously; an in-memory capture can
+        // already be available while the writer is still opening a new journal.
+        if !self.0.path.try_exists().map_err(|e| e.to_string())? {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(
+            &self.0.path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| format!("open teaching reader: {e}"))?;
+        conn.busy_timeout(BUSY).map_err(|e| e.to_string())?;
+        Ok(Some(conn))
     }
 
     /// Holds the report queue mutex for deterministic admission tests.
@@ -454,7 +646,7 @@ impl Journal {
         })
     }
 
-    /// Application-close coordination only. True means every accepted event/report/sample
+    /// Application-close coordination only. True means every accepted event/report/capture/sample
     /// was committed and both workers exited. False means a timeout or abandoned data.
     /// A blocked OS/SQLite call can outlive this return; no forced cancellation or join.
     pub fn shutdown(&self, timeout: Duration) -> bool {
@@ -495,6 +687,15 @@ fn capped(value: &str, max: usize) -> String {
     value[..end].to_owned()
 }
 
+fn teaching_table_exists(conn: &Connection) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='teachings')",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|e| e.to_string())
+}
+
 fn open_writer(path: &Path) -> rusqlite::Result<Connection> {
     // Directory setup is intentionally also on the writer, never on start/log.
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -522,6 +723,15 @@ fn open_writer(path: &Path) -> rusqlite::Result<Connection> {
              payloadJSON TEXT NOT NULL
          );
          CREATE TABLE IF NOT EXISTS calibration_curves (
+             id TEXT PRIMARY KEY,
+             payloadJSON TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS teachings (
+             id TEXT PRIMARY KEY,
+             created_at_ms INTEGER NOT NULL,
+             payloadJSON TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS teaching_points (
              id TEXT PRIMARY KEY,
              payloadJSON TEXT NOT NULL
          );",
@@ -599,6 +809,38 @@ fn write_calibration(conn: &mut Connection, report: &Report) -> Result<(), Strin
     tx.commit().map_err(|e| e.to_string())
 }
 
+fn write_teaching(
+    conn: &mut Connection,
+    capture: &Capture,
+    serialized: &mut Option<(String, String)>,
+) -> Result<(), String> {
+    // This runs only on the writer, after releasing the admission mutex. Keep
+    // encoded payloads across SQLite busy retries instead of flattening again.
+    if serialized.is_none() {
+        let trajectory = capture.trajectory();
+        *serialized = Some((
+            serde_json::to_string(&trajectory.summary).map_err(|e| e.to_string())?,
+            serde_json::to_string(&trajectory.points).map_err(|e| e.to_string())?,
+        ));
+    }
+    let (summary, points) = serialized.as_ref().unwrap();
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "INSERT INTO teachings(id,created_at_ms,payloadJSON) VALUES(?1,?2,?3)
+         ON CONFLICT(id) DO UPDATE SET
+             created_at_ms=excluded.created_at_ms,payloadJSON=excluded.payloadJSON",
+        params![capture.summary.id, capture.summary.created_at_ms, summary],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "INSERT INTO teaching_points(id,payloadJSON) VALUES(?1,?2)
+         ON CONFLICT(id) DO UPDATE SET payloadJSON=excluded.payloadJSON",
+        params![capture.summary.id, points],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
 fn backoff(s: &State, delay: Duration) {
     let start = Instant::now();
     while !s.abort.load(Ordering::Acquire) && start.elapsed() < delay {
@@ -611,9 +853,22 @@ fn writer(path: &Path, state: Arc<State>) {
     let mut conn = None;
     let mut batch = Vec::with_capacity(BATCH_SIZE);
     let mut calibration = None;
+    let mut teaching = None;
+    let mut teaching_serialized = None;
+    let mut retired: Vec<Arc<Capture>> = Vec::new();
     let mut delay = Duration::from_millis(20);
     let mut checkpoint_at = Instant::now();
     loop {
+        #[cfg(test)]
+        let retirement_paused = s.pause_retirement.load(Ordering::Acquire);
+        #[cfg(not(test))]
+        let retirement_paused = false;
+        if !retirement_paused {
+            // Core owns a distinct Capture sharing these chunks. Keep our copy
+            // until its last control/watch copy has gone, so chunk destruction
+            // happens here rather than during a control tick.
+            retired.retain(|capture| !capture.can_retire());
+        }
         if s.abort.load(Ordering::Acquire) {
             let mut count = batch.len() as u64;
             batch.clear();
@@ -632,10 +887,20 @@ fn writer(path: &Path, state: Arc<State>) {
             }
             s.calibration_dropped.fetch_add(count, Ordering::Relaxed);
             s.calibration_pending.fetch_sub(count, Ordering::Relaxed);
+            let mut count = u64::from(teaching.take().is_some());
+            teaching_serialized = None;
+            {
+                let mut queue = s.teachings.lock().unwrap_or_else(|p| p.into_inner());
+                count += queue.queue.len() as u64;
+                queue.queue.clear();
+            }
+            s.teaching_dropped.fetch_add(count, Ordering::Relaxed);
+            s.teaching_pending.fetch_sub(count, Ordering::Relaxed);
             // Producers admitted just before close can still publish a final record.
             if s.gate.load(Ordering::SeqCst) == CLOSED
                 && s.pending.load(Ordering::Relaxed) == 0
                 && s.calibration_pending.load(Ordering::Relaxed) == 0
+                && s.teaching_pending.load(Ordering::Relaxed) == 0
             {
                 break;
             }
@@ -674,7 +939,15 @@ fn writer(path: &Path, state: Arc<State>) {
                 .unwrap_or_else(|p| p.into_inner())
                 .pop_front();
         }
-        let idle = batch.is_empty() && calibration.is_none();
+        if teaching.is_none() {
+            teaching = s
+                .teachings
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .queue
+                .pop_front();
+        }
+        let idle = batch.is_empty() && calibration.is_none() && teaching.is_none();
         if !batch.is_empty() {
             match write_batch(conn.as_mut().unwrap(), &batch) {
                 Ok(()) => {
@@ -711,13 +984,43 @@ fn writer(path: &Path, state: Arc<State>) {
                 }
             }
         }
+        if let Some(capture) = &teaching {
+            match write_teaching(conn.as_mut().unwrap(), capture, &mut teaching_serialized) {
+                Ok(()) => {
+                    s.teachings
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .uncommitted
+                        .retain(|cached| !Arc::ptr_eq(cached, capture));
+                    let completed = teaching.take().unwrap();
+                    // Repeated admissions share a tail. Keep one worker owner
+                    // so duplicate retired captures cannot pin one another.
+                    if !retired
+                        .iter()
+                        .any(|previous| previous.shares_data(&completed))
+                    {
+                        retired.push(completed);
+                    }
+                    s.teaching_pending.fetch_sub(1, Ordering::Relaxed);
+                    teaching_serialized = None;
+                    delay = Duration::from_millis(20);
+                }
+                Err(_) => {
+                    s.teaching_errors.fetch_add(1, Ordering::Relaxed);
+                    backoff(s, delay);
+                    delay = (delay * 2).min(Duration::from_secs(1));
+                    continue;
+                }
+            }
+        }
         if idle {
             // Polling avoids producer-side notification and its hidden wakeup locks.
             thread::sleep(POLL);
         }
         let closing = s.gate.load(Ordering::SeqCst) == CLOSED
             && s.pending.load(Ordering::Relaxed) == 0
-            && s.calibration_pending.load(Ordering::Relaxed) == 0;
+            && s.calibration_pending.load(Ordering::Relaxed) == 0
+            && s.teaching_pending.load(Ordering::Relaxed) == 0;
         if closing || checkpoint_at.elapsed() >= Duration::from_secs(5) {
             // PASSIVE never waits for readers; outstanding WAL pages remain safe to reopen.
             if conn
@@ -769,6 +1072,571 @@ mod tests {
             journal.stats().dropped == dropped
         });
         attempts
+    }
+
+    fn teaching_capture(id: &str, created_at_ms: i64, samples: usize) -> Capture {
+        let mut recorder = crate::teaching::Recorder::new(TeachingSummary {
+            id: id.into(),
+            name: "示教 ' 与换行\n完整保存".into(),
+            created_at_ms,
+            side: "right".into(),
+            tcp: crate::kinematics::Pose::identity(),
+            duration_ms: 0,
+            sample_count: 0,
+            outcome: String::new(),
+        });
+        for i in 0..samples {
+            recorder.push(crate::teaching::Point {
+                t_ms: i as u64 * 10,
+                q: [i as f64 / 1024.0; 7],
+            });
+        }
+        recorder.finish("completed")
+    }
+
+    fn assert_teaching_matches(actual: &Trajectory, expected: &Capture) {
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected.trajectory()).unwrap()
+        );
+    }
+
+    #[test]
+    fn teaching_flush_reopen_keeps_every_point_and_separates_event_accounting() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nested/events.sqlite3");
+        let journal = Journal::start(path.clone()).unwrap();
+        let mut capture = teaching_capture("quote' OR 1=1 --", 1234, 8193);
+        let expected = capture.clone();
+        wait_for(|| journal.record_teaching(&capture));
+        capture.summary.name = "caller changed after admission".into();
+        assert!(journal.shutdown(Duration::from_secs(8)));
+        assert_teaching_matches(
+            &journal.teaching(&expected.summary.id).unwrap().unwrap(),
+            &expected,
+        );
+        assert!(journal.teaching("unknown' OR 1=1 --").unwrap().is_none());
+        let stats = journal.stats();
+        assert_eq!(
+            (stats.written, stats.pending, stats.dropped, stats.errors),
+            (0, 0, 0, 0)
+        );
+        drop(journal);
+
+        let reopened = Journal::start(path.clone()).unwrap();
+        wait_for(|| reopened.stats().healthy);
+        assert_teaching_matches(
+            &reopened.teaching(&expected.summary.id).unwrap().unwrap(),
+            &expected,
+        );
+        let history = reopened.teachings().unwrap();
+        assert_eq!(
+            serde_json::to_value(&history).unwrap(),
+            serde_json::json!([expected.summary])
+        );
+        let conn = Connection::open(path).unwrap();
+        let (summary, points): (String, String) = conn.query_row(
+            "SELECT t.payloadJSON,p.payloadJSON FROM teachings t JOIN teaching_points p ON p.id=t.id",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert!(!summary.contains("points"));
+        assert!(summary.len() * 50 < points.len());
+        assert!(reopened.shutdown(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn teaching_history_has_no_retention_cap_and_upserts_literal_ids() {
+        let dir = tempdir().unwrap();
+        let journal = Journal::start(dir.path().join("events.sqlite3")).unwrap();
+        for i in (0..106).rev() {
+            let capture = teaching_capture(&format!("teaching-{i:03}"), 1000 + i / 2, 3);
+            wait_for(|| journal.record_teaching(&capture));
+        }
+        let mut changed = teaching_capture("teaching-002", 2000, 7);
+        changed.summary.name = "updated".into();
+        wait_for(|| journal.record_teaching(&changed));
+        assert!(journal.shutdown(Duration::from_secs(8)));
+        let history = journal.teachings().unwrap();
+        assert_eq!(history.len(), 106);
+        assert_eq!(history[0].id, "teaching-002");
+        assert_eq!(history[1].id, "teaching-105");
+        assert_eq!(history[2].id, "teaching-104");
+        assert_eq!(history.last().unwrap().id, "teaching-000");
+        assert_teaching_matches(
+            &journal.teaching("teaching-002").unwrap().unwrap(),
+            &changed,
+        );
+        let conn = Connection::open(&journal.0.path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM teaching_points", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 106);
+    }
+
+    #[test]
+    fn teaching_contention_and_sqlite_busy_retry_preserve_admitted_captures() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.sqlite3");
+        let journal = Journal::start(path.clone()).unwrap();
+        wait_for(|| journal.stats().healthy);
+        let mut capture = teaching_capture("busy-shared", 1, 6001);
+        let expected = capture.clone();
+        thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (producer, result) = journal.with_teaching_queue_locked(|| {
+                let borrowed = &capture;
+                let worker = &journal;
+                let producer =
+                    scope.spawn(move || tx.send(worker.record_teaching(borrowed)).unwrap());
+                (producer, rx.recv_timeout(Duration::from_secs(1)))
+            });
+            producer.join().unwrap();
+            assert!(!result.expect("teaching admission waited for the queue mutex"));
+        });
+        let locker = Connection::open(path).unwrap();
+        locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let mut admission_attempts = 0;
+        wait_for(|| {
+            admission_attempts += 1;
+            journal.record_teaching(&capture)
+        });
+        capture.summary.name = "caller changed after admission".into();
+        let start = Instant::now();
+        let accepted: Vec<_> = (0..100)
+            .filter_map(|i| {
+                let capture = teaching_capture(&format!("busy-{i}"), 100 + i, 3);
+                journal.record_teaching(&capture).then_some(capture)
+            })
+            .collect();
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(accepted.len() <= TEACHING_CAPACITY);
+        wait_for(|| journal.0.state.teaching_errors.load(Ordering::Relaxed) > 0);
+        assert_eq!(
+            journal.0.state.teaching_pending.load(Ordering::Relaxed),
+            accepted.len() as u64 + 1
+        );
+        assert_eq!(journal.teachings().unwrap().len(), accepted.len() + 1);
+        assert_teaching_matches(
+            &journal.teaching(&capture.summary.id).unwrap().unwrap(),
+            &expected,
+        );
+        for capture in &accepted {
+            assert_teaching_matches(
+                &journal.teaching(&capture.summary.id).unwrap().unwrap(),
+                capture,
+            );
+        }
+        assert!(journal.stored_teachings().unwrap().is_empty());
+        let stats = journal.stats();
+        assert_eq!(
+            (stats.written, stats.pending, stats.dropped, stats.errors),
+            (0, 0, 0, 0)
+        );
+        locker.execute_batch("ROLLBACK").unwrap();
+        assert!(journal.shutdown(Duration::from_secs(8)));
+        assert_teaching_matches(
+            &journal.teaching(&capture.summary.id).unwrap().unwrap(),
+            &expected,
+        );
+        for capture in &accepted {
+            assert_teaching_matches(
+                &journal.teaching(&capture.summary.id).unwrap().unwrap(),
+                capture,
+            );
+        }
+        assert_eq!(journal.teachings().unwrap().len(), accepted.len() + 1);
+        assert_eq!(journal.0.state.teaching_pending.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            journal.0.state.teaching_dropped.load(Ordering::Relaxed),
+            100 + admission_attempts - accepted.len() as u64
+        );
+    }
+
+    #[test]
+    fn teaching_concurrent_admission_close_flushes_exactly_the_accepted_set() {
+        let dir = tempdir().unwrap();
+        let journal = Journal::start(dir.path().join("events.sqlite3")).unwrap();
+        let first = teaching_capture("first", 1, 3);
+        let mut first_attempts = 0;
+        wait_for(|| {
+            first_attempts += 1;
+            journal.record_teaching(&first)
+        });
+        let barrier = Arc::new(std::sync::Barrier::new(5));
+        let producers: Vec<_> = (0..4)
+            .map(|worker| {
+                let journal = journal.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    (0..100)
+                        .filter_map(|i| {
+                            let id = format!("parallel-{worker}-{i}");
+                            let capture = teaching_capture(&id, i, 3);
+                            journal.record_teaching(&capture).then_some(id)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        barrier.wait();
+        assert!(journal.shutdown(Duration::from_secs(8)));
+        let mut accepted = vec!["first".to_owned()];
+        for producer in producers {
+            accepted.extend(producer.join().unwrap());
+        }
+        let mut actual: Vec<_> = journal
+            .teachings()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.id)
+            .collect();
+        accepted.sort();
+        actual.sort();
+        assert_eq!(actual, accepted);
+        assert_eq!(journal.0.state.teaching_pending.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            journal.0.state.teaching_dropped.load(Ordering::Relaxed),
+            400 + first_attempts - accepted.len() as u64
+        );
+        assert!(!journal.record_teaching(&first));
+        let stats = journal.stats();
+        assert_eq!(
+            (stats.written, stats.pending, stats.dropped, stats.errors),
+            (0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn teaching_busy_shutdown_timeout_accounts_abandoned_and_closed_admissions() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.sqlite3");
+        let journal = Journal::start(path.clone()).unwrap();
+        wait_for(|| journal.stats().healthy);
+        let locker = Connection::open(path).unwrap();
+        locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let capture = teaching_capture("busy-at-close", 1, 3);
+        let mut attempts = 0;
+        wait_for(|| {
+            attempts += 1;
+            journal.record_teaching(&capture)
+        });
+        wait_for(|| journal.0.state.teaching_errors.load(Ordering::Relaxed) > 0);
+        let start = Instant::now();
+        assert!(!journal.shutdown(Duration::from_millis(15)));
+        assert!(start.elapsed() < Duration::from_millis(250));
+        assert!(!journal.record_teaching(&capture));
+        wait_for(|| journal.0.state.done.load(Ordering::Acquire));
+        assert_eq!(journal.0.state.teaching_pending.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            journal.0.state.teaching_dropped.load(Ordering::Relaxed),
+            attempts + 1
+        );
+        assert_teaching_matches(
+            &journal.teaching(&capture.summary.id).unwrap().unwrap(),
+            &capture,
+        );
+        assert!(journal.stored_teachings().unwrap().is_empty());
+        let stats = journal.stats();
+        assert_eq!(
+            (stats.written, stats.pending, stats.dropped, stats.errors),
+            (0, 0, 0, 0)
+        );
+        locker.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn teaching_inflight_and_queued_captures_remain_readable_and_plannable_until_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.sqlite3");
+        let journal = Journal::start(path.clone()).unwrap();
+        wait_for(|| journal.stats().healthy);
+        let locker = Connection::open(&path).unwrap();
+        locker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let captures = [
+            teaching_capture("in-flight", 1, 3),
+            teaching_capture("queued-a", 2, 5),
+            teaching_capture("queued-b", 3, 7),
+        ];
+        wait_for(|| journal.record_teaching(&captures[0]));
+        wait_for(|| journal.0.state.teaching_errors.load(Ordering::Relaxed) > 0);
+        for capture in &captures[1..] {
+            wait_for(|| journal.record_teaching(capture));
+        }
+        {
+            let state = journal.0.state.teachings.lock().unwrap();
+            assert_eq!(state.queue.len(), 2);
+            assert_eq!(state.uncommitted.len(), 3);
+            assert_eq!(state.queue.capacity(), TEACHING_CAPACITY);
+            assert_eq!(state.uncommitted.capacity(), TEACHING_CAPACITY + 1);
+        }
+        assert!(journal.stored_teachings().unwrap().is_empty());
+        assert_eq!(journal.teachings().unwrap().len(), 3);
+        let model = crate::kinematics::Kinematics::load("right").unwrap();
+        for capture in &captures {
+            let trajectory = journal.teaching(&capture.summary.id).unwrap().unwrap();
+            assert_teaching_matches(&trajectory, capture);
+            let program = crate::teaching::plan(
+                &trajectory,
+                [0.0; 7],
+                &model,
+                crate::trajectory::MotionTuning::default(),
+                crate::teaching::PlaybackOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(program.trajectory_id(), capture.summary.id);
+            assert!(
+                program
+                    .preview(&model)
+                    .unwrap()
+                    .points
+                    .iter()
+                    .any(|point| point.phase == "path")
+            );
+        }
+        locker.execute_batch("ROLLBACK").unwrap();
+        assert!(journal.shutdown(Duration::from_secs(8)));
+        assert!(
+            journal
+                .0
+                .state
+                .teachings
+                .lock()
+                .unwrap()
+                .uncommitted
+                .is_empty()
+        );
+        assert_eq!(journal.teachings().unwrap().len(), 3);
+        drop(journal);
+        let reopened = Journal::start(path).unwrap();
+        wait_for(|| reopened.stats().healthy);
+        for capture in &captures {
+            let trajectory = reopened.teaching(&capture.summary.id).unwrap().unwrap();
+            assert_teaching_matches(&trajectory, capture);
+            assert!(
+                crate::teaching::plan(
+                    &trajectory,
+                    [0.0; 7],
+                    &model,
+                    crate::trajectory::MotionTuning::default(),
+                    crate::teaching::PlaybackOptions::default(),
+                )
+                .is_ok()
+            );
+        }
+        assert_eq!(reopened.teachings().unwrap().len(), 3);
+        assert!(reopened.shutdown(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn teaching_old_upsert_commit_cannot_remove_a_newer_uncommitted_capture() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.sqlite3");
+        let journal = Journal::start(path.clone()).unwrap();
+        wait_for(|| journal.stats().healthy);
+        let locker = Connection::open(&path).unwrap();
+        locker.busy_timeout(Duration::from_secs(1)).unwrap();
+        locker
+            .execute_batch(
+                "CREATE TRIGGER pause_newer_teaching BEFORE INSERT ON teachings
+             WHEN NEW.created_at_ms=2 BEGIN SELECT RAISE(ABORT, 'pause newer upsert'); END;
+             BEGIN IMMEDIATE;",
+            )
+            .unwrap();
+        let older = teaching_capture("upsert", 1, 3);
+        let newer = teaching_capture("upsert", 2, 9);
+        wait_for(|| journal.record_teaching(&older));
+        wait_for(|| journal.0.state.teaching_errors.load(Ordering::Relaxed) > 0);
+        wait_for(|| journal.record_teaching(&newer));
+        let newer_task = {
+            let state = journal.0.state.teachings.lock().unwrap();
+            assert_eq!(state.uncommitted.len(), 2);
+            state.queue.front().unwrap().clone()
+        };
+        assert_teaching_matches(&journal.teaching("upsert").unwrap().unwrap(), &newer);
+        locker.execute_batch("ROLLBACK").unwrap();
+        wait_for(|| {
+            journal
+                .stored_teachings()
+                .is_ok_and(|summaries| summaries.len() == 1 && summaries[0].created_at_ms == 1)
+        });
+        wait_for(|| journal.0.state.teaching_pending.load(Ordering::Relaxed) == 1);
+        {
+            let state = journal.0.state.teachings.lock().unwrap();
+            assert_eq!(state.uncommitted.len(), 1);
+            assert!(Arc::ptr_eq(&state.uncommitted[0], &newer_task));
+        }
+        assert_teaching_matches(&journal.teaching("upsert").unwrap().unwrap(), &newer);
+        let summaries = journal.teachings().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].sample_count, 9);
+        locker
+            .execute_batch("DROP TRIGGER pause_newer_teaching")
+            .unwrap();
+        assert!(journal.shutdown(Duration::from_secs(8)));
+        assert!(
+            journal
+                .0
+                .state
+                .teachings
+                .lock()
+                .unwrap()
+                .uncommitted
+                .is_empty()
+        );
+        drop(journal);
+        let reopened = Journal::start(path).unwrap();
+        wait_for(|| reopened.stats().healthy);
+        assert_teaching_matches(&reopened.teaching("upsert").unwrap().unwrap(), &newer);
+        assert!(reopened.shutdown(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn teaching_retirement_frees_chunks_on_the_writer_including_duplicate_admissions() {
+        for admissions in [1, 2] {
+            let dir = tempdir().unwrap();
+            let journal = Journal::start(dir.path().join("events.sqlite3")).unwrap();
+            wait_for(|| journal.stats().healthy);
+            journal
+                .0
+                .state
+                .pause_retirement
+                .store(true, Ordering::Release);
+            let capture = teaching_capture("retire-on-writer", 1, 8193);
+            let alive = capture.data_alive();
+            for _ in 0..admissions {
+                wait_for(|| journal.record_teaching(&capture));
+            }
+            wait_for(|| journal.0.state.teaching_pending.load(Ordering::Relaxed) == 0);
+            assert!(
+                journal
+                    .0
+                    .state
+                    .teachings
+                    .lock()
+                    .unwrap()
+                    .uncommitted
+                    .is_empty()
+            );
+            drop(capture);
+            assert!(
+                alive(),
+                "control-side final capture drop released its chunks"
+            );
+            journal
+                .0
+                .state
+                .pause_retirement
+                .store(false, Ordering::Release);
+            wait_for(|| !alive());
+            let saved = journal.teaching("retire-on-writer").unwrap().unwrap();
+            assert_eq!(saved.points.len(), 8193);
+            let stats = journal.stats();
+            assert_eq!(
+                (stats.written, stats.pending, stats.dropped, stats.errors),
+                (0, 0, 0, 0)
+            );
+            assert!(journal.shutdown(Duration::from_secs(2)));
+        }
+    }
+
+    #[test]
+    fn teaching_summary_and_points_roll_back_together() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.sqlite3");
+        let mut conn = open_writer(&path).unwrap();
+        let original = teaching_capture("atomic", 1, 3);
+        write_teaching(&mut conn, &original, &mut None).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_teaching_points BEFORE UPDATE ON teaching_points
+             BEGIN SELECT RAISE(ABORT, 'point write failed'); END;",
+        )
+        .unwrap();
+        let changed = teaching_capture("atomic", 2, 9);
+        assert!(write_teaching(&mut conn, &changed, &mut None).is_err());
+        let (summary, points): (String, String) = conn.query_row(
+            "SELECT t.payloadJSON,p.payloadJSON FROM teachings t JOIN teaching_points p ON p.id=t.id",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&summary).unwrap(),
+            serde_json::to_value(&original.summary).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&points).unwrap(),
+            serde_json::to_value(original.trajectory().points).unwrap()
+        );
+    }
+
+    #[test]
+    fn teaching_legacy_database_reads_are_empty_and_do_not_migrate_on_read() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.sqlite3");
+        let journal = Journal::start(path.clone()).unwrap();
+        wait_for(|| journal.stats().healthy);
+        assert!(journal.shutdown(Duration::from_secs(2)));
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TABLE teaching_points; DROP TABLE teachings;")
+            .unwrap();
+        let before: i64 = conn
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert!(journal.teachings().unwrap().is_empty());
+        assert!(journal.teaching("missing").unwrap().is_none());
+        let after: i64 = conn
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, after);
+        assert!(!teaching_table_exists(&conn).unwrap());
+        drop(conn);
+        drop(journal);
+        let reopened = Journal::start(path).unwrap();
+        let capture = teaching_capture("after-migration", 10, 5);
+        wait_for(|| reopened.record_teaching(&capture));
+        assert!(reopened.shutdown(Duration::from_secs(2)));
+        assert_teaching_matches(
+            &reopened.teaching(&capture.summary.id).unwrap().unwrap(),
+            &capture,
+        );
+    }
+
+    #[test]
+    fn teaching_concurrent_reads_keep_summary_and_points_on_the_same_commit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.sqlite3");
+        let journal = Journal::start(path.clone()).unwrap();
+        let original = teaching_capture("concurrent-upsert", 1, 3);
+        wait_for(|| journal.record_teaching(&original));
+        wait_for(|| {
+            journal
+                .stored_teachings()
+                .is_ok_and(|summaries| !summaries.is_empty())
+        });
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let writer_barrier = barrier.clone();
+        let updates = thread::spawn(move || {
+            let mut conn = Connection::open(path).unwrap();
+            conn.busy_timeout(Duration::from_secs(1)).unwrap();
+            writer_barrier.wait();
+            for i in 0..100 {
+                let capture = teaching_capture("concurrent-upsert", 1000 + i, 3 + i as usize);
+                write_teaching(&mut conn, &capture, &mut None).unwrap();
+            }
+        });
+        barrier.wait();
+        for _ in 0..100 {
+            let trajectory = journal.teaching(&original.summary.id).unwrap().unwrap();
+            assert_eq!(trajectory.summary.sample_count, trajectory.points.len());
+            assert_eq!(
+                trajectory.summary.duration_ms,
+                trajectory.points.last().unwrap().t_ms
+            );
+        }
+        updates.join().unwrap();
+        let last = journal.teaching(&original.summary.id).unwrap().unwrap();
+        assert_eq!(last.summary.created_at_ms, 1099);
+        assert_eq!(last.points.len(), 102);
+        assert!(journal.shutdown(Duration::from_secs(2)));
     }
 
     fn calibration_report(id: &str, created_at_ms: i64) -> crate::calibration::Report {

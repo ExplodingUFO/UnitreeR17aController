@@ -4,7 +4,7 @@
   "info": {
     "title": "R1-7a Controller 本机 API",
     "version": "0.1.0",
-    "description": "对应当前桌面软件。应用从 127.0.0.1:8177 提供 HTTP 与 WebSocket，随桌面启停。token 从桌面“接口”面板取得，每次启动变化。POST /v1/commands 的 202 仅代表入队，执行结果从 Snapshot.results 按 request_id 读取。字段范围表示有效业务输入；业务校验可在入队后返回 rejected。所有量采用 m、rad、s，显式 _ms 字段采用 ms，_us 字段采用 μs。示例数值为协议示例。 短时采样沿用 Bearer/Origin 校验，无需运动租约。关节速度/加速度/jerk 由MotionTuning配置，默认为1 rad/s、0.60 rad/s²、6 rad/s³；实际串口发送可重复或合并参考。 伺服调试提供逐轴阻尼/速度前馈权重及可切换的双向 Stribeck 摩擦，完整配置见 ServoTuning；仅当前连接内存生效，连接/断开恢复基线，发送时间对齐、轨迹、采样及本轮辨识补偿尚未真机验证。",
+    "description": "对应当前桌面软件。应用从 127.0.0.1:8177 提供 HTTP 与 WebSocket，随桌面启停。token 从桌面“接口”面板取得，每次启动变化。POST /v1/commands 的 202 仅代表入队，执行结果从 Snapshot.results 按 request_id 读取。字段范围表示有效业务输入；业务校验可在入队后返回 rejected。所有量采用 m、rad、s，显式 _ms 字段采用 ms，_us 字段采用 μs。示例数值为协议示例。 短时采样沿用 Bearer/Origin 校验，无需运动租约。关节速度/加速度/jerk 由MotionTuning配置，默认为1 rad/s、0.60 rad/s²、6 rad/s³；实际串口发送可重复或合并参考。 伺服调试提供逐轴阻尼/速度前馈权重及可切换的双向 Stribeck 摩擦，完整配置见 ServoTuning；仅当前连接内存生效，连接/断开恢复基线，发送时间对齐、轨迹、采样及本轮辨识补偿尚未真机验证。 示教提供teach_start/teach_drag/teach_finish/teach_replay及/v1/teachings只读历史、下载和预览；完整录制先在内存可用，后台SQLite保存，预览包含接近与完整路径。",
     "license": {
       "name": "BSD-3-Clause",
       "url": "https://opensource.org/license/bsd-3-clause"
@@ -36,6 +36,9 @@
     },
     {
       "name": "采样"
+    },
+    {
+      "name": "示教"
     }
   ],
   "paths": {
@@ -281,7 +284,9 @@
                     "joint_speed": 1.0,
                     "acceleration": 0.6,
                     "jerk": 6.0
-                  }
+                  },
+                  "teaching": null,
+                  "latest_teaching": null
                 }
               }
             }
@@ -425,8 +430,8 @@
         "tags": [
           "命令"
         ],
-        "summary": "提交设备操作或点动请求",
-        "description": "HTTP 202 仅确认入队。控制权、generation、运行阶段、运动范围在控制线程中校验，失败通过 Snapshot.results 返回 rejected。results 新到旧，按 request_id 取第一条，最多 32 条记录。相同 generation/request_id 有最多 256 项的内存去重历史；网络超时后先查结果，不自动重发运动。 configure_servo 同样先返回 202 queued；参数范围越限等业务错误通过 rejected 返回。",
+        "summary": "提交设备或动作请求",
+        "description": "HTTP 202 仅确认入队。控制权、generation、运行阶段、运动范围在控制线程中校验，失败通过 Snapshot.results 返回 rejected。results 新到旧，按 request_id 取第一条，最多 32 条记录。相同 generation/request_id 有最多 256 项的内存去重历史；网络超时后先查结果，不自动重发运动。 configure_servo 同样先返回 202 queued；参数范围越限等业务错误通过 rejected 返回。 teach_replay先在工作线程读取并准备路径，失败可在202前返回JSON400/404/503；准备成功才入队，原generation与租约不变，控制线程继续异步校验。",
         "requestBody": {
           "required": true,
           "content": {
@@ -859,6 +864,62 @@
                       "max_friction": null
                     }
                   }
+                },
+                "teach_start": {
+                  "value": {
+                    "request_id": "req-teach-start-001",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 5,
+                    "kind": "teach_start",
+                    "name": "装配路径",
+                    "transition_s": 0.4
+                  }
+                },
+                "teach_drag": {
+                  "value": {
+                    "request_id": "req-teach-press-001",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 6,
+                    "kind": "teach_drag",
+                    "pressed": true,
+                    "input_seq": 1,
+                    "ttl_ms": 350
+                  }
+                },
+                "teach_drag_release": {
+                  "value": {
+                    "request_id": "req-teach-release-001",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 6,
+                    "kind": "teach_drag",
+                    "pressed": false,
+                    "input_seq": 2,
+                    "ttl_ms": 350
+                  }
+                },
+                "teach_finish": {
+                  "value": {
+                    "request_id": "req-teach-finish-001",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 6,
+                    "kind": "teach_finish"
+                  }
+                },
+                "teach_replay": {
+                  "value": {
+                    "request_id": "req-teach-replay-001",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 7,
+                    "kind": "teach_replay",
+                    "trajectory_id": "44444444-4444-4444-8444-444444444444",
+                    "speed_scale": 1.5,
+                    "smoothing_s": 0.12
+                  }
                 }
               }
             }
@@ -880,15 +941,31 @@
             }
           },
           "400": {
-            "description": "request_id 无效时 JSON；JSON 语法错误时纯文本。",
+            "description": "request_id无效或teach_replay准备失败时为JSON；JSON语法错误仍由框架返回纯文本。",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ApiError"
                 },
-                "example": {
-                  "code": "invalid_request",
-                  "message": "请求标识无效"
+                "examples": {
+                  "invalid_request": {
+                    "value": {
+                      "code": "invalid_request",
+                      "message": "请求标识无效"
+                    }
+                  },
+                  "teaching_preparation_failed": {
+                    "value": {
+                      "code": "teaching_preparation_failed",
+                      "message": "示教轨迹准备未完成"
+                    }
+                  },
+                  "teaching_side_mismatch": {
+                    "value": {
+                      "code": "teaching_side_mismatch",
+                      "message": "示教轨迹与当前机械臂侧不一致"
+                    }
+                  }
                 }
               },
               "text/plain": {
@@ -918,7 +995,31 @@
             "$ref": "#/components/responses/QueueFull"
           },
           "503": {
-            "$ref": "#/components/responses/Closing"
+            "description": "应用正在关闭，或 teach_replay 入队前读取示教记录失败。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                },
+                "examples": {
+                  "closing": {
+                    "value": {
+                      "code": "closing",
+                      "message": "应用正在关闭"
+                    }
+                  },
+                  "teaching_unavailable": {
+                    "value": {
+                      "code": "teaching_unavailable",
+                      "message": "示教记录暂不可读"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/TeachingNotFound"
           }
         }
       }
@@ -1332,7 +1433,9 @@
                   "joint_speed": 1.0,
                   "acceleration": 0.6,
                   "jerk": 6.0
-                }
+                },
+                "teaching": null,
+                "latest_teaching": null
               }
             }
           },
@@ -2617,6 +2720,383 @@
           }
         }
       }
+    },
+    "/v1/teachings": {
+      "get": {
+        "operationId": "listTeachings",
+        "tags": [
+          "示教"
+        ],
+        "summary": "查询已保存示教轨迹摘要",
+        "description": "沿用应用 Bearer/Origin 校验，无需运动租约。工作线程读取 SQLite，按ID合并最新完整内存录制并按 created_at_ms、id 降序；最新录制在提交前可见。用户轨迹不随校准报告保留清理。",
+        "responses": {
+          "200": {
+            "description": "摘要列表，没有 data 包装。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TeachingSummary"
+                  }
+                },
+                "example": [
+                  {
+                    "id": "44444444-4444-4444-8444-444444444444",
+                    "name": "装配路径",
+                    "created_at_ms": 1795392000000,
+                    "side": "right",
+                    "tcp": {
+                      "translation": [
+                        0.025,
+                        -0.015,
+                        0.1
+                      ],
+                      "rotation": [
+                        0.0,
+                        0.0,
+                        0.0,
+                        1.0
+                      ]
+                    },
+                    "duration_ms": 1000,
+                    "sample_count": 2,
+                    "outcome": "completed"
+                  }
+                ]
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "禁用缓存。",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                },
+                "example": "no-store"
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenOrigin"
+          },
+          "503": {
+            "$ref": "#/components/responses/TeachingUnavailable"
+          }
+        }
+      }
+    },
+    "/v1/teachings/{id}": {
+      "get": {
+        "operationId": "readTeaching",
+        "tags": [
+          "示教"
+        ],
+        "summary": "读取或下载完整示教轨迹",
+        "description": "沿用 Bearer/Origin，无需运动租约。相同ID优先读取最新完整内存录制，SQLite提交前即可使用；展开、读取与编码在线程外执行。download=true只增加附件头，返回结构相同，包含全部实测点。",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "轨迹 ID。",
+            "example": "44444444-4444-4444-8444-444444444444"
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": "true时返回附件头。",
+            "example": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "摘要字段在顶层，同时包含 points。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TeachingTrajectory"
+                },
+                "example": {
+                  "id": "44444444-4444-4444-8444-444444444444",
+                  "name": "装配路径",
+                  "created_at_ms": 1795392000000,
+                  "side": "right",
+                  "tcp": {
+                    "translation": [
+                      0.025,
+                      -0.015,
+                      0.1
+                    ],
+                    "rotation": [
+                      0.0,
+                      0.0,
+                      0.0,
+                      1.0
+                    ]
+                  },
+                  "duration_ms": 1000,
+                  "sample_count": 2,
+                  "outcome": "completed",
+                  "points": [
+                    {
+                      "t_ms": 0,
+                      "q": [
+                        0.3247388790451326,
+                        0.757930926624494,
+                        1.001786232318326,
+                        1.098527642438808,
+                        -0.3061488549819603,
+                        0.02953262647141774,
+                        -0.28453416096909007
+                      ]
+                    },
+                    {
+                      "t_ms": 1000,
+                      "q": [
+                        0.3,
+                        0.7,
+                        1.1,
+                        0.9,
+                        -0.4,
+                        0.2,
+                        -0.3
+                      ]
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "禁用缓存。",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                },
+                "example": "no-store"
+              },
+              "Content-Disposition": {
+                "description": "download=true 时返回；ID中除ASCII字母、数字、-、_外的字符替换为下划线。",
+                "schema": {
+                  "type": "string"
+                },
+                "example": "attachment; filename=\"teaching-44444444-4444-4444-8444-444444444444.json\""
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/TeachingInvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenOrigin"
+          },
+          "404": {
+            "$ref": "#/components/responses/TeachingNotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/TeachingUnavailable"
+          }
+        }
+      }
+    },
+    "/v1/teachings/{id}/preview": {
+      "post": {
+        "operationId": "previewTeaching",
+        "tags": [
+          "示教"
+        ],
+        "summary": "只读预览接近与完整示教路径",
+        "description": "沿用 Bearer/Origin，无需运动租约。{}使用默认倍速和平滑；工作线程读取、平滑、重定时和逐点FK，不改变generation、控制者、使能、动作或配置。当前侧别必须匹配录制。以真实模型和录制TCP显示接近与路径、关键姿态和整臂连杆扫掠。预览不作为客户端提交的执行程序。",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "轨迹 ID。",
+            "example": "44444444-4444-4444-8444-444444444444"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TeachingPlaybackOptions"
+              },
+              "examples": {
+                "defaults": {
+                  "value": {}
+                },
+                "retimed": {
+                  "value": {
+                    "speed_scale": 1.5,
+                    "smoothing_s": 0.12
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "包含接近与整条路径的关节/TCP预览。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TeachingPreview"
+                },
+                "example": {
+                  "trajectory_id": "44444444-4444-4444-8444-444444444444",
+                  "side": "right",
+                  "tcp": {
+                    "translation": [
+                      0.025,
+                      -0.015,
+                      0.1
+                    ],
+                    "rotation": [
+                      0.0,
+                      0.0,
+                      0.0,
+                      1.0
+                    ]
+                  },
+                  "origin": [
+                    0.3,
+                    0.7,
+                    1.1,
+                    0.9,
+                    -0.4,
+                    0.2,
+                    -0.3
+                  ],
+                  "duration_ms": 3000.0,
+                  "approach_duration_ms": 1500.0,
+                  "requested_speed_scale": 1.5,
+                  "effective_speed_scale": 0.6666666666666666,
+                  "points": [
+                    {
+                      "t_ms": 0.0,
+                      "joints": [
+                        0.3,
+                        0.7,
+                        1.1,
+                        0.9,
+                        -0.4,
+                        0.2,
+                        -0.3
+                      ],
+                      "tcp": [
+                        0.16066829881553443,
+                        -0.09034619083225098,
+                        0.17514881233964943
+                      ],
+                      "phase": "approach"
+                    },
+                    {
+                      "t_ms": 1500.0,
+                      "joints": [
+                        0.3247388790451326,
+                        0.757930926624494,
+                        1.001786232318326,
+                        1.098527642438808,
+                        -0.3061488549819603,
+                        0.02953262647141774,
+                        -0.28453416096909007
+                      ],
+                      "tcp": [
+                        0.16066527662352315,
+                        -0.09034592148024663,
+                        0.2244337842419732
+                      ],
+                      "phase": "approach"
+                    },
+                    {
+                      "t_ms": 1500.0,
+                      "joints": [
+                        0.3247388790451326,
+                        0.757930926624494,
+                        1.001786232318326,
+                        1.098527642438808,
+                        -0.3061488549819603,
+                        0.02953262647141774,
+                        -0.28453416096909007
+                      ],
+                      "tcp": [
+                        0.16066527662352315,
+                        -0.09034592148024663,
+                        0.2244337842419732
+                      ],
+                      "phase": "path"
+                    },
+                    {
+                      "t_ms": 3000.0,
+                      "joints": [
+                        0.3,
+                        0.7,
+                        1.1,
+                        0.9,
+                        -0.4,
+                        0.2,
+                        -0.3
+                      ],
+                      "tcp": [
+                        0.16066829881553443,
+                        -0.09034619083225098,
+                        0.17514881233964943
+                      ],
+                      "phase": "path"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "description": "禁用缓存。",
+                "schema": {
+                  "type": "string",
+                  "const": "no-store"
+                },
+                "example": "no-store"
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/TeachingPreviewFailed"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenOrigin"
+          },
+          "404": {
+            "$ref": "#/components/responses/TeachingNotFound"
+          },
+          "503": {
+            "$ref": "#/components/responses/TeachingUnavailable"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -3837,6 +4317,18 @@
           },
           {
             "$ref": "#/components/schemas/ConfigureMotionCommand"
+          },
+          {
+            "$ref": "#/components/schemas/TeachStartCommand"
+          },
+          {
+            "$ref": "#/components/schemas/TeachDragCommand"
+          },
+          {
+            "$ref": "#/components/schemas/TeachFinishCommand"
+          },
+          {
+            "$ref": "#/components/schemas/TeachReplayCommand"
           }
         ],
         "discriminator": {
@@ -3856,10 +4348,14 @@
             "configure_servo": "#/components/schemas/ConfigureServoCommand",
             "calibrate_start": "#/components/schemas/CalibrateStartCommand",
             "calibrate_apply": "#/components/schemas/CalibrateApplyCommand",
-            "configure_motion": "#/components/schemas/ConfigureMotionCommand"
+            "configure_motion": "#/components/schemas/ConfigureMotionCommand",
+            "teach_start": "#/components/schemas/TeachStartCommand",
+            "teach_drag": "#/components/schemas/TeachDragCommand",
+            "teach_finish": "#/components/schemas/TeachFinishCommand",
+            "teach_replay": "#/components/schemas/TeachReplayCommand"
           }
         },
-        "description": "全部操作参数与公共字段位于同一层。范围表示有效业务输入；HTTP 202 后仍可能异步 rejected。未知 JSON 字段当前会被忽略。",
+        "description": "全部操作参数与公共字段位于同一层。范围表示有效业务输入；HTTP 202 后仍可能异步 rejected。未知 JSON 字段当前会被忽略。 teach_replay 先在后台读取和准备，仅提交轨迹 ID 与选项；准备错误可在 202 前返回，内部程序不是公开命令。",
         "examples": [
           {
             "request_id": "req-connect-001",
@@ -4082,6 +4578,42 @@
               "acceleration": 0.6,
               "jerk": 6.0
             }
+          },
+          {
+            "request_id": "req-teach-start-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 5,
+            "kind": "teach_start",
+            "name": "装配路径",
+            "transition_s": 0.4
+          },
+          {
+            "request_id": "req-teach-press-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 6,
+            "kind": "teach_drag",
+            "pressed": true,
+            "input_seq": 1,
+            "ttl_ms": 350
+          },
+          {
+            "request_id": "req-teach-finish-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 6,
+            "kind": "teach_finish"
+          },
+          {
+            "request_id": "req-teach-replay-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 7,
+            "kind": "teach_replay",
+            "trajectory_id": "44444444-4444-4444-8444-444444444444",
+            "speed_scale": 1.5,
+            "smoothing_s": 0.12
           }
         ]
       },
@@ -4163,6 +4695,24 @@
             "status": "rejected",
             "code": "invalid_servo_tuning",
             "message": "J1 kd超限"
+          },
+          {
+            "request_id": "req-teach-start-001",
+            "status": "accepted",
+            "code": "teach_start",
+            "message": "操作已接受"
+          },
+          {
+            "request_id": "req-teach-finish-001",
+            "status": "completed",
+            "code": "teaching_saved",
+            "message": "示教轨迹已保存"
+          },
+          {
+            "request_id": "req-teach-replay-001",
+            "status": "completed",
+            "code": "replayed",
+            "message": "轨迹重放完成"
           }
         ]
       },
@@ -4316,7 +4866,9 @@
               "continuous",
               "step",
               "return",
-              "calibration"
+              "calibration",
+              "teaching",
+              "replay"
             ]
           },
           "axis": {
@@ -4326,7 +4878,7 @@
             ],
             "minimum": 0,
             "maximum": 6,
-            "description": "点动轴索引；收纳返回涉及七轴，mode=return 时为 null。 mode=calibration 时为正在测试的关节索引。"
+            "description": "点动轴索引；收纳返回涉及七轴，mode=return 时为 null。 mode=calibration 时为正在测试的关节索引。 mode=teaching/replay 时为 null，space=joint。"
           },
           "progress": {
             "type": "number",
@@ -4347,7 +4899,11 @@
             "if": {
               "properties": {
                 "mode": {
-                  "const": "return"
+                  "enum": [
+                    "return",
+                    "teaching",
+                    "replay"
+                  ]
                 }
               },
               "required": [
@@ -4371,6 +4927,22 @@
                 }
               }
             }
+          }
+        ],
+        "examples": [
+          {
+            "request_id": "req-teach-start-001",
+            "space": "joint",
+            "mode": "teaching",
+            "axis": null,
+            "progress": 0.0
+          },
+          {
+            "request_id": "req-teach-replay-001",
+            "space": "joint",
+            "mode": "replay",
+            "axis": null,
+            "progress": 0.25
           }
         ]
       },
@@ -4461,6 +5033,7 @@
               "connecting",
               "disabled",
               "enabling",
+              "teaching",
               "ready",
               "moving",
               "stopping",
@@ -4610,6 +5183,28 @@
             "joint_speed": 1.0,
             "acceleration": 0.6,
             "jerk": 6.0
+          },
+          "teaching": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TeachingStatus"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "当前录制/回放状态，无会话时为 null。"
+          },
+          "latest_teaching": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TeachingSummary"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "最近完整内存录制摘要，尚无记录时为 null；完整点经详情接口读取，SQLite 提交前也可用。"
           }
         },
         "required": [
@@ -4634,7 +5229,9 @@
           "servo_tuning",
           "servo_tuning_revision",
           "calibration",
-          "motion_tuning"
+          "motion_tuning",
+          "teaching",
+          "latest_teaching"
         ],
         "description": "完整状态；所有键均存在，可选值用 null。tcp 是实测关节计算的基座 → TCP；未设置 TCP 或反馈无效时为 null。",
         "examples": [
@@ -4812,7 +5409,9 @@
               "joint_speed": 1.0,
               "acceleration": 0.6,
               "jerk": 6.0
-            }
+            },
+            "teaching": null,
+            "latest_teaching": null
           }
         ]
       },
@@ -5008,7 +5607,9 @@
                 "joint_speed": 1.0,
                 "acceleration": 0.6,
                 "jerk": 6.0
-              }
+              },
+              "teaching": null,
+              "latest_teaching": null
             }
           }
         ]
@@ -9052,6 +9653,735 @@
             "max_friction": 0.0
           }
         ]
+      },
+      "TeachingPoint": {
+        "type": "object",
+        "properties": {
+          "t_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "相对录制开始的单调主机毫秒；不是 Unix 时间或设备同步时刻。",
+            "maximum": 18446744073709551615
+          },
+          "q": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "J1..J7 实测位置，rad。"
+          }
+        },
+        "required": [
+          "t_ms",
+          "q"
+        ],
+        "description": "原始录制点；保持段也记录，完整详情不按绘图需要裁剪。",
+        "examples": [
+          {
+            "t_ms": 0,
+            "q": [
+              0.3247388790451326,
+              0.757930926624494,
+              1.001786232318326,
+              1.098527642438808,
+              -0.3061488549819603,
+              0.02953262647141774,
+              -0.28453416096909007
+            ]
+          }
+        ]
+      },
+      "TeachingSummary": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "轨迹 ID。"
+          },
+          "name": {
+            "type": "string",
+            "description": "录制名称；空白输入由后端命名为“示教轨迹”。"
+          },
+          "created_at_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": -9223372036854775808,
+            "maximum": 9223372036854775807,
+            "description": "创建时的 Unix 毫秒。"
+          },
+          "side": {
+            "type": "string",
+            "enum": [
+              "left",
+              "right"
+            ]
+          },
+          "tcp": {
+            "$ref": "#/components/schemas/Pose",
+            "description": "录制时的 Link7→TCP，用于路径 FK 与预览。"
+          },
+          "duration_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "全部录制点覆盖的时长，ms。",
+            "maximum": 18446744073709551615
+          },
+          "sample_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "全部录制点数；不按校准报告保留策略裁剪。"
+          },
+          "outcome": {
+            "type": "string",
+            "description": "结束原因，如 completed、stopped、failed；不限定为固定枚举。"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "created_at_ms",
+          "side",
+          "tcp",
+          "duration_ms",
+          "sample_count",
+          "outcome"
+        ],
+        "description": "示教摘要；最新完整内存录制可在 SQLite 提交前读取。",
+        "examples": [
+          {
+            "id": "44444444-4444-4444-8444-444444444444",
+            "name": "装配路径",
+            "created_at_ms": 1795392000000,
+            "side": "right",
+            "tcp": {
+              "translation": [
+                0.025,
+                -0.015,
+                0.1
+              ],
+              "rotation": [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            },
+            "duration_ms": 1000,
+            "sample_count": 2,
+            "outcome": "completed"
+          }
+        ]
+      },
+      "TeachingTrajectory": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/TeachingSummary"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "points": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/TeachingPoint"
+                },
+                "description": "全部原始实测点，含保持段。"
+              }
+            },
+            "required": [
+              "points"
+            ]
+          }
+        ],
+        "description": "摘要字段与 points 位于同一层，没有 summary/data 包装。JSON 展开、编码与读取在工作线程执行。",
+        "examples": [
+          {
+            "id": "44444444-4444-4444-8444-444444444444",
+            "name": "装配路径",
+            "created_at_ms": 1795392000000,
+            "side": "right",
+            "tcp": {
+              "translation": [
+                0.025,
+                -0.015,
+                0.1
+              ],
+              "rotation": [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            },
+            "duration_ms": 1000,
+            "sample_count": 2,
+            "outcome": "completed",
+            "points": [
+              {
+                "t_ms": 0,
+                "q": [
+                  0.3247388790451326,
+                  0.757930926624494,
+                  1.001786232318326,
+                  1.098527642438808,
+                  -0.3061488549819603,
+                  0.02953262647141774,
+                  -0.28453416096909007
+                ]
+              },
+              {
+                "t_ms": 1000,
+                "q": [
+                  0.3,
+                  0.7,
+                  1.1,
+                  0.9,
+                  -0.4,
+                  0.2,
+                  -0.3
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "TeachingPlaybackOptions": {
+        "type": "object",
+        "properties": {
+          "speed_scale": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "有限正数，请求回放倍速；不设额外上限，规划继续服从当前 MotionTuning 与模型速度约束。",
+            "default": 1.0
+          },
+          "smoothing_s": {
+            "type": "number",
+            "minimum": 0,
+            "description": "有限非负秒数，轨迹平滑设置；0 也有效。",
+            "default": 0.12
+          }
+        },
+        "description": "两个字段均可省略。倍速与平滑参与后台规划，实际倍速与时长从 TeachingPreview 读取。",
+        "examples": [
+          {},
+          {
+            "speed_scale": 1.5,
+            "smoothing_s": 0.12
+          }
+        ]
+      },
+      "TeachingPreviewPoint": {
+        "type": "object",
+        "properties": {
+          "t_ms": {
+            "type": "number",
+            "minimum": 0,
+            "description": "相对回放程序开始的时间，ms，包含接近段。"
+          },
+          "joints": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "规划 J1..J7 位置，rad。"
+          },
+          "tcp": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 3,
+            "maxItems": 3,
+            "description": "按真实模型和录制 TCP 计算的基座 XYZ，m。"
+          },
+          "phase": {
+            "type": "string",
+            "enum": [
+              "approach",
+              "path"
+            ],
+            "description": "接近首点或录制路径。"
+          }
+        },
+        "required": [
+          "t_ms",
+          "joints",
+          "tcp",
+          "phase"
+        ],
+        "description": "用于真实模型、TCP 路线与连杆扫掠预览；不是串口实际发送记录。",
+        "examples": [
+          {
+            "t_ms": 0.0,
+            "joints": [
+              0.3,
+              0.7,
+              1.1,
+              0.9,
+              -0.4,
+              0.2,
+              -0.3
+            ],
+            "tcp": [
+              0.16066829881553443,
+              -0.09034619083225098,
+              0.17514881233964943
+            ],
+            "phase": "approach"
+          },
+          {
+            "t_ms": 3000.0,
+            "joints": [
+              0.3,
+              0.7,
+              1.1,
+              0.9,
+              -0.4,
+              0.2,
+              -0.3
+            ],
+            "tcp": [
+              0.16066829881553443,
+              -0.09034619083225098,
+              0.17514881233964943
+            ],
+            "phase": "path"
+          }
+        ]
+      },
+      "TeachingPreview": {
+        "type": "object",
+        "properties": {
+          "trajectory_id": {
+            "type": "string"
+          },
+          "side": {
+            "type": "string",
+            "enum": [
+              "left",
+              "right"
+            ]
+          },
+          "tcp": {
+            "$ref": "#/components/schemas/Pose"
+          },
+          "origin": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 7,
+            "maxItems": 7,
+            "description": "生成预览时的当前指令保持位置，rad。"
+          },
+          "duration_ms": {
+            "type": "number",
+            "minimum": 0,
+            "description": "接近段与录制路径重定时后的总时长，ms。"
+          },
+          "approach_duration_ms": {
+            "type": "number",
+            "minimum": 0,
+            "description": "从 origin 接近录制首点的时长，ms。"
+          },
+          "requested_speed_scale": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "请求倍速。"
+          },
+          "effective_speed_scale": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "按当前运动设置与模型约束重定时后的实际倍速。"
+          },
+          "points": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TeachingPreviewPoint"
+            },
+            "description": "包含接近与完整录制路径。"
+          }
+        },
+        "required": [
+          "trajectory_id",
+          "side",
+          "tcp",
+          "origin",
+          "duration_ms",
+          "approach_duration_ms",
+          "requested_speed_scale",
+          "effective_speed_scale",
+          "points"
+        ],
+        "description": "只读后台规划结果；使用当前侧别和录制 TCP，不改变控制者、generation、使能、动作或配置。",
+        "examples": [
+          {
+            "trajectory_id": "44444444-4444-4444-8444-444444444444",
+            "side": "right",
+            "tcp": {
+              "translation": [
+                0.025,
+                -0.015,
+                0.1
+              ],
+              "rotation": [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            },
+            "origin": [
+              0.3,
+              0.7,
+              1.1,
+              0.9,
+              -0.4,
+              0.2,
+              -0.3
+            ],
+            "duration_ms": 3000.0,
+            "approach_duration_ms": 1500.0,
+            "requested_speed_scale": 1.5,
+            "effective_speed_scale": 0.6666666666666666,
+            "points": [
+              {
+                "t_ms": 0.0,
+                "joints": [
+                  0.3,
+                  0.7,
+                  1.1,
+                  0.9,
+                  -0.4,
+                  0.2,
+                  -0.3
+                ],
+                "tcp": [
+                  0.16066829881553443,
+                  -0.09034619083225098,
+                  0.17514881233964943
+                ],
+                "phase": "approach"
+              },
+              {
+                "t_ms": 1500.0,
+                "joints": [
+                  0.3247388790451326,
+                  0.757930926624494,
+                  1.001786232318326,
+                  1.098527642438808,
+                  -0.3061488549819603,
+                  0.02953262647141774,
+                  -0.28453416096909007
+                ],
+                "tcp": [
+                  0.16066527662352315,
+                  -0.09034592148024663,
+                  0.2244337842419732
+                ],
+                "phase": "approach"
+              },
+              {
+                "t_ms": 1500.0,
+                "joints": [
+                  0.3247388790451326,
+                  0.757930926624494,
+                  1.001786232318326,
+                  1.098527642438808,
+                  -0.3061488549819603,
+                  0.02953262647141774,
+                  -0.28453416096909007
+                ],
+                "tcp": [
+                  0.16066527662352315,
+                  -0.09034592148024663,
+                  0.2244337842419732
+                ],
+                "phase": "path"
+              },
+              {
+                "t_ms": 3000.0,
+                "joints": [
+                  0.3,
+                  0.7,
+                  1.1,
+                  0.9,
+                  -0.4,
+                  0.2,
+                  -0.3
+                ],
+                "tcp": [
+                  0.16066829881553443,
+                  -0.09034619083225098,
+                  0.17514881233964943
+                ],
+                "phase": "path"
+              }
+            ]
+          }
+        ]
+      },
+      "TeachingStatus": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "当前轨迹 ID。"
+          },
+          "request_id": {
+            "type": "string",
+            "description": "启动录制或回放的 request_id。"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "holding",
+              "dragging",
+              "entering",
+              "leaving",
+              "finishing",
+              "replaying",
+              "approaching"
+            ]
+          },
+          "recording": {
+            "type": "boolean",
+            "description": "true 为录制含结束过渡，false 为回放。"
+          },
+          "sample_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "当前录制点数；回放为 0。"
+          },
+          "duration_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "录制已采集时长或回放计划总时长，ms。",
+            "maximum": 18446744073709551615
+          },
+          "progress": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "录制为 0；回放为含接近的时间进度，不能代替 completed 结果。"
+          },
+          "trajectory_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "关联保存的轨迹 ID。"
+          }
+        },
+        "required": [
+          "id",
+          "request_id",
+          "state",
+          "recording",
+          "sample_count",
+          "duration_ms",
+          "progress",
+          "trajectory_id"
+        ],
+        "description": "当前录制或回放会话，无会话时 Snapshot.teaching 为 null；这里不携带全量录制点。",
+        "examples": [
+          {
+            "id": "44444444-4444-4444-8444-444444444444",
+            "request_id": "req-teach-start-001",
+            "state": "holding",
+            "recording": true,
+            "sample_count": 2,
+            "duration_ms": 1000,
+            "progress": 0.0,
+            "trajectory_id": "44444444-4444-4444-8444-444444444444"
+          },
+          {
+            "id": "44444444-4444-4444-8444-444444444444",
+            "request_id": "req-teach-replay-001",
+            "state": "approaching",
+            "recording": false,
+            "sample_count": 0,
+            "duration_ms": 3000,
+            "progress": 0.25,
+            "trajectory_id": "44444444-4444-4444-8444-444444444444"
+          }
+        ]
+      },
+      "TeachStartCommand": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CommandEnvelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "teach_start"
+              },
+              "name": {
+                "type": "string",
+                "default": "",
+                "description": "空白名称由后端命名为“示教轨迹”。"
+              },
+              "transition_s": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": "有限正数，拖动/保持的位置刚度切换时间，s；不是额外运动上限。",
+                "default": 0.4
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          }
+        ],
+        "description": "接受后进入 phase=teaching，初始保持，随后由 teach_drag 按住/释放。正常切换保留 Servo、模型重力与当前阻尼；保存全部实测位置，完成后以 teaching_saved 确认。",
+        "examples": [
+          {
+            "request_id": "req-teach-start-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 5,
+            "kind": "teach_start",
+            "name": "装配路径",
+            "transition_s": 0.4
+          }
+        ]
+      },
+      "TeachDragCommand": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CommandEnvelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "teach_drag"
+              },
+              "pressed": {
+                "type": "boolean",
+                "description": "true 持续拖动，false 恢复当前位置保持。"
+              },
+              "input_seq": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "同一录制内严格递增；较旧或相同序号不覆盖新输入。",
+                "maximum": 18446744073709551615
+              },
+              "ttl_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 18446744073709551615,
+                "default": 150,
+                "description": "按住输入从后端接收起的有效毫秒，排队不延长；须在单调时钟可表示范围内。桌面每100ms续发、使用350ms TTL。"
+              }
+            },
+            "required": [
+              "kind",
+              "pressed",
+              "input_seq"
+            ]
+          }
+        ],
+        "description": "只操作已开始的录制会话。状态切换产生 accepted/teach_drag，重复按住续期不逐次产生结果；到期恢复保持，不自动失能。释放后不再续发。",
+        "examples": [
+          {
+            "request_id": "req-teach-press-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 6,
+            "kind": "teach_drag",
+            "pressed": true,
+            "input_seq": 1,
+            "ttl_ms": 350
+          },
+          {
+            "request_id": "req-teach-release-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 6,
+            "kind": "teach_drag",
+            "pressed": false,
+            "input_seq": 2,
+            "ttl_ms": 350
+          }
+        ]
+      },
+      "TeachFinishCommand": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CommandEnvelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "teach_finish"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          }
+        ],
+        "description": "平滑恢复保持后形成完整录制；启动和结束请求报告 completed/teaching_saved，Snapshot.teaching=null，latest_teaching 更新。SQLite 编码/事务异步执行，完成结果不表示磁盘已提交。",
+        "examples": [
+          {
+            "request_id": "req-teach-finish-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 6,
+            "kind": "teach_finish"
+          }
+        ]
+      },
+      "TeachReplayCommand": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CommandEnvelope"
+          },
+          {
+            "$ref": "#/components/schemas/TeachingPlaybackOptions"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "teach_replay"
+              },
+              "trajectory_id": {
+                "type": "string",
+                "description": "已保存轨迹 ID；也可读取尚未提交 SQLite 的最新完整内存录制。"
+              }
+            },
+            "required": [
+              "kind",
+              "trajectory_id"
+            ]
+          }
+        ],
+        "description": "读取、路径平滑、重定时在工作线程先完成再入队；准备失败可在202前返回JSON错误。保留原租约/generation，由控制线程再次复核并从当前有效起点接近首点。正常完成 completed/replayed，保持末点；停止取消剩余段。输出 q/dq/ddq 参考，复用已有发送/补偿流程，不重放原始扭矩。内部 teaching_prepared 无法从客户端 JSON 反序列化。",
+        "examples": [
+          {
+            "request_id": "req-teach-replay-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 7,
+            "kind": "teach_replay",
+            "trajectory_id": "44444444-4444-4444-8444-444444444444",
+            "speed_scale": 1.5,
+            "smoothing_s": 0.12
+          }
+        ]
       }
     },
     "responses": {
@@ -9319,6 +10649,96 @@
                 "value": {
                   "code": "closing",
                   "message": "应用正在关闭"
+                }
+              }
+            }
+          }
+        }
+      },
+      "TeachingInvalidRequest": {
+        "description": "示教查询参数格式或类型无效。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "examples": {
+              "invalid_teaching_request": {
+                "value": {
+                  "code": "invalid_teaching_request",
+                  "message": "示教查询参数无效"
+                }
+              }
+            }
+          }
+        }
+      },
+      "TeachingNotFound": {
+        "description": "示教轨迹 ID 不存在。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "examples": {
+              "teaching_not_found": {
+                "value": {
+                  "code": "teaching_not_found",
+                  "message": "示教轨迹不存在"
+                }
+              }
+            }
+          }
+        }
+      },
+      "TeachingUnavailable": {
+        "description": "示教记录读取、编码或后台任务当前不可用。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "examples": {
+              "teaching_unavailable": {
+                "value": {
+                  "code": "teaching_unavailable",
+                  "message": "示教记录暂不可读"
+                }
+              }
+            }
+          }
+        }
+      },
+      "TeachingPreviewFailed": {
+        "description": "预览未生成；JSON提取错误统一返回400 JSON，包括语法、字段类型、Content-Type与请求体积错误。",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ApiError"
+            },
+            "examples": {
+              "invalid_teaching_request": {
+                "value": {
+                  "code": "invalid_teaching_request",
+                  "message": "示教回放参数无效"
+                }
+              },
+              "teaching_side_mismatch": {
+                "value": {
+                  "code": "teaching_side_mismatch",
+                  "message": "示教轨迹与当前机械臂侧不一致"
+                }
+              },
+              "teaching_preparation_failed": {
+                "value": {
+                  "code": "teaching_preparation_failed",
+                  "message": "示教轨迹准备未完成"
+                }
+              },
+              "preview_failed": {
+                "value": {
+                  "code": "preview_failed",
+                  "message": "示教轨迹预览未完成"
                 }
               }
             }

@@ -3,6 +3,7 @@
 use crate::trajectory::JOINT_ACCELERATION;
 use crate::{
     kinematics::{CartesianPath, Kinematics, Pose, pose_error},
+    teaching::Program as TeachingProgram,
     trajectory::JOINT_SPEED,
     tuning::ServoTuning,
 };
@@ -29,6 +30,18 @@ pub struct Reference {
     pub cartesian: Option<CartesianGuard>,
     pub servo_tuning: ServoTuning,
     pub tuning_revision: u64,
+    pub sampling: Sampling,
+}
+
+#[derive(Clone, Debug, Default)]
+pub enum Sampling {
+    #[default]
+    Integrated,
+    Absolute,
+    Playback {
+        program: Arc<TeachingProgram>,
+        started: Instant,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +107,7 @@ impl Reference {
             cartesian: None,
             servo_tuning: ServoTuning::default(),
             tuning_revision: 0,
+            sampling: Sampling::Integrated,
         }
     }
 
@@ -130,6 +144,24 @@ impl Reference {
             {
                 return Err(SampleStatus::Invalid);
             }
+        }
+        match &self.sampling {
+            Sampling::Absolute => {
+                return Ok(Sample {
+                    q: self.q,
+                    dq: self.dq,
+                    timing: self.timing(at, SampleStatus::Aligned),
+                });
+            }
+            Sampling::Playback { program, started } => {
+                let sample = program.sample(at.saturating_duration_since(*started).as_secs_f64());
+                return Ok(Sample {
+                    q: sample.q,
+                    dq: sample.dq,
+                    timing: self.timing(at, SampleStatus::Aligned),
+                });
+            }
+            Sampling::Integrated => {}
         }
         let mut q = self.q;
         let mut dq = self.dq;
