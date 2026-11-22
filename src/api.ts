@@ -28,6 +28,17 @@ export interface Pose {
   translation: [number, number, number];
   rotation: [number, number, number, number];
 }
+export interface FrictionCurve {
+  coulomb: number;
+  static_friction: number;
+  viscous: number;
+  stribeck_velocity: number;
+}
+export interface StribeckTuning {
+  enabled: boolean;
+  positive: FrictionCurve;
+  negative: FrictionCurve;
+}
 export interface JointTuning {
   kd: number;
   velocity_ff: number;
@@ -35,6 +46,7 @@ export interface JointTuning {
   viscous: number;
   velocity_scale: number;
   max_friction: number;
+  stribeck?: StribeckTuning;
 }
 export interface ServoTuning {
   friction_enabled: boolean;
@@ -62,7 +74,8 @@ export interface CalibrationSettings {
   axis: number | null;
   excursion: number;
   speed: number;
-  max_friction: number;
+  speeds?: number[];
+  max_friction: number | null;
   cartesian?: CartesianProgram | null;
 }
 export interface CalibrationPreviewRequest {
@@ -124,6 +137,30 @@ export interface CalibrationPoint {
   feedback_velocity: JointPositions;
   feedback_age_ms: JointPositions;
   command_at_ms: number | null;
+  effort?: JointPositions | null;
+}
+export interface FitPoint {
+  velocity: number;
+  effort: number;
+  predicted: number;
+  samples: number;
+}
+export interface DirectionFit {
+  curve: FrictionCurve;
+  samples: number;
+  velocity_min: number;
+  velocity_max: number;
+  rmse: number;
+  points: FitPoint[];
+}
+export interface Identification {
+  axis: number;
+  source: string;
+  samples: number;
+  positive: DirectionFit | null;
+  negative: DirectionFit | null;
+  inertia: number;
+  max_friction?: number;
 }
 export interface CalibrationChoice {
   axis: number;
@@ -147,8 +184,10 @@ export interface CalibrationReport {
   recommended: ServoTuning | null;
   trials: CalibrationTrial[];
   sample_count: number;
+  captured_samples?: number;
   curves: CalibrationPoint[];
   choices: CalibrationChoice[];
+  identification?: Identification[];
   outcome: "improved" | "unchanged" | "insufficient" | "cancelled" | "failed";
   improvement: number | null;
   message: string;
@@ -159,6 +198,7 @@ export interface CalibrationStatus {
   state: "running" | "stopping" | "completed" | "cancelled" | "failed";
   stage:
     | "baseline"
+    | "identifying"
     | "candidate"
     | "baseline_check"
     | "validation"
@@ -185,6 +225,48 @@ const SERVO_TUNING_FIELDS = [
   "velocity_scale",
   "max_friction",
 ] as const;
+const FRICTION_CURVE_FIELDS = [
+  "coulomb",
+  "static_friction",
+  "viscous",
+  "stribeck_velocity",
+] as const;
+export function createStribeckTuning(): StribeckTuning {
+  const curve = (): FrictionCurve => ({
+    coulomb: 0,
+    static_friction: 0,
+    viscous: 0,
+    stribeck_velocity: 0.02,
+  });
+  return { enabled: false, positive: curve(), negative: curve() };
+}
+export function isFrictionCurve(value: unknown): value is FrictionCurve {
+  if (!value || typeof value !== "object") return false;
+  const curve = value as FrictionCurve;
+  return FRICTION_CURVE_FIELDS.every((key) => {
+    const number = curve[key];
+    return (
+      typeof number === "number" &&
+      Number.isFinite(number) &&
+      (key === "stribeck_velocity" ? number > 0 : number >= 0)
+    );
+  });
+}
+export function sameStribeckTuning(
+  a: StribeckTuning | undefined,
+  b: StribeckTuning | undefined,
+): boolean {
+  const left = a ?? createStribeckTuning();
+  const right = b ?? createStribeckTuning();
+  return (
+    left.enabled === right.enabled &&
+    (["positive", "negative"] as const).every((direction) =>
+      FRICTION_CURVE_FIELDS.every(
+        (key) => left[direction][key] === right[direction][key],
+      ),
+    )
+  );
+}
 export function createServoTuning(): ServoTuning {
   return {
     friction_enabled: false,
@@ -195,6 +277,7 @@ export function createServoTuning(): ServoTuning {
       viscous: 0,
       velocity_scale: 0.02,
       max_friction: 0.5,
+      stribeck: createStribeckTuning(),
     })) as ServoTuning["joints"],
   };
 }
@@ -208,6 +291,7 @@ export function isServoTuning(value: unknown): value is ServoTuning {
     Array.from(config.joints).every(
       (joint) =>
         joint &&
+        typeof joint === "object" &&
         SERVO_TUNING_FIELDS.every((key) => {
           const number = joint[key];
           return (
@@ -215,7 +299,12 @@ export function isServoTuning(value: unknown): value is ServoTuning {
             Number.isFinite(number) &&
             (key === "velocity_scale" ? number > 0 : number >= 0)
           );
-        }),
+        }) &&
+        (joint.stribeck === undefined ||
+          (joint.stribeck &&
+            typeof joint.stribeck.enabled === "boolean" &&
+            isFrictionCurve(joint.stribeck.positive) &&
+            isFrictionCurve(joint.stribeck.negative))),
     )
   );
 }
@@ -224,8 +313,11 @@ export function sameServoTuning(a: ServoTuning, b: ServoTuning): boolean {
     a.friction_enabled === b.friction_enabled &&
     a.joints.length === 7 &&
     b.joints.length === 7 &&
-    a.joints.every((joint, index) =>
-      SERVO_TUNING_FIELDS.every((key) => joint[key] === b.joints[index][key]),
+    a.joints.every(
+      (joint, index) =>
+        SERVO_TUNING_FIELDS.every(
+          (key) => joint[key] === b.joints[index][key],
+        ) && sameStribeckTuning(joint.stribeck, b.joints[index].stribeck),
     )
   );
 }
@@ -260,6 +352,25 @@ export function parseCalibrationReport(value: unknown): CalibrationReport {
   const axis = report.settings?.axis ?? null;
   const validAxis = (n: unknown) =>
     typeof n === "number" && Number.isInteger(n) && n >= 0 && n < 7;
+  const validCount = (n: number) => Number.isInteger(n) && n >= 0;
+  const validDirection = (fit: DirectionFit | null) =>
+    fit === null ||
+    (fit &&
+      isFrictionCurve(fit.curve) &&
+      validCount(fit.samples) &&
+      Number.isFinite(fit.velocity_min) &&
+      Number.isFinite(fit.velocity_max) &&
+      Number.isFinite(fit.rmse) &&
+      fit.rmse >= 0 &&
+      Array.isArray(fit.points) &&
+      fit.points.every(
+        (point) =>
+          point &&
+          Number.isFinite(point.velocity) &&
+          Number.isFinite(point.effort) &&
+          Number.isFinite(point.predicted) &&
+          validCount(point.samples),
+      ));
   const validMetrics = (metrics: CalibrationMetrics | null) =>
     metrics === null ||
     (metrics &&
@@ -277,6 +388,14 @@ export function parseCalibrationReport(value: unknown): CalibrationReport {
     typeof report.id !== "string" ||
     !report.settings ||
     (axis !== null && !validAxis(axis)) ||
+    (report.settings.max_friction != null &&
+      (!Number.isFinite(report.settings.max_friction) ||
+        report.settings.max_friction < 0)) ||
+    (report.settings.speeds !== undefined &&
+      (!Array.isArray(report.settings.speeds) ||
+        !report.settings.speeds.every(
+          (speed) => Number.isFinite(speed) && speed > 0,
+        ))) ||
     !isServoTuning(report.baseline) ||
     (report.recommended != null && !isServoTuning(report.recommended)) ||
     !isJointPositions(report.center_reference) ||
@@ -319,6 +438,7 @@ export function parseCalibrationReport(value: unknown): CalibrationReport {
           point.feedback_age_ms,
         ].every(isJointPositions) &&
         (point.command === null || isJointPositions(point.command)) &&
+        (point.effort == null || isJointPositions(point.effort)) &&
         (point.command_at_ms === null || Number.isFinite(point.command_at_ms)),
     ) ||
     !Array.isArray(choices) ||
@@ -335,6 +455,23 @@ export function parseCalibrationReport(value: unknown): CalibrationReport {
     )
   )
     throw new Error("报告中的曲线或比较数据无效");
+  if (
+    report.identification !== undefined &&
+    (!Array.isArray(report.identification) ||
+      !report.identification.every(
+        (fit) =>
+          fit &&
+          validAxis(fit.axis) &&
+          typeof fit.source === "string" &&
+          validCount(fit.samples) &&
+          Number.isFinite(fit.inertia) &&
+          (fit.max_friction === undefined ||
+            (Number.isFinite(fit.max_friction) && fit.max_friction >= 0)) &&
+          validDirection(fit.positive) &&
+          validDirection(fit.negative),
+      ))
+  )
+    throw new Error("报告中的摩擦拟合数据无效");
   return {
     ...report,
     settings: { ...report.settings, axis },

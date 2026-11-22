@@ -26,6 +26,8 @@ import {
   readMotionDraft,
 } from "./ServoPanel";
 import CalibrationChart, {
+  calibrationParameters,
+  calibrationParameterValue,
   calibrationTrialLabel,
   calibrationTrials,
 } from "./CalibrationChart";
@@ -38,7 +40,7 @@ export interface CalibrationPanelProps {
 }
 type Page = "settings" | "progress" | "result" | "curves" | "history";
 type Pending = {
-  kind: "start" | "apply";
+  kind: "start" | "apply" | "restore";
   id: string;
   connection: string;
   generation: number;
@@ -57,8 +59,9 @@ const DEG = 180 / Math.PI;
 const stages: Record<CalibrationStatus["stage"], string> = {
   cartesian_before: "末端路径 · 调整前",
   cartesian_after: "末端路径 · 调整后",
-  baseline: "测量七轴基线",
-  candidate: "比较候选参数",
+  baseline: "逐轴采集摩擦",
+  identifying: "拟合摩擦曲线",
+  candidate: "验证拟合参数",
   baseline_check: "复测基线",
   validation: "整体对比",
   after: "整体对比",
@@ -110,7 +113,14 @@ function Change({ value }: { value: number | null }) {
 }
 function measuredAxes(report: CalibrationReport) {
   return Array.from({ length: 7 }, (_, axis) => axis).filter(
-    (axis) => calibrationTrials(report, axis).length > 0,
+    (axis) =>
+      calibrationTrials(report, axis).length > 0 ||
+      report.identification?.some((fit) => fit.axis === axis) ||
+      (report.recommended &&
+        calibrationParameters(
+          report.baseline.joints[axis],
+          report.recommended.joints[axis],
+        ).some((row) => row.before !== row.after)),
   );
 }
 function comparisonFor(report: CalibrationReport, axis: number) {
@@ -177,11 +187,13 @@ function ReportDetails({
   report,
   local,
   applied,
+  restored,
   onCurves,
 }: {
   report: CalibrationReport;
   local: boolean;
   applied: boolean;
+  restored: boolean;
   onCurves: () => void;
 }) {
   const axes = measuredAxes(report);
@@ -193,6 +205,7 @@ function ReportDetails({
   );
   const hasCartesian = !!cartesianBefore || !!cartesianAfter;
   const recordedCount = report.sample_count || report.curves?.length || 0;
+  const capturedCount = report.captured_samples || recordedCount;
   const recordedDuration = report.curves?.length
     ? Math.max(...report.curves.map((point) => point.t_ms)) / 1000
     : null;
@@ -210,26 +223,17 @@ function ReportDetails({
       trial.metrics,
   );
   const deltas = report.baseline.joints.flatMap((before, axis) =>
-    (["coulomb", "velocity_ff"] as const).flatMap((key) => {
-      const after = report.recommended?.joints[axis][key];
-      return after != null && after !== before[key]
-        ? [{ axis, key, before: before[key], after }]
-        : [];
-    }),
+    calibrationParameters(before, report.recommended?.joints[axis])
+      .filter((row) => row.after !== undefined && row.after !== row.before)
+      .map((row) => ({ axis, ...row })),
   );
-  const kdUnchanged =
+  const controlUnchanged =
     !report.recommended ||
     report.baseline.joints.every(
-      (joint, axis) => joint.kd === report.recommended!.joints[axis].kd,
+      (joint, axis) =>
+        joint.kd === report.recommended!.joints[axis].kd &&
+        joint.velocity_ff === report.recommended!.joints[axis].velocity_ff,
     );
-  const fields = [
-    ["kd", "阻尼 Kd"],
-    ["velocity_ff", "速度前馈"],
-    ["coulomb", "补偿 Fc"],
-    ["viscous", "黏性补偿 B"],
-    ["velocity_scale", "过零速度"],
-    ["max_friction", "补偿限幅"],
-  ] as const;
   return (
     <div className="calibration-report">
       <div className="calibration-result-heading">
@@ -242,7 +246,9 @@ function ReportDetails({
         </div>
         <small>
           {report.curves?.length
-            ? `${(report.sample_count || report.curves.length).toLocaleString()} 采样`
+            ? capturedCount > recordedCount
+              ? `采集 ${capturedCount.toLocaleString()} · 保留 ${recordedCount.toLocaleString()}`
+              : `${recordedCount.toLocaleString()} 采样`
             : report.trials.length
               ? `${report.trials.length} 轮测量`
               : "统计报告"}
@@ -254,13 +260,19 @@ function ReportDetails({
           : report.recommended
             ? applied
               ? "已应用本次推荐参数。"
-              : "已恢复起始参数。"
+              : restored
+                ? "已恢复起始参数。"
+                : "推荐参数待应用。"
             : "各轮测量已保留，可查看每轴的变化与曲线。"}
       </p>
-      {recordedCount > 0 && (
+      {(recordedCount > 0 || !!report.identification?.length) && (
         <div className="calibration-recorded">
           <span>
-            <b>{recordedCount.toLocaleString()} 点</b>
+            <b>
+              {recordedCount > 0
+                ? `${recordedCount.toLocaleString()} 点`
+                : "力矩残差拟合"}
+            </b>
             {recordedDuration != null && (
               <small>已录制 {recordedDuration.toFixed(3)} s</small>
             )}
@@ -268,38 +280,45 @@ function ReportDetails({
               <small>末端动作 · 已采集部分</small>
             )}
           </span>
-          <button onClick={onCurves}>查看曲线</button>
+          <button onClick={onCurves}>
+            {report.identification?.length ? "查看曲线 / 拟合" : "查看曲线"}
+          </button>
         </div>
       )}
       {(!["failed", "cancelled"].includes(report.outcome) ||
         report.recommended) && (
         <>
-          <section className="calibration-deltas" aria-label="参数变化">
-            <div className="calibration-deltas-heading">
+          <details
+            className="calibration-deltas"
+            aria-label="参数变化"
+            open={deltas.length <= 4}
+          >
+            <summary className="calibration-deltas-heading">
               <h4>{applied ? "已应用的参数变化" : "推荐参数变化"}</h4>
               <b>
-                {kdUnchanged
-                  ? "Kp / Kd 保持原值"
-                  : "Kp 保持原值 · Kd 见历史参数明细"}
+                {deltas.some((row) => row.key.startsWith("stribeck"))
+                  ? "双向 Stribeck · "
+                  : ""}
+                {deltas.length} 项
+                {controlUnchanged ? " · Kd / 速度前馈保持原值" : ""}
               </b>
-            </div>
+            </summary>
             {deltas.length ? (
               <div className="calibration-delta-list">
-                {deltas.map(({ axis, key, before, after }) => (
+                {deltas.map(({ axis, key, label, unit, before, after }) => (
                   <div key={`${axis}:${key}`}>
                     <span>
-                      J{axis + 1} ·{" "}
-                      {key === "coulomb" ? "摩擦补偿 Fc" : "速度前馈 FF"}
+                      J{axis + 1} · {label}
                     </span>
                     <strong>
-                      {before} <span>→</span> {after}
-                      {key === "coulomb" ? " N·m" : ""}
+                      {calibrationParameterValue(before)} <span>→</span>{" "}
+                      {calibrationParameterValue(after)} {unit}
                     </strong>
                   </div>
                 ))}
               </div>
             ) : (
-              <p>Fc 与速度前馈保持原值。</p>
+              <p>逐轴参数保持原值。</p>
             )}
             {report.recommended &&
               report.baseline.friction_enabled !==
@@ -309,14 +328,24 @@ function ReportDetails({
                   → {report.recommended.friction_enabled ? "开启" : "关闭"}
                 </small>
               )}
-            {!!report.recommended && (
-              <small>
-                {applied
-                  ? "已采用本次推荐参数。"
-                  : "测试结束已恢复起始参数；点击“应用推荐”后生效。"}
-              </small>
-            )}
-          </section>
+          </details>
+          {!!report.identification?.some((fit) => fit.max_friction != null) && (
+            <div className="calibration-fit-budgets" aria-label="实际补偿幅值">
+              <span>
+                {report.settings.max_friction == null
+                  ? "自动补偿幅值"
+                  : "补偿幅值"}{" "}
+                · Nm
+              </span>
+              {report.identification
+                .filter((fit) => fit.max_friction != null)
+                .map((fit) => (
+                  <span key={fit.axis}>
+                    J{fit.axis + 1} <b>{fit.max_friction}</b>
+                  </span>
+                ))}
+            </div>
+          )}
         </>
       )}
       {hasCartesian && cartesianAxes.length > 0 && (
@@ -447,7 +476,7 @@ function ReportDetails({
       {hasJointStatistics ? (
         <details className="calibration-round-details" open={!hasCartesian}>
           <summary>
-            关节候选测量 <small>基线与各轮参数比较</small>
+            关节测量 <small>采集与拟合参数验证</small>
           </summary>
           <div className="calibration-table-scroll">
             <table
@@ -490,7 +519,7 @@ function ReportDetails({
                                 : trial.phase === "baseline_check"
                                   ? "基线复测"
                                   : trial.phase === "candidate"
-                                    ? "候选参数"
+                                    ? "拟合参数"
                                     : "整体对照"
                             : calibrationTrialLabel(report, trial, axis)}
                         </th>
@@ -560,19 +589,20 @@ function ReportDetails({
             <tbody>
               {(axes.length ? axes : [report.settings.axis ?? 0]).flatMap(
                 (axis) =>
-                  fields.map(([key, label]) => (
+                  calibrationParameters(
+                    report.baseline.joints[axis],
+                    report.recommended?.joints[axis],
+                  ).map(({ key, label, unit, before, after }) => (
                     <tr key={`${axis}:${key}`}>
                       <th>J{axis + 1}</th>
-                      <th>{label}</th>
-                      <td>{report.baseline.joints[axis][key]}</td>
+                      <th>
+                        {label} <small>{unit}</small>
+                      </th>
+                      <td>{calibrationParameterValue(before)}</td>
                       <td
-                        data-changed={
-                          !!report.recommended &&
-                          report.recommended.joints[axis][key] !==
-                            report.baseline.joints[axis][key]
-                        }
+                        data-changed={after !== undefined && after !== before}
                       >
-                        {report.recommended?.joints[axis][key] ?? "—"}
+                        {calibrationParameterValue(after)}
                       </td>
                     </tr>
                   )),
@@ -598,6 +628,25 @@ export default function CalibrationPanel({
   const [autoRange, setAutoRange] = useState(true);
   const [amplitudeText, setAmplitudeText] = useState("50");
   const [speedText, setSpeedText] = useState("10");
+  const [jointSpeedsText, setJointSpeedsText] = useState("");
+  const [frictionBudgetText, setFrictionBudgetText] = useState("");
+  const speedEntries = jointSpeedsText.trim()
+    ? jointSpeedsText
+        .trim()
+        .split(/[,，\s/]+/)
+        .filter(Boolean)
+    : [];
+  const jointSpeeds = speedEntries.map((value) => Number(value) / DEG);
+  const jointSpeedsValid =
+    !jointSpeedsText.trim() ||
+    (jointSpeeds.length > 0 &&
+      jointSpeeds.every((value) => Number.isFinite(value) && value > 0));
+  const frictionBudget = frictionBudgetText.trim()
+    ? Number(frictionBudgetText)
+    : null;
+  const frictionBudgetValid =
+    frictionBudget === null ||
+    (Number.isFinite(frictionBudget) && frictionBudget >= 0);
   const [motionDraft, setMotionDraft] = useState(() =>
     toMotionDraft(s.motion_tuning ?? DEFAULT_MOTION_TUNING),
   );
@@ -926,12 +975,15 @@ export default function CalibrationPanel({
       return;
     }
     if (
-      request.kind === "apply" &&
+      request.kind !== "start" &&
       accepted &&
       sameServoTuning(s.servo_tuning, request.config)
     ) {
       setPending(null);
-      setFeedback({ text: "推荐参数已应用", tone: "success" });
+      setFeedback({
+        text: request.kind === "restore" ? "起始参数已恢复" : "推荐参数已应用",
+        tone: "success",
+      });
       return;
     }
     if (
@@ -1139,6 +1191,8 @@ export default function CalibrationPanel({
     idleReason ||
     (!s.enabled ? "请先使能机械臂" : "") ||
     (busy ? "等待当前请求完成" : "") ||
+    (!jointSpeedsValid ? "关节速度须为正数，以逗号分隔" : "") ||
+    (!frictionBudgetValid ? "补偿幅值须为非负数或留空" : "") ||
     (previewBusy || !preview ? "请先生成并检查运动预览" : "");
   const previewReason =
     !view.online || ["disconnected", "connecting", "closing"].includes(s.phase)
@@ -1161,6 +1215,14 @@ export default function CalibrationPanel({
         : idleReason ||
           (busy ? "等待当前请求完成" : "") ||
           (recommendedApplied ? "推荐参数已应用" : "");
+  const restoreReason =
+    local || reportId !== status?.report?.id
+      ? "历史报告仅供查看"
+      : idleReason ||
+        (busy ? "等待当前请求完成" : "") ||
+        (report && sameServoTuning(s.servo_tuning, report.baseline)
+          ? "已是起始参数"
+          : "");
   function stop() {
     const id =
       status?.request_id ??
@@ -1219,11 +1281,15 @@ export default function CalibrationPanel({
       if (!controller.signal.aborted && alive.current) setPreviewBusy(false);
     }
   }
-  function send(kind: "start" | "apply") {
+  function send(kind: Pending["kind"]) {
     if (
       !open ||
       pendingRef.current ||
-      (kind === "start" ? startReason : applyReason)
+      (kind === "start"
+        ? startReason
+        : kind === "restore"
+          ? restoreReason
+          : applyReason)
     )
       return;
     const id = crypto.randomUUID();
@@ -1233,7 +1299,11 @@ export default function CalibrationPanel({
       connection,
       generation: s.generation,
       config: structuredClone(
-        kind === "apply" ? report!.recommended! : s.servo_tuning,
+        kind === "apply"
+          ? report!.recommended!
+          : kind === "restore"
+            ? report!.baseline
+            : s.servo_tuning,
       ),
       accepted: false,
       uncertain: false,
@@ -1247,10 +1317,22 @@ export default function CalibrationPanel({
     }
     void api
       .command(
-        kind === "start" ? "calibrate_start" : "calibrate_apply",
         kind === "start"
-          ? { settings: { cartesian: preview!.program } }
-          : { calibration_id: reportId },
+          ? "calibrate_start"
+          : kind === "restore"
+            ? "configure_servo"
+            : "calibrate_apply",
+        kind === "start"
+          ? {
+              settings: {
+                cartesian: preview!.program,
+                speeds: jointSpeeds,
+                max_friction: frictionBudget,
+              },
+            }
+          : kind === "restore"
+            ? { config: request.config }
+            : { calibration_id: reportId },
         id,
         s.generation,
       )
@@ -1287,7 +1369,7 @@ export default function CalibrationPanel({
         } else {
           setPending({ ...pendingRef.current, uncertain: true });
           setFeedback({
-            text: `${kind === "start" ? "启动" : "应用"}未确认：${error instanceof Error ? error.message : "请求失败"}`,
+            text: `${kind === "start" ? "启动" : kind === "restore" ? "恢复" : "应用"}未确认：${error instanceof Error ? error.message : "请求失败"}`,
             tone: "info",
           });
         }
@@ -1364,8 +1446,8 @@ export default function CalibrationPanel({
     feedback?.text ||
     (page === "settings"
       ? preview
-        ? idleReason || "确认上述完整范围后开始；测试完成恢复起始参数。"
-        : previewReason || "生成预览仅计算路径；确认开始后机械臂才会运动。"
+        ? startReason || "测试完成后恢复起始参数"
+        : previewReason || "预览路径后确认开始"
       : page === "result" && report?.recommended
         ? applyReason || "点击“应用推荐”采用本次建议。"
         : "");
@@ -1443,86 +1525,131 @@ export default function CalibrationPanel({
             <div className="calibration-start">
               <div className="calibration-intro">
                 <small>XYZ 末端动作 + J1–J7 关节试验</small>
-                <h3>先预览，再开始</h3>
-                <p>以当前姿态为原位，比较摩擦补偿与速度前馈。</p>
-                <div className="calibration-range-settings">
-                  <label className="calibration-range-mode">
-                    <span>末端行程</span>
-                    <select
-                      aria-label="末端行程模式"
-                      value={autoRange ? "auto" : "manual"}
-                      disabled={busy}
-                      onChange={(event) =>
-                        setAutoRange(event.target.value === "auto")
-                      }
-                    >
-                      <option value="auto">自动可达行程</option>
-                      <option value="manual">指定行程</option>
-                    </select>
-                  </label>
-                  {!autoRange && (
-                    <label className="calibration-amplitude">
-                      <span>单侧行程 · mm</span>
-                      <span>
-                        <b>±</b>
-                        <input
-                          type="number"
-                          aria-label="末端单侧幅度 mm"
-                          min={0}
-                          step="any"
-                          value={amplitudeText}
-                          disabled={busy}
-                          aria-invalid={!amplitudeValid}
-                          onChange={(event) =>
-                            setAmplitudeText(event.target.value)
-                          }
-                        />
-                        <b>mm</b>
-                      </span>
-                      {!amplitudeValid && <small>输入大于 0 的行程</small>}
+                <h3>一键校准摩擦</h3>
+                <p>双向多速度采集，拟合逐轴 Stribeck 曲线。</p>
+                <details className="calibration-advanced">
+                  <summary>
+                    高级设置 <small>行程 / 速度 / 幅值</small>
+                  </summary>
+                  <div className="calibration-range-settings">
+                    <label className="calibration-range-mode">
+                      <span>末端行程</span>
+                      <select
+                        aria-label="末端行程模式"
+                        value={autoRange ? "auto" : "manual"}
+                        disabled={busy}
+                        onChange={(event) =>
+                          setAutoRange(event.target.value === "auto")
+                        }
+                      >
+                        <option value="auto">自动可达行程</option>
+                        <option value="manual">指定行程</option>
+                      </select>
                     </label>
-                  )}
-                  <label className="calibration-speed">
-                    <span>
-                      末端速度 <small>mm/s</small>
-                    </span>
-                    <input
-                      type="number"
-                      aria-label="校准末端速度 mm/s"
-                      min={0}
-                      step="any"
-                      value={speedText}
-                      disabled={busy}
-                      aria-invalid={!speedValid}
-                      onChange={(event) => setSpeedText(event.target.value)}
-                    />
-                  </label>
-                  <details className="motion-preferences calibration-motion">
-                    <summary>运动偏好</summary>
-                    <MotionTuningFields
-                      draft={motionDraft}
-                      disabled={busy}
-                      onChange={(value) => {
-                        setMotionEdited(true);
-                        setMotionDraft(value);
-                      }}
-                    />
-                    <small>用于本次预览与执行</small>
-                  </details>
-                </div>
+                    {!autoRange && (
+                      <label className="calibration-amplitude">
+                        <span>单侧行程 · mm</span>
+                        <span>
+                          <b>±</b>
+                          <input
+                            type="number"
+                            aria-label="末端单侧幅度 mm"
+                            min={0}
+                            step="any"
+                            value={amplitudeText}
+                            disabled={busy}
+                            aria-invalid={!amplitudeValid}
+                            onChange={(event) =>
+                              setAmplitudeText(event.target.value)
+                            }
+                          />
+                          <b>mm</b>
+                        </span>
+                        {!amplitudeValid && <small>输入大于 0 的行程</small>}
+                      </label>
+                    )}
+                    <label className="calibration-speed">
+                      <span>
+                        末端速度 <small>mm/s</small>
+                      </span>
+                      <input
+                        type="number"
+                        aria-label="校准末端速度 mm/s"
+                        min={0}
+                        step="any"
+                        value={speedText}
+                        disabled={busy}
+                        aria-invalid={!speedValid}
+                        onChange={(event) => setSpeedText(event.target.value)}
+                      />
+                    </label>
+                    <label className="calibration-fit-setting">
+                      <span>
+                        关节速度 <small>°/s · 逗号分隔</small>
+                      </span>
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        aria-label="校准关节速度 °/s"
+                        placeholder="自动：1, 2, 4"
+                        value={jointSpeedsText}
+                        disabled={busy}
+                        aria-invalid={!jointSpeedsValid}
+                        onChange={(event) =>
+                          setJointSpeedsText(event.target.value)
+                        }
+                      />
+                    </label>
+                    <label className="calibration-fit-setting">
+                      <span>
+                        补偿幅值 <small>Nm</small>
+                      </span>
+                      <input
+                        type="number"
+                        aria-label="校准补偿幅值 Nm"
+                        placeholder="自动"
+                        title="留空自动；0 不试用摩擦"
+                        min={0}
+                        step="any"
+                        value={frictionBudgetText}
+                        disabled={busy}
+                        aria-invalid={!frictionBudgetValid}
+                        onChange={(event) =>
+                          setFrictionBudgetText(event.target.value)
+                        }
+                      />
+                    </label>
+                    <details className="motion-preferences calibration-motion">
+                      <summary>运动偏好</summary>
+                      <MotionTuningFields
+                        draft={motionDraft}
+                        disabled={busy}
+                        onChange={(value) => {
+                          setMotionEdited(true);
+                          setMotionDraft(value);
+                        }}
+                      />
+                      <small>用于本次预览与执行</small>
+                    </details>
+                  </div>
+                </details>
                 <ol className="calibration-plan">
                   <li>
                     <b>末端动作 · 调整前</b>
                     <span>基座 X → Y → Z 往返</span>
                   </li>
                   <li>
-                    <b>七轴基线与候选参数</b>
+                    <b>双向采集 · 拟合与验证</b>
                     <span>
                       逐轴 ±
                       {preview
                         ? degrees(preview.program.joint_excursion / 2, 0)
                         : "8"}
-                      ° · 2 / 4°/s
+                      ° ·{" "}
+                      {jointSpeedsText.trim() && jointSpeedsValid
+                        ? speedEntries.join(" / ")
+                        : "1 / 2 / 4"}
+                      °/s
                     </span>
                   </li>
                   <li>
@@ -1531,7 +1658,10 @@ export default function CalibrationPanel({
                   </li>
                 </ol>
                 <p className="calibration-note">
-                  Kp / Kd 保持原值 · 可随时停止
+                  Kd / 速度前馈保持原值 ·{" "}
+                  {frictionBudget == null
+                    ? "自动补偿幅值"
+                    : `补偿幅值 ${frictionBudget} Nm`}
                 </p>
               </div>
               <div className="calibration-preview-view">
@@ -1727,6 +1857,7 @@ export default function CalibrationPanel({
                   [
                     "cartesian_before",
                     "baseline",
+                    "identifying",
                     "candidate",
                     "cartesian_after",
                     "restoring",
@@ -1823,6 +1954,10 @@ export default function CalibrationPanel({
                         report={report}
                         local={local}
                         applied={recommendedApplied}
+                        restored={sameServoTuning(
+                          s.servo_tuning,
+                          report.baseline,
+                        )}
                         onCurves={() => setPage("curves")}
                       />
                     ) : (
@@ -1950,23 +2085,33 @@ export default function CalibrationPanel({
               {downloading ? "正在下载…" : "下载完整 JSON"}
             </button>
           )}
-          {page === "result" &&
+          {(page === "result" || page === "curves") &&
             report?.recommended &&
             !local &&
             reportId === status?.report?.id && (
-              <button
-                className="primary"
-                disabled={!!applyReason}
-                title={applyReason || "应用推荐参数"}
-                aria-busy={pending?.kind === "apply"}
-                onClick={() => send("apply")}
-              >
-                {pending?.kind === "apply"
-                  ? "等待确认…"
-                  : recommendedApplied
-                    ? "已应用"
-                    : "应用推荐"}
-              </button>
+              <>
+                <button
+                  disabled={!!restoreReason}
+                  title={restoreReason || "恢复本次校准起始参数"}
+                  aria-busy={pending?.kind === "restore"}
+                  onClick={() => send("restore")}
+                >
+                  {pending?.kind === "restore" ? "等待确认…" : "恢复起始"}
+                </button>
+                <button
+                  className="primary"
+                  disabled={!!applyReason}
+                  title={applyReason || "应用推荐参数"}
+                  aria-busy={pending?.kind === "apply"}
+                  onClick={() => send("apply")}
+                >
+                  {pending?.kind === "apply"
+                    ? "等待确认…"
+                    : recommendedApplied
+                      ? "已应用"
+                      : "应用推荐"}
+                </button>
+              </>
             )}
           <button onClick={onClose}>关闭</button>
         </footer>

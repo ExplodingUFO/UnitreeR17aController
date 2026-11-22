@@ -1345,6 +1345,11 @@ impl BusHandle {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_transmit_sink(&self) -> impl Send + use<> {
+        self.setpoints.subscribe()
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_idle_bus() -> (Self, watch::Sender<Option<SentReference>>) {
         let (setpoints, _) = watch::channel(PublishedSetpoints {
             values: stopped_setpoints(),
@@ -1663,149 +1668,168 @@ mod tests {
             reference::CartesianGuard,
             trajectory::{JOINT_ACCELERATION, JOINT_JERK, JOINT_SPEED},
         };
-        let origin = Instant::now();
-        let tcp = Pose {
-            translation: [0.0, 0.0, 0.1],
-            ..Pose::identity()
-        };
-        for side in ["left", "right"] {
-            let model = Arc::new(Kinematics::load(side).unwrap());
-            for frame in [Frame::Base, Frame::Tool] {
-                for axis in 0..6 {
-                    let mut q = [0.3, 0.7, 1.1, 0.9, -0.4, 0.2, -0.3];
-                    let (mut dq, mut ddq) = ([0.0; 7], [0.0; 7]);
-                    let path = CartesianPath {
-                        origin: model.fk(&q, &tcp).unwrap(),
-                        axis,
-                        frame,
-                    };
-                    let (mut baseline, mut tuned) = (None, None);
-                    let mut peak_friction = 0.0_f64;
-                    for tick in 0..150 {
-                        let stopping = tick >= 60;
-                        let mut twist = [0.0; 6];
-                        if !stopping {
-                            twist[axis] = if axis < 3 { 0.014 } else { 0.14 };
-                        }
-                        let step = model
-                            .step(StepInput {
-                                planning: None,
-                                reference: q,
-                                measured: q,
-                                previous_velocity: dq,
-                                target: LocalTarget::Velocity { twist, frame },
-                                dt: 0.01,
+        for stribeck in [false, true] {
+            let friction_model = crate::tuning::StribeckTuning {
+                enabled: stribeck,
+                positive: crate::tuning::FrictionCurve {
+                    coulomb: 0.3,
+                    static_friction: 0.5,
+                    viscous: 1.0,
+                    stribeck_velocity: 0.03,
+                },
+                negative: crate::tuning::FrictionCurve {
+                    coulomb: 0.2,
+                    static_friction: 0.6,
+                    viscous: 1.1,
+                    stribeck_velocity: 0.04,
+                },
+            };
+            let origin = Instant::now();
+            let tcp = Pose {
+                translation: [0.0, 0.0, 0.1],
+                ..Pose::identity()
+            };
+            for side in ["left", "right"] {
+                let model = Arc::new(Kinematics::load(side).unwrap());
+                for frame in [Frame::Base, Frame::Tool] {
+                    for axis in 0..6 {
+                        let mut q = [0.3, 0.7, 1.1, 0.9, -0.4, 0.2, -0.3];
+                        let (mut dq, mut ddq) = ([0.0; 7], [0.0; 7]);
+                        let path = CartesianPath {
+                            origin: model.fk(&q, &tcp).unwrap(),
+                            axis,
+                            frame,
+                        };
+                        let (mut baseline, mut tuned) = (None, None);
+                        let mut peak_friction = 0.0_f64;
+                        for tick in 0..150 {
+                            let stopping = tick >= 60;
+                            let mut twist = [0.0; 6];
+                            if !stopping {
+                                twist[axis] = if axis < 3 { 0.014 } else { 0.14 };
+                            }
+                            let step = model
+                                .step(StepInput {
+                                    planning: None,
+                                    reference: q,
+                                    measured: q,
+                                    previous_velocity: dq,
+                                    target: LocalTarget::Velocity { twist, frame },
+                                    dt: 0.01,
+                                    tcp,
+                                    limits: MotionLimits {
+                                        joint_velocity: [JOINT_SPEED; 7],
+                                        joint_acceleration: [JOINT_ACCELERATION; 7],
+                                        linear_speed: 0.015,
+                                        angular_speed: 0.15,
+                                    },
+                                    smoothing: Some(SmoothingState {
+                                        hold: None,
+                                        acceleration: ddq,
+                                        jerk: [JOINT_JERK; 7],
+                                        path: Some(path),
+                                        stopping,
+                                    }),
+                                })
+                                .unwrap();
+                            (q, dq, ddq) = (step.q, step.dq, step.ddq);
+                            let at = origin + Duration::from_millis(tick * 10);
+                            let mut reference = Reference::joint(at, q, dq, ddq, 1, 0);
+                            reference.stopping = stopping;
+                            reference.cartesian = Some(CartesianGuard {
+                                model: model.clone(),
                                 tcp,
-                                limits: MotionLimits {
-                                    joint_velocity: [JOINT_SPEED; 7],
-                                    joint_acceleration: [JOINT_ACCELERATION; 7],
-                                    linear_speed: 0.015,
-                                    angular_speed: 0.15,
-                                },
-                                smoothing: Some(SmoothingState {
-                                    hold: None,
-                                    acceleration: ddq,
-                                    jerk: [JOINT_JERK; 7],
-                                    path: Some(path),
-                                    stopping,
-                                }),
-                            })
+                                path,
+                                goal: None,
+                            });
+                            let values = std::array::from_fn(|i| Setpoint {
+                                mode: DriveMode::Servo,
+                                q: q[i],
+                                dq: dq[i],
+                                tau: 0.3,
+                                kp: 60.0,
+                                kd: 10.0,
+                            });
+                            let at = at + Duration::from_millis(2);
+                            let normal = PublishedSetpoints {
+                                values,
+                                seq: tick,
+                                reference: Some(reference.clone()),
+                            }
+                            .prepare(at, baseline)
                             .unwrap();
-                        (q, dq, ddq) = (step.q, step.dq, step.ddq);
-                        let at = origin + Duration::from_millis(tick * 10);
-                        let mut reference = Reference::joint(at, q, dq, ddq, 1, 0);
-                        reference.stopping = stopping;
-                        reference.cartesian = Some(CartesianGuard {
-                            model: model.clone(),
-                            tcp,
-                            path,
-                            goal: None,
-                        });
-                        let values = std::array::from_fn(|i| Setpoint {
-                            mode: DriveMode::Servo,
-                            q: q[i],
-                            dq: dq[i],
-                            tau: 0.3,
-                            kp: 60.0,
-                            kd: 10.0,
-                        });
-                        let at = at + Duration::from_millis(2);
-                        let normal = PublishedSetpoints {
-                            values,
-                            seq: tick,
-                            reference: Some(reference.clone()),
+                            reference.servo_tuning.friction_enabled = true;
+                            for (i, joint) in reference.servo_tuning.joints.iter_mut().enumerate() {
+                                joint.kd = 3.0 + i as f64;
+                                joint.velocity_ff = 0.0;
+                                joint.coulomb = 0.3;
+                                joint.viscous = 1.0;
+                                joint.stribeck = friction_model;
+                            }
+                            let actual = PublishedSetpoints {
+                                values,
+                                seq: tick,
+                                reference: Some(reference),
+                            }
+                            .prepare(at, tuned)
+                            .unwrap();
+                            assert!(normal.rejection.is_none() && actual.rejection.is_none());
+                            assert_eq!(actual.values.map(|s| s.q), normal.values.map(|s| s.q));
+                            assert_eq!(actual.motion_velocity, normal.motion_velocity);
+                            assert_eq!(actual.values.map(|s| s.dq), [0.0; 7]);
+                            let (wire_q, _) = test_wire_targets(
+                                side,
+                                actual.values.map(|s| s.q),
+                                actual.values.map(|s| s.dq),
+                            );
+                            path.check(&model.fk(&wire_q, &tcp).unwrap()).unwrap();
+                            let friction = actual.tuning.unwrap().friction_applied;
+                            peak_friction = friction
+                                .into_iter()
+                                .fold(peak_friction, |peak, f| peak.max(f.abs()));
+                            baseline = Some(Committed {
+                                at,
+                                values: normal.values,
+                                motion_velocity: normal.motion_velocity,
+                                gravity: normal.gravity,
+                            });
+                            tuned = Some(Committed {
+                                at,
+                                values: actual.values,
+                                motion_velocity: actual.motion_velocity,
+                                gravity: actual.gravity,
+                            });
                         }
-                        .prepare(at, baseline)
-                        .unwrap();
-                        reference.servo_tuning.friction_enabled = true;
-                        for (i, joint) in reference.servo_tuning.joints.iter_mut().enumerate() {
-                            joint.kd = 3.0 + i as f64;
-                            joint.velocity_ff = 0.0;
+                        assert!(peak_friction > 0.01);
+                        let held = tuned.unwrap();
+                        assert!(held.motion_velocity.iter().all(|v| v.abs() < 1e-5));
+                        // The controller finishes its brake with a zero-velocity
+                        // hold. No previous friction is carried into that hold.
+                        let mut idle = Reference::joint(
+                            held.at,
+                            held.values.map(|s| s.q),
+                            [0.0; 7],
+                            [0.0; 7],
+                            1,
+                            0,
+                        );
+                        idle.servo_tuning.friction_enabled = true;
+                        for joint in &mut idle.servo_tuning.joints {
                             joint.coulomb = 0.3;
                             joint.viscous = 1.0;
+                            joint.stribeck = friction_model;
+                            joint.velocity_ff = 0.0;
                         }
-                        let actual = PublishedSetpoints {
-                            values,
-                            seq: tick,
-                            reference: Some(reference),
-                        }
-                        .prepare(at, tuned)
-                        .unwrap();
-                        assert!(normal.rejection.is_none() && actual.rejection.is_none());
-                        assert_eq!(actual.values.map(|s| s.q), normal.values.map(|s| s.q));
-                        assert_eq!(actual.motion_velocity, normal.motion_velocity);
-                        assert_eq!(actual.values.map(|s| s.dq), [0.0; 7]);
-                        let (wire_q, _) = test_wire_targets(
-                            side,
-                            actual.values.map(|s| s.q),
-                            actual.values.map(|s| s.dq),
-                        );
-                        path.check(&model.fk(&wire_q, &tcp).unwrap()).unwrap();
-                        let friction = actual.tuning.unwrap().friction_applied;
-                        peak_friction = friction
-                            .into_iter()
-                            .fold(peak_friction, |peak, f| peak.max(f.abs()));
-                        baseline = Some(Committed {
-                            at,
-                            values: normal.values,
-                            motion_velocity: normal.motion_velocity,
-                            gravity: normal.gravity,
-                        });
-                        tuned = Some(Committed {
-                            at,
-                            values: actual.values,
-                            motion_velocity: actual.motion_velocity,
-                            gravity: actual.gravity,
-                        });
+                        let rest = PublishedSetpoints {
+                            values: held.values.map(|s| Setpoint { tau: 0.3, ..s }),
+                            seq: 151,
+                            reference: Some(idle),
+                        };
+                        let rest = rest.prepare(held.at + WRITE_PERIOD, Some(held)).unwrap();
+                        assert_eq!(rest.motion_velocity, [0.0; 7]);
+                        assert_eq!(rest.tuning.unwrap().friction_applied, [0.0; 7]);
+                        assert_eq!(rest.values.map(|s| s.tau), [0.3; 7]);
                     }
-                    assert!(peak_friction > 0.01);
-                    let held = tuned.unwrap();
-                    assert!(held.motion_velocity.iter().all(|v| v.abs() < 1e-5));
-                    // The controller finishes its brake with a zero-velocity
-                    // hold. No previous friction is carried into that hold.
-                    let mut idle = Reference::joint(
-                        held.at,
-                        held.values.map(|s| s.q),
-                        [0.0; 7],
-                        [0.0; 7],
-                        1,
-                        0,
-                    );
-                    idle.servo_tuning.friction_enabled = true;
-                    for joint in &mut idle.servo_tuning.joints {
-                        joint.coulomb = 0.3;
-                        joint.viscous = 1.0;
-                        joint.velocity_ff = 0.0;
-                    }
-                    let rest = PublishedSetpoints {
-                        values: held.values.map(|s| Setpoint { tau: 0.3, ..s }),
-                        seq: 151,
-                        reference: Some(idle),
-                    };
-                    let rest = rest.prepare(held.at + WRITE_PERIOD, Some(held)).unwrap();
-                    assert_eq!(rest.motion_velocity, [0.0; 7]);
-                    assert_eq!(rest.tuning.unwrap().friction_applied, [0.0; 7]);
-                    assert_eq!(rest.values.map(|s| s.tau), [0.3; 7]);
                 }
             }
         }

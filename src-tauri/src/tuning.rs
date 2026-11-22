@@ -9,6 +9,52 @@ pub struct ServoTuning {
     pub joints: [JointTuning; 7],
 }
 
+/// Directional friction magnitudes in SI units. Fs may be smaller than Fc.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FrictionCurve {
+    pub coulomb: f64,
+    pub static_friction: f64,
+    pub viscous: f64,
+    pub stribeck_velocity: f64,
+}
+
+impl Default for FrictionCurve {
+    fn default() -> Self {
+        Self {
+            coulomb: 0.0,
+            static_friction: 0.0,
+            viscous: 0.0,
+            stribeck_velocity: 0.02,
+        }
+    }
+}
+
+impl FrictionCurve {
+    /// Unclipped compensation; callers supply the joint's smooth zero scale.
+    pub(crate) fn evaluate(&self, velocity: f64, velocity_scale: f64) -> f64 {
+        if velocity == 0.0 {
+            return 0.0;
+        }
+        let ratio = velocity.abs() / self.stribeck_velocity;
+        let decay = (-(ratio * ratio)).exp();
+        // Interpolate from the smaller endpoint to avoid cancellation and
+        // intermediate overflow even for the largest finite magnitudes.
+        let magnitude = if self.static_friction >= self.coulomb {
+            self.coulomb + (self.static_friction - self.coulomb) * decay
+        } else {
+            self.static_friction + (self.coulomb - self.static_friction) * (1.0 - decay)
+        };
+        magnitude * (velocity / velocity_scale).tanh() + self.viscous * velocity
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct StribeckTuning {
+    pub enabled: bool,
+    pub positive: FrictionCurve,
+    pub negative: FrictionCurve,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct JointTuning {
     pub kd: f64,
@@ -21,6 +67,8 @@ pub struct JointTuning {
     pub velocity_scale: f64,
     /// Absolute friction compensation limit, in Nm.
     pub max_friction: f64,
+    #[serde(default)]
+    pub stribeck: StribeckTuning,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
@@ -43,6 +91,7 @@ impl Default for JointTuning {
             viscous: 0.0,
             velocity_scale: 0.02,
             max_friction: 0.5,
+            stribeck: StribeckTuning::default(),
         }
     }
 }
@@ -63,6 +112,24 @@ impl ServoTuning {
                 }
                 if value < 0.0 || (name == "velocity_scale" && value == 0.0) {
                     return Err(format!("J{} {name}符号无效", index + 1));
+                }
+            }
+            for (direction, curve) in [
+                ("positive", joint.stribeck.positive),
+                ("negative", joint.stribeck.negative),
+            ] {
+                for (name, value) in [
+                    ("coulomb", curve.coulomb),
+                    ("static_friction", curve.static_friction),
+                    ("viscous", curve.viscous),
+                    ("stribeck_velocity", curve.stribeck_velocity),
+                ] {
+                    if !value.is_finite()
+                        || value < 0.0
+                        || (name == "stribeck_velocity" && value == 0.0)
+                    {
+                        return Err(format!("J{} stribeck.{direction}.{name}无效", index + 1));
+                    }
                 }
             }
             // Kd is a wire field; keep its SDK and signed-integer limits in
@@ -118,8 +185,16 @@ impl ServoTuning {
                 continue;
             }
 
-            let raw =
-                joint.coulomb * (velocity / joint.velocity_scale).tanh() + joint.viscous * velocity;
+            let raw = if joint.stribeck.enabled {
+                let curve = if velocity > 0.0 {
+                    joint.stribeck.positive
+                } else {
+                    joint.stribeck.negative
+                };
+                curve.evaluate(velocity, joint.velocity_scale)
+            } else {
+                joint.coulomb * (velocity / joint.velocity_scale).tanh() + joint.viscous * velocity
+            };
             let requested = raw.clamp(-joint.max_friction, joint.max_friction);
             result.clamped[index] = raw < -joint.max_friction || raw > joint.max_friction;
             // Preserve gravity's bits (including -0.0) and canonical +0.0 friction.
@@ -192,6 +267,160 @@ mod tests {
             .friction_requested[0]
     }
 
+    fn asymmetric() -> StribeckTuning {
+        StribeckTuning {
+            enabled: true,
+            positive: FrictionCurve {
+                coulomb: 0.2,
+                static_friction: 0.7,
+                viscous: 0.12,
+                stribeck_velocity: 0.06,
+            },
+            negative: FrictionCurve {
+                coulomb: 0.5,
+                static_friction: 0.1,
+                viscous: 0.24,
+                stribeck_velocity: 0.03,
+            },
+        }
+    }
+
+    #[test]
+    fn legacy_json_defaults_to_disabled_curves_and_exact_old_formula() {
+        let tuning = enabled(JointTuning {
+            coulomb: 0.31,
+            viscous: 0.27,
+            max_friction: 0.6,
+            ..JointTuning::default()
+        });
+        let mut json = serde_json::to_value(tuning).unwrap();
+        for joint in json["joints"].as_array_mut().unwrap() {
+            joint.as_object_mut().unwrap().remove("stribeck");
+        }
+        let restored: ServoTuning = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, tuning);
+        assert_eq!(restored.joints[0].stribeck, StribeckTuning::default());
+        assert_eq!(FrictionCurve::default().stribeck_velocity, 0.02);
+        for velocity in [-3.0, -0.1, -1e-9, -0.0, 0.0, 1e-9, 0.05, 3.0] {
+            let joint = restored.joints[0];
+            let expected = if velocity == 0.0 {
+                0.0
+            } else {
+                (joint.coulomb * (velocity / joint.velocity_scale).tanh()
+                    + joint.viscous * velocity)
+                    .clamp(-joint.max_friction, joint.max_friction)
+            };
+            assert_eq!(friction(&restored, velocity).to_bits(), expected.to_bits());
+            let mut off = restored;
+            off.joints[0].stribeck = asymmetric();
+            off.joints[0].stribeck.enabled = false;
+            assert_eq!(friction(&off, velocity).to_bits(), expected.to_bits());
+        }
+    }
+
+    #[test]
+    fn directional_stribeck_matches_formula_and_both_sides_approach_exact_zero() {
+        let tuning = enabled(JointTuning {
+            stribeck: asymmetric(),
+            max_friction: 10.0,
+            ..JointTuning::default()
+        });
+        for velocity in [-0.3_f64, -0.05, -1e-6, -1e-10, 1e-10, 1e-6, 0.05, 0.3] {
+            let joint = tuning.joints[0];
+            let curve = if velocity > 0.0 {
+                joint.stribeck.positive
+            } else {
+                joint.stribeck.negative
+            };
+            let expected = (curve.coulomb
+                + (curve.static_friction - curve.coulomb)
+                    * (-(velocity.abs() / curve.stribeck_velocity).powi(2)).exp())
+                * (velocity / joint.velocity_scale).tanh()
+                + curve.viscous * velocity;
+            let actual = friction(&tuning, velocity);
+            assert_close(actual, expected, 1e-14);
+            assert_eq!(actual.signum(), velocity.signum());
+        }
+        for velocity in [-0.0, 0.0] {
+            assert_eq!(friction(&tuning, velocity).to_bits(), 0.0_f64.to_bits());
+        }
+        assert!(friction(&tuning, 1e-10).abs() < 4e-9);
+        assert!(friction(&tuning, -1e-10).abs() < 4e-9);
+        assert_ne!(friction(&tuning, 0.05), -friction(&tuning, -0.05));
+    }
+
+    #[test]
+    fn directional_switches_and_limits_preserve_gravity_and_velocity_weight() {
+        let mut tuning = enabled(JointTuning {
+            velocity_ff: 0.25,
+            stribeck: asymmetric(),
+            max_friction: 0.1,
+            ..JointTuning::default()
+        });
+        tuning.joints[2].max_friction = 0.0;
+        let dq = [1.0, -1.0, 1.0, 0.0, -0.0, 0.0, 0.0];
+        let gravity = [8.0, -8.0, -0.0, 0.0, -0.0, 0.0, 0.0];
+        let result = tuning.apply(dq, gravity).unwrap();
+        assert_bits(
+            result.friction_requested,
+            [0.1, -0.1, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        assert_eq!(&result.clamped[..3], &[true, true, true]);
+        assert_eq!(result.tau[0], 8.1);
+        tuning.friction_enabled = false;
+        let off = tuning.apply(dq, gravity).unwrap();
+        assert_bits(off.tau, gravity);
+        assert_bits(off.friction_requested, [0.0; 7]);
+        assert_bits(off.dq_feedforward, dq.map(|v| v * 0.25));
+    }
+
+    #[test]
+    fn directional_validation_accepts_fs_below_fc_and_has_no_arbitrary_caps() {
+        let mut tuning = enabled(JointTuning {
+            stribeck: asymmetric(),
+            ..JointTuning::default()
+        });
+        assert!(tuning.validate().is_ok());
+        for direction in 0..2 {
+            for field in 0..4 {
+                for value in [
+                    -1e-20,
+                    f64::NAN,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    0.0,
+                    f64::MAX,
+                ] {
+                    let mut candidate = tuning;
+                    let curve = if direction == 0 {
+                        &mut candidate.joints[0].stribeck.positive
+                    } else {
+                        &mut candidate.joints[0].stribeck.negative
+                    };
+                    let target = match field {
+                        0 => &mut curve.coulomb,
+                        1 => &mut curve.static_friction,
+                        2 => &mut curve.viscous,
+                        _ => &mut curve.stribeck_velocity,
+                    };
+                    *target = value;
+                    assert_eq!(
+                        candidate.validate().is_ok(),
+                        value.is_finite() && value >= 0.0 && (field != 3 || value > 0.0)
+                    );
+                }
+            }
+        }
+        tuning.joints[0].stribeck.positive = FrictionCurve {
+            coulomb: f64::MAX,
+            static_friction: f64::MAX,
+            viscous: f64::MAX,
+            stribeck_velocity: f64::from_bits(1),
+        };
+        assert!(tuning.validate().is_ok());
+        assert_eq!(friction(&tuning, 2.0), tuning.joints[0].max_friction);
+    }
+
     #[test]
     fn defaults_preserve_baseline_bits() {
         let tuning = ServoTuning::default();
@@ -205,6 +434,7 @@ mod tests {
                 viscous: 0.0,
                 velocity_scale: 0.02,
                 max_friction: 0.5,
+                stribeck: StribeckTuning::default(),
             }; 7]
         );
         assert!(tuning.validate().is_ok());
@@ -424,6 +654,7 @@ mod tests {
                 viscous: 2.0,
                 velocity_scale: 0.05,
                 max_friction: 0.3,
+                stribeck: StribeckTuning::default(),
             };
             let result = tuning.apply(dq, gravity).unwrap();
             assert_eq!(result.dq_feedforward[changed], dq[changed] * 0.25);

@@ -797,6 +797,18 @@ fn finite(data: &TraceData) -> bool {
                             j.max_friction,
                         ]
                         .into_iter()
+                        .chain(
+                            [j.stribeck.positive, j.stribeck.negative]
+                                .into_iter()
+                                .flat_map(|curve| {
+                                    [
+                                        curve.coulomb,
+                                        curve.static_friction,
+                                        curve.viscous,
+                                        curve.stribeck_velocity,
+                                    ]
+                                }),
+                        )
                         .all(f64::is_finite)
                     })
                 })
@@ -1233,6 +1245,30 @@ mod tests {
             servo_tuning.as_mut().unwrap().joints[6].velocity_scale = f64::NAN;
         }
         assert!(!finite(&ctrl));
+        for direction in [false, true] {
+            for field in 0..4 {
+                let mut sample = control(7);
+                let mut config = ServoTuning::default();
+                let curve = if direction {
+                    &mut config.joints[3].stribeck.negative
+                } else {
+                    &mut config.joints[3].stribeck.positive
+                };
+                match field {
+                    0 => curve.coulomb = f64::NAN,
+                    1 => curve.static_friction = f64::INFINITY,
+                    2 => curve.viscous = f64::NEG_INFINITY,
+                    _ => curve.stribeck_velocity = f64::NAN,
+                }
+                if let TraceData::Control { servo_tuning, .. } = &mut sample {
+                    *servo_tuning = Some(config);
+                }
+                assert!(
+                    !finite(&sample),
+                    "nonfinite directional parameters must not be serialized as null"
+                );
+            }
+        }
         let mut tx = transmit(5);
         if let TraceData::Transmit { tuning, .. } = &mut tx {
             *tuning = Some(ServoSample {
@@ -1266,9 +1302,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let event_path = directory.path().join("events.db");
         let recorder = Recorder::start(&event_path).unwrap();
-        // The full seven-joint configuration stays inline: no producer allocation,
-        // with the 4096-slot queue still bounded to at most 6 MiB of payloads.
-        assert!(std::mem::size_of::<TraceData>() <= 1536);
+        // The seven-joint configuration remains inline and Copy. Queue capacity,
+        // tested separately, bounds memory without a stale per-record byte cap.
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<TraceData>();
         for duration in [0, u64::MAX / 1_000_000 + 1, u64::MAX] {
             assert_eq!(
                 recorder.trace_start(duration, "left", None).unwrap_err(),

@@ -66,7 +66,7 @@ Tauri 命令只向打包的主窗口开放，不授权远程页面。开发与�
 
 控制页 3D 标题栏直接提供录制时长、录制/停止和“记录”按钮；“记录”打开最近录制与下载弹窗，不切页。录制默认 10 秒，可输入正的录制时长；端口已连接时可开始，无需控制权或使能。界面显示“控制参考 · 实际发送 · 关节反馈”、采样状态、样本/写入/待写/丢弃/错误数，完成或失败后可下载 JSON，写入中暂不可下载。“停止录制”只结束记录，工作台停止按钮继续负责取消机械臂动作。
 
-伺服调试弹窗提供全局摩擦开关及 J1..J7 的阻尼、速度前馈权重和摩擦参数草稿，可恢复基线、显式应用或复制 JSON。关闭并重开保留本次连接的草稿和上次编辑位置，连接变化时重置草稿。打开弹窗结束按住连续点动；停止按钮持续可用，Esc 停止并关闭，Tab 焦点在弹窗内循环，关闭后返回入口按钮。编辑与恢复基线只更新草稿；取得控制权、连接就绪且无动作后才能应用。连接、断开均恢复后端基线，参数不自动持久化。
+伺服调试弹窗提供全局摩擦开关及 J1..J7 的阻尼、速度前馈权重和摩擦参数草稿，每轴可切换 Stribeck 并分别编辑正负方向曲线，可恢复基线、显式应用或复制 JSON。关闭并重开保留本次连接的草稿和上次编辑位置，连接变化时重置草稿。打开弹窗结束按住连续点动；停止按钮持续可用，Esc 停止并关闭，Tab 焦点在弹窗内循环，关闭后返回入口按钮。编辑与恢复基线只更新草稿；取得控制权、连接就绪且无动作后才能应用。连接、断开均恢复后端基线，参数不自动持久化。
 
 左右栏边界、3D/末端坐标区边界及日志上边界均可拖动，尺寸保存在本机，双击恢复对应项默认值。日志默认收起为 36 px，可展开或拖动调整；工作区至少 390 px，末端坐标区至少 128 px。窗口缩小或日志拉高时，关节表和点动列表允许内部滚动，各模块继续保留在当前页面。3D 画布跟随实际面板尺寸更新。
 
@@ -100,17 +100,25 @@ Tauri 命令只向打包的主窗口开放，不授权远程页面。开发与�
 
 参考过旧或时间暂未对齐时，保持最近成功目标并将速度置零；新参考到达后继续，不结束整个动作。非有限输入与动作到期仍结束动作。generation/epoch 已变化的迟到事件不影响新动作。首次无效且没有成功伺服历史时走 I/O 错误处理。
 
-正常停止继续受 jerk 限制减速，可能比此前需要更长时间。停止求解惩罚关节速度本身，使冗余方向的速度也减至零，连续性由导数硬约束维持。笛卡尔路径上无法继续制动时，记录 `stop_path` 并转为受限关节制动；故障、失能和关闭仍优先处理。同一源参考可以在不同发送时刻取样，尚未发送的更新也可合并；控制器导数约束不保证实际 TX 节拍或物理 jerk。发送时间对齐、轨迹和采样尚未真机验收。
+正常停止继续受 jerk 限制减速，可能比此前需要更长时间。停止求解惩罚关节速度本身，使冗余方向的速度也减至零，连续性由导数硬约束维持。笛卡尔路径上无法继续制动时，记录 `stop_path` 并转为受限关节制动；故障、失能和关闭仍优先处理。同一源参考可以在不同发送时刻取样，尚未发送的更新也可合并；控制器导数约束不保证实际 TX 节拍或物理 jerk。
 
 ### 伺服调试
 
-`ServoTuning` 必须完整包含 `friction_enabled:boolean` 及七个关节的 `kd/velocity_ff/coulomb/viscous/velocity_scale/max_friction`。基线为摩擦关闭，每轴依次为 `10/1/0/0/0.02/0.5`。参数为有限非负数，`velocity_scale` 为正数；Kd 的实际可表示范围由协议编码统一处理。
+`ServoTuning` 必须完整包含 `friction_enabled:boolean` 及七个关节的 `kd/velocity_ff/coulomb/viscous/velocity_scale/max_friction`。基线为摩擦关闭，每轴依次为 `10/1/0/0/0.02/0.5`。每轴新增可选 `stribeck:{enabled,positive,negative}`，省略时按关闭读取；显式提供时包含完整双向曲线，各为 `FrictionCurve{coulomb,static_friction,viscous,stribeck_velocity}`。曲线默认前三项为 0、Vs 为 0.02 rad/s。所有数值有限且非负，`velocity_scale` 与 `stribeck_velocity` 为正数，Fs 可小于 Fc；Kd 的实际可表示范围由协议编码统一处理。
 
-发送端按未缩放的轨迹速度 `v` 计算 `friction=clamp(Fc*tanh(v/epsilon)+B*v, ±max_friction)`，与重力相加后按实际协议编码。摩擦关闭或 `v=0` 时摩擦项严格为零；开关不影响独立的速度前馈权重。`velocity_ff*v` 仅用于报文 `dq`，轨迹积分、TCP 路径、停止及收纳返回时序继续使用原始速度。协议字段范围不能视为电机总输出扭矩的保证。
+发送端使用未缩放轨迹速度 `v`。全局摩擦开启且该轴 Stribeck 开启时，按 `v` 符号选择 positive/negative，计算 `raw=[Fc+(Fs-Fc)*exp(-(abs(v)/Vs)^2)]*tanh(v/velocity_scale)+B*v`；该轴 Stribeck 关闭时保留原六字段的 `raw=Fc*tanh(v/velocity_scale)+B*v`。两者均由原有 `max_friction` 限幅，再与重力相加并按实际协议编码。全局摩擦关闭或 `v=0` 时摩擦项严格为零。`velocity_ff*v` 仅用于报文 `dq`，轨迹积分、TCP 路径、停止及收纳返回时序继续使用原始速度。
 
 持有者通过 `configure_servo` 显式应用整份配置；HTTP 202 表示入队，结果为 `accepted/configure_servo` 或 `rejected`。运动、停止减速和使能确认期间返回 `motion_busy`，连接中/未连接不接受，故障或待清错返回 `fault`。已使能空闲时使用当前连接最近成功发送的位置；配置和 generation 版本提升，旧运动请求失效。认证、租约与停止权限沿用原约定。详见[伺服调试配置](implementation-contract.md#59-伺服调试配置)。
 
-以上前馈计算无内部状态，参数标定与减抖效果尚未真机验证。候选方案与证据见[补偿方案调查](research/motion-compensation-repositories-2026-11-21.md)。
+以上前馈使用纯 Rust 无状态计算。低速校准沿用“预览 → 确认 → 前后比较 → 显式应用”的入口：先测末端基线，再逐轴双向多速度采样，在后台辨识正负曲线，对每个所选轴的有效候选进行实测，合并优选结果后重跑同一末端路线；纯关节模式以合并参数逐轴复测。Kp、Kd 与速度前馈权重在校准期间保持起始值。正常完成回原位并恢复开始前参数；取消按原停止流程减速、恢复参数，不继续回原位。推荐需要显式应用。
+
+`CalibrationSettings.speeds` 为可省略的正有限数数组，单位 rad/s。缺失或为空时按 `speed/2、speed、2×speed` 推导，默认 1/2/4°/s；显式设置不另加速度或档数上限，实际执行仍服从运动设置与模型约束。`max_friction` 可省略或为 null，按各轴 `abs(反馈扭矩−URDF重力)` 的有效样本峰值自动确定；非负有限数为使用者指定的 Nm 上限，0 不生成补偿候选。候选来自辨识，不使用固定 Fc 或速度前馈比例，也不只选择误差最大的两轴。
+
+`identifying` 表示后台分析阶段，重力计算、加速度估计和拟合不占用控制周期，控制线程不等待日志或 SQLite。重力按实际反馈位置计算；辨识同时拟合 `inertia*a` 分离加速段影响，不把该项下发为补偿。拟合对象是反馈扭矩减模型重力的经验残差 `feedback_effort_residual`，不等同于独立测得的摩擦力矩或真实等效刚度。不可辨识的方向报告 null 并沿用起始补偿模型，已辨识的方向仍可比较；两方向均不可辨识时该轴保持起始配置；不会把数据不足当作运动故障。
+
+报告新增可省略的 `captured_samples`（全程采集次数，旧报告为 0），`sample_count` 为保留点数。录制空间按轴/片段或试验组分配，较长校准采用保留端点的真实样本抽取，覆盖最终复测，排序与序列化在后台完成。报告新增可省略的 `identification[]`，旧报告按空数组读取；逐轴记录来源、样本数、正负 `DirectionFit|null`、inertia 与实际 max_friction。方向结果包含曲线、样本数、有符号实测速度范围、模型残差 RMSE 及 velocity/effort/predicted/samples 绘图点；velocity、effort、predicted 保留方向符号，predicted 包含惯性项，RMSE 与跟随误差 RMS 分别报告。所有数值采用 SI 单位。时间曲线新增可省略的七轴 `effort`，表示原始反馈扭矩，旧报告缺失时按 null 读取；重力在后台按实际反馈关节位置和 URDF 计算。字段与单位见[低速稳定性校准](implementation-contract.md#510-低速稳定性校准)。
+
+发送时间对齐、轨迹、采样及本轮辨识补偿尚未真机验证。方案与证据见[补偿方案调查](research/motion-compensation-repositories-2026-11-21.md)。
 
 ### 状态语义
 
@@ -138,19 +146,20 @@ Tauri 命令只向打包的主窗口开放，不授权远程页面。开发与�
 
 产品采用下面的集中模块，不建立额外 workspace 包或多后端框架。模块接口以[接口说明](implementation-contract.md)为准。
 
-| 位置                                                                 | 拥有的内容                                               | 不向调用方暴露的实现                                       |
-| -------------------------------------------------------------------- | -------------------------------------------------------- | ---------------------------------------------------------- |
-| src-tauri/src/lib.rs                                                 | Tauri 启停、会话信息、桌面停止、控制句柄、关闭协调       | 应用和线程资源回收                                         |
-| src-tauri/src/arm.rs                                                 | 唯一设备/控制权/动作状态，控制线程、超时与快照           | 串口调度、当前目标、有效期和状态转换                       |
-| src-tauri/src/protocol.rs                                            | 当前报文、CRC、反馈组帧、单位与标定映射                  | 包字段、缩放、字节序和恢复缓冲                             |
-| src-tauri/src/reference.rs                                           | 发送时刻取样、源年龄、目标与路径复核                     | 速度/首次零点封顶、与上一成功伺服目标比较、取样状态        |
-| src-tauri/src/tuning.rs | 完整伺服配置、范围校验与无状态前馈计算 | 速度权重、摩擦与总前馈限幅；不改变运动参考 |
-| src-tauri/src/kinematics.rs                                          | 不可变模型/TCP、显式输入的 FK/Jacobian、候选局部步与诊断 | 7R 递推、加权/阻尼、内部矩阵；不持有持续动作目标           |
-| src-tauri/src/trajectory.rs                                          | 离散导数窗口、参考积分、有界二次规划                     | 速度/加速度/jerk 的共同限制与数值求解                      |
-| src-tauri/src/server.rs                                              | HTTP/WS、序列化、会话与请求映射                          | 网络连接与慢消费者处理；日志查询移交 spawn_blocking        |
-| src-tauri/src/journal.rs                                             | SQLite 结构化事件、只读查询与原子统计                    | 队列单次尝试取锁、专用 writer、事务/重试/保留与 checkpoint |
-| src-tauri/src/trace.rs                                               | 有界短时采样、采样汇总与读取                             | 预分配队列、独立 SQLite writer、保留与采样计数             |
-| src/App.tsx、PanelLayout.tsx、RobotScene.tsx、TracePanel.tsx、LogsPanel.tsx、ServoPanel.tsx、api.ts | 工作台、面板尺寸、三维渲染、采样、伺服调试、单一本机客户端         | 不拥有设备运动状态                                         |
+| 位置                                                                                                | 拥有的内容                                                 | 不向调用方暴露的实现                                       |
+| --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- | ---------------------------------------------------------- |
+| src-tauri/src/lib.rs                                                                                | Tauri 启停、会话信息、桌面停止、控制句柄、关闭协调         | 应用和线程资源回收                                         |
+| src-tauri/src/arm.rs                                                                                | 唯一设备/控制权/动作状态，控制线程、超时与快照             | 串口调度、当前目标、有效期和状态转换                       |
+| src-tauri/src/protocol.rs                                                                           | 当前报文、CRC、反馈组帧、单位与标定映射                    | 包字段、缩放、字节序和恢复缓冲                             |
+| src-tauri/src/reference.rs                                                                          | 发送时刻取样、源年龄、目标与路径复核                       | 速度/首次零点封顶、与上一成功伺服目标比较、取样状态        |
+| src-tauri/src/tuning.rs                                                                             | 完整伺服配置、范围校验与无状态前馈计算                     | 速度权重、摩擦与总前馈限幅；不改变运动参考                 |
+| src-tauri/src/friction.rs                                                                           | 逐轴双向摩擦拟合与可辨识性计算                             | 纯数据计算，精确加权方程；不访问设备或日志                 |
+| src-tauri/src/kinematics.rs                                                                         | 不可变模型/TCP、显式输入的 FK/Jacobian、候选局部步与诊断   | 7R 递推、加权/阻尼、内部矩阵；不持有持续动作目标           |
+| src-tauri/src/trajectory.rs                                                                         | 离散导数窗口、参考积分、有界二次规划                       | 速度/加速度/jerk 的共同限制与数值求解                      |
+| src-tauri/src/server.rs                                                                             | HTTP/WS、序列化、会话与请求映射                            | 网络连接与慢消费者处理；日志查询移交 spawn_blocking        |
+| src-tauri/src/journal.rs                                                                            | SQLite 结构化事件、只读查询与原子统计                      | 队列单次尝试取锁、专用 writer、事务/重试/保留与 checkpoint |
+| src-tauri/src/trace.rs                                                                              | 有界短时采样、采样汇总与读取                               | 预分配队列、独立 SQLite writer、保留与采样计数             |
+| src/App.tsx、PanelLayout.tsx、RobotScene.tsx、TracePanel.tsx、LogsPanel.tsx、ServoPanel.tsx、api.ts | 工作台、面板尺寸、三维渲染、采样、伺服调试、单一本机客户端 | 不拥有设备运动状态                                         |
 
 同一 Rust 应用里，串口与控制用专用线程，网络使用异步运行时，渲染在 WebView。命令交接有界，状态发送采用最新快照；慢 UI/订阅者不能阻塞电机循环。
 
@@ -174,19 +183,19 @@ arm 独占求解 seed、上个已接受参考和当前目标。kinematics 只计
 
 默认仅绑定 `127.0.0.1:8177`；绑定失败应在界面说明并禁用设备操作，不静默改成局域网监听。端口号是应用默认值，不是硬件参数。
 
-| 入口                  | 当前用途                                                                                                                      | 返回的语义                                              |
-| --------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
-| GET /v1/ports         | 端口列表和可得的设备信息                                                                                                      | 只读，不打开或使能设备                                  |
-| GET /v1/state         | 完整状态快照                                                                                                                  | 当前状态，不用查询成功推断设备健康                      |
-| POST /v1/control      | acquire / renew / release                                                                                                     | 控制模块决定后返回结果；控制者获得私有租约凭据          |
-| POST /v1/commands     | connect / disconnect / enable / disable / clear_fault / configure_tcp / configure_servo / jog_start / jog_update / step / return_to_pose / stop | 请求入队不等于被控制器接受或设备执行完成                |
-| GET /v1/logs?limit=50 | 最近结构化事件                                                                                                                | 按 id 降序，最多 500 条；阻塞读通过 spawn_blocking 执行 |
-| GET /v1/logs/page     | 持久化日志搜索与分页；page/page_size/search/through_id                                                                         | 200 {items,page,page_size,total,total_pages,through_id}；spawn_blocking 只读事务 |
-| GET /v1/traces        | 最近采样汇总                                                                                                                  | 默认 limit=20，实际限制到 1..10                         |
-| POST /v1/traces       | 开始短时观察，duration_ms 默认 10000、可表示的正整数毫秒                                                                        | 200 TraceSummary；需要已有端口连接，无需租约            |
-| POST /v1/traces/stop  | 结束当前采样                                                                                                                  | 200 TraceSummary 或 null；不取消机械臂动作              |
-| GET /v1/traces/{id}   | 读取采样 JSON；download=true 下载，attachment=true 为别名                                                                     | 200 {trace,samples}，包含原始来源时间                   |
-| WS /v1/events         | 完整快照，包含请求结果和日志统计                                                                                              | 首帧认证后发送状态；掉线后重取快照，不重放运动          |
+| 入口                  | 当前用途                                                                                                                                        | 返回的语义                                                                       |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| GET /v1/ports         | 端口列表和可得的设备信息                                                                                                                        | 只读，不打开或使能设备                                                           |
+| GET /v1/state         | 完整状态快照                                                                                                                                    | 当前状态，不用查询成功推断设备健康                                               |
+| POST /v1/control      | acquire / renew / release                                                                                                                       | 控制模块决定后返回结果；控制者获得私有租约凭据                                   |
+| POST /v1/commands     | connect / disconnect / enable / disable / clear_fault / configure_tcp / configure_servo / jog_start / jog_update / step / return_to_pose / stop | 请求入队不等于被控制器接受或设备执行完成                                         |
+| GET /v1/logs?limit=50 | 最近结构化事件                                                                                                                                  | 按 id 降序，最多 500 条；阻塞读通过 spawn_blocking 执行                          |
+| GET /v1/logs/page     | 持久化日志搜索与分页；page/page_size/search/through_id                                                                                          | 200 {items,page,page_size,total,total_pages,through_id}；spawn_blocking 只读事务 |
+| GET /v1/traces        | 最近采样汇总                                                                                                                                    | 默认 limit=20，实际限制到 1..10                                                  |
+| POST /v1/traces       | 开始短时观察，duration_ms 默认 10000、可表示的正整数毫秒                                                                                        | 200 TraceSummary；需要已有端口连接，无需租约                                     |
+| POST /v1/traces/stop  | 结束当前采样                                                                                                                                    | 200 TraceSummary 或 null；不取消机械臂动作                                       |
+| GET /v1/traces/{id}   | 读取采样 JSON；download=true 下载，attachment=true 为别名                                                                                       | 200 {trace,samples}，包含原始来源时间                                            |
+| WS /v1/events         | 完整快照，包含请求结果和日志统计                                                                                                                | 首帧认证后发送状态；掉线后重取快照，不重放运动                                   |
 
 本机接口使用当前应用会话凭据，控制请求还需有效的私有租约。只读快照只公开控制者标识与有效性，不广播可用于接管的租约凭据。CORS/Origin 不能替代控制权校验；接口信息可查看/复制，凭据不进入日志。
 
@@ -209,7 +218,7 @@ HTTP 在请求头中携带应用会话凭据；WebSocket 升级后首帧认证�
 | 数据         | 必需信息                                                                                                 |
 | ------------ | -------------------------------------------------------------------------------------------------------- |
 | 上下文       | side、port、TCP 配置状态、控制者、generation、快照序号                                                   |
-| 伺服配置 | servo_tuning 完整配置、servo_tuning_revision 当前版本；每次连接/断开恢复基线 |
+| 伺服配置     | servo_tuning 完整配置、servo_tuning_revision 当前版本；每次连接/断开恢复基线                             |
 | 实测关节     | 固定七个关节的名称/ID、q/dq/tau、逐关节 age_ms、可得的温度/电压/error；无反馈字段为 null                 |
 | 反馈计算 TCP | 当前关节快照经当前模型/TCP 的 FK 结果；TCP 未配置或无有效完整反馈时为 null，四元数为 x/y/z/w             |
 | 动作         | space、mode、axis、request_id、progress；last_result 与有限 results 保存请求结果和原因                   |
@@ -263,7 +272,7 @@ npm run tauri dev
 | 界面/API                | 完整快照与请求结果一致；实测、参考和过期状态可辨识；800×600 及常用桌面尺寸无页面滚动；打包 WebView 的本机访问成功                                                                                                |
 | SQLite 日志             | 持久化后查询、降序/上限、保留清理、队列饱和/数据库不可写时生产者返回、后台恢复和关闭边界                                                                                                                         |
 | 轨迹与短时采样          | 不等控制周期下最终参考的速度/加速度/jerk、TCP 路径约束与停止回退；来源时间与发送序号、编码值、队列竞争/饱和计数、独立持久化和认证下载                                                                            |
-| 伺服调试 | 完整配置与范围、默认行为、零速/全局开关、逐轴隔离、静止发送目标交接、版本推进/旧请求失效、新旧 Trace 与加权速度编码误差 |
+| 伺服调试                | 完整配置与范围、默认行为、零速/全局开关、逐轴隔离、静止发送目标交接、版本推进/旧请求失效、新旧 Trace 与加权速度编码误差                                                                                          |
 | 发送时间对齐            | 原始 10 ms 网格与跳槽、普通起点间距、50 ms 新鲜边界、速度/首次零点封顶、固定 TCP 路径与目标、上一成功伺服目标、写前 epoch/有效期复查、无效参考保持与首个无效参考 I/O 错误、旧 JSON 兼容                          |
 
 真机测试包括 6 Mbps 通信、七关节反馈与标定、本体方向、TCP、六维运动，以及停止、失联和重连。测试状态见[测试记录](implementation-status.md)。
@@ -284,7 +293,6 @@ npm run tauri dev
 原型采用同一三栏工作台，具体运行入口、演示场景、视觉基线和检查结果见[原型说明](prototype.md)。原型的场景栏、演示数值与简化行为只服务于本次评审，不进入产品功能范围。
 
 历史原型单独保存，未纳入本仓库。当前前端位于 src，使用 Rust 后端的状态和请求接口。
-
 
 ## 低速稳定性校准（2026-11-22）
 

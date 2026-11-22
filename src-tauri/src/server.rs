@@ -359,11 +359,11 @@ async fn calibration(
                 .ok_or_else(|| ApiError::new("calibration_not_found", "校准记录不存在"))?
         };
         let download = query.download.unwrap_or(false);
-        let report = if download {
-            report
+        let report = report.for_plot(if download {
+            0
         } else {
-            report.for_plot(query.points.unwrap_or(3000))
-        };
+            query.points.unwrap_or(3000)
+        });
         let body = serde_json::to_vec(&report)
             .map_err(|_| ApiError::new("journal_unavailable", "校准记录编码失败"))?;
         let mut response = (
@@ -690,7 +690,8 @@ mod tests {
                 axis: Some(1),
                 excursion: 0.1,
                 speed: 0.02,
-                max_friction: 0.1,
+                max_friction: Some(0.1),
+                speeds: Vec::new(),
                 cartesian: None,
             },
             center_reference: [0.0; 7],
@@ -701,6 +702,8 @@ mod tests {
             trials: vec![],
             choices: vec![],
             sample_count,
+            captured_samples: sample_count,
+            identification: Vec::new(),
             curves: Arc::new(
                 (0..sample_count)
                     .map(|i| crate::calibration::Point {
@@ -715,6 +718,7 @@ mod tests {
                         feedback_velocity: [3.0 / 256.0; 7],
                         feedback_age_ms: [2; 7],
                         command_at_ms: (i % 3 != 0).then_some(i as u32 * 20),
+                        effort: None,
                     })
                     .collect(),
             ),

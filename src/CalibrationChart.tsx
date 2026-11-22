@@ -1,13 +1,18 @@
 import { useMemo, useState } from "react";
-import type {
-  CalibrationPoint,
-  CalibrationReport,
-  CalibrationTrial,
-  Space,
+import {
+  createStribeckTuning,
+  sameStribeckTuning,
+  type DirectionFit,
+  type Identification,
+  type JointTuning,
+  type CalibrationPoint,
+  type CalibrationReport,
+  type CalibrationTrial,
+  type Space,
 } from "./api";
 
 const DEG = 180 / Math.PI;
-type Metric = "position" | "velocity" | "error";
+type Metric = "position" | "velocity" | "error" | "friction";
 const metrics: [Metric, string][] = [
   ["position", "位置"],
   ["velocity", "速度"],
@@ -26,6 +31,275 @@ type Live = {
   points: CalibrationPoint[];
 };
 type Plot = { key: string; label: string; points: CalibrationPoint[] };
+
+export function calibrationParameters(
+  before: JointTuning,
+  after?: JointTuning,
+) {
+  const rows: {
+    key: string;
+    label: string;
+    unit: string;
+    before: number | boolean;
+    after: number | boolean | undefined;
+  }[] = (
+    [
+      ["kd", "阻尼 Kd", "Nm·s/rad"],
+      ["velocity_ff", "速度前馈", ""],
+      ["coulomb", "库仑 Fc", "Nm"],
+      ["viscous", "黏性 B", "Nm·s/rad"],
+      ["velocity_scale", "过零速度", "rad/s"],
+      ["max_friction", "补偿限幅", "Nm"],
+    ] as const
+  ).map(([key, label, unit]) => ({
+    key,
+    label,
+    unit,
+    before: before[key],
+    after: after?.[key],
+  }));
+  const original = before.stribeck ?? createStribeckTuning();
+  const next = after ? (after.stribeck ?? createStribeckTuning()) : undefined;
+  rows.push({
+    key: "stribeck.enabled",
+    label: "Stribeck",
+    unit: "",
+    before: original.enabled,
+    after: next?.enabled,
+  });
+  for (const direction of ["positive", "negative"] as const) {
+    for (const [key, label, unit] of [
+      ["static_friction", "Fs", "Nm"],
+      ["coulomb", "Fc", "Nm"],
+      ["viscous", "B", "Nm·s/rad"],
+      ["stribeck_velocity", "Vs", "rad/s"],
+    ] as const) {
+      rows.push({
+        key: `stribeck.${direction}.${key}`,
+        label: `${direction === "positive" ? "正向" : "反向"} ${label}`,
+        unit,
+        before: original[direction][key],
+        after: next?.[direction][key],
+      });
+    }
+  }
+  return rows;
+}
+export const calibrationParameterValue = (
+  value: number | boolean | undefined,
+) => (typeof value === "boolean" ? (value ? "开启" : "关闭") : (value ?? "—"));
+const fitNumber = (value: number) => Number(value.toPrecision(4)).toString();
+
+function DirectionChart({
+  fit,
+  label,
+  direction,
+}: {
+  fit: DirectionFit | null;
+  label: string;
+  direction: "positive" | "negative";
+}) {
+  const [focused, setFocused] = useState<number | null>(null);
+  if (!fit)
+    return (
+      <figure className="calibration-fit-direction">
+        <figcaption>{label}</figcaption>
+        <p className="calibration-empty">无拟合数据</p>
+      </figure>
+    );
+  const points = [...fit.points].sort((a, b) => a.velocity - b.velocity);
+  const velocities = points.map((point) => point.velocity);
+  const efforts = points.flatMap((point) => [point.effort, point.predicted]);
+  let xMin = Math.min(0, ...velocities),
+    xMax = Math.max(0, ...velocities);
+  let yMin = Math.min(0, ...efforts),
+    yMax = Math.max(0, ...efforts);
+  if (xMax === xMin) xMax = xMin + 0.01;
+  if (yMax === yMin) yMax = yMin + 0.01;
+  const yPad = (yMax - yMin) * 0.1;
+  yMin -= yPad;
+  yMax += yPad;
+  const width = 340,
+    height = 150,
+    left = 48,
+    right = 12,
+    top = 14,
+    bottom = 30;
+  const x = (velocity: number) =>
+    left + ((velocity - xMin) / (xMax - xMin)) * (width - left - right);
+  const y = (effort: number) =>
+    top + ((yMax - effort) / (yMax - yMin)) * (height - top - bottom);
+  const point = focused == null ? null : points[focused];
+  return (
+    <figure className="calibration-fit-direction" data-direction={direction}>
+      <figcaption>
+        <strong>{label}</strong>
+        <small>
+          {fit.samples.toLocaleString()} 采样 · 残差 RMS {fitNumber(fit.rmse)}{" "}
+          Nm
+        </small>
+      </figcaption>
+      {points.length ? (
+        <svg
+          viewBox={`0 0 ${width} ${height}`}
+          role="img"
+          aria-label={`${label}力矩残差分箱实测与拟合预测，速度 rad/s，力矩 Nm`}
+        >
+          {[0, 0.5, 1].map((fraction) => {
+            const effort = yMin + fraction * (yMax - yMin);
+            return (
+              <g className="calibration-chart-grid" key={fraction}>
+                <line
+                  x1={left}
+                  x2={width - right}
+                  y1={y(effort)}
+                  y2={y(effort)}
+                />
+                <text x={left - 6} y={y(effort) + 3} textAnchor="end">
+                  {fitNumber(effort)}
+                </text>
+                <text
+                  x={x(xMin + fraction * (xMax - xMin))}
+                  y={height - 13}
+                  textAnchor={
+                    fraction === 0 ? "start" : fraction === 1 ? "end" : "middle"
+                  }
+                >
+                  {fitNumber(xMin + fraction * (xMax - xMin))}
+                </text>
+              </g>
+            );
+          })}
+          <text className="calibration-chart-tick" x={left} y={10}>
+            Nm
+          </text>
+          <text
+            className="calibration-chart-tick"
+            x={width - right}
+            y={height - 1}
+            textAnchor="end"
+          >
+            rad/s
+          </text>
+          <path
+            className="calibration-fit-prediction"
+            fill="none"
+            d={points
+              .map(
+                (point, index) =>
+                  `${index ? "L" : "M"}${x(point.velocity)},${y(point.predicted)}`,
+              )
+              .join(" ")}
+          />
+          {points.map((point, index) => (
+            <g key={index}>
+              <circle
+                className="calibration-fit-predicted-point"
+                cx={x(point.velocity)}
+                cy={y(point.predicted)}
+                r={2}
+              />
+              <circle
+                className="calibration-fit-measurement"
+                cx={x(point.velocity)}
+                cy={y(point.effort)}
+                r={3.5}
+                tabIndex={0}
+                aria-label={`速度 ${point.velocity} rad/s，实测 ${point.effort} Nm，拟合 ${point.predicted} Nm，${point.samples} 采样`}
+                onPointerEnter={() => setFocused(index)}
+                onFocus={() => setFocused(index)}
+              >
+                <title>
+                  {point.velocity} rad/s · 实测 {point.effort} Nm · 拟合{" "}
+                  {point.predicted} Nm · {point.samples} 采样
+                </title>
+              </circle>
+            </g>
+          ))}
+        </svg>
+      ) : (
+        <p className="calibration-empty">无分箱数据</p>
+      )}
+      <div className="calibration-fit-range">
+        速度 {fitNumber(fit.velocity_min)} → {fitNumber(fit.velocity_max)} rad/s
+      </div>
+      <dl className="calibration-fit-parameters">
+        {(
+          [
+            ["static_friction", "Fs", "Nm"],
+            ["coulomb", "Fc", "Nm"],
+            ["viscous", "B", "Nm·s/rad"],
+            ["stribeck_velocity", "Vs", "rad/s"],
+          ] as const
+        ).map(([key, name, unit]) => (
+          <div key={key}>
+            <dt>
+              {name} <small>{unit}</small>
+            </dt>
+            <dd title={String(fit.curve[key])}>{fitNumber(fit.curve[key])}</dd>
+          </div>
+        ))}
+      </dl>
+      <div className="calibration-fit-sample" aria-live="polite">
+        {point
+          ? `${fitNumber(point.velocity)} rad/s · 实测 ${fitNumber(point.effort)} / 拟合 ${fitNumber(point.predicted)} Nm · ${point.samples} 采样`
+          : "指向分箱点查看采样"}
+      </div>
+    </figure>
+  );
+}
+function FrictionFitChart({
+  fit,
+  axis,
+  automatic,
+}: {
+  fit?: Identification;
+  axis: number;
+  automatic: boolean;
+}) {
+  return (
+    <section
+      className="calibration-friction-fit"
+      aria-label={`J${axis + 1} 力矩残差拟合`}
+    >
+      <div className="calibration-fit-heading">
+        <strong>J{axis + 1} · 力矩残差拟合</strong>
+        {fit && (
+          <small>
+            {fit.samples.toLocaleString()} 采样
+            {fit.max_friction != null
+              ? ` · ${automatic ? "自动" : ""}补偿幅值 ${fitNumber(fit.max_friction)} Nm`
+              : ""}
+          </small>
+        )}
+      </div>
+      {fit ? (
+        <>
+          <div className="calibration-fit-legend">
+            <span>● 分箱实测</span>
+            <span>━ 拟合预测</span>
+          </div>
+          <div className="calibration-fit-directions">
+            <DirectionChart
+              key={`${axis}:positive`}
+              fit={fit.positive}
+              direction="positive"
+              label="正向"
+            />
+            <DirectionChart
+              key={`${axis}:negative`}
+              fit={fit.negative}
+              direction="negative"
+              label="反向"
+            />
+          </div>
+        </>
+      ) : (
+        <p className="calibration-empty">J{axis + 1} 无摩擦拟合数据</p>
+      )}
+    </section>
+  );
+}
 
 export function calibrationTrials(
   report: CalibrationReport,
@@ -62,11 +336,14 @@ export function calibrationTrialLabel(
     original = report.baseline.joints[axis];
   return (
     [
-      config.coulomb !== original.coulomb ? `Fc ${config.coulomb}` : "",
-      config.velocity_ff !== original.velocity_ff
-        ? `前馈 ${config.velocity_ff}`
+      !sameStribeckTuning(config.stribeck, original.stribeck)
+        ? "拟合 Stribeck"
         : "",
-      config.kd !== original.kd ? `Kd ${config.kd}` : "",
+      ...calibrationParameters(original, config)
+        .filter(
+          (row) => !row.key.startsWith("stribeck") && row.before !== row.after,
+        )
+        .map((row) => `${row.label} ${calibrationParameterValue(row.after)}`),
     ]
       .filter(Boolean)
       .join(" / ") || `试验 #${trial.index}`
@@ -84,9 +361,11 @@ export default function CalibrationChart({
     live?.axis ??
       report?.settings.axis ??
       report?.trials.find((trial) => trial.axis != null)?.axis ??
+      report?.identification?.[0]?.axis ??
       0,
   );
   const [metric, setMetric] = useState<Metric>("position");
+  const hasIdentification = !!report?.identification?.length;
   const hasCartesian = !!report?.trials.some(
     (trial) =>
       trial.space === "cartesian" || trial.phase.startsWith("cartesian_"),
@@ -95,7 +374,7 @@ export default function CalibrationChart({
     hasCartesian ? "cartesian" : "all",
   );
   const [mode, setMode] = useState<"full" | "compare">(
-    hasCartesian ? "compare" : "full",
+    report ? "compare" : "full",
   );
   const [comparison, setComparison] = useState<number | null>(null);
   const [hover, setHover] = useState<{ plot: string; index: number } | null>(
@@ -224,7 +503,7 @@ export default function CalibrationChart({
       data-mode={report ? mode : "full"}
       data-live-count={live?.points.length}
     >
-      {hasCartesian && (
+      {hasCartesian && metric !== "friction" && (
         <div className="calibration-space-tabs" aria-label="曲线动作类型">
           {(
             [
@@ -266,7 +545,12 @@ export default function CalibrationChart({
           ))}
         </div>
         <div className="calibration-metric-tabs" aria-label="曲线指标">
-          {metrics.map(([key, label]) => (
+          {[
+            ...metrics,
+            ...(hasIdentification
+              ? [["friction", "摩擦拟合"] as [Metric, string]]
+              : []),
+          ].map(([key, label]) => (
             <button
               key={key}
               aria-pressed={metric === key}
@@ -279,24 +563,32 @@ export default function CalibrationChart({
             </button>
           ))}
         </div>
-        <select
-          className="calibration-chart-mode"
-          aria-label="曲线范围"
-          value={report ? mode : "full"}
-          onChange={(event) => {
-            setMode(event.target.value as "full" | "compare");
-            setHover(null);
-          }}
-        >
-          <option value="full">全程</option>
-          {report && (
-            <option value="compare">
-              {scope === "cartesian" ? "末端调整前 / 后" : "基线 / 候选对比"}
-            </option>
-          )}
-        </select>
+        {metric !== "friction" && (
+          <select
+            className="calibration-chart-mode"
+            aria-label="曲线范围"
+            value={report ? mode : "full"}
+            onChange={(event) => {
+              setMode(event.target.value as "full" | "compare");
+              setHover(null);
+            }}
+          >
+            <option value="full">全程</option>
+            {report && (
+              <option value="compare">
+                {scope === "cartesian" ? "末端调整前 / 后" : "基线 / 候选对比"}
+              </option>
+            )}
+          </select>
+        )}
       </div>
-      {hasCurves ? (
+      {metric === "friction" && report ? (
+        <FrictionFitChart
+          fit={report.identification?.find((fit) => fit.axis === axis)}
+          axis={axis}
+          automatic={report.settings.max_friction == null}
+        />
+      ) : hasCurves ? (
         <>
           <div className="calibration-chart-toolbar">
             <div className="calibration-chart-legend">

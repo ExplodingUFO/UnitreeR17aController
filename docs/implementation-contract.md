@@ -1,6 +1,6 @@
 # API 接入说明
 
-本文对应当前桌面软件的实现，说明请求、返回值、状态订阅和动作确认方式。更新日期：2026-11-22。机器可读定义见 [OpenAPI 3.1](openapi.json)。
+本文对应当前桌面软件的实现，说明请求、返回值、状态订阅和动作确认方式。更新日期：2026-11-23。机器可读定义见 [OpenAPI 3.1](openapi.json)。
 
 ## 1. 连接与认证
 
@@ -11,7 +11,7 @@
 | 服务生命周期   | 随桌面应用启动和退出                                   |
 | 访问范围       | 当前仅监听本机回环地址                                 |
 | HTTP 认证      | `Authorization: Bearer <token>`                        |
-| POST 格式      | `Content-Type: application/json`，请求体最多 2 MiB    |
+| POST 格式      | `Content-Type: application/json`，请求体最多 2 MiB     |
 | 状态与数值     | JSON；长度用米，角度用弧度；`_ms` 用毫秒，`_us` 用微秒 |
 
 应用每次启动生成新的 `token`。外部程序从桌面顶部“接口”页复制令牌；当前没有通过 HTTP 获取令牌的接口。令牌用于访问应用，`lease_id` 用于持有控制权，两者用途不同。
@@ -20,22 +20,22 @@
 
 ## 2. 接口总表
 
-| 方法与路径              | 输入                          | 成功输出                           | 含义                     |
-| ----------------------- | ----------------------------- | ---------------------------------- | ------------------------ |
-| `GET /v1/ports`         | 无                            | `200 PortInfo[]`                   | 枚举本机串口             |
-| `GET /v1/state`         | 无                            | `200 Snapshot`                     | 读取最近一次状态快照     |
-| `POST /v1/control`      | `ControlRequest`              | `200 ControlReply`                 | 取得、续期或释放控制权   |
-| `POST /v1/commands`     | `CommandRequest`              | `202 {request_id,status:"queued"}` | 提交设备或动作请求       |
-| `GET /v1/events`        | WebSocket 升级后发送认证首帧  | `101`，随后推送 `StateEvent`       | 订阅完整状态快照         |
-| `GET /v1/logs?limit=50` | 可选条数                      | `200 LogRecord[]`                  | 查询 SQLite 中最近的日志 |
-| `GET /v1/logs/page`     | 分页、搜索与记录范围          | `200 LogPage`                      | 查询持久化日志历史       |
-| `GET /v1/traces`        | 可选 `limit`                  | `200 TraceSummary[]`               | 查询最近采样             |
-| `POST /v1/traces`       | `{duration_ms?:number\|null}` | `200 TraceSummary`                 | 开始短时采样             |
-| `POST /v1/traces/stop`  | 无                            | `200 TraceSummary\|null`           | 结束当前采样             |
-| `GET /v1/traces/{id}`   | 可选 `download/attachment`    | `200 TraceRecording`               | 读取或下载采样 JSON      |
-| `POST /v1/calibrations/preview` | 幅度、速度、方向 | `200 CalibrationPreview` | 生成只读运动预览 |
-| `GET /v1/calibrations?limit=20` | 可选条数 | `200 CalibrationReport[]` | 查询最近校准报告 |
-| `GET /v1/calibrations/{id}?points=3000` | 报告 ID、绘图点数 | `200 CalibrationReport` | 读取校准报告及绘图曲线 |
+| 方法与路径                              | 输入                          | 成功输出                           | 含义                     |
+| --------------------------------------- | ----------------------------- | ---------------------------------- | ------------------------ |
+| `GET /v1/ports`                         | 无                            | `200 PortInfo[]`                   | 枚举本机串口             |
+| `GET /v1/state`                         | 无                            | `200 Snapshot`                     | 读取最近一次状态快照     |
+| `POST /v1/control`                      | `ControlRequest`              | `200 ControlReply`                 | 取得、续期或释放控制权   |
+| `POST /v1/commands`                     | `CommandRequest`              | `202 {request_id,status:"queued"}` | 提交设备或动作请求       |
+| `GET /v1/events`                        | WebSocket 升级后发送认证首帧  | `101`，随后推送 `StateEvent`       | 订阅完整状态快照         |
+| `GET /v1/logs?limit=50`                 | 可选条数                      | `200 LogRecord[]`                  | 查询 SQLite 中最近的日志 |
+| `GET /v1/logs/page`                     | 分页、搜索与记录范围          | `200 LogPage`                      | 查询持久化日志历史       |
+| `GET /v1/traces`                        | 可选 `limit`                  | `200 TraceSummary[]`               | 查询最近采样             |
+| `POST /v1/traces`                       | `{duration_ms?:number\|null}` | `200 TraceSummary`                 | 开始短时采样             |
+| `POST /v1/traces/stop`                  | 无                            | `200 TraceSummary\|null`           | 结束当前采样             |
+| `GET /v1/traces/{id}`                   | 可选 `download/attachment`    | `200 TraceRecording`               | 读取或下载采样 JSON      |
+| `POST /v1/calibrations/preview`         | 幅度、速度、方向              | `200 CalibrationPreview`           | 生成只读运动预览         |
+| `GET /v1/calibrations?limit=20`         | 可选条数                      | `200 CalibrationReport[]`          | 查询最近校准报告         |
+| `GET /v1/calibrations/{id}?points=3000` | 报告 ID、绘图点数             | `200 CalibrationReport`            | 读取校准报告及绘图曲线   |
 
 普通 HTTP 返回值直接使用表中的结构，没有统一的 `data` 包装。只有 WebSocket 状态消息使用 `{type:"state",data:Snapshot}`。
 
@@ -61,7 +61,7 @@
 | 字段        | 类型           | 输入要求                                                          |
 | ----------- | -------------- | ----------------------------------------------------------------- |
 | `action`    | string         | `acquire`、`renew`、`release`                                     |
-| `client_id` | string         | 非空；建议使用可辨认的名称     |
+| `client_id` | string         | 非空；建议使用可辨认的名称                                        |
 | `lease_id`  | string 或 null | `acquire` 可省略；`renew`、`release` 必须传入取得控制权时返回的值 |
 
 取得控制权：
@@ -108,35 +108,35 @@
 
 所有命令都提交到 `POST /v1/commands`，包含以下字段。操作参数与公共字段处于同一层。
 
-| 字段         | 类型          | 要求                                                       |
-| ------------ | ------------- | ---------------------------------------------------------- |
+| 字段         | 类型          | 要求                                |
+| ------------ | ------------- | ----------------------------------- |
 | `request_id` | string        | 非空；每个新请求使用新值，建议 UUID |
-| `client_id`  | string        | 当前持有控制权的客户端标识                                 |
-| `lease_id`   | string        | 当前控制权凭据                                             |
-| `generation` | 非负整数，u64 | 最新状态或控制权响应中的值                                 |
-| `kind`       | string        | 下表中的命令名                                             |
+| `client_id`  | string        | 当前持有控制权的客户端标识          |
+| `lease_id`   | string        | 当前控制权凭据                      |
+| `generation` | 非负整数，u64 | 最新状态或控制权响应中的值          |
+| `kind`       | string        | 下表中的命令名                      |
 
 `generation` 会随控制权变化、连接、配置、动作结束或取消等状态变化而更新。收到 `stale_context` 后先读取状态，重新确认操作意图，不直接重发旧动作。
 
 ### 5.2 操作参数与确认条件
 
-| `kind`           | 附加输入                                              | 确认方式                                                                |
-| ---------------- | ----------------------------------------------------- | ----------------------------------------------------------------------- |
-| `connect`        | `port:string`，`side:"left"\|"right"`                 | 请求被接受后，等待 `phase:"disabled"`，七轴反馈齐全且新鲜               |
-| `disconnect`     | `allow_release?:boolean`                              | `phase:"disconnected"`、`port:null`                                     |
-| `enable`         | 无                                                    | 该请求 `completed/enabled`，`enabled:true`、`phase:"ready"`             |
-| `disable`        | `allow_release?:boolean`                              | 请求被接受且 `enabled:false`；若已有故障，`phase` 仍可为 `fault`        |
-| `clear_fault`    | 无                                                    | 该请求 `completed/cleared`，`error:null`、`enabled:false`               |
-| `configure_tcp`  | `tcp:Pose`                                            | 请求被接受，`tcp_configured:true`，`tcp_transform` 与归一化后的输入一致 |
-| `configure_servo` | `config:ServoTuning`（完整七轴配置） | `accepted/configure_servo`，快照配置及版本更新；不产生独立 completed |
-| `configure_motion` | `config:MotionTuning` | `accepted/configure_motion`，快照运动设置与 generation 更新 |
-| `calibrate_start` | `settings:CalibrationSettings` | 接受后跟踪 `calibration`；结束返回 completed、cancelled 或 failed，code 为 calibration_done |
-| `calibrate_apply` | `calibration_id:string` | `accepted/calibrate_apply`，配置及版本与推荐一致 |
-| `jog_start`      | `space,axis,direction,speed,frame?,ttl_ms?,input_seq` | 请求被接受且 `action.request_id` 等于本次 `request_id`                  |
-| `jog_update`     | `action_id,input_seq,ttl_ms?`                         | 成功更新不产生 `accepted` 记录；按当前动作与后续状态判断                |
-| `step`           | `space,axis,direction,amount,speed,frame?`            | 该请求 `completed/completed`                                            |
-| `return_to_pose` | `joints:[number;7],speed,disconnect_after?:boolean`   | 该请求 `completed/returned`（继续保持）或 `completed/parked`（已断开）  |
-| `stop`           | 无                                                    | 原动作收到 `cancelled`、`action:null`，等待 `stopping` 结束             |
+| `kind`             | 附加输入                                              | 确认方式                                                                                    |
+| ------------------ | ----------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `connect`          | `port:string`，`side:"left"\|"right"`                 | 请求被接受后，等待 `phase:"disabled"`，七轴反馈齐全且新鲜                                   |
+| `disconnect`       | `allow_release?:boolean`                              | `phase:"disconnected"`、`port:null`                                                         |
+| `enable`           | 无                                                    | 该请求 `completed/enabled`，`enabled:true`、`phase:"ready"`                                 |
+| `disable`          | `allow_release?:boolean`                              | 请求被接受且 `enabled:false`；若已有故障，`phase` 仍可为 `fault`                            |
+| `clear_fault`      | 无                                                    | 该请求 `completed/cleared`，`error:null`、`enabled:false`                                   |
+| `configure_tcp`    | `tcp:Pose`                                            | 请求被接受，`tcp_configured:true`，`tcp_transform` 与归一化后的输入一致                     |
+| `configure_servo`  | `config:ServoTuning`（完整七轴配置）                  | `accepted/configure_servo`，快照配置及版本更新；不产生独立 completed                        |
+| `configure_motion` | `config:MotionTuning`                                 | `accepted/configure_motion`，快照运动设置与 generation 更新                                 |
+| `calibrate_start`  | `settings:CalibrationSettings`                        | 接受后跟踪 `calibration`；结束返回 completed、cancelled 或 failed，code 为 calibration_done |
+| `calibrate_apply`  | `calibration_id:string`                               | `accepted/calibrate_apply`，配置及版本与推荐一致                                            |
+| `jog_start`        | `space,axis,direction,speed,frame?,ttl_ms?,input_seq` | 请求被接受且 `action.request_id` 等于本次 `request_id`                                      |
+| `jog_update`       | `action_id,input_seq,ttl_ms?`                         | 成功更新不产生 `accepted` 记录；按当前动作与后续状态判断                                    |
+| `step`             | `space,axis,direction,amount,speed,frame?`            | 该请求 `completed/completed`                                                                |
+| `return_to_pose`   | `joints:[number;7],speed,disconnect_after?:boolean`   | 该请求 `completed/returned`（继续保持）或 `completed/parked`（已断开）                      |
+| `stop`             | 无                                                    | 原动作收到 `cancelled`、`action:null`，等待 `stopping` 结束                                 |
 
 `connect.port` 使用枚举返回的 `name`，非空。串口当前使用 6,000,000 波特率。更换串口或左右臂前先断开连接；切换左右臂会清除已设置的 TCP。
 
@@ -147,10 +147,10 @@
 ### 5.3 坐标、单位与范围
 
 | 点动类型 | `space` / `axis`                | `speed` 单位 | `amount` 单位 |
-| -------- | ------------------------------- | ------------------ | ------------------- |
-| 关节     | `joint`，0..6 对应 J1..J7       | rad/s | rad |
-| 末端平移 | `cartesian`，0..2 对应 X/Y/Z    | m/s | m |
-| 末端旋转 | `cartesian`，3..5 对应 Rx/Ry/Rz | rad/s | rad |
+| -------- | ------------------------------- | ------------ | ------------- |
+| 关节     | `joint`，0..6 对应 J1..J7       | rad/s        | rad           |
+| 末端平移 | `cartesian`，0..2 对应 X/Y/Z    | m/s          | m             |
+| 末端旋转 | `cartesian`，3..5 对应 Rx/Ry/Rz | rad/s        | rad           |
 
 `speed`、`amount` 必须为正数，方向由 `direction:-1|1` 指定。`frame` 默认 `base`：`base` 沿固定基座轴运动，`tool` 沿当前 TCP 轴运动。关节点动建议传 `base`，该字段不影响关节轴。
 
@@ -281,7 +281,7 @@ J1 正向连续点动，速度 0.1 rad/s：
 
 停止权限、租约与 generation 校验、原请求的 cancelled 结果保持原有语义。正常停止按 jerk 限制减速，可能需要更长时间；`action:null` 后仍须等待 `stopping` 结束。停止求解惩罚关节速度本身，使冗余方向的速度也减至零，连续性由导数硬约束维持。笛卡尔路径无法满足制动约束时，写入 `control/stop_path` 警告并转为受限关节制动。故障、失能和关闭继续优先处理。
 
-离散参考的导数限制不保证实际 TX 节拍或机械臂物理运动的 jerk。发送时间对齐、轨迹与采样尚未真机验收；伺服基线仍为 `kp=60`、`kd=10` 和 URDF 重力前馈；本轮可显式配置逐轴阻尼、速度前馈权重及平滑摩擦，总附加前馈按实际协议编码。
+离散参考的导数限制不保证实际 TX 节拍或机械臂物理运动的 jerk。伺服基线仍为 `kp=60`、`kd=10` 和 URDF 重力前馈；本轮可显式配置逐轴阻尼、速度前馈权重及平滑摩擦，总附加前馈按实际协议编码。
 
 ### 5.8 发送时间对齐
 
@@ -305,18 +305,27 @@ J1 正向连续点动，速度 0.1 rad/s：
 
 ### 5.9 伺服调试配置
 
-`configure_servo` 应用完整 `config:ServoTuning`，不是部分更新。`friction_enabled` 为必填 boolean，`joints` 为 J1..J7 顺序的恰好七项；各项以下六个字段全部必填且必须有限。表中范围均含端点，基线值不表示请求可以省略字段。
+`configure_servo` 应用完整 `config:ServoTuning`，不是部分更新。`friction_enabled` 为必填 boolean，`joints` 为 J1..J7 顺序的恰好七项；各项以下六个字段仍全部必填且必须有限，另可提供 `stribeck`。表中范围均含端点，基线值不表示请求可以省略这六个字段。
 
-| 每轴字段 | 含义与单位 | 有效数值 | 基线 |
-| --- | --- | --- | --- |
-| `kd` | 阻尼，Nm·s/rad | 非负，实际协议可表示 | 10 |
-| `velocity_ff` | 速度前馈权重，无量纲 | 非负 | 1 |
-| `coulomb` | 库仑摩擦幅值 Fc，Nm | 非负 | 0 |
-| `viscous` | 黏性系数 B，Nm·s/rad | 非负 | 0 |
-| `velocity_scale` | 平滑过零尺度 epsilon，rad/s | 正数 | 0.02 |
-| `max_friction` | 摩擦补偿幅值上限，Nm | 非负 | 0.5 |
+| 每轴字段         | 含义与单位                  | 有效数值             | 基线 |
+| ---------------- | --------------------------- | -------------------- | ---- |
+| `kd`             | 阻尼，Nm·s/rad              | 非负，实际协议可表示 | 10   |
+| `velocity_ff`    | 速度前馈权重，无量纲        | 非负                 | 1    |
+| `coulomb`        | 库仑摩擦幅值 Fc，Nm         | 非负                 | 0    |
+| `viscous`        | 黏性系数 B，Nm·s/rad        | 非负                 | 0    |
+| `velocity_scale` | 平滑过零尺度 epsilon，rad/s | 正数                 | 0.02 |
+| `max_friction`   | 摩擦补偿幅值上限，Nm        | 非负                 | 0.5  |
 
-全局基线为 `friction_enabled:false`。完整请求示例：
+`stribeck:StribeckTuning` 为可选对象，包含 `enabled:boolean`、`positive:FrictionCurve` 和 `negative:FrictionCurve`。省略整个对象时按关闭读取，兼容原有六字段配置。显式提供时三个字段都需完整；正、负方向分别提供以下四个有限参数：
+
+| 曲线字段            | 含义与单位           | 有效数值        | 默认曲线 |
+| ------------------- | -------------------- | --------------- | -------- |
+| `coulomb`           | 库仑幅值 Fc，Nm      | 非负            | 0        |
+| `static_friction`   | 低速幅值 Fs，Nm      | 非负，可小于 Fc | 0        |
+| `viscous`           | 黏性系数 B，Nm·s/rad | 非负            | 0        |
+| `stribeck_velocity` | 衰减速度 Vs，rad/s   | 正数            | 0.02     |
+
+全局基线为 `friction_enabled:false`，各轴 `stribeck.enabled:false`。以下原有完整请求继续有效：
 
 ```json
 {
@@ -328,14 +337,91 @@ J1 正向连续点动，速度 0.1 rad/s：
   "config": {
     "friction_enabled": false,
     "joints": [
-      {"kd":10,"velocity_ff":1,"coulomb":0,"viscous":0,"velocity_scale":0.02,"max_friction":0.5},
-      {"kd":10,"velocity_ff":1,"coulomb":0,"viscous":0,"velocity_scale":0.02,"max_friction":0.5},
-      {"kd":10,"velocity_ff":1,"coulomb":0,"viscous":0,"velocity_scale":0.02,"max_friction":0.5},
-      {"kd":10,"velocity_ff":1,"coulomb":0,"viscous":0,"velocity_scale":0.02,"max_friction":0.5},
-      {"kd":10,"velocity_ff":1,"coulomb":0,"viscous":0,"velocity_scale":0.02,"max_friction":0.5},
-      {"kd":10,"velocity_ff":1,"coulomb":0,"viscous":0,"velocity_scale":0.02,"max_friction":0.5},
-      {"kd":10,"velocity_ff":1,"coulomb":0,"viscous":0,"velocity_scale":0.02,"max_friction":0.5}
+      {
+        "kd": 10,
+        "velocity_ff": 1,
+        "coulomb": 0,
+        "viscous": 0,
+        "velocity_scale": 0.02,
+        "max_friction": 0.5
+      },
+      {
+        "kd": 10,
+        "velocity_ff": 1,
+        "coulomb": 0,
+        "viscous": 0,
+        "velocity_scale": 0.02,
+        "max_friction": 0.5
+      },
+      {
+        "kd": 10,
+        "velocity_ff": 1,
+        "coulomb": 0,
+        "viscous": 0,
+        "velocity_scale": 0.02,
+        "max_friction": 0.5
+      },
+      {
+        "kd": 10,
+        "velocity_ff": 1,
+        "coulomb": 0,
+        "viscous": 0,
+        "velocity_scale": 0.02,
+        "max_friction": 0.5
+      },
+      {
+        "kd": 10,
+        "velocity_ff": 1,
+        "coulomb": 0,
+        "viscous": 0,
+        "velocity_scale": 0.02,
+        "max_friction": 0.5
+      },
+      {
+        "kd": 10,
+        "velocity_ff": 1,
+        "coulomb": 0,
+        "viscous": 0,
+        "velocity_scale": 0.02,
+        "max_friction": 0.5
+      },
+      {
+        "kd": 10,
+        "velocity_ff": 1,
+        "coulomb": 0,
+        "viscous": 0,
+        "velocity_scale": 0.02,
+        "max_friction": 0.5
+      }
     ]
+  }
+}
+```
+
+例如启用 J2 的双向 Stribeck 曲线时，把完整请求的 `config.friction_enabled` 设为 `true`，并把 `joints[1]` 替换为以下对象；其余六轴仍须一并提交：
+
+```json
+{
+  "kd": 10,
+  "velocity_ff": 1,
+  "coulomb": 0,
+  "viscous": 0,
+  "velocity_scale": 0.02,
+  "max_friction": 0.6,
+  "stribeck": {
+    "enabled": true,
+    "positive": {
+      "coulomb": 0.18,
+      "static_friction": 0.32,
+      "viscous": 0.04,
+      "stribeck_velocity": 0.025
+    },
+    "negative": {
+      "coulomb": 0.22,
+      "static_friction": 0.36,
+      "viscous": 0.05,
+      "stribeck_velocity": 0.03
+    }
   }
 }
 ```
@@ -346,9 +432,17 @@ J1 正向连续点动，速度 0.1 rad/s：
 
 每次连接或断开都恢复基线并更新配置版本；配置只保存在当前连接内存中，不自动持久化。在控制页点击“点动 → 参数”打开弹窗，编辑、恢复基线只改草稿，须显式应用；复制 JSON 不发送命令。关闭弹窗保留当前连接的草稿，已提交请求继续等待确认；重新连接清除旧草稿。
 
-发送端以对齐后的未缩放轨迹速度 `v` 计算 `requested=clamp(Fc*tanh(v/epsilon)+B*v, ±max_friction)`，再计算 `tau_ff=tau_gravity+requested`，并按实际协议编码。摩擦开关关闭或 `v=0` 时摩擦项严格为零。速度前馈独立为 `dq_feedforward=velocity_ff*v`，只作用于最终报文速度字段；`Reference.dq`、位置积分、TCP/目标复核、停止与收纳时序保持原值。输出字段仍须满足实际协议的可表示范围；该范围不是电机总输出扭矩的保证。
+发送端使用对齐后的未缩放轨迹速度 `v`。全局摩擦开启且该轴 `stribeck.enabled:true` 时，`v>0` 选 positive，`v<0` 选 negative，计算：
 
-参数标定与减抖效果尚未真机验证；候选方案和证据见[补偿方案调查](research/motion-compensation-repositories-2026-11-21.md)。
+```text
+raw = [Fc + (Fs - Fc) * exp(-(abs(v) / Vs)^2)] * tanh(v / velocity_scale) + B * v
+requested = clamp(raw, -max_friction, max_friction)
+tau_ff = tau_gravity + requested
+```
+
+该轴 Stribeck 关闭或省略时，保留原公式 `raw=Fc*tanh(v/velocity_scale)+B*v`，Fc/B 使用原六字段中的 `coulomb/viscous`。全局摩擦关闭或 `v=0` 时摩擦项严格为零；两种模型共用该轴原有 `max_friction` 限幅。速度前馈独立为 `dq_feedforward=velocity_ff*v`，只作用于最终报文速度字段；`Reference.dq`、位置积分、TCP/目标复核、停止与收纳时序保持原值。纯 Rust 无状态计算只改变附加前馈，输出继续按实际协议编码。
+
+候选方案和证据见[补偿方案调查](research/motion-compensation-repositories-2026-11-21.md)。
 
 ### 5.10 低速稳定性校准
 
@@ -360,12 +454,12 @@ J1 正向连续点动，速度 0.1 rad/s：
 { "amplitude": 0.05, "speed": 0.01, "axes": [0, 1, 2] }
 ```
 
-| 字段 | 默认 | 范围与单位 |
-| --- | --- | --- |
-| `amplitude` | null | 自动计算各方向连续可达行程；指定时为有限正数，单位 m，按实际可达范围截取 |
-| `speed` | 0.01 | 有限正数，单位 m/s；运动设置与模型决定实际可执行速度 |
-| `axes` | [0,1,2] | 基座 X/Y/Z；重复值合并 |
-| `motion` | 1 / 0.6 / 6 | joint_speed / acceleration / jerk，分别为 rad/s、rad/s²、rad/s³ |
+| 字段        | 默认        | 范围与单位                                                               |
+| ----------- | ----------- | ------------------------------------------------------------------------ |
+| `amplitude` | null        | 自动计算各方向连续可达行程；指定时为有限正数，单位 m，按实际可达范围截取 |
+| `speed`     | 0.01        | 有限正数，单位 m/s；运动设置与模型决定实际可执行速度                     |
+| `axes`      | [0,1,2]     | 基座 X/Y/Z；重复值合并                                                   |
+| `motion`    | 1 / 0.6 / 6 | joint_speed / acceleration / jerk，分别为 rad/s、rad/s²、rad/s³          |
 
 预览使用当前指令保持位置和当前 TCP，沿各方向生成正向、反向、回原位片段。保持 TCP 姿态，连续求解关节构型；不足整段时保留可达行程。返回 `program` 与 `points`：
 
@@ -386,12 +480,21 @@ J1 正向连续点动，速度 0.1 rad/s：
   "lease_id": "11111111-1111-4111-8111-111111111111",
   "generation": 5,
   "kind": "calibrate_start",
-  "settings": { "cartesian": {
-      "side": "right", "origin": [0.3,0.7,1.1,0.9,-0.4,0.2,-0.3],
-      "tcp": {"translation":[0,0,0],"rotation":[0,0,0,1]},
-      "amplitude": 0.05, "speed": 0.01, "joint_excursion": 0.2792526803190927,
-      "segments": [{"axis":0,"offset":0.05},{"axis":0,"offset":-0.05},{"axis":0,"offset":0}]
-    } }
+  "settings": {
+    "cartesian": {
+      "side": "right",
+      "origin": [0.3, 0.7, 1.1, 0.9, -0.4, 0.2, -0.3],
+      "tcp": { "translation": [0, 0, 0], "rotation": [0, 0, 0, 1] },
+      "amplitude": 0.05,
+      "speed": 0.01,
+      "joint_excursion": 0.2792526803190927,
+      "segments": [
+        { "axis": 0, "offset": 0.05 },
+        { "axis": 0, "offset": -0.05 },
+        { "axis": 0, "offset": 0 }
+      ]
+    }
+  }
 }
 ```
 
@@ -400,67 +503,84 @@ J1 正向连续点动，速度 0.1 rad/s：
 程序顺序：
 
 1. 按预览的末端三向路线记录七轴基线。
-2. 以原位为中心逐轴 ±8° 往返，两档速度默认 2°/s、4°/s，测量关节跟随。
-3. 在误差较大的两轴分别比较 Fc=0.1/0.2 Nm 与起始速度前馈的 75%，合并优选参数。
-4. 执行同一条末端路线，测量补偿后七轴响应；再回到原始关节姿态、恢复起始参数。
+2. 以原位为中心逐轴 ±8° 往返，默认使用 1°/s、2°/s、4°/s 三档，采集正、负两个方向的实测速度、位置与反馈扭矩。
+3. 进入 `identifying`，后台依据逐轴反馈扭矩减实际反馈位置处 URDF 模型重力的残差，分别拟合正负方向的 Fc、Fs、B、Vs，同时拟合加速度项 `inertia*a`。
+4. 对每个所选轴产生的有效拟合候选执行实测比较，合并各轴优选结果；数据不足的轴保持起始配置并报告部分辨识结果。
+5. 执行同一条末端路线验证合并参数；纯关节模式使用合并参数逐轴复测。正常结束回到原始关节姿态，恢复开始前的伺服与运动设置。
 
-Kp/Kd 保持起始值。推荐只涉及平滑摩擦与速度前馈，末端前后测量用于比较整臂跟随。无末端路线的纯关节模式仍支持；它使用关节复测。没有改善也正常完成并保留数据。
+Kp、Kd 和速度前馈权重在整个校准中保持起始值，不进行 PID 自动整定。候选来自本次辨识，不再搜索固定 Fc=0.1/0.2 Nm、75% 速度前馈或只挑两轴。只有合并参数复测改善后才生成推荐，仍需显式应用；没有改善或某轴不可辨识也正常结束并保留数据。
+
+这里拟合的是 `feedback_effort_residual`，即反馈扭矩与模型重力的经验残差。`inertia*a` 用于分离加速段影响，不作为补偿项下发；这些结果不等同于独立测得的摩擦力矩或真实等效刚度。重力、加速度和拟合均在后台计算，控制线程不等待拟合、日志或 SQLite。
 
 `settings` 字段可单独省略。省略 cartesian 时为纯关节模式；完整省略 settings 的现有 API 仍可用：
 
-| 字段 | 默认 | 范围 |
-| --- | --- | --- |
-| `axis` | null，七轴 | 0..6 指定单轴；末端程序测试七轴 |
-| `excursion` | 0.2792526803190927（16°） | 有限正数，rad，目标取一半；末端程序采用 program.joint_excursion |
-| `speed` | 0.03490658503988659（2°/s） | 有限正数，rad/s，第二档两倍 |
-| `max_friction` | 0.2 | Nm，非负，Fc 取一半及全部，0 跳过摩擦候选 |
-| `cartesian` | null | 已预览的 CartesianProgram |
+| 字段           | 默认                        | 范围                                                                                                                                |
+| -------------- | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `axis`         | null，七轴                  | 0..6 指定单轴；末端程序测试七轴                                                                                                     |
+| `excursion`    | 0.2792526803190927（16°）   | 有限正数，rad，目标取一半；末端程序采用 program.joint_excursion                                                                     |
+| `speed`        | 0.03490658503988659（2°/s） | 有限正数，rad/s；用于推导缺省速度档                                                                                                 |
+| `speeds`       | []                          | 可选正有限数数组，rad/s；省略或空数组时为 speed/2、speed、2×speed，显式数组不另设档数或速度上限                                     |
+| `max_friction` | null                        | 可省略或为 null，按各轴有效样本的 `abs(反馈扭矩−URDF重力)` 峰值自动确定补偿限幅；非负有限数为使用者指定的 Nm 上限，0 不生成补偿候选 |
+| `cartesian`    | null                        | 已预览的 CartesianProgram                                                                                                           |
 
-测试沿用已有运动学、速度/加速度/jerk、停止和设备故障处理。片段完成看生成的参考轨迹，不用原始反馈速度或另设的位置静止窗决定下一步。HTTP `202 queued` 后按请求 ID 查看结果及 `Snapshot.calibration`；后端自行推进，客户端只需续期控制权，不发送逐段点动。
+校准的自动限幅与 `JointTuning.max_friction` 的 0.5 Nm 基线用途不同，不以固定候选幅值替代实测残差。显式速度与幅度是试验设置，实际动作继续受现有运动设置和模型约束，不增加另一组固定上限。测试沿用已有运动学、停止和设备故障处理。片段完成看生成的参考轨迹，不用原始反馈速度或另设的位置静止窗决定下一步。HTTP `202 queued` 后按请求 ID 查看结果及 `Snapshot.calibration`；后端自行推进，客户端只需续期控制权，不发送逐段点动。
 
-| 状态字段 | 含义 |
-| --- | --- |
-| `id` / `request_id` | 报告 / 启动请求 ID |
-| `state` | running、stopping、completed、cancelled、failed |
-| `stage` | cartesian_before、baseline、candidate、cartesian_after、validation（纯关节复测）、restoring、done |
-| `space` / `axis` | 当前阶段为 joint 或 cartesian；axis 为 J1..J7 或基座 XYZ 的零起始索引 |
-| `trial_index/trial_count` | 组进度，候选由实测选择，总数会调整 |
-| `leg_index/leg_count` | 当前组片段进度 |
-| `progress` | 0..1，终态以 state/report 判断 |
-| `live` | 运行中的最近一个曲线点，终态省略 |
-| `report` | 终态摘要，curves 为空，sample_count 保留原始总数 |
+| 状态字段                  | 含义                                                                                                                                                         |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `id` / `request_id`       | 报告 / 启动请求 ID                                                                                                                                           |
+| `state`                   | running、stopping、completed、cancelled、failed                                                                                                              |
+| `stage`                   | cartesian_before、baseline、identifying（后台辨识）、candidate、cartesian_after、validation（纯关节复测）、restoring、done；保留 baseline_check 供旧报告读取 |
+| `space` / `axis`          | 当前阶段为 joint 或 cartesian；axis 为 J1..J7 或基座 XYZ 的零起始索引                                                                                        |
+| `trial_index/trial_count` | 组进度，候选由实测选择，总数会调整                                                                                                                           |
+| `leg_index/leg_count`     | 当前组片段进度                                                                                                                                               |
+| `progress`                | 0..1，终态以 state/report 判断                                                                                                                               |
+| `live`                    | 运行中的最近一个曲线点，终态省略                                                                                                                             |
+| `report`                  | 终态摘要，curves 为空，sample_count 与 captured_samples 保留                                                                                                 |
 
 `trials[]` 含 space、phase、axis、config、metrics 与 metrics_by_joint。关节试验的 metrics 为该轴统计；末端试验 axis=null、metrics=null，metrics_by_joint 按 J1..J7 保存七项统计。窗口数 windows、有效时长 valid_ms、速度误差 RMS velocity_rms（rad/s）、位置 RMS/峰值 tracking_rms/tracking_peak（rad），other_peak 为其他轴相对原位偏移。历史试验仍可有 baseline_check/validation 阶段。
 
 候选按相对基线的速度误差 0.6、位置误差 0.4 综合比较，没有固定改善百分比门槛。末端程序用末端复测的七轴综合指标给出结论。`choices[]` 保存所选候选索引及单项相对变化；`recommended` 为完整 ServoTuning 或 null，`improvement` 为综合指标变化，不能替代各轴位置和速度对比。
 
-**曲线**每 20 ms 记录七轴数据，最多 90000 点。所有数组为 J1..J7：
+`report.identification` 为可选数组，旧报告省略时按 `[]` 读取。每项包含：
 
-| 字段 | 含义 |
-| --- | --- |
-| `t_ms` | 距测试开始的主机时间，ms |
-| `trial` / `space` / `axis` | 试验及运动空间/轴；其他六轴仍完整采样 |
-| `reference` | 控制参考位置，rad |
-| `command` | 最近成功发送整批目标，rad；无记录时 null |
-| `feedback` | 缓存实测位置，rad |
-| `velocity` | 成功发送的未缩放轨迹速度，rad/s；无记录时使用控制参考 |
-| `feedback_velocity` | 原始回传速度，rad/s |
-| `feedback_age_ms` | 各轴反馈年龄，ms |
-| `command_at_ms` | 该批发送完成的相对时间，ms；无记录时 null |
+| 字段                    | 含义与单位                                                  |
+| ----------------------- | ----------------------------------------------------------- |
+| `axis` / `source`       | J1..J7 的 0..6 索引；来源固定为 `feedback_effort_residual`  |
+| `samples`               | 参与该轴辨识的样本数                                        |
+| `positive` / `negative` | `DirectionFit` 或 null；该方向不可辨识时为 null，不补造曲线 |
+| `inertia`               | 加速度干扰项的拟合系数，kg·m²；不作为刚度或已验证的物理惯量 |
+| `max_friction`          | 本次实际使用的逐轴补偿预算值，Nm                            |
 
-时间为主机观测，发送和反馈各自保留时效。旧报告只有统计时展示指标，不生成时间曲线。
+`DirectionFit` 包含 `curve:FrictionCurve`、`samples`、`velocity_min/velocity_max`（该方向有符号的实测速度范围，rad/s）、`rmse`（加权模型残差 RMSE，Nm）及 `points:FitPoint[]`。每个绘图点包含 `velocity`（rad/s）、`effort/predicted`（残差与模型预测的加权均值，Nm）和聚合样本数 `samples`；预测为未截断摩擦模型加 `inertia*a`；补偿幅值只用于实际输出，不参与辨识模型的截断，velocity、effort、predicted 均保留方向符号。模型 RMSE 与位置/速度跟随 RMS 分别报告。曲线参数含义与 5.9 相同；所有参数、速度及力矩采用 SI 单位。仅 Stribeck 衰减不可辨识时可退化为 Fc=Fs 的平滑库仑/黏性曲线；整个方向不可辨识时为 null，缺失方向沿用起始补偿模型，已有辨识结果的方向仍参与比较；两方向均不可辨识时该轴保持起始配置。
 
-**应用**：用最新 generation 提交 `kind:"calibrate_apply", calibration_id:"..."`。只应用当前连接最近完成且含推荐的报告；手工改过伺服配置或已应用的结果不重复覆盖。沿用普通参数应用的连接、控制权和空闲要求。结果界面列出具体轴、参数原值/推荐值及末端同轨迹前后表现。
+**曲线**每 20 ms 采集七轴数据，在 90000 点的内存空间内按试验组保留真实样本。较长试验使用保留每组端点的抽样，覆盖全部试验和最终复测，不截断后半段。`captured_samples` 是采集次数（旧报告缺失时为 0），`sample_count` 是保留点数，详情抽取后仍保持这两个计数。后台按时间排序，曲线采用实际时间戳。所有数组为 J1..J7：
+
+| 字段                       | 含义                                                  |
+| -------------------------- | ----------------------------------------------------- |
+| `t_ms`                     | 距测试开始的主机时间，ms                              |
+| `trial` / `space` / `axis` | 试验及运动空间/轴；其他六轴仍完整采样                 |
+| `reference`                | 控制参考位置，rad                                     |
+| `command`                  | 最近成功发送整批目标，rad；无记录时 null              |
+| `feedback`                 | 缓存实测位置，rad                                     |
+| `velocity`                 | 成功发送的未缩放轨迹速度，rad/s；无记录时使用控制参考 |
+| `feedback_velocity`        | 原始回传速度，rad/s                                   |
+| `effort`                   | 可选七轴原始反馈扭矩，Nm；省略或 null 表示未记录      |
+| `feedback_age_ms`          | 各轴反馈年龄，ms                                      |
+| `command_at_ms`            | 该批发送完成的相对时间，ms；无记录时 null             |
+
+时间为主机观测，发送和反馈各自保留时效。旧报告缺失 effort 时按 null 读取，只有统计时展示指标，不生成时间曲线。辨识所用重力在后台按实际反馈关节位置和 URDF 计算。抽样前保留每条反馈的原始邻帧时间和速度，后台据此计算加速度与时间权重，避免把抽样间隔误作反馈间隔。
+
+**应用**：用最新 generation 提交 `kind:"calibrate_apply", calibration_id:"..."`。只应用当前连接最近完成且含推荐的报告；手工改过伺服配置或已应用的结果不重复覆盖。沿用普通参数应用的连接、控制权和空闲要求。结果界面列出逐轴正负方向拟合、参数原值/推荐值及同轨迹前后表现，单轴 Stribeck 开关可在伺服参数中显式切换。
 
 正常完成回原位并恢复原参数；停止取消后续动作、按原停止流程减速并恢复参数，不继续回原位。关闭弹窗可重新查看进度，Esc 请求停止。故障不自动重新使能。
 
 **保存与读取**：完整结果在发布 completed 前即保留于本机内存，详情、下载和历史可立即读到；SQLite 编码、写入及重试仍在写入线程，不阻塞控制。元数据与曲线同事务保存，保留最近 100 份，重启后读取数据库。内部完整结果不会重复进入 HTTP/WS 状态 JSON。
 
 - `GET /v1/calibrations?limit=20`：摘要，limit 1..100，合并刚完成结果。
-- `GET /v1/calibrations/{id}?points=3000`：默认约 3000 个真实点，保留段端点和七轴位置/速度误差极值；points=0 返回全部。
+- `GET /v1/calibrations/{id}?points=3000`：默认约 3000 个真实点，保留段端点和七轴位置/速度误差极值；points=0 返回全部保留点。
 - `GET /v1/calibrations/{id}?download=true`：完整 JSON 附件。
 
-读取、绘图点抽取和编码使用工作线程。未知历史 ID 返回 `404 calibration_not_found`；写盘尚未完成不会让当前结果返回 404。历史可查看、导入和下载，重启后不自动取得应用资格。操作与试用见[校准流程](low-speed-calibration-test-plan.md)。
+读取、绘图点抽取和编码使用工作线程。未知历史 ID 返回 `404 calibration_not_found`；写盘尚未完成不会让当前结果返回 404。历史可查看、导入和下载，重启后不自动取得应用资格。操作与试用见[校准流程](low-speed-calibration-test-plan.md)。发送时间对齐、轨迹、采样及本轮辨识补偿尚未真机验证。
 
 ## 6. 命令输出与执行结果
 
@@ -501,28 +621,28 @@ Kp/Kd 保持起始值。推荐只涉及平滑摩擦与速度前馈，末端前�
 
 `GET /v1/state` 返回 `Snapshot` 本体。WebSocket 使用相同结构作为 `data`。所有字段均存在；暂无数据的可选字段返回 `null`。
 
-| 字段                      | 类型                           | 含义                                               |
-| ------------------------- | ------------------------------ | -------------------------------------------------- |
-| `seq`                     | u64                            | 当前应用运行期间的快照序号                         |
-| `generation`              | u64                            | 当前控制上下文编号，提交命令时原样带回             |
-| `phase`                   | string                         | 运行阶段，见下表                                   |
-| `side` / `port`           | string / string 或 null        | `left` 或 `right`；当前串口                        |
-| `enabled`                 | boolean                        | 已确认的使能状态                                   |
-| `owner`                   | object 或 null                 | `{client_id,expires_in_ms}`；不包含控制权凭据      |
-| `joints`                  | 7 个 `JointSnapshot`           | J1..J7 的实测反馈                                  |
-| `tcp`                     | `Pose` 或 null                 | 根据实测关节计算的基座 → 当前 TCP 位姿             |
-| `tcp_transform`           | `Pose` 或 null                 | 当前 Link7 → TCP 变换；连接后默认为单位变换        |
-| `tcp_configured`          | boolean                        | 是否有可用的 TCP；连接后默认 Link7 法兰为 true     |
-| `servo_tuning` | `ServoTuning` | 当前完整伺服配置，见 5.9；连接/断开恢复基线 |
-| `servo_tuning_revision` | u64 | 当前配置版本；应用及连接/断开重置时更新，不跨进程保存 |
-| `motion_tuning` | `MotionTuning` | 当前关节速度、加速度与 jerk 设置，见 5.7 |
-| `feedback_age_ms`         | u64 或 null                    | 已有反馈中最大的接收年龄                           |
-| `action`                  | object 或 null                 | 当前动作：`request_id,space,mode,axis,progress`    |
-| `calibration` | `CalibrationStatus` 或 null | 当前校准或最近一次结果，见 5.10 |
-| `last_result` / `results` | `CommandResult` 或 null / 数组 | 最新一条结果 / 最近结果                            |
-| `error`                   | `{code,message}` 或 null       | 当前故障                                           |
-| `journal`                 | object                         | `pending,written,dropped,errors,healthy`           |
-| `communication`           | object                         | `received,crc_errors,timeouts`，本次运行的通信计数 |
+| 字段                      | 类型                           | 含义                                                  |
+| ------------------------- | ------------------------------ | ----------------------------------------------------- |
+| `seq`                     | u64                            | 当前应用运行期间的快照序号                            |
+| `generation`              | u64                            | 当前控制上下文编号，提交命令时原样带回                |
+| `phase`                   | string                         | 运行阶段，见下表                                      |
+| `side` / `port`           | string / string 或 null        | `left` 或 `right`；当前串口                           |
+| `enabled`                 | boolean                        | 已确认的使能状态                                      |
+| `owner`                   | object 或 null                 | `{client_id,expires_in_ms}`；不包含控制权凭据         |
+| `joints`                  | 7 个 `JointSnapshot`           | J1..J7 的实测反馈                                     |
+| `tcp`                     | `Pose` 或 null                 | 根据实测关节计算的基座 → 当前 TCP 位姿                |
+| `tcp_transform`           | `Pose` 或 null                 | 当前 Link7 → TCP 变换；连接后默认为单位变换           |
+| `tcp_configured`          | boolean                        | 是否有可用的 TCP；连接后默认 Link7 法兰为 true        |
+| `servo_tuning`            | `ServoTuning`                  | 当前完整伺服配置，见 5.9；连接/断开恢复基线           |
+| `servo_tuning_revision`   | u64                            | 当前配置版本；应用及连接/断开重置时更新，不跨进程保存 |
+| `motion_tuning`           | `MotionTuning`                 | 当前关节速度、加速度与 jerk 设置，见 5.7              |
+| `feedback_age_ms`         | u64 或 null                    | 已有反馈中最大的接收年龄                              |
+| `action`                  | object 或 null                 | 当前动作：`request_id,space,mode,axis,progress`       |
+| `calibration`             | `CalibrationStatus` 或 null    | 当前校准或最近一次结果，见 5.10                       |
+| `last_result` / `results` | `CommandResult` 或 null / 数组 | 最新一条结果 / 最近结果                               |
+| `error`                   | `{code,message}` 或 null       | 当前故障                                              |
+| `journal`                 | object                         | `pending,written,dropped,errors,healthy`              |
+| `communication`           | object                         | `received,crc_errors,timeouts`，本次运行的通信计数    |
 
 | `phase`        | 含义                     |
 | -------------- | ------------------------ |
@@ -604,12 +724,12 @@ TCP 未设置或控制反馈无效时，`tcp:null`。`action.mode` 为 `continuo
 
 `GET /v1/logs/page` 返回完整数据库中的历史记录，无需取得控制权。日志存放在应用日志目录的 `events.sqlite3`，退出后保留，仍按最近 100000 条清理。
 
-| 查询参数 | 类型与默认值 | 规则 |
-| --- | --- | --- |
-| `page` | u32，默认 1 | 0 按 1，超过末页时返回末页 |
-| `page_size` | u32，默认 50 | 限制到 1..500，0 按 1 |
-| `search` | string，默认空串 | UTF-8 完整的2 字节；在级别、来源、编号、内容和请求 ID 中搜索字面子串；ASCII 不区分大小写 |
-| `through_id` | 可选 i64 | 非负；省略时取当前最大 ID，传入时只查询不大于该 ID 的记录；0 表示空范围 |
+| 查询参数     | 类型与默认值     | 规则                                                                                     |
+| ------------ | ---------------- | ---------------------------------------------------------------------------------------- |
+| `page`       | u32，默认 1      | 0 按 1，超过末页时返回末页                                                               |
+| `page_size`  | u32，默认 50     | 限制到 1..500，0 按 1                                                                    |
+| `search`     | string，默认空串 | UTF-8 完整的2 字节；在级别、来源、编号、内容和请求 ID 中搜索字面子串；ASCII 不区分大小写 |
+| `through_id` | 可选 i64         | 非负；省略时取当前最大 ID，传入时只查询不大于该 ID 的记录；0 表示空范围                  |
 
 ```http
 GET /v1/logs/page?page=2&page_size=50&through_id=123
@@ -618,15 +738,17 @@ Authorization: Bearer <token>
 
 ```json
 {
-  "items": [{
-    "id": 73,
-    "ts_ms": 1794268800000,
-    "level": "info",
-    "source": "app",
-    "code": "started",
-    "message": "控制工作台已启动",
-    "request_id": null
-  }],
+  "items": [
+    {
+      "id": 73,
+      "ts_ms": 1794268800000,
+      "level": "info",
+      "source": "app",
+      "code": "started",
+      "message": "控制工作台已启动",
+      "request_id": null
+    }
+  ],
   "page": 2,
   "page_size": 50,
   "total": 123,
@@ -647,7 +769,7 @@ Authorization: Bearer <token>
 
 | 请求                      | 行为                                                                                                                                                                                                              |
 | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `POST /v1/traces`         | JSON 对象，`duration_ms` 为整数，默认 10000，可表示的正整数毫秒；`{}` 或 `{"duration_ms":null}` 使用默认值，未知字段被拒绝。返回 `200 TraceSummary`。                                                               |
+| `POST /v1/traces`         | JSON 对象，`duration_ms` 为整数，默认 10000，可表示的正整数毫秒；`{}` 或 `{"duration_ms":null}` 使用默认值，未知字段被拒绝。返回 `200 TraceSummary`。                                                             |
 | `GET /v1/traces?limit=20` | `limit` 为可省略的 u32，默认 20；实际限制到 1..10，0 按 1，超过 10 按 10。返回最近的 `TraceSummary[]`。                                                                                                           |
 | `POST /v1/traces/stop`    | 无需请求体。结束当前记录并返回 `200 TraceSummary`；没有正在记录的采样时返回 JSON `null`。                                                                                                                         |
 | `GET /v1/traces/{id}`     | 返回 `{trace:TraceSummary,samples:TraceSample[]}`。`download=true` 或别名 `attachment=true` 增加 `Content-Disposition: attachment; filename="trace-{id}.json"`，内容仍为 JSON。响应带 `Cache-Control: no-store`。 |
@@ -695,11 +817,11 @@ Authorization: Bearer <token>
 
 所有七元素数组按 J1..J7 排列。关节位置单位 rad、速度 rad/s、加速度 rad/s²、jerk rad/s³、扭矩 Nm、电压 V、温度 °C；`at_us/age_us/write_us` 单位 μs。
 
-| `source`   | 其余字段                                                                                                                                                                                                                                                                                  |
-| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `control`  | `seq`、`generation`（u64），`enabled/stopping`（boolean），`motion`（0..5），`axis`（整数或 null）；`servo_tuning`（完整配置或 null，可缺省）、`servo_tuning_revision`（u64，可缺省）；`q_ref/dq_ref/ddq_ref/jerk_ref/tau_ff` 为七个数值；`q/dq/tau/voltage` 为七个数值或 null；`age_us` 为七个 u64 或 null。缺失反馈的对应元素为 null，已有旧反馈保留数值与年龄。           |
-| `transmit` | `seq`（u64），`timing`（对象或 null，可缺省）、`tuning`（ServoSample 或 null，可缺省），`mode` 为七个实际编码的命令模式（0 disabled、1 servo、6 clear）；对齐后位置/未缩放轨迹速度 `q_ref/dq_ref`、最终总附加前馈 `tau_ff`、编码后反标定为关节 SI 的 `q_wire/dq_wire/tau_wire`、`kp/kd` 均为七个数值，`write_us`（u64）为主机成功写入整个七轴批次的耗时。 |
-| `feedback` | `joint`（0..6），`q/dq/tau/temperature/voltage`（number），`error`（u32）、`mode`（u8）、`timeout`（boolean）。                                                                                                                                                                           |
+| `source`   | 其余字段                                                                                                                                                                                                                                                                                                                                                           |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `control`  | `seq`、`generation`（u64），`enabled/stopping`（boolean），`motion`（0..5），`axis`（整数或 null）；`servo_tuning`（完整配置或 null，可缺省）、`servo_tuning_revision`（u64，可缺省）；`q_ref/dq_ref/ddq_ref/jerk_ref/tau_ff` 为七个数值；`q/dq/tau/voltage` 为七个数值或 null；`age_us` 为七个 u64 或 null。缺失反馈的对应元素为 null，已有旧反馈保留数值与年龄。 |
+| `transmit` | `seq`（u64），`timing`（对象或 null，可缺省）、`tuning`（ServoSample 或 null，可缺省），`mode` 为七个实际编码的命令模式（0 disabled、1 servo、6 clear）；对齐后位置/未缩放轨迹速度 `q_ref/dq_ref`、最终总附加前馈 `tau_ff`、编码后反标定为关节 SI 的 `q_wire/dq_wire/tau_wire`、`kp/kd` 均为七个数值，`write_us`（u64）为主机成功写入整个七轴批次的耗时。          |
+| `feedback` | `joint`（0..6），`q/dq/tau/temperature/voltage`（number），`error`（u32）、`mode`（u8）、`timeout`（boolean）。                                                                                                                                                                                                                                                    |
 
 `control.motion`：0 无当前动作、1 关节连续、2 关节步长、3 笛卡尔连续、4 笛卡尔步长、5 收纳返回。`axis` 在无动作或收纳返回时为 null，关节为 0..6，笛卡尔为 0..5；减速阶段可能为 `motion:0,stopping:true`。
 
@@ -709,28 +831,28 @@ Authorization: Bearer <token>
 
 控制样本的 `servo_tuning` 保存该周期的完整配置，`servo_tuning_revision` 保存配置版本；旧文件缺省时按 null/0 读取。发送样本的 `tuning` 为 `ServoSample` 或 null，旧文件缺省按 null 读取；直接写入和非伺服批次可为 null。先通过 `transmit.seq → control.seq` 找源周期，再用 `tuning.revision` 关联 `control.servo_tuning_revision` 与完整配置；源样本丢失时保留未知，不从当前配置反推历史。
 
-| `ServoSample` 字段 | 含义 |
-| --- | --- |
-| `revision` | u64，当前发送使用的配置版本 |
-| `dq_feedforward` | 七轴加权后的编码前速度前馈，rad/s；速度编码误差的参照 |
-| `tau_gravity` | 七轴重力前馈，Nm |
-| `friction_requested` | 七轴经自身 `max_friction` 限幅后的摩擦请求，Nm |
-| `friction_applied` | 总前馈限幅后的摩擦增量 `tau_ff-tau_gravity`，Nm，仍为编码前值 |
-| `clamped` | 七个 boolean；摩擦自身或合计前馈任一发生截断即为 true，恰好等于边界不算截断 |
+| `ServoSample` 字段   | 含义                                                                        |
+| -------------------- | --------------------------------------------------------------------------- |
+| `revision`           | u64，当前发送使用的配置版本                                                 |
+| `dq_feedforward`     | 七轴加权后的编码前速度前馈，rad/s；速度编码误差的参照                       |
+| `tau_gravity`        | 七轴重力前馈，Nm                                                            |
+| `friction_requested` | 七轴经自身 `max_friction` 限幅后的摩擦请求，Nm                              |
+| `friction_applied`   | 总前馈限幅后的摩擦增量 `tau_ff-tau_gravity`，Nm，仍为编码前值               |
+| `clamped`            | 七个 boolean；摩擦自身或合计前馈任一发生截断即为 true，恰好等于边界不算截断 |
 
 `transmit.dq_ref` 仍记录未缩放的轨迹速度，`tau_ff` 是重力与摩擦合成、限幅后的最终总附加前馈，`dq_wire` 是实际编码值。计算速度编码误差必须优先比较 `tuning.dq_feedforward` 与 `dq_wire`，仅在 `tuning` 缺省或 null 时回退到 `dq_ref`；权重为零导致的速度差不属于编码误差。位置与扭矩仍分别比较 `q_ref/q_wire`、`tau_ff/tau_wire`。限幅标记描述软件命令，不代表测得的电机总扭矩或物理补偿效果。
 
 发送样本的 `timing` 为 `{"status":"aligned","age_us":100}` 这样的对象或 null。对象包含 `status` 和 `age_us`；后者为 u64 微秒或 null，无法计算非负源年龄时为 null。未执行发送端取样的直接写入、disabled/clear 批次为 `timing:null`。该字段以 `#[serde(default)]` 读取，旧 JSON 缺省时按 null 处理，接口不要求旧文件补字段。
 
-| `timing.status` | 含义                                                       |
-| --------------- | ---------------------------------------------------------- |
-| `aligned`       | 完成发送时刻取样；速度上限或首次零点封顶也归此类。         |
-| `bounded`       | 关节目标使候选限幅，或末端目标越界后保持位置。             |
-| `stale`         | 源年龄超过 50 ms。                                         |
-| `future`        | 取样时刻早于源时刻，或不晚于上一成功伺服批次起点。         |
-| `invalid`       | 数值非有限或取样参数无效。                                |
-| `constraint`    | 目标 FK 无法计算；旧采样也使用此值记录路径检查失败。       |
-| `expired`       | 已到输入或租约的有效截止时间。                             |
+| `timing.status` | 含义                                                 |
+| --------------- | ---------------------------------------------------- |
+| `aligned`       | 完成发送时刻取样；速度上限或首次零点封顶也归此类。   |
+| `bounded`       | 关节目标使候选限幅，或末端目标越界后保持位置。       |
+| `stale`         | 源年龄超过 50 ms。                                   |
+| `future`        | 取样时刻早于源时刻，或不晚于上一成功伺服批次起点。   |
+| `invalid`       | 数值非有限或取样参数无效。                           |
+| `constraint`    | 目标 FK 无法计算；旧采样也使用此值记录路径检查失败。 |
+| `expired`       | 已到输入或租约的有效截止时间。                       |
 
 完整三类样本示例见 [OpenAPI](openapi.json) 的 `TraceSample` 和读取响应。事件日志与短时采样仍使用单次 `try_lock`、竞争即丢弃和独立 SQLite writer，不等待队列或磁盘。
 
@@ -794,16 +916,16 @@ CLI 原有输出字段保留，新增 `tuning`：`servo_batches_with_tuning/serv
 { "code": "owned", "message": "控制权已被占用" }
 ```
 
-| HTTP 状态 | 典型 `code`                                                                                                                                                        | 处理方式                                 |
-| --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------- |
+| HTTP 状态 | 典型 `code`                                                                                                                                                                             | 处理方式                                 |
+| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- |
 | 400       | `invalid_request`、`invalid_client`、`invalid_action`、`ports_failed`、`invalid_trace_request`、`invalid_trace_duration`、`invalid_trace_context`、`invalid_log_query`、`not_connected` | 修正输入或检查当前连接                   |
-| 401       | `unauthorized`                                                                                                                                                     | 使用本次应用启动后的令牌                 |
-| 403       | `forbidden_origin`                                                                                                                                                 | 检查浏览器来源                           |
-| 404       | `trace_not_found`                                                                                                                                                  | 采样 ID 无效、不存在或已被保留清理       |
-| 409       | `owned`、`not_owner`、`stale_context`、`motion_busy`、`trace_active`                                                                                               | 重新读取控制或采样状态                   |
-| 429       | `queue_full`、`too_many_connections`、`trace_capacity`                                                                                                             | 降低提交速率、关闭多余订阅或等待采样写入 |
-| 503       | `closing`、`journal_unavailable`、`trace_unavailable`                                                                                                              | 应用退出或存储当前不可读写               |
-| 504       | `timeout`                                                                                                                                                          | 控制权请求等待超时；先读取状态           |
+| 401       | `unauthorized`                                                                                                                                                                          | 使用本次应用启动后的令牌                 |
+| 403       | `forbidden_origin`                                                                                                                                                                      | 检查浏览器来源                           |
+| 404       | `trace_not_found`                                                                                                                                                                       | 采样 ID 无效、不存在或已被保留清理       |
+| 409       | `owned`、`not_owner`、`stale_context`、`motion_busy`、`trace_active`                                                                                                                    | 重新读取控制或采样状态                   |
+| 429       | `queue_full`、`too_many_connections`、`trace_capacity`                                                                                                                                  | 降低提交速率、关闭多余订阅或等待采样写入 |
+| 503       | `closing`、`journal_unavailable`、`trace_unavailable`                                                                                                                                   | 应用退出或存储当前不可读写               |
+| 504       | `timeout`                                                                                                                                                                               | 控制权请求等待超时；先读取状态           |
 
 控制权和命令接口的 JSON 解析与类型错误由 HTTP 框架直接返回纯文本：格式错误 400、超大请求体 413、缺少或错误的 JSON Content-Type 415、字段缺失或类型/枚举错误 422。旧日志接口的查询参数格式错误返回 400 纯文本；`/v1/logs/page` 统一返回 `400` JSON `invalid_log_query`。采样开始的 JSON 提取错误和采样查询参数错误统一返回 `400` JSON `invalid_trace_request`；有效整数但时长超出范围返回 `invalid_trace_duration`。调用方先判断 HTTP 状态和 Content-Type，再解析错误内容。
 
@@ -813,13 +935,13 @@ CLI 原有输出字段保留，新增 `tuning`：`servo_batches_with_tuning/serv
 | -------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
 | `not_owner`、`stale_context`                                                                                                     | 控制权或上下文变化；读取状态，重新确认操作                        |
 | `not_connected`、`fault`、`enable_busy`、`motion_busy`                                                                           | 当前运行阶段不接受该操作                                          |
-| `invalid_motion`、`invalid_step`、`speed_limit`、`invalid_tcp`、`invalid_ttl`、`invalid_servo_tuning`                                                    | 修改输入                                                          |
-| `feedback_missing`、`feedback_stale`、`invalid_feedback`                                                        | 反馈不满足控制条件                                                |
+| `invalid_motion`、`invalid_step`、`speed_limit`、`invalid_tcp`、`invalid_ttl`、`invalid_servo_tuning`                            | 修改输入                                                          |
+| `feedback_missing`、`feedback_stale`、`invalid_feedback`                                                                         | 反馈不满足控制条件                                                |
 | `tcp_missing`                                                                                                                    | 设置 TCP 后再使用末端点动                                         |
 | `support_required`、`disable_first`                                                                                              | 确认支撑后释放保持；清错前先失能                                  |
 | `invalid_pose`                                                                                                                   | 检查收纳位的七轴数值和相对行程                                    |
 | `no_action`、`stale_input`、`input_expired`                                                                                      | 连续点动已经结束，或更新序号/有效期不符                           |
-| `joint_dynamics`、`kinematics`                                                              | 本次运动不能继续，结合状态和日志检查原因                          |
+| `joint_dynamics`、`kinematics`                                                                                                   | 本次运动不能继续，结合状态和日志检查原因                          |
 | `send_reference`                                                                                                                 | 参考无法安全取样；动作或使能请求 failed，保留原有使能状态与控制权 |
 | `communication_error`、`feedback_timeout`、`device_error`、`device_timeout`、`device_disabled`、`enable_timeout`、`clear_failed` | 通信、设备或确认失败                                              |
 | `stopped`、`host_stop`、`released`、`lease_expired`、`disabled`、`disconnected`、`clearing`、`closing`                           | 动作取消原因                                                      |
@@ -854,7 +976,7 @@ Tauri 仅向主窗口提供三个命令：
 
 ## 12. 模块对应关系
 
-控制状态集中在 `arm.rs`；`protocol.rs` 处理通信与标定；`kinematics.rs` 处理当前模型与局部运动学，`trajectory.rs` 提供共享导数窗口和有界求解，`tuning.rs` 提供完整伺服配置校验与无状态前馈计算；`server.rs` 提供本机接口；`lib.rs` 管理 Tauri 生命周期；`journal.rs` 处理事件持久化并提供采样入口，`trace.rs` 管理短时采样。前端位于 `src`，模型与标定位于 `resources`。
+控制状态集中在 `arm.rs`；`protocol.rs` 处理通信与标定；`kinematics.rs` 处理当前模型与局部运动学，`trajectory.rs` 提供共享导数窗口和有界求解，`tuning.rs` 提供完整伺服配置校验与无状态前馈计算，`friction.rs` 负责基于真实样本的双向模型拟合；`server.rs` 提供本机接口；`lib.rs` 管理 Tauri 生命周期；`journal.rs` 处理事件持久化并提供采样入口，`trace.rs` 管理短时采样。前端位于 `src`，模型与标定位于 `resources`。
 
 ### protocol.rs
 
@@ -874,7 +996,7 @@ Tauri 仅向主窗口提供三个命令：
 
 ### tuning.rs
 
-`ServoTuning {friction_enabled,joints:[JointTuning;7]}` 和 `JointTuning {kd,velocity_ff,coulomb,viscous,velocity_scale,max_friction}` 具备序列化；请求不对缺失字段补默认值。`validate()` 检查有限数与范围，`apply(dq,gravity)` 返回固定七轴的 `dq_feedforward/friction_requested/friction_applied/tau/clamped`，无 I/O 或内部辨识状态。基线、公式和输入限制见 5.9。协议层在 Reference 取样和路径检查后应用前馈；用于后续位置积分和静止交接的成功发送历史保存未缩放轨迹速度。
+`ServoTuning {friction_enabled,joints:[JointTuning;7]}` 和 `JointTuning {kd,velocity_ff,coulomb,viscous,velocity_scale,max_friction,stribeck}` 具备序列化；六个原字段仍必填；新增 stribeck 缺失时默认关闭。`validate()` 检查有限数与范围，`apply(dq,gravity)` 返回固定七轴的 `dq_feedforward/friction_requested/friction_applied/tau/clamped`，无 I/O 或内部辨识状态。基线、公式和输入限制见 5.9。协议层在 Reference 取样和路径检查后应用前馈；用于后续位置积分和静止交接的成功发送历史保存未缩放轨迹速度。
 
 ### kinematics.rs
 

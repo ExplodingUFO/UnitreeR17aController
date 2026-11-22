@@ -2,11 +2,13 @@ import { useEffect, useRef, useState } from "react";
 import {
   api,
   createServoTuning,
+  createStribeckTuning,
   sameServoTuning,
   isServoTuning,
   DEFAULT_MOTION_TUNING,
   type MotionTuning,
   type JointTuning,
+  type FrictionCurve,
   type ServoTuning,
   type View,
 } from "./api";
@@ -79,7 +81,7 @@ export function MotionTuningFields({
 }
 
 const fields: {
-  key: keyof JointTuning;
+  key: Exclude<keyof JointTuning, "stribeck">;
   label: string;
   unit: string;
   title: string;
@@ -129,23 +131,61 @@ const fields: {
   },
 ];
 
-type DraftJoint = Record<keyof JointTuning, string>;
+const curveFields = [
+  ["static_friction", "Fs", "Nm"],
+  ["coulomb", "Fc", "Nm"],
+  ["viscous", "B", "Nm·s/rad"],
+  ["stribeck_velocity", "Vs", "rad/s"],
+] as const;
+type DraftCurve = Record<keyof FrictionCurve, string>;
+type DraftJoint = Record<Exclude<keyof JointTuning, "stribeck">, string> & {
+  stribeck: {
+    enabled: boolean;
+    positive: DraftCurve;
+    negative: DraftCurve;
+  };
+};
 type Draft = { friction_enabled: boolean; joints: DraftJoint[] };
+const toCurveDraft = (curve: FrictionCurve): DraftCurve => ({
+  static_friction: String(curve.static_friction),
+  coulomb: String(curve.coulomb),
+  viscous: String(curve.viscous),
+  stribeck_velocity: String(curve.stribeck_velocity),
+});
 function toDraft(config: ServoTuning): Draft {
   return {
     friction_enabled: config.friction_enabled,
-    joints: config.joints.map(
-      (joint) =>
-        Object.fromEntries(
+    joints: config.joints.map((joint) => {
+      const model = joint.stribeck ?? createStribeckTuning();
+      return {
+        ...Object.fromEntries(
           fields.map(({ key }) => [key, String(joint[key])]),
-        ) as DraftJoint,
-    ),
+        ),
+        stribeck: {
+          enabled: model.enabled,
+          positive: toCurveDraft(model.positive),
+          negative: toCurveDraft(model.negative),
+        },
+      } as DraftJoint;
+    }),
   };
 }
+const readCurveDraft = (curve: DraftCurve): FrictionCurve => ({
+  static_friction: Number(curve.static_friction),
+  coulomb: Number(curve.coulomb),
+  viscous: Number(curve.viscous),
+  stribeck_velocity: Number(curve.stribeck_velocity),
+});
 function readDraft(draft: Draft): ServoTuning | null {
   if (
     draft.joints.length !== 7 ||
-    draft.joints.some((joint) => fields.some(({ key }) => !joint[key].trim()))
+    draft.joints.some(
+      (joint) =>
+        fields.some(({ key }) => !joint[key].trim()) ||
+        (["positive", "negative"] as const).some((direction) =>
+          curveFields.some(([key]) => !joint.stribeck[direction][key].trim()),
+        ),
+    )
   )
     return null;
   const config = {
@@ -157,6 +197,11 @@ function readDraft(draft: Draft): ServoTuning | null {
       viscous: Number(joint.viscous),
       velocity_scale: Number(joint.velocity_scale),
       max_friction: Number(joint.max_friction),
+      stribeck: {
+        enabled: joint.stribeck.enabled,
+        positive: readCurveDraft(joint.stribeck.positive),
+        negative: readCurveDraft(joint.stribeck.negative),
+      },
     })) as ServoTuning["joints"],
   };
   return isServoTuning(config) ? config : null;
@@ -187,6 +232,7 @@ export default function ServoPanel({
     : `${s.side}:${s.port ?? ""}`;
   const previous = useRef({ connectionKey, applied });
   const [draft, setDraft] = useState(() => toDraft(applied));
+  const [selectedAxis, setSelectedAxis] = useState(0);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState("");
   const [copyFeedback, setCopyFeedback] = useState("");
@@ -300,6 +346,19 @@ export default function ServoPanel({
         : [];
     }),
   )[0];
+  const invalidCurve = draft.joints.flatMap((joint, index) =>
+    (["positive", "negative"] as const).flatMap((direction) =>
+      curveFields.flatMap(([key, label, unit]) => {
+        const text = joint.stribeck[direction][key];
+        const number = Number(text);
+        return !text.trim() ||
+          !Number.isFinite(number) ||
+          (key === "stribeck_velocity" ? number <= 0 : number < 0)
+          ? [{ index, direction, key, label, unit }]
+          : [];
+      }),
+    ),
+  )[0];
   const applyReason =
     !view.online || s.phase === "disconnected"
       ? "未连接"
@@ -322,7 +381,9 @@ export default function ServoPanel({
                       : "";
   const validation = invalid
     ? `J${invalid.index + 1} ${invalid.label}：须为有限${invalid.key === "velocity_scale" ? "正数" : "非负数"}${invalid.unit === "权重" ? "" : ` ${invalid.unit}`}`
-    : "";
+    : invalidCurve
+      ? `J${invalidCurve.index + 1} ${invalidCurve.direction === "positive" ? "正向" : "反向"} ${invalidCurve.label}：须为有限${invalidCurve.key === "stribeck_velocity" ? "正数" : "非负数"} ${invalidCurve.unit}`
+      : "";
   const feedback = error || validation || copyFeedback || applyReason;
   const status = pending
     ? "等待确认…"
@@ -549,8 +610,16 @@ export default function ServoPanel({
               </thead>
               <tbody>
                 {draft.joints.map((joint, index) => (
-                  <tr key={index}>
-                    <th scope="row">J{index + 1}</th>
+                  <tr key={index} data-selected={selectedAxis === index}>
+                    <th scope="row">
+                      <button
+                        aria-label={`选择 J${index + 1} 摩擦模型`}
+                        aria-pressed={selectedAxis === index}
+                        onClick={() => setSelectedAxis(index)}
+                      >
+                        J{index + 1}
+                      </button>
+                    </th>
                     {fields.map(({ key, label, unit, step }) => {
                       const number = Number(joint[key]);
                       const invalid =
@@ -574,6 +643,7 @@ export default function ServoPanel({
                             data-changed={
                               invalid || number !== applied.joints[index][key]
                             }
+                            onFocus={() => setSelectedAxis(index)}
                             onChange={(event) => {
                               const value = event.target.value;
                               edited();
@@ -595,6 +665,107 @@ export default function ServoPanel({
               </tbody>
             </table>
           </div>
+          <section
+            className="servo-stribeck"
+            aria-label={`J${selectedAxis + 1} 摩擦模型`}
+          >
+            <div className="servo-model-heading">
+              <strong>J{selectedAxis + 1} · 摩擦模型</strong>
+              <small>
+                {draft.joints[selectedAxis].stribeck.enabled
+                  ? "双向 Stribeck"
+                  : "库仑 / 黏性"}
+              </small>
+              <label className="servo-friction">
+                <input
+                  type="checkbox"
+                  role="switch"
+                  aria-label={`J${selectedAxis + 1} Stribeck`}
+                  checked={draft.joints[selectedAxis].stribeck.enabled}
+                  onChange={(event) => {
+                    const enabled = event.target.checked;
+                    edited();
+                    setDraft((current) => ({
+                      ...current,
+                      joints: current.joints.map((joint, index) =>
+                        index === selectedAxis
+                          ? {
+                              ...joint,
+                              stribeck: { ...joint.stribeck, enabled },
+                            }
+                          : joint,
+                      ),
+                    }));
+                  }}
+                />
+                Stribeck
+              </label>
+            </div>
+            <div className="servo-curve-fields">
+              <span />
+              {curveFields.map(([key, label, unit]) => (
+                <span key={key}>
+                  {label} <small>{unit}</small>
+                </span>
+              ))}
+              {(["positive", "negative"] as const).map((direction) => {
+                const label = direction === "positive" ? "正向" : "反向";
+                const curve = draft.joints[selectedAxis].stribeck[direction];
+                const original = (applied.joints[selectedAxis].stribeck ??
+                  createStribeckTuning())[direction];
+                return (
+                  <div className="servo-curve-row" key={direction}>
+                    <span>{label}</span>
+                    {curveFields.map(([key, name]) => {
+                      const number = Number(curve[key]);
+                      const invalid =
+                        !curve[key].trim() ||
+                        !Number.isFinite(number) ||
+                        (key === "stribeck_velocity"
+                          ? number <= 0
+                          : number < 0);
+                      return (
+                        <input
+                          key={key}
+                          type="number"
+                          aria-label={`J${selectedAxis + 1} ${label} ${name}`}
+                          aria-invalid={invalid}
+                          aria-describedby={
+                            invalid ? "servo-feedback" : undefined
+                          }
+                          data-changed={invalid || number !== original[key]}
+                          min={0}
+                          step="any"
+                          value={curve[key]}
+                          onChange={(event) => {
+                            const value = event.target.value;
+                            edited();
+                            setDraft((current) => ({
+                              ...current,
+                              joints: current.joints.map((joint, index) =>
+                                index === selectedAxis
+                                  ? {
+                                      ...joint,
+                                      stribeck: {
+                                        ...joint.stribeck,
+                                        [direction]: {
+                                          ...joint.stribeck[direction],
+                                          [key]: value,
+                                        },
+                                      },
+                                    }
+                                  : joint,
+                              ),
+                            }));
+                          }}
+                        />
+                      );
+                    })}
+                  </div>
+                );
+              })}
+            </div>
+          </section>
           {copyText && (
             <textarea
               className="servo-json"

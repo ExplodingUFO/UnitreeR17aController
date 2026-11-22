@@ -1,6 +1,6 @@
 //! Offline low-speed calibration candidates, trajectories, and measurements.
 
-use crate::tuning::ServoTuning;
+use crate::{friction, kinematics::Kinematics, tuning::ServoTuning};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -11,7 +11,11 @@ pub struct Settings {
     pub axis: Option<usize>,
     pub excursion: f64,
     pub speed: f64,
-    pub max_friction: f64,
+    /// Empty uses three speed levels around `speed`; these are test settings,
+    /// not a second set of hardware motion limits.
+    pub speeds: Vec<f64>,
+    /// None derives the compensation budget from the recorded effort residual.
+    pub max_friction: Option<f64>,
     pub cartesian: Option<Arc<crate::calibration_path::CartesianProgram>>,
 }
 
@@ -21,7 +25,8 @@ impl Default for Settings {
             axis: None,
             excursion: 16.0f64.to_radians(),
             speed: 2.0f64.to_radians(),
-            max_friction: 0.2,
+            speeds: Vec::new(),
+            max_friction: None,
             cartesian: None,
         }
     }
@@ -36,10 +41,13 @@ fn validate_settings(settings: &Settings) -> Result<(), String> {
             return Err(format!("校准 {name} 必须为正数"));
         }
     }
-    if !(settings.speed * 2.0).is_finite() {
-        return Err("校准试验速度无法表示".into());
+    if speeds(settings).iter().any(|v| !v.is_finite() || *v <= 0.0) {
+        return Err("校准试验速度必须为可表示的正数".into());
     }
-    if !settings.max_friction.is_finite() || settings.max_friction < 0.0 {
+    if settings
+        .max_friction
+        .is_some_and(|v| !v.is_finite() || v < 0.0)
+    {
         return Err("摩擦试验参数无效".into());
     }
     Ok(())
@@ -62,42 +70,247 @@ pub fn validate(settings: &Settings, baseline: &ServoTuning) -> Result<(), Strin
     baseline.validate()
 }
 
-pub fn candidates(
-    settings: &Settings,
-    axis: usize,
-    baseline: ServoTuning,
-) -> Result<Vec<ServoTuning>, String> {
-    validate(settings, &baseline)?;
-    if axis >= 7 {
-        return Err("校准关节必须为 0..6".into());
+pub fn speeds(settings: &Settings) -> Vec<f64> {
+    if settings.speeds.is_empty() {
+        vec![settings.speed / 2.0, settings.speed, settings.speed * 2.0]
+    } else {
+        settings.speeds.clone()
     }
-    let mut result = Vec::with_capacity(4);
-    result.push(baseline);
-    if settings.max_friction > 0.0 {
-        for coulomb in [settings.max_friction / 2.0, settings.max_friction] {
-            let mut candidate = baseline;
-            if !baseline.friction_enabled {
-                // The global switch must not activate dormant coefficients on
-                // any joint, including the measured joint's viscous term.
-                for joint in &mut candidate.joints {
-                    joint.coulomb = 0.0;
-                    joint.viscous = 0.0;
-                }
+}
+
+/// Raw feedback only: gravity, derivatives and parameter fitting run off-thread.
+#[derive(Clone, Copy, Debug)]
+pub struct Observation {
+    pub axis: usize,
+    pub at_us: u64,
+    pub position: [f64; 7],
+    pub velocity: f64,
+    pub effort: f64,
+    neighbors: [(u64, f64); 2],
+}
+
+impl Observation {
+    pub fn new(axis: usize, at_us: u64, position: [f64; 7], velocity: f64, effort: f64) -> Self {
+        Self {
+            axis,
+            at_us,
+            position,
+            velocity,
+            effort,
+            neighbors: [(at_us, velocity); 2],
+        }
+    }
+
+    fn acceleration_and_weight(&self) -> Option<(f64, f64)> {
+        let [(before_at, before_velocity), (after_at, after_velocity)] = self.neighbors;
+        let dt = after_at.checked_sub(before_at)? as f64 / 1_000_000.0;
+        (dt > 0.0).then(|| ((after_velocity - before_velocity) / dt, dt))
+    }
+}
+
+/// Preserve original neighboring feedback before any recording subsampling.
+/// One pending sample supplies the central derivative without extra I/O or a
+/// scan of retained data on the control thread.
+pub struct ObservationRecording {
+    samples: Recording<Observation>,
+    pending: Option<((usize, usize), Observation)>,
+}
+
+impl ObservationRecording {
+    pub fn new(budget: usize, groups: usize) -> Self {
+        Self {
+            samples: Recording::new(budget, groups),
+            pending: None,
+        }
+    }
+
+    pub fn push(&mut self, group: (usize, usize), mut sample: Observation) {
+        if let Some((previous_group, mut previous)) = self.pending.take() {
+            if previous_group == group {
+                previous.neighbors[1] = (sample.at_us, sample.velocity);
+                sample.neighbors[0] = (previous.at_us, previous.velocity);
             }
-            candidate.friction_enabled = true;
-            candidate.joints[axis].coulomb = coulomb;
-            candidate.joints[axis].max_friction = settings.max_friction;
-            if !result.contains(&candidate) {
-                result.push(candidate);
+            self.samples.push(previous_group, previous);
+        }
+        self.pending = Some((group, sample));
+    }
+
+    pub fn into_samples(mut self) -> Vec<Observation> {
+        if let Some((group, sample)) = self.pending.take() {
+            self.samples.push(group, sample);
+        }
+        self.samples.into_samples()
+    }
+}
+
+/// Share a recording budget across the program's trials (or movement legs).
+/// Reservoir replacement is O(1) per capture and keeps each group's endpoints.
+/// Sorting and serialization belong to the analysis/database workers.
+pub struct Recording<T> {
+    samples: Vec<T>,
+    quota: usize,
+    group: Option<(usize, usize)>,
+    start: usize,
+    seen: usize,
+    captured: usize,
+    random: u64,
+}
+
+impl<T> Recording<T> {
+    pub fn new(budget: usize, groups: usize) -> Self {
+        Self {
+            samples: Vec::with_capacity(budget),
+            quota: budget / groups.max(1),
+            group: None,
+            start: 0,
+            seen: 0,
+            captured: 0,
+            random: 0,
+        }
+    }
+
+    pub fn push(&mut self, group: (usize, usize), sample: T) {
+        if self.group != Some(group) {
+            self.group = Some(group);
+            self.start = self.samples.len();
+            self.seen = 0;
+        }
+        self.seen += 1;
+        self.captured += 1;
+        let retained = self.samples.len() - self.start;
+        if retained < self.quota {
+            self.samples.push(sample);
+        } else if retained > 0 {
+            let previous = std::mem::replace(self.samples.last_mut().unwrap(), sample);
+            if retained > 2 {
+                // The previous endpoint now joins the interior reservoir.
+                self.random = self.random.wrapping_add(0x9e3779b97f4a7c15);
+                let mut random = self.random;
+                random = (random ^ (random >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                random = (random ^ (random >> 27)).wrapping_mul(0x94d049bb133111eb);
+                let slot = ((random ^ (random >> 31)) % (self.seen as u64 - 2)) as usize;
+                if slot < retained - 2 {
+                    self.samples[self.start + 1 + slot] = previous;
+                }
             }
         }
     }
-    let mut feedforward = baseline;
-    feedforward.joints[axis].velocity_ff = 0.75;
-    if !result.contains(&feedforward) {
-        result.push(feedforward);
+
+    pub fn last(&self) -> Option<&T> {
+        self.samples.last()
     }
-    Ok(result)
+
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn captured(&self) -> usize {
+        self.captured
+    }
+
+    pub fn into_samples(self) -> Vec<T> {
+        self.samples
+    }
+}
+
+pub fn identify(
+    observations: &[Observation],
+    model: &Kinematics,
+    settings: &Settings,
+    baseline: &ServoTuning,
+) -> Vec<friction::Identification> {
+    let axes = settings
+        .axis
+        .map_or_else(|| (0..7).collect(), |axis| vec![axis]);
+    axes.into_iter()
+        .map(|axis| {
+            let mut data: Vec<_> = observations
+                .iter()
+                .filter(|s| s.axis == axis)
+                .filter_map(|s| {
+                    model
+                        .gravity(&s.position)
+                        .ok()
+                        .map(|gravity| (*s, s.effort - gravity[axis]))
+                })
+                .collect();
+            data.sort_unstable_by_key(|(s, _)| s.at_us);
+            let samples: Vec<_> = data
+                .iter()
+                .filter_map(|(s, effort)| {
+                    let (acceleration, weight) = s.acceleration_and_weight()?;
+                    Some(friction::Sample {
+                        velocity: s.velocity,
+                        acceleration,
+                        effort: *effort,
+                        weight,
+                    })
+                })
+                .collect();
+            let budget = settings.max_friction.unwrap_or_else(|| {
+                samples
+                    .iter()
+                    .map(|s| s.effort.abs())
+                    .filter(|e| e.is_finite())
+                    .fold(0.0_f64, f64::max)
+            });
+            friction::identify(axis, &samples, baseline.joints[axis].velocity_scale, budget)
+        })
+        .collect()
+}
+
+pub fn fitted_config(
+    settings: &Settings,
+    baseline: ServoTuning,
+    fit: &friction::Identification,
+) -> Option<ServoTuning> {
+    if fit.positive.is_none() && fit.negative.is_none() {
+        return None;
+    }
+    let budget = settings.max_friction.unwrap_or(fit.max_friction);
+    if budget == 0.0 {
+        return None;
+    }
+    let previous = baseline.joints[fit.axis];
+    let inherited = if !baseline.friction_enabled {
+        crate::tuning::StribeckTuning::default()
+    } else if previous.stribeck.enabled {
+        previous.stribeck
+    } else {
+        let curve = crate::tuning::FrictionCurve {
+            coulomb: previous.coulomb,
+            static_friction: previous.coulomb,
+            viscous: previous.viscous,
+            stribeck_velocity: previous.velocity_scale,
+        };
+        crate::tuning::StribeckTuning {
+            enabled: true,
+            positive: curve,
+            negative: curve,
+        }
+    };
+    let mut config = baseline;
+    if !baseline.friction_enabled {
+        for joint in &mut config.joints {
+            joint.coulomb = 0.0;
+            joint.viscous = 0.0;
+            joint.stribeck.enabled = false;
+        }
+    }
+    config.friction_enabled = true;
+    let joint = &mut config.joints[fit.axis];
+    joint.max_friction = budget;
+    joint.stribeck.enabled = true;
+    joint.stribeck.positive = fit
+        .positive
+        .as_ref()
+        .map_or(inherited.positive, |d| d.curve);
+    joint.stribeck.negative = fit
+        .negative
+        .as_ref()
+        .map_or(inherited.negative, |d| d.curve);
+    config.validate().ok()?;
+    Some(config)
 }
 
 #[derive(Clone, Debug)]
@@ -113,8 +326,9 @@ pub fn legs(settings: &Settings, axis: usize, center: [f64; 7]) -> Vec<Leg> {
     {
         return Vec::new();
     }
-    let mut result = Vec::with_capacity(6);
-    for speed in [settings.speed, settings.speed * 2.0] {
+    let speeds = speeds(settings);
+    let mut result = Vec::with_capacity(speeds.len() * 3);
+    for speed in speeds {
         for offset in [settings.excursion / 2.0, -settings.excursion / 2.0, 0.0] {
             let mut target = center;
             if offset != 0.0 {
@@ -362,6 +576,8 @@ pub struct Point {
     pub feedback_velocity: [f64; 7],
     pub feedback_age_ms: [u16; 7],
     pub command_at_ms: Option<u32>,
+    #[serde(default)]
+    pub effort: Option<[f64; 7]>,
     #[serde(default = "joint_space")]
     pub space: String,
 }
@@ -398,7 +614,11 @@ pub struct Report {
     #[serde(default)]
     pub sample_count: usize,
     #[serde(default)]
+    pub captured_samples: usize,
+    #[serde(default)]
     pub curves: Arc<Vec<Point>>,
+    #[serde(default)]
+    pub identification: Vec<friction::Identification>,
 }
 
 impl Report {
@@ -412,8 +632,18 @@ impl Report {
 
     /// Select real samples without interpolation. Keep each segment's endpoints
     /// and per-bucket extrema of all joints' position/velocity tracking errors.
-    /// A zero budget returns all samples with an O(1) clone of their Arc.
+    /// A zero budget returns all retained samples. Already sorted records share
+    /// their allocation; reservoir records are sorted only on a worker thread.
     pub fn for_plot(&self, max_points: usize) -> Self {
+        if !self
+            .curves
+            .windows(2)
+            .all(|pair| pair[0].t_ms <= pair[1].t_ms)
+        {
+            let mut sorted = self.clone();
+            Arc::make_mut(&mut sorted.curves).sort_unstable_by_key(|point| point.t_ms);
+            return sorted.for_plot(max_points);
+        }
         if max_points == 0 || self.curves.len() <= max_points {
             return self.clone();
         }
@@ -527,207 +757,278 @@ mod tests {
     }
 
     #[test]
-    fn defaults_select_all_axes_with_a_small_six_leg_programme_for_each() {
-        let settings: Settings = serde_json::from_str("{}").unwrap();
-        assert_eq!(settings.axis, None);
-        close(settings.excursion, 16.0f64.to_radians());
-        close(settings.speed, 2.0f64.to_radians());
-        close(settings.max_friction, 0.2);
-        assert!(validate(&settings, &ServoTuning::default()).is_ok());
-        let center = [0.5, -0.4, 0.3, -0.2, 0.1, -0.0, 0.7];
-        for axis in 0..7 {
-            let programme = legs(&settings, axis, center);
-            assert_eq!(programme.len(), 6);
-            for (index, leg) in programme.iter().enumerate() {
-                let offset = [8.0f64.to_radians(), -8.0f64.to_radians(), 0.0][index % 3];
-                close(leg.speed, (1 + index / 3) as f64 * 2.0f64.to_radians());
-                close(leg.target[axis], center[axis] + offset);
-                for other in (0..7).filter(|other| *other != axis) {
-                    assert_eq!(leg.target[other].to_bits(), center[other].to_bits());
-                }
-                if index % 3 == 2 {
-                    assert_eq!(leg.target.map(f64::to_bits), center.map(f64::to_bits));
-                }
-            }
-        }
-        let selected: Settings = serde_json::from_str(r#"{"axis":3}"#).unwrap();
-        assert_eq!(selected.axis, Some(3));
-        close(selected.excursion, settings.excursion);
-    }
-
-    #[test]
-    fn explicit_small_ranges_move_only_the_requested_axis_relative_to_its_center() {
-        let center = [-0.7, 0.6, -0.5, 0.4, -0.3, 0.2, -0.1];
-        for axis in 0..7 {
-            let settings = Settings {
-                axis: Some(axis),
-                excursion: 2.0f64.to_radians(),
-                speed: 0.5f64.to_radians(),
-                ..Settings::default()
-            };
-            assert!(validate(&settings, &ServoTuning::default()).is_ok());
-            let programme = legs(&settings, axis, center);
-            assert_eq!(programme.len(), 6);
-            for (index, leg) in programme.iter().enumerate() {
-                close(
-                    leg.target[axis] - center[axis],
-                    [1.0f64.to_radians(), -1.0f64.to_radians(), 0.0][index % 3],
-                );
-                close(leg.speed, settings.speed * (1 + index / 3) as f64);
-                for other in (0..7).filter(|other| *other != axis) {
-                    assert_eq!(leg.target[other], center[other]);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn settings_and_explicit_axes_reject_invalid_inputs_without_panicking() {
-        let baseline = ServoTuning::default();
-        for axis in [7, usize::MAX] {
-            assert!(
-                validate(
-                    &Settings {
-                        axis: Some(axis),
-                        ..Settings::default()
-                    },
-                    &baseline
-                )
-                .is_err()
-            );
-            assert!(candidates(&Settings::default(), axis, baseline).is_err());
-            assert!(legs(&Settings::default(), axis, [0.0; 7]).is_empty());
-        }
-        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0] {
-            for field in 0..3 {
-                let mut settings = Settings::default();
-                match field {
-                    0 => settings.excursion = invalid,
-                    1 => settings.speed = invalid,
-                    _ => settings.max_friction = invalid,
-                }
-                assert!(validate(&settings, &baseline).is_err());
-                assert!(candidates(&settings, 0, baseline).is_err());
-                assert!(legs(&settings, 0, [0.0; 7]).is_empty());
-            }
-        }
-        let mut invalid_baseline = baseline;
-        invalid_baseline.joints[0].kd = f64::NAN;
-        assert!(validate(&Settings::default(), &invalid_baseline).is_err());
-        assert!(legs(&Settings::default(), 0, [f64::NAN; 7]).is_empty());
-    }
-
-    #[test]
-    fn calibration_friction_has_no_independent_upper_limit() {
-        let settings = Settings {
-            max_friction: 12.5,
-            ..Settings::default()
-        };
-        let actual = candidates(&settings, 3, ServoTuning::default()).unwrap();
-        assert_eq!(actual[1].joints[3].coulomb, 6.25);
-        assert_eq!(actual[2].joints[3].coulomb, 12.5);
-        assert_eq!(actual[2].joints[3].max_friction, 12.5);
-    }
-
-    #[test]
-    fn validation_rejects_unrepresentable_trial_speed_before_building_legs() {
-        let settings = Settings {
-            speed: f64::MAX,
-            ..Settings::default()
-        };
+    fn automatic_and_explicit_speed_programs_revisit_the_same_previewed_range() {
+        let defaults: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.axis, None);
+        assert_eq!(defaults.max_friction, None);
         assert_eq!(
-            validate(&settings, &ServoTuning::default()).unwrap_err(),
-            "校准试验速度无法表示"
+            speeds(&defaults),
+            vec![defaults.speed / 2.0, defaults.speed, defaults.speed * 2.0]
         );
-        assert!(candidates(&settings, 3, ServoTuning::default()).is_err());
-        assert!(legs(&settings, 3, [0.0; 7]).is_empty());
-    }
-
-    #[test]
-    fn default_candidates_are_independent_fc_point_one_point_two_and_ff_point_seven_five() {
-        let mut baseline = ServoTuning::default();
-        baseline.joints[3].velocity_ff = 0.8;
-        for axis in 0..7 {
-            let actual = candidates(&Settings::default(), axis, baseline).unwrap();
-            assert_eq!(actual.len(), 4);
-            assert_eq!(actual[0], baseline);
-            for (candidate, coulomb) in actual[1..3].iter().zip([0.1, 0.2]) {
-                let mut expected = baseline;
-                expected.friction_enabled = true;
-                expected.joints[axis].coulomb = coulomb;
-                expected.joints[axis].max_friction = 0.2;
-                assert_eq!(*candidate, expected);
-                assert!(candidate.validate().is_ok());
-            }
-            let mut expected = baseline;
-            expected.joints[axis].velocity_ff = 0.75;
-            assert_eq!(actual[3], expected);
-            assert_eq!(baseline.joints[3].velocity_ff, 0.8);
-        }
-    }
-
-    #[test]
-    fn dormant_friction_is_cleared_before_enabling_only_the_measured_axis() {
-        let mut baseline = ServoTuning::default();
-        for (axis, joint) in baseline.joints.iter_mut().enumerate() {
-            joint.coulomb = 0.2 + axis as f64 * 0.05;
-            joint.viscous = 0.3 + axis as f64 * 0.1;
-            joint.kd += axis as f64;
-        }
-        assert!(validate(&Settings::default(), &baseline).is_ok());
-        for axis in 0..7 {
-            let actual = candidates(&Settings::default(), axis, baseline).unwrap();
-            assert_eq!(actual[0], baseline);
-            for candidate in &actual[1..3] {
-                let applied = candidate.apply([0.02; 7], [0.0; 7]).unwrap();
-                assert!(applied.friction_requested[axis] > 0.0);
-                for other in 0..7 {
-                    assert_eq!(candidate.joints[other].viscous, 0.0);
-                    assert_eq!(candidate.joints[other].kd, baseline.joints[other].kd);
-                    if other != axis {
-                        assert_eq!(candidate.joints[other].coulomb, 0.0);
-                        assert_eq!(applied.friction_requested[other], 0.0);
+        let center = [0.5, -0.4, 0.3, -0.2, 0.1, -0.0, 0.7];
+        for speed_levels in [Vec::new(), vec![0.00001, 0.03, 0.8, 1.2]] {
+            let settings = Settings {
+                speeds: speed_levels,
+                ..defaults.clone()
+            };
+            let levels = speeds(&settings);
+            for axis in 0..7 {
+                let programme = legs(&settings, axis, center);
+                assert_eq!(programme.len(), levels.len() * 3);
+                for (index, leg) in programme.iter().enumerate() {
+                    let offset =
+                        [settings.excursion / 2.0, -settings.excursion / 2.0, 0.0][index % 3];
+                    close(leg.target[axis], center[axis] + offset);
+                    close(leg.speed, levels[index / 3]);
+                    for other in (0..7).filter(|other| *other != axis) {
+                        assert_eq!(leg.target[other].to_bits(), center[other].to_bits());
+                    }
+                    if index % 3 == 2 {
+                        assert_eq!(leg.target.map(f64::to_bits), center.map(f64::to_bits));
                     }
                 }
             }
-            let mut expected_ff = baseline;
-            expected_ff.joints[axis].velocity_ff = 0.75;
-            assert_eq!(actual[3], expected_ff);
         }
     }
 
     #[test]
-    fn enabled_friction_preserves_other_axes_and_duplicate_candidates_are_omitted() {
-        let mut baseline = ServoTuning {
-            friction_enabled: true,
-            ..ServoTuning::default()
-        };
-        baseline.joints[0].coulomb = 0.3;
-        baseline.joints[2].viscous = 0.4;
-        baseline.joints[3].coulomb = 0.1;
-        baseline.joints[3].max_friction = 0.2;
-        let actual = candidates(&Settings::default(), 3, baseline).unwrap();
-        assert_eq!(actual.len(), 3);
-        assert_eq!(actual[0], baseline);
-        assert_eq!(actual[1].joints[3].coulomb, 0.2);
-        for candidate in &actual {
-            for axis in (0..7).filter(|axis| *axis != 3) {
-                assert_eq!(candidate.joints[axis], baseline.joints[axis]);
+    fn settings_use_finite_positive_test_speeds_and_legacy_optional_budgets() {
+        let baseline = ServoTuning::default();
+        let legacy: Settings = serde_json::from_str(r#"{"axis":3,"max_friction":12.5}"#).unwrap();
+        assert_eq!(legacy.max_friction, Some(12.5));
+        assert!(validate(&legacy, &baseline).is_ok());
+        assert!(
+            validate(
+                &Settings {
+                    max_friction: Some(0.0),
+                    ..legacy.clone()
+                },
+                &baseline
+            )
+            .is_ok()
+        );
+        for bad in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
+            let settings = Settings {
+                speeds: vec![bad],
+                ..legacy.clone()
+            };
+            assert!(validate(&settings, &baseline).is_err());
+            assert!(legs(&settings, 3, [0.0; 7]).is_empty());
+        }
+        assert!(
+            validate(
+                &Settings {
+                    speed: f64::MAX,
+                    ..legacy.clone()
+                },
+                &baseline
+            )
+            .is_err()
+        );
+        assert!(
+            validate(
+                &Settings {
+                    speed: f64::MAX,
+                    speeds: vec![0.1],
+                    ..legacy.clone()
+                },
+                &baseline
+            )
+            .is_ok()
+        );
+        assert!(
+            validate(
+                &Settings {
+                    axis: Some(7),
+                    ..legacy.clone()
+                },
+                &baseline
+            )
+            .is_err()
+        );
+        assert!(legs(&legacy, 7, [0.0; 7]).is_empty());
+    }
+
+    fn identified(axis: usize) -> friction::Identification {
+        serde_json::from_value(json!({
+            "axis":axis,"source":"feedback_effort_residual","samples":1000,
+            "max_friction":1.25,"inertia":0.02,
+            "positive":{"curve":{"coulomb":0.2,"static_friction":0.4,"viscous":0.3,"stribeck_velocity":0.025},
+                "samples":500,"velocity_min":0.002,"velocity_max":0.1,"rmse":0.003,"points":[]},
+            "negative":{"curve":{"coulomb":0.3,"static_friction":0.5,"viscous":0.4,"stribeck_velocity":0.04},
+                "samples":500,"velocity_min":0.002,"velocity_max":0.1,"rmse":0.004,"points":[]}
+        })).unwrap()
+    }
+
+    #[test]
+    fn fitted_compensation_is_directional_preserves_gains_and_keeps_dormant_axes_off() {
+        let mut baseline = ServoTuning::default();
+        for (axis, joint) in baseline.joints.iter_mut().enumerate() {
+            joint.coulomb = 0.2;
+            joint.viscous = 0.3;
+            joint.stribeck.enabled = true;
+            joint.kd += axis as f64;
+            joint.velocity_ff = 0.8;
+        }
+        let fit = identified(3);
+        let candidate = fitted_config(&Settings::default(), baseline, &fit).unwrap();
+        assert!(candidate.friction_enabled && candidate.joints[3].stribeck.enabled);
+        assert_eq!(candidate.joints[3].max_friction, fit.max_friction);
+        assert_eq!(
+            candidate.joints[3].stribeck.positive,
+            fit.positive.as_ref().unwrap().curve
+        );
+        assert_eq!(
+            candidate.joints[3].stribeck.negative,
+            fit.negative.as_ref().unwrap().curve
+        );
+        let output = candidate.apply([0.02; 7], [0.0; 7]).unwrap();
+        for axis in 0..7 {
+            assert_eq!(candidate.joints[axis].kd, baseline.joints[axis].kd);
+            assert_eq!(
+                candidate.joints[axis].velocity_ff,
+                baseline.joints[axis].velocity_ff
+            );
+            if axis != 3 {
+                assert_eq!(output.friction_requested[axis], 0.0);
             }
         }
-        baseline.joints[3].velocity_ff = 0.75;
-        assert_eq!(
-            candidates(
+        let explicit = fitted_config(
+            &Settings {
+                max_friction: Some(3.0),
+                ..Settings::default()
+            },
+            baseline,
+            &fit,
+        )
+        .unwrap();
+        assert_eq!(explicit.joints[3].max_friction, 3.0);
+        assert!(
+            fitted_config(
                 &Settings {
-                    max_friction: 0.0,
+                    max_friction: Some(0.0),
                     ..Settings::default()
                 },
-                3,
-                baseline
+                baseline,
+                &fit
             )
-            .unwrap(),
-            vec![baseline]
+            .is_none()
         );
+        let mut partial = fit;
+        partial.negative = None;
+        let partial_config = fitted_config(&Settings::default(), baseline, &partial).unwrap();
+        assert_eq!(
+            partial_config.joints[3].stribeck.negative,
+            crate::tuning::FrictionCurve::default()
+        );
+        assert_eq!(
+            partial_config.joints[3].stribeck.positive,
+            partial.positive.as_ref().unwrap().curve
+        );
+        partial.positive = None;
+        assert!(fitted_config(&Settings::default(), baseline, &partial).is_none());
+    }
+
+    #[test]
+    fn feedback_effort_identification_subtracts_actual_pose_gravity_without_using_ff_commands() {
+        let model = Kinematics::load("right").unwrap();
+        let axis = 1;
+        let mut recording = ObservationRecording::new(1600, 1);
+        for i in 0..1600 {
+            let t = i as f64 * 0.02;
+            let mut q = [0.3, 0.7, 1.1, 0.9, -0.4, 0.2, -0.3];
+            q[axis] += 0.1 * (t * 0.8).sin();
+            let velocity = 0.08 * (t * 0.8).cos();
+            let acceleration = -0.064 * (t * 0.8).sin();
+            recording.push(
+                (axis, 0),
+                Observation::new(
+                    axis,
+                    i * 20_000,
+                    q,
+                    velocity,
+                    model.gravity(&q).unwrap()[axis]
+                        + 0.12 * (velocity / 0.02).tanh()
+                        + 0.2 * velocity
+                        + 0.03 * acceleration,
+                ),
+            );
+        }
+        let result = identify(
+            &recording.into_samples(),
+            &model,
+            &Settings {
+                axis: Some(axis),
+                ..Settings::default()
+            },
+            &ServoTuning::default(),
+        );
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].source, "feedback_effort_residual");
+        assert!(result[0].positive.is_some() && result[0].negative.is_some());
+        assert!(
+            result[0].max_friction < 0.2,
+            "model gravity leaked into the friction budget"
+        );
+        for direction in [&result[0].positive, &result[0].negative] {
+            assert!(direction.as_ref().unwrap().rmse < 0.02);
+        }
+    }
+
+    #[test]
+    fn subsampling_keeps_original_feedback_neighbors_for_acceleration_and_fit() {
+        let mut recording = ObservationRecording::new(90_000, 63);
+        let omega = std::f64::consts::TAU;
+        for i in 0..24_000 {
+            let t = i as f64 * 0.01;
+            let velocity = 0.06 * (omega * t).sin();
+            let acceleration = 0.06 * omega * (omega * t).cos();
+            let effort = 0.3 * (velocity / 0.017).tanh() + 0.2 * velocity + 0.2 * acceleration;
+            recording.push(
+                (0, 0),
+                Observation::new(0, i * 10_000, [0.0; 7], velocity, effort),
+            );
+        }
+        let retained = recording.into_samples();
+        assert_eq!(retained.len(), 90_000 / 63);
+        let samples: Vec<_> = retained
+            .iter()
+            .map(|s| {
+                let (acceleration, weight) = s.acceleration_and_weight().unwrap();
+                let analytic = 0.06 * omega * (omega * s.at_us as f64 / 1_000_000.0).cos();
+                assert!((acceleration - analytic).abs() < 0.001);
+                assert!(
+                    weight <= 0.02 + 1e-12,
+                    "sampling gaps must not become derivative intervals"
+                );
+                friction::Sample {
+                    velocity: s.velocity,
+                    acceleration,
+                    effort: s.effort,
+                    weight,
+                }
+            })
+            .collect();
+        let fit = friction::identify(0, &samples, 0.017, 1.0);
+        assert!((fit.inertia - 0.2).abs() < 0.002, "I={}", fit.inertia);
+        for direction in [fit.positive, fit.negative] {
+            let direction = direction.unwrap();
+            assert!(
+                (direction.curve.viscous - 0.2).abs() < 0.002,
+                "B={}",
+                direction.curve.viscous
+            );
+            assert!(direction.rmse < 0.001);
+        }
+
+        let mut boundaries = ObservationRecording::new(4, 2);
+        boundaries.push((0, 0), Observation::new(0, 0, [0.0; 7], 1.0, 0.0));
+        boundaries.push((0, 0), Observation::new(0, 10_000, [0.0; 7], 2.0, 0.0));
+        boundaries.push((0, 1), Observation::new(0, 1_000_000, [0.0; 7], -10.0, 0.0));
+        boundaries.push((0, 1), Observation::new(0, 1_010_000, [0.0; 7], -9.0, 0.0));
+        for sample in boundaries.into_samples() {
+            assert_eq!(sample.acceleration_and_weight(), Some((100.0, 0.01)));
+        }
     }
 
     fn point(axis: usize, selected: f64) -> [f64; 7] {
@@ -979,15 +1280,17 @@ mod tests {
         // Measured RMS values exercise the tradeoff: Fc=0.1 wins on velocity,
         // while Fc=0.2 wins overall with about 38% less position error.
         let mut baseline = trial(0, 0.010828694820050612, 0.005910435712582818);
-        let configs = candidates(&Settings::default(), 3, baseline.config).unwrap();
+
         baseline.metrics.as_mut().unwrap().windows = 184;
         baseline.metrics.as_mut().unwrap().valid_ms = 20_599;
         let mut low_friction = trial(1, 0.010345783198140366, 0.004638951499589994);
-        low_friction.config = configs[1];
+        low_friction.config.friction_enabled = true;
+        low_friction.config.joints[3].coulomb = 0.1;
         let mut high_friction = trial(2, 0.010688245119382338, 0.0036441167515515152);
-        high_friction.config = configs[2];
+        high_friction.config.friction_enabled = true;
+        high_friction.config.joints[3].coulomb = 0.2;
         let mut feedforward = trial(3, 0.010893930573407125, 0.007077228086301605);
-        feedforward.config = configs[3];
+        feedforward.config.joints[3].velocity_ff = 0.75;
         let before = baseline.metrics.as_ref().unwrap();
         let after = high_friction.metrics.as_ref().unwrap();
         assert!((0.38..0.39).contains(&(1.0 - after.tracking_rms / before.tracking_rms)));
@@ -1112,6 +1415,7 @@ mod tests {
             feedback_velocity: [if t_ms.is_multiple_of(2) { -1.0 } else { 1.0 }; 7],
             feedback_age_ms: [(t_ms % 100) as u16; 7],
             command_at_ms: t_ms.checked_sub(4),
+            effort: None,
         }
     }
 
@@ -1147,7 +1451,9 @@ mod tests {
                 tracking_change: 0.38,
             }],
             sample_count: curves.len(),
+            captured_samples: curves.len(),
             curves: Arc::new(curves),
+            identification: Vec::new(),
         }
     }
 
@@ -1160,6 +1466,70 @@ mod tests {
         assert!(Arc::ptr_eq(&report.curves, &clone.curves));
         assert!(Arc::ptr_eq(&report.curves, &full.curves));
         assert!(Arc::ptr_eq(&report.curves, &ample_budget.curves));
+    }
+
+    #[test]
+    fn bounded_recording_keeps_every_axis_leg_and_final_comparison() {
+        let mut observations = Recording::new(630, 7 * 9);
+        for axis in 0..7 {
+            for leg in 0..9 {
+                for sample in 0..1000 {
+                    observations.push((axis, leg), (axis, leg, sample));
+                }
+            }
+        }
+        assert_eq!(observations.captured(), 63_000);
+        let retained = observations.into_samples();
+        assert_eq!(retained.len(), 630);
+        for axis in 0..7 {
+            for leg in 0..9 {
+                let group: Vec<_> = retained
+                    .iter()
+                    .filter(|p| p.0 == axis && p.1 == leg)
+                    .collect();
+                assert_eq!(group.len(), 10);
+                assert_eq!(group.first().unwrap().2, 0);
+                assert_eq!(group.last().unwrap().2, 999);
+                assert!(group.iter().all(|p| p.2 < 1000));
+            }
+        }
+
+        let mut curves = Recording::new(420, 21);
+        for trial in 0..21 {
+            for sample in 0..1000 {
+                curves.push(
+                    (trial, 0),
+                    curve_point((trial * 1000 + sample) as u32, trial, trial % 7),
+                );
+            }
+        }
+        assert_eq!(curves.captured(), 21_000);
+        let plotted = report(curves.into_samples()).for_plot(0);
+        assert_eq!(plotted.curves.len(), 420);
+        assert!(plotted.curves.windows(2).all(|p| p[0].t_ms < p[1].t_ms));
+        for trial in 0..21 {
+            let group: Vec<_> = plotted.curves.iter().filter(|p| p.trial == trial).collect();
+            assert_eq!(group.len(), 20);
+            assert_eq!(group.first().unwrap().t_ms, trial as u32 * 1000);
+            assert_eq!(group.last().unwrap().t_ms, trial as u32 * 1000 + 999);
+        }
+    }
+
+    #[test]
+    fn sorting_recorded_curves_does_not_mutate_the_live_report() {
+        let report = report(vec![
+            curve_point(0, 0, 3),
+            curve_point(80, 0, 3),
+            curve_point(20, 0, 3),
+            curve_point(100, 0, 3),
+        ]);
+        let full = report.for_plot(0);
+        assert_eq!(report.curves[1].t_ms, 80);
+        assert_eq!(
+            full.curves.iter().map(|p| p.t_ms).collect::<Vec<_>>(),
+            [0, 20, 80, 100]
+        );
+        assert!(!Arc::ptr_eq(&report.curves, &full.curves));
     }
 
     #[test]

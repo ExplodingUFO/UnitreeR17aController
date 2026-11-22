@@ -494,6 +494,7 @@ enum CalibrationStep {
     Configure,
     Move,
     Moving,
+    Identifying,
     Restore,
 }
 struct CalibrationPlan {
@@ -523,10 +524,11 @@ struct CalibrationRun {
     started: Instant,
     observed: Option<Instant>,
     sent: VecDeque<SentReference>,
-    candidates_added: bool,
+    identification: Option<Receiver<Vec<crate::friction::Identification>>>,
+    observations: calibration::ObservationRecording,
     after_added: bool,
     proposed: Option<ServoTuning>,
-    points: Vec<Point>,
+    points: calibration::Recording<Point>,
     last_sample: Instant,
     cancelled: bool,
 }
@@ -1287,6 +1289,15 @@ impl Core {
                 .map(CalibrationLeg::Joint)
                 .collect()
         };
+        let trial_count = if queue.iter().any(|trial| trial.cartesian) {
+            axes.len() * 2 + 2
+        } else {
+            axes.len() * 3
+        };
+        let observation_groups = axes.len() * calibration::legs(&settings, first, anchor).len();
+        // Recording memory is bounded independently of movement duration.
+        // Every trial/leg receives a share, including the final comparison.
+        let recording_budget = 90_000;
         self.calibration = Some(CalibrationRun {
             original_motion,
             report: CalibrationReport {
@@ -1311,7 +1322,9 @@ impl Core {
                 trials: Vec::with_capacity(20),
                 choices: Vec::new(),
                 sample_count: 0,
+                captured_samples: 0,
                 curves: Arc::default(),
+                identification: Vec::new(),
                 outcome: "unchanged".into(),
                 improvement: None,
                 message: "测试完成，参数保持原样".into(),
@@ -1325,10 +1338,14 @@ impl Core {
             started: now,
             observed: None,
             sent: VecDeque::with_capacity(32),
-            candidates_added: false,
+            identification: None,
+            observations: calibration::ObservationRecording::new(
+                recording_budget,
+                observation_groups,
+            ),
             after_added: false,
             proposed: None,
-            points: Vec::with_capacity(90_000),
+            points: calibration::Recording::new(recording_budget, trial_count),
             last_sample: now,
             cancelled: false,
         });
@@ -1357,9 +1374,9 @@ impl Core {
                 .as_ref()
                 .is_some_and(|p| !p.segments.is_empty())
             {
-                axes + axes.min(2) * 3 + 2
+                axes * 2 + 2
             } else {
-                axes * 2 + axes.min(2) * 3
+                axes * 3
             })
             .max(run.queue.len())
         };
@@ -1370,6 +1387,8 @@ impl Core {
             state: if restoring { "stopping" } else { "running" }.into(),
             stage: if restoring {
                 "restoring"
+            } else if matches!(run.step, CalibrationStep::Identifying) {
+                "identifying"
             } else if phase == "after" {
                 "validation"
             } else {
@@ -1408,7 +1427,8 @@ impl Core {
             }
         }
         run.report.sample_count = run.points.len();
-        run.report.curves = Arc::new(run.points);
+        run.report.captured_samples = run.points.captured();
+        run.report.curves = Arc::new(run.points.into_samples());
         let report = run.report;
         self.last_calibration_report = Some(Arc::new(report.clone()));
         let state = match report.outcome.as_str() {
@@ -1468,42 +1488,41 @@ impl Core {
         }
         self.finish_calibration(run);
     }
-    fn extend_calibration_plan(run: &mut CalibrationRun) {
-        if !run.candidates_added {
-            run.candidates_added = true;
-            let mut axes = run
-                .report
-                .trials
-                .iter()
-                .filter(|trial| trial.phase == "baseline")
-                .filter_map(|trial| {
-                    trial.metrics.as_ref().map(|m| {
-                        (
-                            trial.axis.unwrap_or(0),
-                            m.velocity_rms + 2.0 * m.tracking_rms,
-                        )
-                    })
-                })
-                .collect::<Vec<_>>();
-            axes.sort_by(|a, b| b.1.total_cmp(&a.1));
-            for (axis, _) in axes.into_iter().take(2) {
-                if let Ok(configs) =
-                    calibration::candidates(&run.report.settings, axis, run.report.baseline)
-                {
-                    for config in configs.into_iter().skip(1) {
-                        run.queue.push(CalibrationPlan {
-                            phase: "candidate".into(),
-                            axis,
-                            config,
-                            cartesian: false,
-                        });
-                    }
-                }
+    fn start_friction_identification(&self, run: &mut CalibrationRun) {
+        let data = std::mem::replace(
+            &mut run.observations,
+            calibration::ObservationRecording::new(0, 1),
+        );
+        let model = self.model.as_ref().unwrap().clone();
+        let settings = run.report.settings.clone();
+        let baseline = run.report.baseline;
+        let (sender, receiver) = bounded(1);
+        match std::thread::Builder::new()
+            .name("friction-identification".into())
+            .spawn(move || {
+                let identified =
+                    calibration::identify(&data.into_samples(), &model, &settings, &baseline);
+                // Stopping drops the receiver. A late analysis result cannot
+                // change the arm's configuration or restart its program.
+                let _ = sender.try_send(identified);
+            }) {
+            Ok(_) => {
+                run.identification = Some(receiver);
+                run.step = CalibrationStep::Identifying;
             }
-            if run.trial < run.queue.len() {
-                return;
+            Err(error) => {
+                self.journal.log(
+                    "error",
+                    "calibration",
+                    "analysis_start",
+                    &error.to_string(),
+                    None,
+                );
+                Self::extend_calibration_plan(run);
             }
         }
+    }
+    fn extend_calibration_plan(run: &mut CalibrationRun) {
         if !run.after_added {
             run.after_added = true;
             let mut proposed = run.report.baseline;
@@ -1531,6 +1550,7 @@ impl Core {
                     for joint in &mut proposed.joints {
                         joint.coulomb = 0.0;
                         joint.viscous = 0.0;
+                        joint.stribeck.enabled = false;
                     }
                     proposed.friction_enabled = true;
                 }
@@ -1538,6 +1558,7 @@ impl Core {
                 if proposed.friction_enabled && !selected.config.friction_enabled {
                     proposed.joints[axis].coulomb = 0.0;
                     proposed.joints[axis].viscous = 0.0;
+                    proposed.joints[axis].stribeck.enabled = false;
                 }
                 let before = baseline.metrics.as_ref().unwrap();
                 let after = selected.metrics.as_ref().unwrap();
@@ -1683,42 +1704,49 @@ impl Core {
             run.sent.push_back(sent);
         }
         if !run.report.trials.is_empty()
+            && !matches!(run.step, CalibrationStep::Identifying)
             && now.saturating_duration_since(run.last_sample) >= Duration::from_millis(20)
-            && run.points.len() < 90_000
             && let Ok(feedback) = self.measured(now)
         {
             run.last_sample = now;
-            run.points.push(Point {
-                t_ms: now
-                    .saturating_duration_since(run.started)
-                    .as_millis()
-                    .min(u32::MAX as u128) as u32,
-                trial: run.trial.min(run.report.trials.len() - 1),
-                axis: run.report.trials[run.trial.min(run.report.trials.len() - 1)]
-                    .axis
-                    .unwrap_or(run.axis()),
-                reference: self.reference,
-                command: latest.map(|sent| sent.q),
-                feedback,
-                velocity: latest.map_or(self.velocity, |sent| sent.dq),
-                feedback_velocity: std::array::from_fn(|i| {
-                    self.feedback[i].as_ref().unwrap().value.dq
-                }),
-                feedback_age_ms: std::array::from_fn(|i| {
-                    now.saturating_duration_since(self.feedback[i].as_ref().unwrap().at)
-                        .as_millis()
-                        .min(u16::MAX as u128) as u16
-                }),
-                command_at_ms: latest.map(|sent| {
-                    sent.completed_at
+            run.points.push(
+                (run.trial.min(run.report.trials.len() - 1), 0),
+                Point {
+                    t_ms: now
                         .saturating_duration_since(run.started)
                         .as_millis()
-                        .min(u32::MAX as u128) as u32
-                }),
-                space: run.report.trials[run.trial.min(run.report.trials.len() - 1)]
-                    .space
-                    .clone(),
-            });
+                        .min(u32::MAX as u128) as u32,
+                    trial: run.trial.min(run.report.trials.len() - 1),
+                    axis: run.report.trials[run.trial.min(run.report.trials.len() - 1)]
+                        .axis
+                        .unwrap_or(run.axis()),
+                    reference: self.reference,
+                    command: latest.map(|sent| sent.q),
+                    feedback,
+                    velocity: latest.map_or(self.velocity, |sent| sent.dq),
+                    feedback_velocity: std::array::from_fn(|i| {
+                        self.feedback[i].as_ref().unwrap().value.dq
+                    }),
+                    feedback_age_ms: std::array::from_fn(|i| {
+                        now.saturating_duration_since(self.feedback[i].as_ref().unwrap().at)
+                            .as_millis()
+                            .min(u16::MAX as u128) as u16
+                    }),
+                    command_at_ms: latest.map(|sent| {
+                        sent.completed_at
+                            .saturating_duration_since(run.started)
+                            .as_millis()
+                            .min(u32::MAX as u128) as u32
+                    }),
+                    effort: Some(std::array::from_fn(|i| {
+                        self.feedback[i].as_ref().unwrap().value.tau
+                    })),
+
+                    space: run.report.trials[run.trial.min(run.report.trials.len() - 1)]
+                        .space
+                        .clone(),
+                },
+            );
         }
         if matches!(run.step, CalibrationStep::Moving) {
             let axis = run.axis();
@@ -1729,6 +1757,19 @@ impl Core {
             {
                 run.observed = Some(at);
                 if let Ok(q) = self.measured(now) {
+                    if run.queue[run.trial].phase == "baseline" {
+                        let feedback = &self.feedback[axis].as_ref().unwrap().value;
+                        run.observations.push(
+                            (run.trial, run.leg),
+                            calibration::Observation::new(
+                                axis,
+                                at.saturating_duration_since(run.started).as_micros() as u64,
+                                q,
+                                feedback.dq,
+                                feedback.tau,
+                            ),
+                        );
+                    }
                     let sent = calibration_reference(&run.sent, at);
                     let moving = self.motion.is_some();
                     for collector in &mut run.collectors {
@@ -1783,6 +1824,38 @@ impl Core {
                     }
                     Err(e) if e.code == "motion_busy" => {}
                     Err(e) => failure = Some(e),
+                }
+            }
+            CalibrationStep::Identifying => {
+                let result = run.identification.as_ref().unwrap().try_recv();
+                match result {
+                    Ok(identified) => {
+                        run.identification = None;
+                        run.report.identification = identified;
+                        for fit in &run.report.identification {
+                            if let Some(config) = calibration::fitted_config(
+                                &run.report.settings,
+                                run.report.baseline,
+                                fit,
+                            ) {
+                                run.queue.push(CalibrationPlan {
+                                    phase: "candidate".into(),
+                                    axis: fit.axis,
+                                    config,
+                                    cartesian: false,
+                                });
+                            }
+                        }
+                        run.step = CalibrationStep::Configure;
+                        if run.trial == run.queue.len() {
+                            Self::extend_calibration_plan(&mut run);
+                        }
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => {}
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        run.identification = None;
+                        Self::extend_calibration_plan(&mut run);
+                    }
                 }
             }
             CalibrationStep::Move => {
@@ -1873,7 +1946,11 @@ impl Core {
                         run.trial += 1;
                         run.step = CalibrationStep::Configure;
                         if run.trial == run.queue.len() {
-                            Self::extend_calibration_plan(&mut run);
+                            if run.report.identification.is_empty() && !run.after_added {
+                                self.start_friction_identification(&mut run);
+                            } else {
+                                Self::extend_calibration_plan(&mut run);
+                            }
                         }
                     }
                 }
@@ -3995,9 +4072,39 @@ mod tests {
             axis: Some(1),
             excursion: 0.1,
             speed: 0.02,
-            max_friction: 0.1,
+            max_friction: Some(0.1),
+            speeds: Vec::new(),
             cartesian: None,
         }
+    }
+    fn joint_calibration_test_ticks(core: &Core, settings: &CalibrationSettings) -> u64 {
+        let axis = settings.axis.unwrap_or(0);
+        let mut previous = core.reference;
+        let speed_limit = core
+            .joint_speeds()
+            .into_iter()
+            .fold(f64::INFINITY, f64::min);
+        let per_trial: u64 = calibration::legs(settings, axis, previous)
+            .iter()
+            .map(|leg| {
+                let distance = previous
+                    .iter()
+                    .zip(leg.target)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f64, f64::max);
+                previous = leg.target;
+                let duration = trajectory::segment_duration(
+                    distance,
+                    leg.speed.min(speed_limit),
+                    core.motion_tuning.acceleration,
+                    core.motion_tuning.jerk,
+                );
+                // Configure, begin, transition and the final measured target tick.
+                (duration / CONTROL_PERIOD.as_secs_f64()).ceil() as u64 + 4
+            })
+            .sum();
+        let axes = if settings.axis.is_some() { 1 } else { 7 };
+        (per_trial + 2) * axes * 3 + 2
     }
 
     #[test]
@@ -4239,31 +4346,57 @@ mod tests {
         origin: Instant,
         jitter: bool,
     ) {
+        // Simulation time must not race ahead while the real background worker
+        // is fitting. Production ticks only try_recv; this wait is test-only.
+        if let Some(run) = core.calibration.as_mut()
+            && matches!(run.step, CalibrationStep::Identifying)
+        {
+            let fitted = run
+                .identification
+                .as_ref()
+                .unwrap()
+                .recv()
+                .expect("background friction analysis");
+            let (sender, receiver) = bounded(1);
+            sender.send(fitted).unwrap();
+            run.identification = Some(receiver);
+        }
         if let Some(lease) = core.lease.as_mut() {
             lease.expires = now + Duration::from_millis(LEASE_MS);
         }
-        let selected = core.calibration.as_ref().map_or(1, |r| r.axis());
-        let amplitude = if !jitter {
-            0.0
-        } else if core.servo_tuning.friction_enabled
-            && core.servo_tuning.joints[selected].coulomb > 0.0
-        {
-            if core.servo_tuning.joints[selected].coulomb >= 0.09 {
-                0.0004
+        // Construct a quasi-static torque-error response. The same analytic
+        // friction generates feedback effort independently of the fitted model;
+        // the test checks data flow and comparison, not real-arm performance.
+        fn friction(v: f64, axis: usize) -> f64 {
+            let fc = 0.05 + axis as f64 * 0.002;
+            let fs = if v >= 0.0 { 0.13 } else { 0.16 };
+            let vs = if v >= 0.0 { 0.025 } else { 0.035 };
+            (fc + (fs - fc) * (-(v / vs).powi(2)).exp()) * (v / 0.02).tanh() + 0.2 * v
+        }
+        let compensation = core.servo_tuning.apply(core.velocity, [0.0; 7]).unwrap();
+        let measured: [f64; 7] = std::array::from_fn(|i| {
+            let residual = if jitter {
+                friction(core.velocity[i], i) - compensation.friction_applied[i]
             } else {
-                0.0012
-            }
-        } else {
-            0.003
-        };
+                0.0
+            };
+            core.reference[i]
+                - residual / SERVO_KP
+                    * (1.0
+                        + 0.3 * (now.saturating_duration_since(origin).as_secs_f64() * 19.0).sin())
+        });
+        let gravity = core.model.as_ref().unwrap().gravity(&measured).unwrap();
         for i in 0..7 {
-            let mut value = core.feedback[i].as_ref().unwrap().value.clone();
-            value.q = core.reference[i];
-            value.dq = core.velocity[i];
-            if i == selected && core.velocity[i].abs() > 0.003 {
-                value.q +=
-                    amplitude * (now.saturating_duration_since(origin).as_secs_f64() * 19.0).sin();
-            }
+            let old = core.feedback[i].as_ref().unwrap();
+            let dt = now.saturating_duration_since(old.at).as_secs_f64();
+            let mut value = old.value.clone();
+            value.q = measured[i];
+            value.dq = if dt > 0.0 {
+                (value.q - old.value.q) / dt
+            } else {
+                core.velocity[i]
+            };
+            value.tau = gravity[i] + if jitter { friction(value.dq, i) } else { 0.0 };
             core.accept_feedback(value, now);
         }
         sent.send_replace(Some(SentReference {
@@ -4303,11 +4436,64 @@ mod tests {
         }
         let report = core.snapshot(origin).calibration.unwrap().report.unwrap();
         assert_eq!(report.outcome, "unchanged");
-        assert_eq!(report.trials.len(), 4);
+        assert!(report.trials.iter().any(|trial| trial.phase == "baseline"));
         assert!(report.recommended.is_none());
         assert_eq!(core.servo_tuning, baseline);
         assert!(core.motion.is_none());
         assert!(core.at_rest());
+    }
+    #[test]
+    fn stopping_while_fitting_discards_late_results_and_restores_the_original_tuning() {
+        let origin = Instant::now();
+        let (mut core, _dir, sent) = calibration_fixture(origin);
+        let baseline = core.servo_tuning;
+        calibration_request(
+            &mut core,
+            "analyse",
+            Operation::CalibrateStart {
+                settings: calibration_settings(),
+            },
+            origin,
+        );
+        let (sender, receiver) = bounded(1);
+        let run = core.calibration.as_mut().unwrap();
+        run.trial = run.queue.len();
+        run.step = CalibrationStep::Identifying;
+        run.identification = Some(receiver);
+        // The pending receiver is deliberately held empty. Ticks continue and
+        // stop uses the normal command path, without waiting for analysis.
+        for tick in 1..5 {
+            core.advance(origin + Duration::from_millis(tick * 10), 0.01);
+            assert_eq!(core.servo_tuning, baseline);
+            assert!(core.enabled && core.motion.is_none());
+        }
+        calibration_request(
+            &mut core,
+            "stop-fit",
+            Operation::Stop,
+            origin + Duration::from_millis(50),
+        );
+        calibration_tick(
+            &mut core,
+            &sent,
+            origin + Duration::from_millis(60),
+            origin,
+            false,
+        );
+        assert!(core.calibration.is_none());
+        assert_eq!(core.calibration_result.as_ref().unwrap().state, "cancelled");
+        assert!(sender.try_send(Vec::new()).is_err());
+        for tick in 7..15 {
+            calibration_tick(
+                &mut core,
+                &sent,
+                origin + Duration::from_millis(tick * 10),
+                origin,
+                false,
+            );
+            assert!(core.motion.is_none());
+            assert_eq!(core.servo_tuning, baseline);
+        }
     }
     #[test]
     fn calibration_default_program_sweeps_seven_axes_and_persists_actual_time_curves() {
@@ -4321,7 +4507,8 @@ mod tests {
             serde_json::from_value(serde_json::json!({"kind": "calibrate_start"})).unwrap(),
             origin,
         );
-        for tick in 1..100_000 {
+        let ticks = joint_calibration_test_ticks(&core, &CalibrationSettings::default());
+        for tick in 1..ticks {
             let now = origin + Duration::from_millis(tick * 10);
             calibration_tick(&mut core, &sent, now, origin, true);
             assert!(core.error.is_none());
@@ -4410,6 +4597,8 @@ mod tests {
         let id = result.id.clone();
         let count = result.report.as_ref().unwrap().sample_count;
         assert!(journal.calibration(&id).unwrap().is_none());
+        // Keep the fake transmitter alive when the fixture starts its worker.
+        let _transmit_sink = core.bus.as_ref().unwrap().test_transmit_sink();
         let arm = ArmHandle::spawn_core(core).unwrap();
         let server = crate::server::launch_at(
             arm.clone(),
@@ -4593,7 +4782,7 @@ mod tests {
             Operation::CalibrateStart {
                 settings: CalibrationSettings {
                     cartesian: Some(preview.program.into()),
-                    max_friction: 0.0,
+                    max_friction: Some(0.0),
                     ..Default::default()
                 },
             },
@@ -4817,12 +5006,22 @@ mod tests {
         assert_eq!(
             report.outcome,
             "improved",
-            "{} {:?}",
+            "{} {:?}; fits {:?}",
             report.message,
             report
                 .trials
                 .iter()
                 .map(|t| (&t.phase, t.metrics.as_ref().map(|m| m.velocity_rms)))
+                .collect::<Vec<_>>(),
+            report
+                .identification
+                .iter()
+                .map(|f| (
+                    f.axis,
+                    f.samples,
+                    f.positive.as_ref().map(|d| (&d.curve, d.samples, d.rmse)),
+                    f.negative.as_ref().map(|d| (&d.curve, d.samples, d.rmse))
+                ))
                 .collect::<Vec<_>>()
         );
         assert_eq!(report.trials.last().unwrap().phase, "after");
@@ -5239,7 +5438,8 @@ mod tests {
                                 axis: Some(axis),
                                 excursion,
                                 speed,
-                                max_friction: 0.1,
+                                max_friction: Some(0.1),
+                                speeds: Vec::new(),
                                 cartesian: None,
                             },
                         },

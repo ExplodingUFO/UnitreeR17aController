@@ -565,6 +565,7 @@ fn failed(s: &State) {
 fn write_calibration(conn: &mut Connection, report: &Report) -> Result<(), String> {
     // The writer owns this report; all producer and sample locks have been released.
     // Serialize before opening the independent short report transaction.
+    let report = report.for_plot(0);
     let payload = serde_json::to_string(&report.summary()).map_err(|e| e.to_string())?;
     let curves = serde_json::to_string(&report.curves).map_err(|e| e.to_string())?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
@@ -775,6 +776,21 @@ mod tests {
         let mut recommended = baseline;
         recommended.friction_enabled = true;
         recommended.joints[2].coulomb = 0.25;
+        recommended.joints[2].stribeck = crate::tuning::StribeckTuning {
+            enabled: true,
+            positive: crate::tuning::FrictionCurve {
+                coulomb: 0.12,
+                static_friction: 0.24,
+                viscous: 0.2,
+                stribeck_velocity: 0.025,
+            },
+            negative: crate::tuning::FrictionCurve {
+                coulomb: 0.15,
+                static_friction: 0.28,
+                viscous: 0.25,
+                stribeck_velocity: 0.035,
+            },
+        };
         serde_json::from_value(serde_json::json!({
             "id": id,
             "request_id": "calibration-request",
@@ -794,6 +810,15 @@ mod tests {
                     "tracking_peak": 0.003, "other_peak": 0.0001, "valid_ms": 1600
                 }
             }, { "index": 1, "phase": "candidate", "config": recommended, "metrics": null }],
+            "identification": [{
+                "axis": 2, "source": "feedback_effort_residual", "samples": 1200, "inertia": 0.03, "max_friction": 0.3,
+                "positive": { "curve": recommended.joints[2].stribeck.positive, "samples": 600,
+                    "velocity_min": 0.001, "velocity_max": 0.1, "rmse": 0.002,
+                    "points": [{"velocity": 0.02, "effort": 0.15, "predicted": 0.148, "samples": 30}] },
+                "negative": { "curve": recommended.joints[2].stribeck.negative, "samples": 600,
+                    "velocity_min": -0.1, "velocity_max": -0.001, "rmse": 0.003,
+                    "points": [{"velocity": -0.02, "effort": -0.18, "predicted": -0.177, "samples": 30}] }
+            }],
             "outcome": "improved",
             "improvement": 0.15,
             "message": "低速报告，含引号 ' 与换行\n完整保存"
@@ -826,6 +851,7 @@ mod tests {
                     feedback_velocity: [3.0 / 256.0; 7],
                     feedback_age_ms: [2; 7],
                     command_at_ms: Some(i as u32 * 20),
+                    effort: None,
                 })
                 .collect(),
         );
