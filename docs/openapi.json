@@ -4,7 +4,7 @@
   "info": {
     "title": "R1-7a Controller 本机 API",
     "version": "0.1.0",
-    "description": "对应当前桌面软件。应用从 127.0.0.1:8177 提供 HTTP 与 WebSocket，随桌面启停。token 从桌面“接口”面板取得，每次启动变化。POST /v1/commands 的 202 仅代表入队，执行结果从 Snapshot.results 按 request_id 读取。字段范围表示有效业务输入；业务校验可在入队后返回 rejected。所有量采用 m、rad、s，显式 _ms 字段采用 ms，_us 字段采用 μs。示例数值为协议示例。 短时采样沿用 Bearer/Origin 校验，无需运动租约。关节速度/加速度/jerk 由MotionTuning配置，默认为1 rad/s、0.60 rad/s²、6 rad/s³；实际串口发送可重复或合并参考。 伺服调试提供逐轴阻尼/速度前馈权重及可切换的双向 Stribeck 摩擦，完整配置见 ServoTuning；仅当前连接内存生效，连接/断开恢复基线，发送时间对齐、轨迹、采样及本轮辨识补偿尚未真机验证。 示教提供teach_start/teach_drag/teach_finish/teach_replay及/v1/teachings只读历史、下载和预览；完整录制先在内存可用，后台SQLite保存，预览包含接近与完整路径。",
+    "description": "对应当前桌面软件。应用从 127.0.0.1:8177 提供 HTTP 与 WebSocket，随桌面启停。token 从桌面“接口”面板取得，每次启动变化。POST /v1/commands 的 202 仅代表入队，执行结果从 Snapshot.results 按 request_id 读取。字段范围表示有效业务输入；业务校验可在入队后返回 rejected。所有量采用 m、rad、s，显式 _ms 字段采用 ms，_us 字段采用 μs。示例数值为协议示例。 短时采样沿用 Bearer/Origin 校验，无需运动租约。关节速度/加速度/jerk 由MotionTuning配置，默认为1 rad/s、0.60 rad/s²、6 rad/s³；实际串口发送可重复或合并参考。 伺服调试提供逐轴阻尼/速度前馈权重及可切换的双向 Stribeck 摩擦，完整配置见 ServoTuning；仅当前连接内存生效，连接/断开恢复基线，发送时间对齐、轨迹、采样及本轮辨识补偿尚未真机验证。 示教提供teach_mode/teach_start/teach_finish/teach_replay及/v1/teachings只读历史、下载和预览。拖动模式持续生效，位置录制独立于模式和动作，可与点动、校准、收纳返回或重放同时运行；开始录制不改变使能、参考或generation。Snapshot.teaching_mode表示拖动，teaching_recording表示录制，teaching只表示重放。完整录制先在内存可用，后台SQLite保存，预览包含接近与完整路径。 独立录制跨越普通机械臂停止、故障及使能/失能；显式结束、控制权失效/释放、断开或关闭时保存。",
     "license": {
       "name": "BSD-3-Clause",
       "url": "https://opensource.org/license/bsd-3-clause"
@@ -285,6 +285,8 @@
                     "acceleration": 0.6,
                     "jerk": 6.0
                   },
+                  "teaching_mode": null,
+                  "teaching_recording": null,
                   "teaching": null,
                   "latest_teaching": null
                 }
@@ -431,7 +433,7 @@
           "命令"
         ],
         "summary": "提交设备或动作请求",
-        "description": "HTTP 202 仅确认入队。控制权、generation、运行阶段、运动范围在控制线程中校验，失败通过 Snapshot.results 返回 rejected。results 新到旧，按 request_id 取第一条，最多 32 条记录。相同 generation/request_id 有最多 256 项的内存去重历史；网络超时后先查结果，不自动重发运动。 configure_servo 同样先返回 202 queued；参数范围越限等业务错误通过 rejected 返回。 teach_replay先在工作线程读取并准备路径，失败可在202前返回JSON400/404/503；准备成功才入队，原generation与租约不变，控制线程继续异步校验。",
+        "description": "HTTP 202 仅确认入队。控制权、运行阶段与运动条件在控制线程确认，失败通过 Snapshot.results 返回 rejected；teach_start/teach_finish 仅录制，仍检查控制权但不因 generation 变化拒绝。其他命令继续检查当前 generation。results 新到旧，按 request_id 取第一条，最多 32 条记录。普通命令最多 256 项内存去重历史，按 generation/request_id 去重；录制开始/结束的 request_id 在当前控制权期间保留，跨 generation 去重；网络超时后先查结果，不自动重发运动。 configure_servo 同样先返回 202 queued；参数范围越限等业务错误通过 rejected 返回。 teach_replay先在工作线程读取并准备路径，失败可在202前返回JSON400/404/503；准备成功才入队，原generation与租约不变，控制线程继续异步校验。",
         "requestBody": {
           "required": true,
           "content": {
@@ -870,34 +872,31 @@
                     "request_id": "req-teach-start-001",
                     "client_id": "example-service",
                     "lease_id": "11111111-1111-4111-8111-111111111111",
-                    "generation": 5,
+                    "generation": 6,
                     "kind": "teach_start",
-                    "name": "装配路径",
+                    "name": "装配路径"
+                  }
+                },
+                "teach_mode": {
+                  "value": {
+                    "request_id": "req-teach-mode-001",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 5,
+                    "kind": "teach_mode",
+                    "enabled": true,
                     "transition_s": 0.4
                   }
                 },
-                "teach_drag": {
+                "teach_hold": {
                   "value": {
-                    "request_id": "req-teach-press-001",
+                    "request_id": "req-teach-hold-001",
                     "client_id": "example-service",
                     "lease_id": "11111111-1111-4111-8111-111111111111",
                     "generation": 6,
-                    "kind": "teach_drag",
-                    "pressed": true,
-                    "input_seq": 1,
-                    "ttl_ms": 350
-                  }
-                },
-                "teach_drag_release": {
-                  "value": {
-                    "request_id": "req-teach-release-001",
-                    "client_id": "example-service",
-                    "lease_id": "11111111-1111-4111-8111-111111111111",
-                    "generation": 6,
-                    "kind": "teach_drag",
-                    "pressed": false,
-                    "input_seq": 2,
-                    "ttl_ms": 350
+                    "kind": "teach_mode",
+                    "enabled": false,
+                    "transition_s": 0.4
                   }
                 },
                 "teach_finish": {
@@ -906,7 +905,8 @@
                     "client_id": "example-service",
                     "lease_id": "11111111-1111-4111-8111-111111111111",
                     "generation": 6,
-                    "kind": "teach_finish"
+                    "kind": "teach_finish",
+                    "recording_request_id": "req-teach-start-001"
                   }
                 },
                 "teach_replay": {
@@ -1434,6 +1434,8 @@
                   "acceleration": 0.6,
                   "jerk": 6.0
                 },
+                "teaching_mode": null,
+                "teaching_recording": null,
                 "teaching": null,
                 "latest_teaching": null
               }
@@ -3389,7 +3391,7 @@
             "type": "integer",
             "minimum": 0,
             "maximum": 18446744073709551615,
-            "description": "来自最新 Snapshot 或 ControlReply，不自行递增。"
+            "description": "当前上下文编号；运动、配置与模式命令需匹配当前状态，独立录制开始/结束不比较该值。"
           }
         },
         "required": [
@@ -4322,7 +4324,7 @@
             "$ref": "#/components/schemas/TeachStartCommand"
           },
           {
-            "$ref": "#/components/schemas/TeachDragCommand"
+            "$ref": "#/components/schemas/TeachModeCommand"
           },
           {
             "$ref": "#/components/schemas/TeachFinishCommand"
@@ -4350,12 +4352,12 @@
             "calibrate_apply": "#/components/schemas/CalibrateApplyCommand",
             "configure_motion": "#/components/schemas/ConfigureMotionCommand",
             "teach_start": "#/components/schemas/TeachStartCommand",
-            "teach_drag": "#/components/schemas/TeachDragCommand",
+            "teach_mode": "#/components/schemas/TeachModeCommand",
             "teach_finish": "#/components/schemas/TeachFinishCommand",
             "teach_replay": "#/components/schemas/TeachReplayCommand"
           }
         },
-        "description": "全部操作参数与公共字段位于同一层。范围表示有效业务输入；HTTP 202 后仍可能异步 rejected。未知 JSON 字段当前会被忽略。 teach_replay 先在后台读取和准备，仅提交轨迹 ID 与选项；准备错误可在 202 前返回，内部程序不是公开命令。",
+        "description": "全部操作参数与公共字段位于同一层。范围表示有效业务输入；HTTP 202 后仍可能异步 rejected。未知 JSON 字段当前会被忽略。 teach_replay 先在后台读取和准备，仅提交轨迹 ID 与选项；准备错误可在 202 前返回，内部程序不是公开命令。 teach_mode持续切换拖动/保持；teach_start仅开始独立录制，不改变当前动作或generation；teach_finish在拖动时恢复保持后保存，其他情况下只保存，原软件动作继续。",
         "examples": [
           {
             "request_id": "req-connect-001",
@@ -4583,20 +4585,27 @@
             "request_id": "req-teach-start-001",
             "client_id": "example-service",
             "lease_id": "11111111-1111-4111-8111-111111111111",
-            "generation": 5,
+            "generation": 6,
             "kind": "teach_start",
-            "name": "装配路径",
+            "name": "装配路径"
+          },
+          {
+            "request_id": "req-teach-mode-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 5,
+            "kind": "teach_mode",
+            "enabled": true,
             "transition_s": 0.4
           },
           {
-            "request_id": "req-teach-press-001",
+            "request_id": "req-teach-hold-001",
             "client_id": "example-service",
             "lease_id": "11111111-1111-4111-8111-111111111111",
             "generation": 6,
-            "kind": "teach_drag",
-            "pressed": true,
-            "input_seq": 1,
-            "ttl_ms": 350
+            "kind": "teach_mode",
+            "enabled": false,
+            "transition_s": 0.4
           },
           {
             "request_id": "req-teach-finish-001",
@@ -4867,7 +4876,6 @@
               "step",
               "return",
               "calibration",
-              "teaching",
               "replay"
             ]
           },
@@ -4878,7 +4886,7 @@
             ],
             "minimum": 0,
             "maximum": 6,
-            "description": "点动轴索引；收纳返回涉及七轴，mode=return 时为 null。 mode=calibration 时为正在测试的关节索引。 mode=teaching/replay 时为 null，space=joint。"
+            "description": "点动轴索引；收纳返回和轨迹重放涉及七轴，mode=return/replay时为null且space=joint。mode=calibration时为正在测试的关节索引。独立位置录制不创建action。"
           },
           "progress": {
             "type": "number",
@@ -4901,7 +4909,6 @@
                 "mode": {
                   "enum": [
                     "return",
-                    "teaching",
                     "replay"
                   ]
                 }
@@ -4931,10 +4938,10 @@
         ],
         "examples": [
           {
-            "request_id": "req-teach-start-001",
+            "request_id": "req-jog-001",
             "space": "joint",
-            "mode": "teaching",
-            "axis": null,
+            "mode": "continuous",
+            "axis": 0,
             "progress": 0.0
           },
           {
@@ -5039,7 +5046,8 @@
               "stopping",
               "fault",
               "closing"
-            ]
+            ],
+            "description": "teaching只表示手动拖动及其过渡；独立录制不创建运动阶段。"
           },
           "side": {
             "type": "string",
@@ -5184,16 +5192,60 @@
             "acceleration": 0.6,
             "jerk": 6.0
           },
-          "teaching": {
+          "teaching_mode": {
             "anyOf": [
               {
-                "$ref": "#/components/schemas/TeachingStatus"
+                "$ref": "#/components/schemas/TeachingModeStatus"
               },
               {
                 "type": "null"
               }
             ],
-            "description": "当前录制/回放状态，无会话时为 null。"
+            "description": "持续手动拖动模式及进入/恢复保持过渡；正常保持时为null，与录制、重放独立。"
+          },
+          "teaching_recording": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TeachingStatus",
+                "properties": {
+                  "state": {
+                    "enum": [
+                      "recording",
+                      "finishing"
+                    ]
+                  },
+                  "recording": {
+                    "const": true
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "独立七轴实测位置录制；无录制时为null。可与拖动或重放同时存在，开始时不改变phase、action、使能、参考或generation。普通停止、输入到期、动作完成、故障和使能/失能不结束录制；有效反馈继续采集，缺失时不编造样本。"
+          },
+          "teaching": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TeachingStatus",
+                "properties": {
+                  "state": {
+                    "enum": [
+                      "approaching",
+                      "replaying"
+                    ]
+                  },
+                  "recording": {
+                    "const": false
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "仅表示轨迹重放，无重放时为null；可与teaching_recording同时存在，不表示拖动模式或录制。"
           },
           "latest_teaching": {
             "anyOf": [
@@ -5230,10 +5282,12 @@
           "servo_tuning_revision",
           "calibration",
           "motion_tuning",
+          "teaching_mode",
+          "teaching_recording",
           "teaching",
           "latest_teaching"
         ],
-        "description": "完整状态；所有键均存在，可选值用 null。tcp 是实测关节计算的基座 → TCP；未设置 TCP 或反馈无效时为 null。",
+        "description": "完整状态；所有键均存在，可选值用 null。tcp 是实测关节计算的基座 → TCP；未设置 TCP 或反馈无效时为 null。 teaching_mode为拖动模式，teaching_recording为独立录制，teaching只为重放；录制与重放可同时存在，录制不创建虚拟action。",
         "examples": [
           {
             "seq": 1,
@@ -5410,8 +5464,526 @@
               "acceleration": 0.6,
               "jerk": 6.0
             },
+            "teaching_mode": null,
+            "teaching_recording": null,
             "teaching": null,
             "latest_teaching": null
+          },
+          {
+            "seq": 120,
+            "generation": 6,
+            "phase": "teaching",
+            "side": "right",
+            "port": "/dev/cu.usbserial-001",
+            "enabled": true,
+            "owner": {
+              "client_id": "example-service",
+              "expires_in_ms": 2500
+            },
+            "joints": [
+              {
+                "id": 0,
+                "name": "J1",
+                "q": 0.3247388790451326,
+                "dq": 0.0,
+                "tau": 0.0,
+                "age_ms": 8,
+                "temperature": 25.0,
+                "voltage": 24.0,
+                "error": 0
+              },
+              {
+                "id": 1,
+                "name": "J2",
+                "q": 0.757930926624494,
+                "dq": 0.0,
+                "tau": 0.0,
+                "age_ms": 8,
+                "temperature": 25.0,
+                "voltage": 24.0,
+                "error": 0
+              },
+              {
+                "id": 2,
+                "name": "J3",
+                "q": 1.001786232318326,
+                "dq": 0.0,
+                "tau": 0.0,
+                "age_ms": 8,
+                "temperature": 25.0,
+                "voltage": 24.0,
+                "error": 0
+              },
+              {
+                "id": 3,
+                "name": "J4",
+                "q": 1.098527642438808,
+                "dq": 0.0,
+                "tau": 0.0,
+                "age_ms": 8,
+                "temperature": 25.0,
+                "voltage": 24.0,
+                "error": 0
+              },
+              {
+                "id": 4,
+                "name": "J5",
+                "q": -0.3061488549819603,
+                "dq": 0.0,
+                "tau": 0.0,
+                "age_ms": 8,
+                "temperature": 25.0,
+                "voltage": 24.0,
+                "error": 0
+              },
+              {
+                "id": 5,
+                "name": "J6",
+                "q": 0.02953262647141774,
+                "dq": 0.0,
+                "tau": 0.0,
+                "age_ms": 8,
+                "temperature": 25.0,
+                "voltage": 24.0,
+                "error": 0
+              },
+              {
+                "id": 6,
+                "name": "J7",
+                "q": -0.28453416096909007,
+                "dq": 0.0,
+                "tau": 0.0,
+                "age_ms": 8,
+                "temperature": 25.0,
+                "voltage": 24.0,
+                "error": 0
+              }
+            ],
+            "tcp": {
+              "translation": [
+                0.16066527662352315,
+                -0.09034592148024663,
+                0.2244337842419732
+              ],
+              "rotation": [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            },
+            "tcp_transform": {
+              "translation": [
+                0.025,
+                -0.015,
+                0.1
+              ],
+              "rotation": [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            },
+            "tcp_configured": true,
+            "feedback_age_ms": 8,
+            "action": null,
+            "last_result": {
+              "request_id": "req-teach-start-001",
+              "status": "accepted",
+              "code": "teach_start",
+              "message": "开始录制"
+            },
+            "results": [
+              {
+                "request_id": "req-teach-start-001",
+                "status": "accepted",
+                "code": "teach_start",
+                "message": "开始录制"
+              }
+            ],
+            "error": null,
+            "journal": {
+              "pending": 0,
+              "written": 1,
+              "dropped": 0,
+              "errors": 0,
+              "healthy": true
+            },
+            "communication": {
+              "received": 0,
+              "crc_errors": 0,
+              "timeouts": 0
+            },
+            "servo_tuning": {
+              "friction_enabled": false,
+              "joints": [
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                }
+              ]
+            },
+            "servo_tuning_revision": 1,
+            "calibration": null,
+            "motion_tuning": {
+              "joint_speed": 1.0,
+              "acceleration": 0.6,
+              "jerk": 6.0
+            },
+            "teaching_mode": {
+              "request_id": "req-teach-mode-001",
+              "state": "dragging"
+            },
+            "teaching_recording": {
+              "id": "55555555-5555-4555-8555-555555555555",
+              "request_id": "req-teach-start-001",
+              "state": "recording",
+              "recording": true,
+              "sample_count": 2,
+              "duration_ms": 1000,
+              "progress": 0.0,
+              "trajectory_id": "55555555-5555-4555-8555-555555555555"
+            },
+            "teaching": null,
+            "latest_teaching": {
+              "id": "44444444-4444-4444-8444-444444444444",
+              "name": "装配路径",
+              "created_at_ms": 1795392000000,
+              "side": "right",
+              "tcp": {
+                "translation": [
+                  0.025,
+                  -0.015,
+                  0.1
+                ],
+                "rotation": [
+                  0.0,
+                  0.0,
+                  0.0,
+                  1.0
+                ]
+              },
+              "duration_ms": 1000,
+              "sample_count": 2,
+              "outcome": "completed"
+            }
+          },
+          {
+            "seq": 121,
+            "generation": 7,
+            "phase": "moving",
+            "side": "right",
+            "port": "/dev/cu.usbserial-001",
+            "enabled": true,
+            "owner": {
+              "client_id": "example-service",
+              "expires_in_ms": 2500
+            },
+            "joints": [
+              {
+                "id": 0,
+                "name": "J1",
+                "q": 0.3247388790451326,
+                "dq": 0.0,
+                "tau": 0.0,
+                "age_ms": 8,
+                "temperature": 25.0,
+                "voltage": 24.0,
+                "error": 0
+              },
+              {
+                "id": 1,
+                "name": "J2",
+                "q": 0.757930926624494,
+                "dq": 0.0,
+                "tau": 0.0,
+                "age_ms": 8,
+                "temperature": 25.0,
+                "voltage": 24.0,
+                "error": 0
+              },
+              {
+                "id": 2,
+                "name": "J3",
+                "q": 1.001786232318326,
+                "dq": 0.0,
+                "tau": 0.0,
+                "age_ms": 8,
+                "temperature": 25.0,
+                "voltage": 24.0,
+                "error": 0
+              },
+              {
+                "id": 3,
+                "name": "J4",
+                "q": 1.098527642438808,
+                "dq": 0.0,
+                "tau": 0.0,
+                "age_ms": 8,
+                "temperature": 25.0,
+                "voltage": 24.0,
+                "error": 0
+              },
+              {
+                "id": 4,
+                "name": "J5",
+                "q": -0.3061488549819603,
+                "dq": 0.0,
+                "tau": 0.0,
+                "age_ms": 8,
+                "temperature": 25.0,
+                "voltage": 24.0,
+                "error": 0
+              },
+              {
+                "id": 5,
+                "name": "J6",
+                "q": 0.02953262647141774,
+                "dq": 0.0,
+                "tau": 0.0,
+                "age_ms": 8,
+                "temperature": 25.0,
+                "voltage": 24.0,
+                "error": 0
+              },
+              {
+                "id": 6,
+                "name": "J7",
+                "q": -0.28453416096909007,
+                "dq": 0.0,
+                "tau": 0.0,
+                "age_ms": 8,
+                "temperature": 25.0,
+                "voltage": 24.0,
+                "error": 0
+              }
+            ],
+            "tcp": {
+              "translation": [
+                0.16066527662352315,
+                -0.09034592148024663,
+                0.2244337842419732
+              ],
+              "rotation": [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            },
+            "tcp_transform": {
+              "translation": [
+                0.025,
+                -0.015,
+                0.1
+              ],
+              "rotation": [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ]
+            },
+            "tcp_configured": true,
+            "feedback_age_ms": 8,
+            "action": {
+              "request_id": "req-teach-replay-001",
+              "space": "joint",
+              "mode": "replay",
+              "axis": null,
+              "progress": 0.75
+            },
+            "last_result": {
+              "request_id": "req-teach-during-replay-001",
+              "status": "accepted",
+              "code": "teach_start",
+              "message": "开始录制"
+            },
+            "results": [
+              {
+                "request_id": "req-teach-during-replay-001",
+                "status": "accepted",
+                "code": "teach_start",
+                "message": "开始录制"
+              }
+            ],
+            "error": null,
+            "journal": {
+              "pending": 0,
+              "written": 1,
+              "dropped": 0,
+              "errors": 0,
+              "healthy": true
+            },
+            "communication": {
+              "received": 0,
+              "crc_errors": 0,
+              "timeouts": 0
+            },
+            "servo_tuning": {
+              "friction_enabled": false,
+              "joints": [
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                },
+                {
+                  "kd": 10.0,
+                  "velocity_ff": 1.0,
+                  "coulomb": 0.0,
+                  "viscous": 0.0,
+                  "velocity_scale": 0.02,
+                  "max_friction": 0.5
+                }
+              ]
+            },
+            "servo_tuning_revision": 1,
+            "calibration": null,
+            "motion_tuning": {
+              "joint_speed": 1.0,
+              "acceleration": 0.6,
+              "jerk": 6.0
+            },
+            "teaching_mode": null,
+            "teaching_recording": {
+              "id": "55555555-5555-4555-8555-555555555555",
+              "request_id": "req-teach-during-replay-001",
+              "state": "recording",
+              "recording": true,
+              "sample_count": 2,
+              "duration_ms": 1000,
+              "progress": 0.0,
+              "trajectory_id": "55555555-5555-4555-8555-555555555555"
+            },
+            "teaching": {
+              "id": "44444444-4444-4444-8444-444444444444",
+              "request_id": "req-teach-replay-001",
+              "state": "replaying",
+              "recording": false,
+              "sample_count": 0,
+              "duration_ms": 3000,
+              "progress": 0.75,
+              "trajectory_id": "44444444-4444-4444-8444-444444444444"
+            },
+            "latest_teaching": {
+              "id": "44444444-4444-4444-8444-444444444444",
+              "name": "装配路径",
+              "created_at_ms": 1795392000000,
+              "side": "right",
+              "tcp": {
+                "translation": [
+                  0.025,
+                  -0.015,
+                  0.1
+                ],
+                "rotation": [
+                  0.0,
+                  0.0,
+                  0.0,
+                  1.0
+                ]
+              },
+              "duration_ms": 1000,
+              "sample_count": 2,
+              "outcome": "completed"
+            }
           }
         ]
       },
@@ -5608,8 +6180,277 @@
                 "acceleration": 0.6,
                 "jerk": 6.0
               },
+              "teaching_mode": null,
+              "teaching_recording": null,
               "teaching": null,
               "latest_teaching": null
+            }
+          },
+          {
+            "type": "state",
+            "data": {
+              "seq": 121,
+              "generation": 7,
+              "phase": "moving",
+              "side": "right",
+              "port": "/dev/cu.usbserial-001",
+              "enabled": true,
+              "owner": {
+                "client_id": "example-service",
+                "expires_in_ms": 2500
+              },
+              "joints": [
+                {
+                  "id": 0,
+                  "name": "J1",
+                  "q": 0.3247388790451326,
+                  "dq": 0.0,
+                  "tau": 0.0,
+                  "age_ms": 8,
+                  "temperature": 25.0,
+                  "voltage": 24.0,
+                  "error": 0
+                },
+                {
+                  "id": 1,
+                  "name": "J2",
+                  "q": 0.757930926624494,
+                  "dq": 0.0,
+                  "tau": 0.0,
+                  "age_ms": 8,
+                  "temperature": 25.0,
+                  "voltage": 24.0,
+                  "error": 0
+                },
+                {
+                  "id": 2,
+                  "name": "J3",
+                  "q": 1.001786232318326,
+                  "dq": 0.0,
+                  "tau": 0.0,
+                  "age_ms": 8,
+                  "temperature": 25.0,
+                  "voltage": 24.0,
+                  "error": 0
+                },
+                {
+                  "id": 3,
+                  "name": "J4",
+                  "q": 1.098527642438808,
+                  "dq": 0.0,
+                  "tau": 0.0,
+                  "age_ms": 8,
+                  "temperature": 25.0,
+                  "voltage": 24.0,
+                  "error": 0
+                },
+                {
+                  "id": 4,
+                  "name": "J5",
+                  "q": -0.3061488549819603,
+                  "dq": 0.0,
+                  "tau": 0.0,
+                  "age_ms": 8,
+                  "temperature": 25.0,
+                  "voltage": 24.0,
+                  "error": 0
+                },
+                {
+                  "id": 5,
+                  "name": "J6",
+                  "q": 0.02953262647141774,
+                  "dq": 0.0,
+                  "tau": 0.0,
+                  "age_ms": 8,
+                  "temperature": 25.0,
+                  "voltage": 24.0,
+                  "error": 0
+                },
+                {
+                  "id": 6,
+                  "name": "J7",
+                  "q": -0.28453416096909007,
+                  "dq": 0.0,
+                  "tau": 0.0,
+                  "age_ms": 8,
+                  "temperature": 25.0,
+                  "voltage": 24.0,
+                  "error": 0
+                }
+              ],
+              "tcp": {
+                "translation": [
+                  0.16066527662352315,
+                  -0.09034592148024663,
+                  0.2244337842419732
+                ],
+                "rotation": [
+                  0.0,
+                  0.0,
+                  0.0,
+                  1.0
+                ]
+              },
+              "tcp_transform": {
+                "translation": [
+                  0.025,
+                  -0.015,
+                  0.1
+                ],
+                "rotation": [
+                  0.0,
+                  0.0,
+                  0.0,
+                  1.0
+                ]
+              },
+              "tcp_configured": true,
+              "feedback_age_ms": 8,
+              "action": {
+                "request_id": "req-teach-replay-001",
+                "space": "joint",
+                "mode": "replay",
+                "axis": null,
+                "progress": 0.75
+              },
+              "last_result": {
+                "request_id": "req-teach-during-replay-001",
+                "status": "accepted",
+                "code": "teach_start",
+                "message": "开始录制"
+              },
+              "results": [
+                {
+                  "request_id": "req-teach-during-replay-001",
+                  "status": "accepted",
+                  "code": "teach_start",
+                  "message": "开始录制"
+                }
+              ],
+              "error": null,
+              "journal": {
+                "pending": 0,
+                "written": 1,
+                "dropped": 0,
+                "errors": 0,
+                "healthy": true
+              },
+              "communication": {
+                "received": 0,
+                "crc_errors": 0,
+                "timeouts": 0
+              },
+              "servo_tuning": {
+                "friction_enabled": false,
+                "joints": [
+                  {
+                    "kd": 10.0,
+                    "velocity_ff": 1.0,
+                    "coulomb": 0.0,
+                    "viscous": 0.0,
+                    "velocity_scale": 0.02,
+                    "max_friction": 0.5
+                  },
+                  {
+                    "kd": 10.0,
+                    "velocity_ff": 1.0,
+                    "coulomb": 0.0,
+                    "viscous": 0.0,
+                    "velocity_scale": 0.02,
+                    "max_friction": 0.5
+                  },
+                  {
+                    "kd": 10.0,
+                    "velocity_ff": 1.0,
+                    "coulomb": 0.0,
+                    "viscous": 0.0,
+                    "velocity_scale": 0.02,
+                    "max_friction": 0.5
+                  },
+                  {
+                    "kd": 10.0,
+                    "velocity_ff": 1.0,
+                    "coulomb": 0.0,
+                    "viscous": 0.0,
+                    "velocity_scale": 0.02,
+                    "max_friction": 0.5
+                  },
+                  {
+                    "kd": 10.0,
+                    "velocity_ff": 1.0,
+                    "coulomb": 0.0,
+                    "viscous": 0.0,
+                    "velocity_scale": 0.02,
+                    "max_friction": 0.5
+                  },
+                  {
+                    "kd": 10.0,
+                    "velocity_ff": 1.0,
+                    "coulomb": 0.0,
+                    "viscous": 0.0,
+                    "velocity_scale": 0.02,
+                    "max_friction": 0.5
+                  },
+                  {
+                    "kd": 10.0,
+                    "velocity_ff": 1.0,
+                    "coulomb": 0.0,
+                    "viscous": 0.0,
+                    "velocity_scale": 0.02,
+                    "max_friction": 0.5
+                  }
+                ]
+              },
+              "servo_tuning_revision": 1,
+              "calibration": null,
+              "motion_tuning": {
+                "joint_speed": 1.0,
+                "acceleration": 0.6,
+                "jerk": 6.0
+              },
+              "teaching_mode": null,
+              "teaching_recording": {
+                "id": "55555555-5555-4555-8555-555555555555",
+                "request_id": "req-teach-during-replay-001",
+                "state": "recording",
+                "recording": true,
+                "sample_count": 2,
+                "duration_ms": 1000,
+                "progress": 0.0,
+                "trajectory_id": "55555555-5555-4555-8555-555555555555"
+              },
+              "teaching": {
+                "id": "44444444-4444-4444-8444-444444444444",
+                "request_id": "req-teach-replay-001",
+                "state": "replaying",
+                "recording": false,
+                "sample_count": 0,
+                "duration_ms": 3000,
+                "progress": 0.75,
+                "trajectory_id": "44444444-4444-4444-8444-444444444444"
+              },
+              "latest_teaching": {
+                "id": "44444444-4444-4444-8444-444444444444",
+                "name": "装配路径",
+                "created_at_ms": 1795392000000,
+                "side": "right",
+                "tcp": {
+                  "translation": [
+                    0.025,
+                    -0.015,
+                    0.1
+                  ],
+                  "rotation": [
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                  ]
+                },
+                "duration_ms": 1000,
+                "sample_count": 2,
+                "outcome": "completed"
+              }
             }
           }
         ]
@@ -9677,7 +10518,7 @@
           "t_ms",
           "q"
         ],
-        "description": "原始录制点；保持段也记录，完整详情不按绘图需要裁剪。",
+        "description": "原始实测位置录制点；保持段和其他运动期间均记录有效反馈，缺失时不编造样本，完整详情不按绘图需要裁剪。",
         "examples": [
           {
             "t_ms": 0,
@@ -10125,6 +10966,47 @@
           }
         ]
       },
+      "TeachingModeStatus": {
+        "type": "object",
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "description": "设置当前拖动模式的请求ID。"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "entering",
+              "dragging",
+              "leaving",
+              "holding"
+            ]
+          }
+        },
+        "required": [
+          "request_id",
+          "state"
+        ],
+        "description": "持续拖动模式与其过渡，独立于录制和重放；正常恢复位置保持后Snapshot.teaching_mode为null。",
+        "examples": [
+          {
+            "request_id": "req-teach-mode-001",
+            "state": "entering"
+          },
+          {
+            "request_id": "req-teach-mode-001",
+            "state": "dragging"
+          },
+          {
+            "request_id": "req-teach-hold-001",
+            "state": "leaving"
+          },
+          {
+            "request_id": "req-teach-hold-001",
+            "state": "holding"
+          }
+        ]
+      },
       "TeachingStatus": {
         "type": "object",
         "properties": {
@@ -10139,18 +11021,16 @@
           "state": {
             "type": "string",
             "enum": [
-              "holding",
-              "dragging",
-              "entering",
-              "leaving",
+              "recording",
               "finishing",
-              "replaying",
-              "approaching"
-            ]
+              "approaching",
+              "replaying"
+            ],
+            "description": "录制为recording/finishing；重放为approaching/replaying。拖动模式单独在teaching_mode中报告。"
           },
           "recording": {
             "type": "boolean",
-            "description": "true 为录制含结束过渡，false 为回放。"
+            "description": "Snapshot.teaching_recording中恒为true；Snapshot.teaching中恒为false。"
           },
           "sample_count": {
             "type": "integer",
@@ -10174,7 +11054,7 @@
               "string",
               "null"
             ],
-            "description": "关联保存的轨迹 ID。"
+            "description": "录制时与id相同；重放时为关联的已保存轨迹ID。"
           }
         },
         "required": [
@@ -10187,15 +11067,25 @@
           "progress",
           "trajectory_id"
         ],
-        "description": "当前录制或回放会话，无会话时 Snapshot.teaching 为 null；这里不携带全量录制点。",
+        "description": "位置录制或轨迹重放的共有字段。Snapshot.teaching_recording仅承载录制，Snapshot.teaching仅承载重放；两者可同时存在。这里不携带全量录制点，也不表示拖动模式。 独立录制持续跨越普通机械臂停止、动作完成、故障和使能/失能；缺失反馈不生成伪样本，结束保存不要求当前反馈有效。",
         "examples": [
           {
             "id": "44444444-4444-4444-8444-444444444444",
             "request_id": "req-teach-start-001",
-            "state": "holding",
+            "state": "recording",
             "recording": true,
             "sample_count": 2,
             "duration_ms": 1000,
+            "progress": 0.0,
+            "trajectory_id": "44444444-4444-4444-8444-444444444444"
+          },
+          {
+            "id": "44444444-4444-4444-8444-444444444444",
+            "request_id": "req-teach-start-001",
+            "state": "finishing",
+            "recording": true,
+            "sample_count": 20,
+            "duration_ms": 190,
             "progress": 0.0,
             "trajectory_id": "44444444-4444-4444-8444-444444444444"
           },
@@ -10208,6 +11098,50 @@
             "duration_ms": 3000,
             "progress": 0.25,
             "trajectory_id": "44444444-4444-4444-8444-444444444444"
+          },
+          {
+            "id": "44444444-4444-4444-8444-444444444444",
+            "request_id": "req-teach-replay-001",
+            "state": "replaying",
+            "recording": false,
+            "sample_count": 0,
+            "duration_ms": 3000,
+            "progress": 0.75,
+            "trajectory_id": "44444444-4444-4444-8444-444444444444"
+          }
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "recording": {
+                  "const": true
+                }
+              },
+              "required": [
+                "recording"
+              ]
+            },
+            "then": {
+              "properties": {
+                "state": {
+                  "enum": [
+                    "recording",
+                    "finishing"
+                  ]
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "state": {
+                  "enum": [
+                    "approaching",
+                    "replaying"
+                  ]
+                }
+              }
+            }
           }
         ]
       },
@@ -10227,12 +11161,6 @@
                 "type": "string",
                 "default": "",
                 "description": "空白名称由后端命名为“示教轨迹”。"
-              },
-              "transition_s": {
-                "type": "number",
-                "exclusiveMinimum": 0,
-                "description": "有限正数，拖动/保持的位置刚度切换时间，s；不是额外运动上限。",
-                "default": 0.4
               }
             },
             "required": [
@@ -10240,20 +11168,26 @@
             ]
           }
         ],
-        "description": "接受后进入 phase=teaching，初始保持，随后由 teach_drag 按住/释放。正常切换保留 Servo、模型重力与当前阻尼；保存全部实测位置，完成后以 teaching_saved 确认。",
+        "description": "仅开始独立的七轴实测位置录制，accepted/teach_start后由Snapshot.teaching_recording报告recording状态。不改变模式、参考、使能、generation或正在执行的动作；在保持、拖动、点动、步长、校准、收纳返回和重放期间均可录制，已连接未使能且反馈有效也可使用。未知JSON字段继续忽略；额外transition_s不会切换模式。 普通停止、点动输入到期、动作完成、故障和使能/失能不结束录制；有有效反馈就继续采集，缺失时不编造样本。显式结束、实际控制权失效/释放、断开、关闭示教弹窗或应用退出结束并保存。 仍需有效控制权和公共 generation 字段，但不比较 generation，以免模式或动作切换与录制请求相互干扰；request_id 在当前控制权期间保留并跨 generation 去重。",
         "examples": [
           {
             "request_id": "req-teach-start-001",
             "client_id": "example-service",
             "lease_id": "11111111-1111-4111-8111-111111111111",
-            "generation": 5,
+            "generation": 6,
             "kind": "teach_start",
-            "name": "装配路径",
-            "transition_s": 0.4
+            "name": "装配路径"
+          },
+          {
+            "request_id": "req-teach-start-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 6,
+            "kind": "teach_start"
           }
         ]
       },
-      "TeachDragCommand": {
+      "TeachModeCommand": {
         "allOf": [
           {
             "$ref": "#/components/schemas/CommandEnvelope"
@@ -10263,54 +11197,44 @@
             "properties": {
               "kind": {
                 "type": "string",
-                "const": "teach_drag"
+                "const": "teach_mode"
               },
-              "pressed": {
+              "enabled": {
                 "type": "boolean",
-                "description": "true 持续拖动，false 恢复当前位置保持。"
+                "description": "true持续进入手动拖动；false以当时实测位置建立保持目标并平滑恢复刚度。模式本身不开始或结束录制。"
               },
-              "input_seq": {
-                "type": "integer",
-                "minimum": 0,
-                "description": "同一录制内严格递增；较旧或相同序号不覆盖新输入。",
-                "maximum": 18446744073709551615
-              },
-              "ttl_ms": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 18446744073709551615,
-                "default": 150,
-                "description": "按住输入从后端接收起的有效毫秒，排队不延长；须在单调时钟可表示范围内。桌面每100ms续发、使用350ms TTL。"
+              "transition_s": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": "有限正数，位置刚度切换时间，s；仅作用于模式切换。",
+                "default": 0.4
               }
             },
             "required": [
               "kind",
-              "pressed",
-              "input_seq"
+              "enabled"
             ]
           }
         ],
-        "description": "只操作已开始的录制会话。状态切换产生 accepted/teach_drag，重复按住续期不逐次产生结果；到期恢复保持，不自动失能。释放后不再续发。",
+        "description": "沿用当前控制权、generation与运动条件。持续模式无需按住或定时续发输入，重复开启不重启过渡。正常切换保留Servo、模型重力和当前阻尼；开启时降低位置刚度，关闭时保持当时位置，不跳回起始姿态。停止、控制权失效或退出结束拖动并恢复保持。状态仅由Snapshot.teaching_mode报告，与录制和重放字段独立。",
         "examples": [
           {
-            "request_id": "req-teach-press-001",
+            "request_id": "req-teach-mode-001",
             "client_id": "example-service",
             "lease_id": "11111111-1111-4111-8111-111111111111",
-            "generation": 6,
-            "kind": "teach_drag",
-            "pressed": true,
-            "input_seq": 1,
-            "ttl_ms": 350
+            "generation": 5,
+            "kind": "teach_mode",
+            "enabled": true,
+            "transition_s": 0.4
           },
           {
-            "request_id": "req-teach-release-001",
+            "request_id": "req-teach-hold-001",
             "client_id": "example-service",
             "lease_id": "11111111-1111-4111-8111-111111111111",
             "generation": 6,
-            "kind": "teach_drag",
-            "pressed": false,
-            "input_seq": 2,
-            "ttl_ms": 350
+            "kind": "teach_mode",
+            "enabled": false,
+            "transition_s": 0.4
           }
         ]
       },
@@ -10325,6 +11249,13 @@
               "kind": {
                 "type": "string",
                 "const": "teach_finish"
+              },
+              "recording_request_id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "可选：要结束或取消的 teach_start 请求编号。尚未执行时取消该开始请求；已开始时保存该记录；不结束编号不同的新记录。省略时结束当前录制。"
               }
             },
             "required": [
@@ -10332,7 +11263,7 @@
             ]
           }
         ],
-        "description": "平滑恢复保持后形成完整录制；启动和结束请求报告 completed/teaching_saved，Snapshot.teaching=null，latest_teaching 更新。SQLite 编码/事务异步执行，完成结果不表示磁盘已提交。",
+        "description": "结束独立录制；若手动拖动当前有效，先平滑恢复当时位置保持再保存，否则仅结束采集，点动、步长、校准、收纳返回或重放继续。无额外静止判定或固定请求时限；当前反馈丢失也能保存已采集数据。普通机械臂停止/故障本身不结束独立录制；若打断已经请求结束的保持过渡，则向等待请求报告实际stopped/failed结果。正常保存后启动与结束请求报告completed/teaching_saved，Snapshot.teaching_recording=null，latest_teaching更新；其他动作不被保存操作取消。SQLite编码/事务异步执行，完成结果不表示磁盘已提交。 仍需有效控制权和公共 generation 字段，但不比较 generation，以免模式或动作切换与录制请求相互干扰；request_id 在当前控制权期间保留并跨 generation 去重。 关闭弹窗使用 recording_request_id 绑定开始请求；开始请求尚未执行时也能取消，返回 completed/recording_ended，原开始请求为 cancelled/recording_cancelled，不生成空记录。",
         "examples": [
           {
             "request_id": "req-teach-finish-001",
@@ -10340,6 +11271,14 @@
             "lease_id": "11111111-1111-4111-8111-111111111111",
             "generation": 6,
             "kind": "teach_finish"
+          },
+          {
+            "request_id": "req-teach-finish-001",
+            "client_id": "example-service",
+            "lease_id": "11111111-1111-4111-8111-111111111111",
+            "generation": 6,
+            "kind": "teach_finish",
+            "recording_request_id": "req-teach-start-001"
           }
         ]
       },

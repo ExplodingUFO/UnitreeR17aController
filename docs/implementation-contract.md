@@ -119,7 +119,7 @@
 | `generation` | 非负整数，u64 | 最新状态或控制权响应中的值          |
 | `kind`       | string        | 下表中的命令名                      |
 
-`generation` 会随控制权变化、连接、配置、动作结束或取消等状态变化而更新。收到 `stale_context` 后先读取状态，重新确认操作意图，不直接重发旧动作。
+`generation` 会随控制权变化、连接、配置、动作结束或取消等状态变化而更新。收到 `stale_context` 后先读取状态，重新确认操作意图，不直接重发旧动作。独立录制开始/结束只观察和保存位置，不因 generation 变化被拒绝，控制权仍需有效。
 
 ### 5.2 操作参数与确认条件
 
@@ -135,9 +135,9 @@
 | `configure_motion` | `config:MotionTuning`                                          | `accepted/configure_motion`，快照运动设置与 generation 更新                                 |
 | `calibrate_start`  | `settings:CalibrationSettings`                                 | 接受后跟踪 `calibration`；结束返回 completed、cancelled 或 failed，code 为 calibration_done |
 | `calibrate_apply`  | `calibration_id:string`                                        | `accepted/calibrate_apply`，配置及版本与推荐一致                                            |
-| `teach_start`      | `name?:string,transition_s?:number`                            | `accepted/teach_start`，`phase:"teaching"`，`teaching.recording:true`                       |
-| `teach_drag`       | `pressed:boolean,input_seq:u64,ttl_ms?:u64`                    | 按住/释放切换产生 `accepted/teach_drag`；重复续输入不逐次产生结果，按 `teaching.state` 判断 |
-| `teach_finish`     | 无                                                             | 平滑恢复保持后 `completed/teaching_saved`，`teaching:null`，`latest_teaching` 更新          |
+| `teach_mode`       | `enabled:boolean,transition_s?:number`                        | 请求被接受后，按 `teaching_mode` 确认拖动过渡；恢复保持后该字段为 null                     |
+| `teach_start`      | `name?:string`                                                | `accepted/teach_start`，`teaching_recording.state:"recording"`；当前动作、模式与 generation 不变 |
+| `teach_finish`     | `recording_request_id?:string`                                                             | `completed/teaching_saved`，`teaching_recording:null`、`latest_teaching` 更新；不取消软件动作 |
 | `teach_replay`     | `trajectory_id:string,speed_scale?:number,smoothing_s?:number` | 准备后入队，接受后跟踪 `teaching`；正常结束为 `completed/replayed` 并保持末点               |
 | `jog_start`        | `space,axis,direction,speed,frame?,ttl_ms?,input_seq`          | 请求被接受且 `action.request_id` 等于本次 `request_id`                                      |
 | `jog_update`       | `action_id,input_seq,ttl_ms?`                                  | 成功更新不产生 `accepted` 记录；按当前动作与后续状态判断                                    |
@@ -591,51 +591,68 @@ Kp、Kd 和速度前馈权重在整个校准中保持起始值，不进行 PID �
 
 ### 5.11 拖动示教
 
-示教沿用本机 Bearer/Origin 认证。历史、详情、下载与预览只读，无需运动租约；四种示教命令仍使用公共请求字段、当前控制权与 generation。录制和回放与点动、校准互斥，运动入口继续检查使能、反馈及 TCP。操作与离线验收见[示教操作与测试](teaching-test-plan.md)。
+示教沿用本机 Bearer/Origin 认证。历史、详情、下载与预览只读，无需运动租约；四种示教命令仍使用公共请求字段与当前控制权；模式和重放检查当前 generation，独立录制开始/结束不比较该值。拖动模式、位置录制和轨迹重放分别报告状态；录制可以与保持、拖动、点动、步长、校准、收纳返回或重放并行。运动入口继续使用原有使能、反馈及 TCP 条件。操作与离线验收见[示教操作与测试](teaching-test-plan.md)。
 
-**录制与保持**：控制页“示教”弹窗开始录制后，按住按钮或空格进入拖动，松开时保持当时的实测位置。位置刚度在 `transition_s` 内平滑切换，正常切换保留伺服模式、模型重力补偿和当前阻尼。释放、失焦、隐藏、指针取消均结束按住；关闭、Esc、卸载或输入链路失效经结束/停止流程处理，不留下后台拖动。
+**拖动与保持**：控制页“示教”弹窗始终显示“位置保持 / 拖动示教”。点击拖动后持续生效，可用手移动机械臂；点击位置保持后，以切换时的实测位置建立保持目标。位置刚度在 `transition_s` 内平滑切换，保留伺服模式、模型重力补偿和当前阻尼，不跳回起始姿态。重复开启不重启过渡。模式本身不开始录制，也不需要按住按钮、空格或定时续发拖动输入。
+
+**独立录制**：`teach_start` 只记录七轴实测位置，不改变运动模式、控制参考、使能或 generation。有有效反馈时，已连接未使能也可录制；软件运动期间开始录制不会取消原动作。`teach_finish` 在拖动模式中先平滑恢复当前位置保持再保存；其他情况下只结束录制，不取消点动、校准、收纳返回或重放。切回保持继续录制；切换页签、失焦或页面隐藏不暂停录制、不改变模式。
+
+普通机械臂停止、点动输入到期、动作完成、故障以及使能/失能都不结束独立录制；反馈有效时继续采集，缺失时不编造样本。停止按钮和 Esc 停止机械臂，录制仍可继续，适合连续记录多次点动与保持。显式 `teach_finish`、控制权失效/释放、断开、关闭示教弹窗和应用退出才结束并保存。“收起”仅隐藏弹窗，控制页入口继续显示录制状态；再打开沿用当前记录。关闭按钮或实际卸载弹窗会显式发送结束录制，而不只调用机械臂停止。
 
 | 命令字段                     | 默认 | 要求                                                                               |
 | ---------------------------- | ---- | ---------------------------------------------------------------------------------- |
+| `teach_mode.enabled`         | 必填 | boolean；true 持续进入拖动，false 平滑恢复当前位置保持                             |
+| `teach_mode.transition_s`    | 0.4  | 有限正数，s，拖动/保持切换时间                                                     |
 | `teach_start.name`           | `""` | string；空白名称由后端命名为“示教轨迹”                                             |
-| `teach_start.transition_s`   | 0.4  | 有限正数，s，拖动/保持切换时间                                                     |
-| `teach_drag.pressed`         | 必填 | boolean；true 持续拖动，false 恢复保持                                             |
-| `teach_drag.input_seq`       | 必填 | u64；同一录制内递增，较旧或相同序号不覆盖已处理的新输入                            |
-| `teach_drag.ttl_ms`          | 150  | 按住输入的正整数有效期，ms，从后端接收时算起，排队不延长；到期恢复保持，不自动失能 |
+| `teach_finish.recording_request_id` | 省略 | 开始录制的请求 ID；绑定指定录制，开始请求尚未执行时也能取消。省略时结束当前录制。 |
 | `teach_replay.trajectory_id` | 必填 | 已保存轨迹 ID，可读取尚未提交 SQLite 的最新完整录制                                |
 | `teach_replay.speed_scale`   | 1    | 有限正数；请求倍速，实际结果见预览                                                 |
 | `teach_replay.smoothing_s`   | 0.12 | 有限非负数，s；0 有效                                                              |
 
-桌面按住期间每 100 ms 发送一次 `teach_drag`，使用 TTL 350 ms 和严格递增序号；释放发送更大的序号及 `pressed:false`，不再续发。租约续期独立进行。`teach_start` 接受和录制结束会推进 generation，后续命令须重新读取快照。
+示教模式没有独立输入有效期；控制权仍按现有租约续期。停止、控制权失效或退出会结束拖动并恢复保持。录制的开始不推进 generation；`teach_start/teach_finish` 不因编号变化而拒绝，也不会绕过控制权检查。这两种请求在当前控制权期间保留 `request_id` 并跨 generation 去重；其他命令仍从最新快照读取 generation。结束不增加静止等待判定或固定请求时限，当前反馈缺失也可保存已经采集的数据。未知 JSON 字段仍会被忽略；例如在 `teach_start` 中发送额外的 `transition_s` 不会切换模式，切换时间只由 `teach_mode` 使用。
 
-以下为同一流程的请求格式，标识和 generation 均为示例，实际使用每一步确认后取得的上下文：
+关闭弹窗时，`teach_finish.recording_request_id` 使用原 `teach_start.request_id`。若开始请求仍未执行，会取消该请求而不生成空记录，结束请求返回 `completed/recording_ended`，开始请求返回 `cancelled/recording_cancelled`；迟到的开始请求不会重新录制。指定旧录制编号不会结束另一条新记录。
+
+以下为一次拖动录制的完整请求，标识和 generation 均为示例，实际使用每一步确认后的上下文。先进入持续拖动，再开始录制：
 
 ```json
 {
-  "request_id": "req-teach-start-001",
+  "request_id": "req-teach-mode-001",
   "client_id": "example-service",
   "lease_id": "11111111-1111-4111-8111-111111111111",
   "generation": 5,
-  "kind": "teach_start",
-  "name": "装配路径",
+  "kind": "teach_mode",
+  "enabled": true,
   "transition_s": 0.4
 }
 ```
 
 ```json
 {
-  "request_id": "req-teach-press-001",
+  "request_id": "req-teach-start-001",
   "client_id": "example-service",
   "lease_id": "11111111-1111-4111-8111-111111111111",
   "generation": 6,
-  "kind": "teach_drag",
-  "pressed": true,
-  "input_seq": 1,
-  "ttl_ms": 350
+  "kind": "teach_start",
+  "name": "装配路径"
 }
 ```
 
-松开使用新的 `request_id`、更大的 `input_seq` 和 `pressed:false`；完成录制提交：
+需要暂时固定姿态时切回保持，录制继续：
+
+```json
+{
+  "request_id": "req-teach-hold-001",
+  "client_id": "example-service",
+  "lease_id": "11111111-1111-4111-8111-111111111111",
+  "generation": 6,
+  "kind": "teach_mode",
+  "enabled": false,
+  "transition_s": 0.4
+}
+```
+
+完成录制提交；处于拖动模式时也可直接结束，无需先发送切回保持：
 
 ```json
 {
@@ -647,7 +664,7 @@ Kp、Kd 和速度前馈权重在整个校准中保持起始值，不进行 PID �
 }
 ```
 
-**保存与读取**：每个点为 `{t_ms:u64,q:[number;7]}`，分别表示相对录制开始的单调主机毫秒和 J1..J7 实测位置（rad），保持段也录制。控制周期采用分块追加，不截断样本、不全量重采样或序列化。结束形成完整内存录制并发布 `latest_teaching`；`teaching_saved` 不表示 SQLite 事务已经提交。worker 在后台展开、编码并同事务写入摘要和全部点，队列受阻时控制线程保留补投。用户轨迹不受校准报告保留数量影响。
+**保存与读取**：每个点为 `{t_ms:u64,q:[number;7]}`，分别表示相对录制开始的单调主机毫秒和 J1..J7 实测位置（rad），包含保持段及其他运动期间的反馈。控制周期采用分块追加，不截断样本、不全量重采样或序列化。结束形成完整内存录制并发布 `latest_teaching`；`teaching_saved` 不表示 SQLite 事务已经提交。后台写入线程展开、编码并同事务写入摘要和全部点，队列受阻时控制线程保留补投。用户轨迹不受校准报告保留数量影响。
 
 `GET /v1/teachings` 返回按 `created_at_ms`、`id` 降序排列的摘要，并按 ID 合并最新内存录制；详情与下载也优先读取相同 ID 的内存录制，因此无需等数据库提交。`GET /v1/teachings/{id}?download=true` 只增加 `Content-Disposition: attachment; filename="teaching-<id>.json"`，JSON 结构相同；文件名中除 ASCII 字母、数字、`-`、`_` 外的字符替换为下划线。读取和预览均返回 `Cache-Control:no-store`。
 
@@ -692,19 +709,26 @@ Kp、Kd 和速度前馈权重在整个校准中保持起始值，不进行 PID �
 
 回放按当前运动设置与模型速度约束重定时，不另加倍速、幅度、时长或样本数量上限；实际倍速和总时长以规划为准。执行从当前有效运动起点重新接近首点，再输出整条路径的 `q/dq/ddq`，复用现有发送取样、伺服补偿、TCP、停止和收纳流程，不重放原始扭矩。正常完成保持末点；停止取消余下轨迹，不自动返回首点或收纳。
 
-`Snapshot.teaching` 为当前录制/回放状态，无会话时为 null；`latest_teaching` 为最近完整录制摘要，尚无记录时为 null。状态只带摘要，完整点通过详情读取。
+**三个独立状态**：`Snapshot.teaching_mode` 只表示拖动模式，`teaching_recording` 只表示录制，`teaching` 只表示重放。没有对应活动时各自为 null。录制可与拖动或重放同时存在，不能用其中一个字段推断另外两个状态。`latest_teaching` 为最近完整录制摘要，尚无记录时为 null。状态不带完整点，完整点通过详情读取。
 
-| `TeachingStatus` 字段 | 含义                                                                    |
+| `TeachingModeStatus` 字段 | 含义                                                                  |
+| ------------------------- | --------------------------------------------------------------------- |
+| `request_id`              | 设置当前拖动模式的请求 ID                                              |
+| `state`                   | entering、dragging、leaving 或 holding；正常恢复位置保持后整个字段为 null |
+
+| `TeachingStatus` 字段 | `teaching_recording` / `teaching` 的含义                                |
 | --------------------- | ----------------------------------------------------------------------- |
 | `id` / `request_id`   | 当前轨迹 ID / 启动录制或回放的请求 ID                                   |
-| `state`               | holding、entering、dragging、leaving、finishing、approaching、replaying |
-| `recording`           | true 为录制含结束过渡，false 为回放                                     |
+| `state`               | 录制为 recording 或 finishing；重放为 approaching 或 replaying           |
+| `recording`           | `teaching_recording` 中恒为 true；`teaching` 中恒为 false                |
 | `sample_count`        | 当前录制点数；回放为 0                                                  |
 | `duration_ms`         | 录制已采集时长或回放计划总时长，u64 ms                                  |
 | `progress`            | 0..1；录制为 0，回放为包含接近的时间进度，终态以请求结果判断            |
-| `trajectory_id`       | string 或 null，关联保存的轨迹 ID                                       |
+| `trajectory_id`       | string 或 null；录制时等于 `id`，重放时关联正在执行的已保存轨迹           |
 
-录制时 `phase:"teaching"`、`action.mode:"teaching"`；回放时 `phase:"moving"`、`action.mode:"replay"`。两者 `action.space:"joint"`、`axis:null`。保存完成后 `teaching:null`，启动与结束请求产生 `completed/teaching_saved`；被停止的录制以相应 cancelled/failed 结果保存已有点。回放正常结束为 `completed/replayed`，取消或故障沿用现有结果语义。
+仅手动拖动及其过渡使用 `phase:"teaching"`。录制不创建 `action`，也不改变原有 phase；点动、步长、校准、收纳返回和重放继续报告各自动作。重放使用 `phase:"moving"`、`action.mode:"replay"`、`action.space:"joint"`、`axis:null`。录制重放反馈时，`teaching_recording` 与 `teaching` 同时存在。
+
+保存完成后 `teaching_recording:null`，启动与结束录制请求产生 `completed/teaching_saved`；其他软件动作不因保存被取消。普通停止或故障本身不结束录制；若已请求结束、正在恢复保持时被停止或故障打断，则保存已有点，并向等待结束的请求报告实际 stopped/failed 结果。重放正常结束为 `completed/replayed`，取消或故障沿用现有结果语义。
 
 ## 6. 命令输出与执行结果
 
@@ -763,7 +787,9 @@ Kp、Kd 和速度前馈权重在整个校准中保持起始值，不进行 PID �
 | `feedback_age_ms`         | u64 或 null                    | 已有反馈中最大的接收年龄                              |
 | `action`                  | object 或 null                 | 当前动作：`request_id,space,mode,axis,progress`       |
 | `calibration`             | `CalibrationStatus` 或 null    | 当前校准或最近一次结果，见 5.10                       |
-| `teaching`                | `TeachingStatus` 或 null       | 当前录制/回放状态，见 5.11                            |
+| `teaching_mode`           | `TeachingModeStatus` 或 null   | 拖动模式与进入/恢复保持过渡，见 5.11                  |
+| `teaching_recording`      | `TeachingStatus` 或 null       | 独立录制，state 为 recording/finishing，recording 为 true |
+| `teaching`                | `TeachingStatus` 或 null       | 重放，state 为 approaching/replaying，recording 为 false |
 | `latest_teaching`         | `TeachingSummary` 或 null      | 最近完整示教摘要；SQLite 提交前即可读取完整轨迹       |
 | `last_result` / `results` | `CommandResult` 或 null / 数组 | 最新一条结果 / 最近结果                               |
 | `error`                   | `{code,message}` 或 null       | 当前故障                                              |
@@ -776,7 +802,7 @@ Kp、Kd 和速度前馈权重在整个校准中保持起始值，不进行 PID �
 | `connecting`   | 串口已打开，等待反馈          |
 | `disabled`     | 已连接，未使能                |
 | `enabling`     | 已发送使能，等待反馈确认      |
-| `teaching`     | 示教录制、拖动/保持与结束过渡 |
+| `teaching`     | 手动拖动及进入/恢复保持过渡   |
 | `ready`        | 已使能，可以接受动作          |
 | `moving`       | 动作执行中                    |
 | `stopping`     | 减速停止中                    |
@@ -797,7 +823,7 @@ Kp、Kd 和速度前馈权重在整个校准中保持起始值，不进行 PID �
 
 从未收到的反馈为 `null`。反馈过期后，关节数值保留最后一次测量，`age_ms` 继续增长。控制使用的七轴反馈需全部存在、单轴年龄不超过 200 ms，不再附加七轴接收跨度门槛。仅检查 `feedback_age_ms` 不能证明七轴已经齐全。
 
-TCP 未设置或控制反馈无效时，`tcp:null`。`action.mode` 为 `continuous`、`step`、`return`、`calibration`、`teaching` 或 `replay`，收纳、示教与回放的 `axis:null`，`progress` 范围 0..1。`seq` 和 `generation` 不跨应用重启保存；重新连接应用后重新读取状态。快照通常约 30 Hz 更新，状态变化时也可提前发布。HTTP 返回缓存中的最近快照，调用方还需考虑接收后经过的时间。
+TCP 未设置或控制反馈无效时，`tcp:null`。`action.mode` 为 `continuous`、`step`、`return`、`calibration` 或 `replay`，收纳与重放的 `axis:null`，`progress` 范围 0..1。录制不创建虚拟动作，不改变正在执行的动作状态。`seq` 和 `generation` 不跨应用重启保存；重新连接应用后重新读取状态。快照通常约 30 Hz 更新，状态变化时也可提前发布。HTTP 返回缓存中的最近快照，调用方还需考虑接收后经过的时间。
 
 完整的未连接状态示例和嵌套类型见 [OpenAPI](openapi.json) 的 `Snapshot` 与 `GET /v1/state` 示例。
 

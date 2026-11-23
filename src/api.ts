@@ -147,17 +147,14 @@ export interface TeachingPreview {
   effective_speed_scale: number;
   points: TeachingPreviewPoint[];
 }
+export interface TeachingMode {
+  request_id: string;
+  state: "entering" | "dragging" | "leaving" | "holding";
+}
 export interface TeachingStatus {
   id: string;
   request_id: string;
-  state:
-    | "holding"
-    | "dragging"
-    | "entering"
-    | "leaving"
-    | "finishing"
-    | "replaying"
-    | "approaching";
+  state: "recording" | "finishing" | "replaying" | "approaching";
   recording: boolean;
   sample_count: number;
   duration_ms: number;
@@ -563,6 +560,8 @@ export interface Snapshot {
   feedback_age_ms: number | null;
   action: Action | null;
   calibration?: CalibrationStatus | null;
+  teaching_mode?: TeachingMode | null;
+  teaching_recording?: TeachingStatus | null;
   teaching?: TeachingStatus | null;
   latest_teaching?: TeachingSummary | null;
   last_result: Result | null;
@@ -669,9 +668,9 @@ export type Operation =
   | { kind: "configure_motion"; config: MotionTuning }
   | { kind: "calibrate_start"; settings?: Partial<CalibrationSettings> }
   | { kind: "calibrate_apply"; calibration_id: string }
-  | { kind: "teach_start"; name?: string; transition_s?: number }
-  | { kind: "teach_drag"; pressed: boolean; input_seq: number; ttl_ms?: number }
-  | { kind: "teach_finish" }
+  | { kind: "teach_mode"; enabled: boolean; transition_s?: number }
+  | { kind: "teach_start"; name?: string }
+  | { kind: "teach_finish"; recording_request_id?: string }
   | ({ kind: "teach_replay"; trajectory_id: string } & TeachingPlaybackOptions)
   | ({
       kind: "jog_start";
@@ -709,6 +708,8 @@ export const emptySnapshot: Snapshot = {
   feedback_age_ms: null,
   action: null,
   calibration: null,
+  teaching_mode: null,
+  teaching_recording: null,
   teaching: null,
   latest_teaching: null,
   last_result: null,
@@ -756,22 +757,7 @@ class DesktopApi {
   private polling = false;
   private cancelReturn: (() => void) | null = null;
   private calibrationRequest: { id: string; pending: boolean } | null = null;
-  private teachingRequest: {
-    id: string;
-    generation: number;
-    pending: boolean;
-  } | null = null;
-  private teachingDrag: {
-    generation: number;
-    connection: number;
-    session: string;
-    pressed: boolean;
-    confirmedSeq: number;
-    requests: Set<AbortController>;
-    timer: ReturnType<typeof setInterval> | null;
-  } | null = null;
-  private teachingInputSeq = 0;
-  private teachingStopEpoch = 0;
+  private teachingRequests = new Set<string>();
   view: View = {
     snapshot: emptySnapshot,
     connectionEpoch: 0,
@@ -1092,36 +1078,23 @@ class DesktopApi {
       )
         this.calibrationRequest.pending = false;
     }
-    if (this.teachingRequest) {
-      const request = this.teachingRequest;
+    for (const id of this.teachingRequests) {
       const result =
-        snapshot.results?.find((item) => item.request_id === request.id) ??
-        (snapshot.last_result?.request_id === request.id
-          ? snapshot.last_result
-          : null);
-      if (snapshot.teaching?.request_id === request.id) {
-        request.pending = false;
-        request.generation = snapshot.generation;
-      } else if (
-        connectionChanged ||
-        (result && result.status !== "accepted") ||
-        snapshot.generation !== request.generation
-      ) {
-        this.teachingRequest = null;
+        snapshot.results?.find((item) => item.request_id === id) ??
+        (snapshot.last_result?.request_id === id ? snapshot.last_result : null);
+      const active =
+        snapshot.teaching_recording?.request_id === id ||
+        snapshot.teaching_mode?.request_id === id ||
+        snapshot.teaching?.request_id === id ||
+        snapshot.action?.request_id === id;
+      if (connectionChanged || (result && result.status !== "accepted"))
+        this.teachingRequests.delete(id);
+      else if (active || result?.status === "accepted") {
+        // Once accepted, the three independent snapshot fields describe the
+        // running operation. Keep only requests whose outcome is still unknown.
+        this.teachingRequests.delete(id);
       }
     }
-    if (
-      this.teachingDrag &&
-      (connectionChanged ||
-        snapshot.generation !== this.teachingDrag.generation ||
-        !snapshot.teaching?.recording ||
-        snapshot.teaching.state === "finishing" ||
-        snapshot.teaching.id !== this.teachingDrag.session ||
-        !snapshot.enabled)
-    )
-      void this.releaseTeachingDrag("teaching_context_changed").catch((error) =>
-        this.fail(error),
-      );
     if (this.lease && snapshot.owner?.client_id !== "desktop")
       this.dropLease(false);
     if (
@@ -1268,8 +1241,8 @@ class DesktopApi {
       throw new ApiError("未持有控制权", null, "no_control", true);
     if (kind === "calibrate_start")
       this.calibrationRequest = { id: requestId, pending: true };
-    if (kind === "teach_start" || kind === "teach_replay")
-      this.teachingRequest = { id: requestId, generation, pending: true };
+    if (["teach_start", "teach_mode", "teach_replay"].includes(kind))
+      this.teachingRequests.add(requestId);
     try {
       return await this.request<CommandAck>(
         "/v1/commands",
@@ -1291,13 +1264,8 @@ class DesktopApi {
         this.calibrationRequest.pending
       )
         this.calibrationRequest = null;
-      if (
-        error instanceof ApiError &&
-        error.notQueued &&
-        this.teachingRequest?.id === requestId &&
-        this.teachingRequest.pending
-      )
-        this.teachingRequest = null;
+      if (error instanceof ApiError && error.notQueued)
+        this.teachingRequests.delete(requestId);
       throw error;
     }
   }
@@ -1579,128 +1547,76 @@ class DesktopApi {
     return request.pending && this.view.hasControl;
   }
   private hasLocalTeaching() {
-    if (this.teachingDrag) return true;
-    const request = this.teachingRequest;
-    if (!request) return false;
+    const s = this.view.snapshot;
     return (
-      this.view.snapshot.teaching?.request_id === request.id ||
-      (request.pending && this.view.hasControl)
+      (s.owner?.client_id === "desktop" &&
+        !!(s.teaching_mode || s.teaching_recording || s.teaching)) ||
+      (this.view.hasControl && this.teachingRequests.size > 0)
     );
   }
-  pressTeachingDrag() {
-    if (this.teachingDrag?.pressed) return;
-    const view = this.view;
-    const teaching = view.snapshot.teaching;
+  async closeTeaching(pendingStart?: string) {
+    const recording = this.view.snapshot.teaching_recording;
     if (
-      !view.online ||
-      !view.hasControl ||
-      !view.snapshot.enabled ||
-      !teaching?.recording ||
-      teaching.state === "finishing"
-    )
-      return;
-    const input = {
-      generation: view.snapshot.generation,
-      connection: view.connectionEpoch ?? 0,
-      session: teaching.id,
-      pressed: true,
-      confirmedSeq: 0,
-      requests: new Set<AbortController>(),
-      timer: null as ReturnType<typeof setInterval> | null,
-    };
-    this.teachingDrag = input;
-    const renew = () => {
-      const current = this.view;
-      if (
-        this.teachingDrag !== input ||
-        !input.pressed ||
-        current.snapshot.generation !== input.generation ||
-        (current.connectionEpoch ?? 0) !== input.connection ||
-        current.snapshot.teaching?.id !== input.session
-      )
-        return;
-      // Reserve at intent creation. Core rejects an older sequence even if its
-      // HTTP request reaches the queue after a release or a fresh press.
-      const sequence = ++this.teachingInputSeq;
-      const controller = new AbortController();
-      input.requests.add(controller);
+      (recording || pendingStart) &&
+      this.view.online &&
+      this.view.hasControl
+    ) {
+      const requestId = crypto.randomUUID();
+      let settled = false;
+      let finish: () => void;
+      const completed = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      const end = () => {
+        if (settled) return;
+        settled = true;
+        finish();
+      };
+      const unsubscribe = this.subscribe((view) => {
+        if (settled) return;
+        const result =
+          view.snapshot.results?.find(
+            (item) => item.request_id === requestId,
+          ) ??
+          (view.snapshot.last_result?.request_id === requestId
+            ? view.snapshot.last_result
+            : null);
+        if (result && result.status !== "accepted") {
+          end();
+          if (recording && ["failed", "rejected"].includes(result.status))
+            this.fail(new Error(result.message));
+        } else if (
+          !view.online ||
+          !view.hasControl ||
+          (recording &&
+            !view.snapshot.teaching_recording &&
+            view.snapshot.latest_teaching?.id === recording.id)
+        )
+          end();
+      });
+      // Confirmation comes from state, even when the HTTP acknowledgement is
+      // delayed. Closing a modal never waits behind that acknowledgement.
       void this.command(
-        "teach_drag",
-        { pressed: true, input_seq: sequence, ttl_ms: 350 },
-        crypto.randomUUID(),
-        input.generation,
-        controller.signal,
-      )
-        .then(() => {
-          input.confirmedSeq = Math.max(input.confirmedSeq, sequence);
-        })
-        .catch((error) => {
-          if (
-            this.teachingDrag !== input ||
-            !input.pressed ||
-            sequence < input.confirmedSeq
-          )
-            return;
-          this.fail(error);
-          void this.hostStop("teaching_drag_failed").catch((e) => this.fail(e));
-        })
-        .finally(() => {
-          input.requests.delete(controller);
-        });
-    };
-    renew();
-    input.timer = setInterval(renew, 100);
-  }
-  private sendTeachingRelease() {
-    const input = this.teachingDrag;
-    if (input) {
-      input.pressed = false;
-      if (input.timer) clearInterval(input.timer);
-      input.timer = null;
-      this.teachingDrag = null;
-      input.requests.forEach((controller) => controller.abort());
-      input.requests.clear();
+        "teach_finish",
+        { recording_request_id: pendingStart ?? recording?.request_id },
+        requestId,
+      ).catch((error) => {
+        if (settled) return;
+        end();
+        this.fail(error);
+      });
+      await completed;
+      unsubscribe();
     }
-    const teaching = this.view.snapshot.teaching;
-    const generation =
-      input?.generation ??
-      (teaching?.recording
-        ? this.view.snapshot.generation
-        : this.teachingRequest?.generation);
-    if (generation === undefined) return Promise.resolve();
-    return this.command(
-      "teach_drag",
-      { pressed: false, input_seq: ++this.teachingInputSeq, ttl_ms: 350 },
-      crypto.randomUUID(),
-      generation,
-    ).then(() => {});
-  }
-  async releaseTeachingDrag(reason = "teaching_released") {
-    const stopEpoch = this.teachingStopEpoch;
-    const generation =
-      this.teachingDrag?.generation ?? this.view.snapshot.generation;
-    const release = this.sendTeachingRelease();
-    const sequence = this.teachingInputSeq;
-    try {
-      await release;
-    } catch (error) {
-      if (
-        stopEpoch !== this.teachingStopEpoch ||
-        generation !== this.view.snapshot.generation ||
-        sequence !== this.teachingInputSeq ||
-        this.view.snapshot.teaching?.state === "finishing"
-      )
-        return;
-      this.fail(error);
-      await this.hostStop(reason);
-    }
+    if (
+      this.view.snapshot.teaching_mode ||
+      this.view.snapshot.teaching ||
+      this.teachingRequests.size
+    )
+      await this.hostStop("teaching_dialog_unmounted");
   }
   async hostStop(reason = "unspecified") {
-    this.teachingStopEpoch++;
-    // Clear the hold timer synchronously, before invoking the desktop stop path.
-    const release = this.sendTeachingRelease();
-    void release.catch(() => {});
-    this.teachingRequest = null;
+    this.teachingRequests.clear();
     this.clearJog();
     this.calibrationRequest = null;
     this.cancelReturn?.();

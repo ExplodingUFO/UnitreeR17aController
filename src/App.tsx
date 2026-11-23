@@ -613,9 +613,18 @@ export default function App() {
               aria-haspopup="dialog"
               aria-controls="teaching-dialog"
               aria-expanded={teachingOpen}
+              title={
+                s.teaching_recording
+                  ? `录制时长 ${fmt(s.teaching_recording.duration_ms / 1000, 1)} s`
+                  : undefined
+              }
               onClick={openTeaching}
             >
-              示教
+              {s.teaching_recording
+                ? "录制中"
+                : s.teaching_mode
+                  ? "拖动示教"
+                  : "示教"}
             </button>
             <button
               type="button"
@@ -1137,6 +1146,7 @@ export default function App() {
         open={teachingOpen}
         blocked={busy || enableInProgress || !!motionPending || !!safetyIntent}
         onClose={() => setTeachingOpen(false)}
+        onFold={() => setTeachingOpen(false)}
         onStop={stop}
       />
       {tcpOpen && (

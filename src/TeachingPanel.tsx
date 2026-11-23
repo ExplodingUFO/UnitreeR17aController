@@ -6,6 +6,7 @@ import {
   isJointPositions,
   type JointPositions,
   type TeachingPreview,
+  type TeachingMode,
   type TeachingStatus,
   type TeachingSummary,
   type TeachingTrajectory,
@@ -18,24 +19,30 @@ interface Props {
   open: boolean;
   blocked: boolean;
   onClose: () => void;
+  onFold: () => void;
   onStop: () => void;
 }
+type Lane = "record" | "mode" | "replay";
 type Pending = {
-  kind: "start" | "finish" | "replay";
+  kind: "start" | "finish" | "replay" | "mode";
   id: string;
-  generation: number;
   connection: string;
   session?: string;
+  enabled?: boolean;
+  waiting: boolean;
 };
 type ReplaySample = { t_ms: number; q: JointPositions };
 const states: Record<TeachingStatus["state"], string> = {
-  holding: "保持中",
-  dragging: "拖动中",
-  entering: "进入拖动",
-  leaving: "恢复保持",
+  recording: "录制中",
   finishing: "保存中",
   replaying: "回放中",
   approaching: "接近起点",
+};
+const modeStates: Record<TeachingMode["state"], string> = {
+  entering: "切换拖动示教",
+  dragging: "可手动拖动",
+  leaving: "恢复位置保持",
+  holding: "位置保持",
 };
 const clock = (ms: number) => `${(ms / 1000).toFixed(1)} s`;
 const nameOf = (item: TeachingSummary) => item.name || "未命名轨迹";
@@ -61,6 +68,7 @@ export default function TeachingPanel({
   open,
   blocked,
   onClose,
+  onFold,
   onStop,
 }: Props) {
   const [page, setPage] = useState<"record" | "paths">("record");
@@ -82,13 +90,12 @@ export default function TeachingPanel({
   const [previewError, setPreviewError] = useState("");
   const [feedback, setFeedback] = useState("");
   const [error, setError] = useState("");
-  const [pending, setPendingState] = useState<Pending | null>(null);
-  const pendingRef = useRef<Pending | null>(null);
-  const owned = useRef<Pending | null>(null);
+  const [requests, setRequests] = useState<Partial<Record<Lane, Pending>>>({});
+  const requestsRef = useRef(requests);
   const closing = useRef(false);
+  const folded = useRef(false);
+  const cleanupRequest = useRef<Promise<void> | null>(null);
   const dialog = useRef<HTMLElement>(null);
-  const source = useRef<"pointer" | "space" | null>(null);
-  const [pressed, setPressed] = useState(false);
   const [revision, setRevision] = useState(0);
   const [stage, setStage] = useState<PreviewStage>("teaching:all");
   const [progress, setProgress] = useState(0);
@@ -103,15 +110,21 @@ export default function TeachingPanel({
   const current = useRef({ view, open, onClose, onStop });
   current.current = { view, open, onClose, onStop };
   const actions = useRef({
-    release: () => {},
-    press: (_source: "pointer" | "space") => {},
     close: () => {},
     stop: () => {},
+    cleanup: () => {},
   });
   const s = view.snapshot;
   const teaching = s.teaching;
-  const recording = !!teaching?.recording;
-  const running = !!teaching && !recording;
+  const capture = s.teaching_recording;
+  const mode = s.teaching_mode;
+  const recording = !!capture;
+  const running = !!teaching;
+  const guiding =
+    !!mode && mode.state !== "leaving" && mode.state !== "holding";
+  const recordPending = requests.record;
+  const replayPending = requests.replay?.waiting ? requests.replay : null;
+  const modePending = requests.mode;
   const summaries = useMemo(
     () => mergeLatest(items, s.latest_teaching),
     [items, s.latest_teaching],
@@ -135,124 +148,109 @@ export default function TeachingPanel({
       : s.generation;
   const previewKey = `${selected}:${Number(speed)}:${Number(smoothing)}:${connectionOf(view)}:${previewGeneration}`;
   const preview = plan?.key === previewKey ? plan.preview : null;
-  const available =
-    view.online &&
-    view.hasControl &&
+  const controlled = view.online && view.hasControl && hasJointFeedback(view);
+  const canRecord = controlled && !recordPending;
+  const canGuide = controlled && s.enabled && !s.action && !running && !blocked;
+  const canReplay =
+    controlled &&
     s.enabled &&
-    hasJointFeedback(view) &&
-    s.phase === "ready" &&
     !s.action &&
-    !teaching &&
+    !mode &&
     !blocked &&
-    !pending;
-  const canDrag =
-    open &&
-    page === "record" &&
-    recording &&
-    teaching.state !== "finishing" &&
-    view.online &&
-    view.hasControl &&
-    s.enabled &&
-    !pending;
+    !requests.replay;
   const unavailable = !view.online
     ? "未连接"
     : !view.hasControl
       ? "未取得控制权"
-      : !s.enabled
-        ? "未使能"
-        : !hasJointFeedback(view)
-          ? "等待反馈"
-          : !sameSide
-            ? `请选择${s.side === "right" ? "右" : "左"}臂轨迹`
-            : "";
+      : !hasJointFeedback(view)
+        ? "等待反馈"
+        : "";
 
-  function setPending(value: Pending | null) {
-    pendingRef.current = value;
-    setPendingState(value);
-  }
-  function release() {
-    source.current = null;
-    setPressed(false);
-    void api.releaseTeachingDrag("teaching_released").catch((e) => {
-      if (current.current.open) setError(messageOf(e));
-    });
-  }
-  function press(input: "pointer" | "space") {
-    if (!canDrag || source.current) return;
-    source.current = input;
-    setPressed(true);
-    api.pressTeachingDrag();
+  function setRequest(lane: Lane, request?: Pending) {
+    const next = { ...requestsRef.current };
+    if (request) next[lane] = request;
+    else delete next[lane];
+    requestsRef.current = next;
+    setRequests(next);
   }
   function stop() {
-    release();
     closing.current = false;
-    setPending(null);
-    if (
-      owned.current &&
-      api.view.snapshot.teaching?.request_id !== owned.current.id &&
-      resultFor(api.view, owned.current.id)?.status !== "accepted"
-    )
-      owned.current = null;
+    const record = requestsRef.current.record;
+    requestsRef.current = record ? { record } : {};
+    setRequests(requestsRef.current);
     setFeedback("停止中");
     setError("");
     setPlaying(false);
     current.current.onStop();
   }
-  function complete(request: Pending, actualMessage = "") {
-    setPending(null);
-    setError("");
-    if (request.kind === "finish") {
-      owned.current = null;
-      const latest = api.view.snapshot.latest_teaching;
-      const outcome =
-        latest && latest.id === request.session ? latest.outcome : "completed";
-      const label =
-        outcome === "completed"
-          ? "轨迹已保存"
-          : outcome === "failed"
-            ? "示教失败，轨迹已保存"
-            : "示教已停止，轨迹已保存";
-      const message =
-        actualMessage && actualMessage !== label
-          ? `${label} · ${actualMessage}`
-          : label;
-      setFeedback(message);
-      setError(outcome === "failed" ? message : "");
-      setPage("paths");
-      if (latest) setSelected(latest.id);
-      setRevision((value) => value + 1);
-      if (closing.current) {
-        closing.current = false;
-        if (outcome !== "failed") current.current.onClose();
-      }
-    } else if (!api.view.snapshot.teaching) {
-      owned.current = null;
-      setFeedback(
-        actualMessage ||
-          (request.kind === "replay" ? "回放完成" : "录制已结束"),
+  function closeAfterSave() {
+    closing.current = false;
+    const state = api.view.snapshot;
+    if (
+      state.teaching_mode ||
+      state.teaching ||
+      requestsRef.current.mode ||
+      requestsRef.current.replay
+    ) {
+      void api.hostStop("teaching_dialog_closed").then(
+        () => current.current.onClose(),
+        (cause) => setError(messageOf(cause)),
       );
-    }
+    } else current.current.onClose();
   }
-  function submit(kind: Pending["kind"]) {
-    if (pendingRef.current) return;
+  function finishSaved(request: Pending, actualMessage = "") {
+    setRequest("record");
+    const latest = api.view.snapshot.latest_teaching;
+    const saved = latest?.id === request.session ? latest : null;
+    const label =
+      saved?.outcome === "failed"
+        ? "录制中断，已保存采集部分"
+        : saved?.outcome === "stopped"
+          ? "录制已停止并保存"
+          : "轨迹已保存";
+    setFeedback(label);
+    setError(saved?.outcome === "failed" ? actualMessage || label : "");
+    setPage("paths");
+    if (saved) setSelected(saved.id);
+    setRevision((value) => value + 1);
+    if (closing.current) closeAfterSave();
+  }
+  function holdPosition() {
+    if (requestsRef.current.mode?.enabled) {
+      // The enter request may have already changed generation while the
+      // corresponding state is still in transit. Stop adopts current hold
+      // without depending on that older generation; recording stays active.
+      setRequest("mode");
+      setFeedback("恢复位置保持");
+      void api
+        .hostStop("teaching_mode_cancelled")
+        .catch((cause) => setError(messageOf(cause)));
+    } else if (mode) submit("mode", false);
+  }
+  function submit(kind: Pending["kind"], enabled?: boolean) {
+    const lane: Lane =
+      kind === "mode" ? "mode" : kind === "replay" ? "replay" : "record";
+    if (lane !== "mode" && requestsRef.current[lane]?.waiting) return;
     const request: Pending = {
       kind,
       id: crypto.randomUUID(),
-      generation: s.generation,
       connection: connectionOf(view),
-      session: teaching?.id,
+      session: capture?.id,
+      enabled,
+      waiting: true,
     };
     const params =
       kind === "start"
-        ? { name: name.trim(), transition_s: Number(transition) }
-        : kind === "replay"
-          ? {
-              trajectory_id: selected,
-              speed_scale: Number(speed),
-              smoothing_s: Number(smoothing),
-            }
-          : {};
-    if (kind !== "finish") owned.current = request;
+        ? { name: name.trim() }
+        : kind === "mode"
+          ? { enabled, transition_s: Number(transition) }
+          : kind === "replay"
+            ? {
+                trajectory_id: selected,
+                speed_scale: Number(speed),
+                smoothing_s: Number(smoothing),
+              }
+            : { recording_request_id: capture?.request_id };
     if (kind === "replay") {
       replaySamples.current = [];
       replayPreview.current = preview;
@@ -261,195 +259,188 @@ export default function TeachingPanel({
       setSampleRevision((value) => value + 1);
       setPlaying(false);
     }
-    setPending(request);
+    setRequest(lane, request);
     setFeedback("");
     setError("");
-    source.current = null;
-    setPressed(false);
-    const send = async () => {
-      if (kind === "finish")
-        void api
-          .releaseTeachingDrag("teaching_finished")
-          .catch((e) => api.fail(e));
-      if (pendingRef.current !== request) return;
-      await api.command(
-        `teach_${kind}`,
-        params,
-        request.id,
-        request.generation,
-      );
-    };
-    void send().catch(async (cause) => {
-      // A terminal state may arrive before the HTTP response, including an error.
-      if (pendingRef.current !== request) return;
-      const known = resultFor(api.view, request.id);
-      if (known?.status === "completed") {
-        complete(request, known.message);
-        return;
-      }
-      if (known?.status === "accepted") return;
-      if (known) {
+    void api
+      .command(`teach_${kind}`, params, request.id, s.generation)
+      .catch(async (cause) => {
+        // Snapshot results can precede the HTTP acknowledgement. A response for
+        // an older intent never changes a newer operation or the current mode.
+        if (requestsRef.current[lane]?.id !== request.id) return;
+        const state = api.view.snapshot;
+        const known = resultFor(api.view, request.id);
         if (
           kind === "finish" &&
-          api.view.snapshot.latest_teaching?.id === request.session &&
-          !api.view.snapshot.teaching
+          state.latest_teaching?.id === request.session &&
+          !state.teaching_recording
         ) {
-          complete(request, known.message);
+          finishSaved(request, known?.message);
           return;
         }
-        setPending(null);
+        if (
+          known ||
+          state.teaching_recording?.request_id === request.id ||
+          state.teaching_mode?.request_id === request.id ||
+          state.teaching?.request_id === request.id
+        )
+          return;
+        setRequest(lane);
         closing.current = false;
-        if (kind !== "finish") owned.current = null;
-        setError(known.message || "操作已结束");
-        return;
-      }
-      if (
-        kind !== "finish" &&
-        api.view.snapshot.teaching?.request_id === request.id
-      ) {
-        setPending(null);
-        owned.current = {
-          ...request,
-          generation: api.view.snapshot.generation,
-        };
-        return;
-      }
-      setPending(null);
-      closing.current = false;
-      setError(messageOf(cause));
-      if (!(cause instanceof ApiError && cause.notQueued)) {
-        source.current = null;
-        setPressed(false);
-        await api.hostStop("teaching_request_failed").catch((e) => {
-          if (current.current.open) setError(messageOf(e));
-        });
-      }
-      if (kind !== "finish") owned.current = null;
-    });
+        setError(messageOf(cause));
+        if (!(cause instanceof ApiError && cause.notQueued))
+          await api.hostStop("teaching_request_failed").catch((error) => {
+            if (current.current.open) setError(messageOf(error));
+          });
+      });
   }
   function close() {
-    release();
     setPlaying(false);
-    if (pendingRef.current?.kind === "finish") {
+    const state = api.view.snapshot;
+    if (!view.online || !view.hasControl) {
+      const pendingStart =
+        requestsRef.current.record?.kind === "start"
+          ? requestsRef.current.record.id
+          : undefined;
+      requestsRef.current = {};
+      setRequests({});
+      void api.closeTeaching(pendingStart).then(
+        () => current.current.onClose(),
+        (cause) => setError(messageOf(cause)),
+      );
+    } else if (requestsRef.current.record?.kind === "finish") {
       closing.current = true;
       setFeedback("保存后关闭");
-    } else if (recording && !pendingRef.current) {
+    } else if (state.teaching_recording && !requestsRef.current.record) {
       closing.current = true;
       submit("finish");
-    } else if (teaching || pendingRef.current || owned.current) {
-      setPending(null);
-      owned.current = null;
-      void api.hostStop("teaching_dialog_closed").then(
+    } else if (
+      state.teaching_mode ||
+      state.teaching ||
+      Object.keys(requestsRef.current).length
+    ) {
+      const pendingStart =
+        requestsRef.current.record?.kind === "start"
+          ? requestsRef.current.record.id
+          : undefined;
+      requestsRef.current = {};
+      setRequests({});
+      void api.closeTeaching(pendingStart).then(
         () => current.current.onClose(),
-        (e) => setError(messageOf(e)),
+        (cause) => setError(messageOf(cause)),
       );
-    } else {
-      current.current.onClose();
-    }
+    } else current.current.onClose();
   }
-  actions.current = { release, press, close, stop };
+  function cleanup() {
+    if (cleanupRequest.current) return;
+    const state = api.view.snapshot;
+    if (
+      !state.teaching_mode &&
+      !state.teaching_recording &&
+      !state.teaching &&
+      !Object.keys(requestsRef.current).length
+    )
+      return;
+    const pendingStart =
+      requestsRef.current.record?.kind === "start"
+        ? requestsRef.current.record.id
+        : undefined;
+    requestsRef.current = {};
+    setRequests({});
+    cleanupRequest.current = api
+      .closeTeaching(pendingStart)
+      .catch((error) => api.fail(error));
+  }
+  function fold() {
+    folded.current = true;
+    setPlaying(false);
+    onFold();
+  }
+  actions.current = { close, stop, cleanup };
+
+  useEffect(() => () => actions.current.cleanup(), []);
 
   useEffect(() => {
-    const request = pendingRef.current ?? owned.current;
-    if (!request) return;
-    const result = resultFor(view, request.id);
-    const terminal = result?.status !== "accepted" ? result : null;
-    if (terminal) {
+    for (const [key, request] of Object.entries(requestsRef.current)) {
+      const lane = key as Lane;
+      const result = resultFor(view, request.id);
       if (
-        request.kind === "start" &&
-        terminal.status === "completed" &&
-        teaching?.request_id === request.id &&
-        teaching.recording
+        request.kind === "finish" &&
+        s.latest_teaching?.id === request.session &&
+        !capture
       ) {
-        if (pendingRef.current?.id === request.id) setPending(null);
-        return;
+        finishSaved(request, result?.message);
+        continue;
+      }
+      if (result && result.status !== "accepted") {
+        setRequest(lane);
+        if (request.kind === "finish" && result.status === "completed")
+          finishSaved(request, result.message);
+        else {
+          setFeedback(
+            result.message ||
+              (request.kind === "replay" ? "回放完成" : "操作已完成"),
+          );
+          setError(
+            ["failed", "rejected"].includes(result.status)
+              ? result.message || "操作未完成"
+              : "",
+          );
+          if (request.kind === "finish") closing.current = false;
+        }
+        continue;
+      }
+      const observed =
+        request.kind === "start"
+          ? capture?.request_id === request.id
+          : request.kind === "mode"
+            ? mode?.request_id === request.id ||
+              (!!result && !request.enabled && !mode)
+            : request.kind === "replay"
+              ? teaching?.request_id === request.id ||
+                s.action?.request_id === request.id
+              : false;
+      if (observed) {
+        if (request.kind === "replay") {
+          if (request.waiting) setRequest(lane, { ...request, waiting: false });
+        } else setRequest(lane);
+        continue;
       }
       if (
-        terminal.status === "completed" ||
-        (request.kind === "finish" &&
-          s.latest_teaching?.id === request.session &&
-          !teaching)
-      )
-        complete(request, terminal.message);
-      else {
-        setPending(null);
+        !view.online ||
+        !view.hasControl ||
+        connectionOf(view) !== request.connection
+      ) {
+        setRequest(lane);
         closing.current = false;
-        if (request.kind !== "finish") owned.current = null;
-        setFeedback(terminal.message || "操作已结束");
-        setError(
-          ["failed", "rejected"].includes(terminal.status)
-            ? terminal.message || "操作未完成"
-            : "",
-        );
+        setError(!view.online ? "连接已断开" : "控制已结束");
       }
-      return;
     }
-    if (
-      request.kind !== "finish" &&
-      (teaching?.request_id === request.id ||
-        s.action?.request_id === request.id)
-    ) {
-      setPending(null);
-      if (owned.current?.id === request.id)
-        owned.current = {
-          ...request,
-          generation: s.generation,
-          session: teaching?.id ?? request.session,
-        };
-      return;
-    }
-    if (
-      request.kind === "finish" &&
-      s.latest_teaching?.id === request.session &&
-      !teaching
-    ) {
-      complete(request);
-      return;
-    }
-    if (
-      !view.online ||
-      !view.hasControl ||
-      connectionOf(view) !== request.connection
-    ) {
-      setPending(null);
-      owned.current = null;
-      closing.current = false;
-      actions.current.release();
-      setError(!view.online ? "连接已断开" : "操作已结束");
-    }
-  }, [view, pending?.id]);
+  }, [view, requests]);
 
   useEffect(() => {
     if (!open) return;
     closing.current = false;
+    folded.current = false;
+    cleanupRequest.current = null;
     const previous = document.activeElement;
-    dialog.current?.focus();
+    dialog.current
+      ?.querySelector<HTMLElement>("button:not(:disabled)")
+      ?.focus();
     const keydown = (event: KeyboardEvent) => {
       if (!dialog.current?.contains(document.activeElement)) return;
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopPropagation();
-        const active =
-          current.current.view.snapshot.teaching || pendingRef.current;
-        if (active) actions.current.stop();
-        else actions.current.close();
-      } else if (event.code === "Space") {
-        if (event.altKey || event.ctrlKey || event.metaKey) return;
-        const target = event.target;
+        const state = current.current.view.snapshot;
         if (
-          target instanceof Element &&
-          (target.closest(
-            "input, textarea, select, [contenteditable], summary",
-          ) ||
-            (target.closest("button") && !target.closest(".teaching-drag")))
+          state.teaching_mode ||
+          state.teaching_recording ||
+          state.teaching ||
+          Object.keys(requestsRef.current).length
         )
-          return;
-        if (event.repeat) {
-          if (source.current === "space") event.preventDefault();
-          return;
-        }
-        event.preventDefault();
-        actions.current.press("space");
+          actions.current.stop();
+        else actions.current.close();
       } else if (event.key === "Tab") {
         const controls = Array.from(
           dialog.current.querySelectorAll<HTMLElement>(
@@ -471,56 +462,14 @@ export default function TeachingPanel({
         }
       }
     };
-    const keyup = (event: KeyboardEvent) => {
-      if (event.code === "Space" && source.current === "space") {
-        event.preventDefault();
-        actions.current.release();
-      }
-    };
-    const pointerup = () => {
-      if (source.current === "pointer") actions.current.release();
-    };
-    const releaseAll = () => actions.current.release();
-    const visibility = () => {
-      if (document.hidden) releaseAll();
-    };
     window.addEventListener("keydown", keydown, true);
-    window.addEventListener("keyup", keyup, true);
-    window.addEventListener("pointerup", pointerup);
-    window.addEventListener("pointercancel", releaseAll);
-    window.addEventListener("blur", releaseAll);
-    document.addEventListener("visibilitychange", visibility);
     return () => {
       window.removeEventListener("keydown", keydown, true);
-      window.removeEventListener("keyup", keyup, true);
-      window.removeEventListener("pointerup", pointerup);
-      window.removeEventListener("pointercancel", releaseAll);
-      window.removeEventListener("blur", releaseAll);
-      document.removeEventListener("visibilitychange", visibility);
-      source.current = null;
-      setPressed(false);
-      void api
-        .releaseTeachingDrag("teaching_dialog_unmounted")
-        .catch((e) => api.fail(e));
-      const active =
-        current.current.view.snapshot.teaching ||
-        pendingRef.current ||
-        owned.current;
-      if (active) {
-        setPending(null);
-        owned.current = null;
-        void api
-          .hostStop("teaching_dialog_unmounted")
-          .catch((e) => api.fail(e));
-      }
+      if (!folded.current) actions.current.cleanup();
       if (previous instanceof HTMLElement && previous.isConnected)
         previous.focus();
     };
   }, [open]);
-
-  useEffect(() => {
-    if (pressed && !canDrag) actions.current.release();
-  }, [canDrag, teaching, pending, pressed]);
 
   useEffect(() => {
     if (!open || !view.online || page !== "paths") return;
@@ -696,15 +645,22 @@ export default function TeachingPanel({
         data-page={page}
       >
         <header className="teaching-header">
-          <h2 id="teaching-title">示教</h2>
+          <h2 id="teaching-title">示教与录制</h2>
           <span>{s.side === "right" ? "右臂" : "左臂"}</span>
           <span
             className="teaching-state"
             data-recording={recording}
             role="status"
           >
-            {teaching ? states[teaching.state] : "待命"}
+            {capture
+              ? states[capture.state]
+              : teaching
+                ? states[teaching.state]
+                : "待命"}
           </span>
+          <button className="teaching-fold" onClick={fold}>
+            收起
+          </button>
           <button
             className="calibration-close"
             aria-label="关闭示教"
@@ -713,32 +669,61 @@ export default function TeachingPanel({
             ×
           </button>
         </header>
-        <nav className="teaching-tabs" aria-label="示教视图">
-          {(
-            [
-              ["record", "录制"],
-              ["paths", "轨迹"],
-            ] as const
-          ).map(([id, label]) => (
-            <button
-              key={id}
-              aria-pressed={page === id}
-              onClick={() => {
-                release();
-                setPlaying(false);
-                setPage(id);
-              }}
-            >
-              {label}
-              {id === "record" && recording && <i />}
-            </button>
-          ))}
-          <small>
-            {page === "record"
-              ? "重力补偿 + 阻尼"
-              : `${summaries.length} 条轨迹`}
-          </small>
-        </nav>
+        <div className="teaching-toolbar">
+          <nav className="teaching-tabs" aria-label="示教视图">
+            {(
+              [
+                ["record", "录制"],
+                ["paths", "轨迹"],
+              ] as const
+            ).map(([id, label]) => (
+              <button
+                key={id}
+                aria-pressed={page === id}
+                onClick={() => {
+                  setPlaying(false);
+                  setPage(id);
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </nav>
+          <div className="teaching-controls">
+            <div className="teaching-mode" role="group" aria-label="运动模式">
+              <button
+                aria-pressed={!(modePending?.enabled ?? guiding)}
+                aria-busy={modePending?.enabled === false}
+                disabled={!view.online || !view.hasControl}
+                onClick={holdPosition}
+              >
+                位置保持
+              </button>
+              <button
+                aria-pressed={modePending?.enabled ?? guiding}
+                aria-busy={modePending?.enabled === true}
+                disabled={!canGuide || !transitionValid}
+                onClick={() => {
+                  if (!guiding && !modePending?.enabled) submit("mode", true);
+                }}
+              >
+                拖动示教
+              </button>
+            </div>
+            <span role="status">
+              {mode
+                ? modeStates[mode.state]
+                : modePending
+                  ? "切换中…"
+                  : s.action
+                    ? "程序运动中"
+                    : s.enabled
+                      ? "保持当前位置"
+                      : "未使能"}
+              {guiding && <small>重力补偿与阻尼</small>}
+            </span>
+          </div>
+        </div>
         <div className="teaching-body">
           <aside className="teaching-sidebar">
             {page === "record" ? (
@@ -749,47 +734,29 @@ export default function TeachingPanel({
                     aria-label="轨迹名称"
                     placeholder="未命名轨迹"
                     value={name}
-                    disabled={recording || !!pending}
+                    disabled={recording || !!recordPending}
                     onChange={(e) => setName(e.target.value)}
                   />
                 </label>
                 <dl className="teaching-stats">
                   <div>
                     <dt>录制时长</dt>
-                    <dd>{clock(recording ? teaching.duration_ms : 0)}</dd>
+                    <dd>{clock(capture?.duration_ms ?? 0)}</dd>
                   </div>
                   <div>
                     <dt>采样</dt>
                     <dd>
-                      {recording ? teaching.sample_count.toLocaleString() : "—"}
+                      {capture ? capture.sample_count.toLocaleString() : "—"}
                     </dd>
                   </div>
                 </dl>
-                <button
-                  className="teaching-drag"
-                  aria-label="按住拖动"
-                  aria-pressed={pressed}
-                  disabled={!canDrag}
-                  onPointerDown={(event) => {
-                    if (event.button !== 0 || !canDrag) return;
-                    event.preventDefault();
-                    event.currentTarget.focus();
-                    event.currentTarget.setPointerCapture(event.pointerId);
-                    press("pointer");
-                  }}
-                  onPointerUp={release}
-                  onPointerCancel={release}
-                  onLostPointerCapture={release}
-                  onContextMenu={(event) => event.preventDefault()}
-                >
-                  <span className="teaching-hand" aria-hidden="true">
-                    ↔
-                  </span>
-                  <strong>{pressed ? "拖动中" : "按住拖动"}</strong>
-                  <small>松开保持 · 空格同效</small>
-                </button>
+                <p className="teaching-record-hint">
+                  {recording
+                    ? "正在记录实测位置，可切换模式或查看轨迹。"
+                    : "拖动示教下可直接移动机械臂。录制记录七轴实测位置。"}
+                </p>
                 <details className="teaching-settings">
-                  <summary>录制设置</summary>
+                  <summary>示教设置</summary>
                   <label className="teaching-field">
                     <span>
                       增益过渡 <small>s</small>
@@ -800,31 +767,11 @@ export default function TeachingPanel({
                       step="any"
                       value={transition}
                       aria-invalid={!transitionValid}
-                      disabled={recording || !!pending}
+                      disabled={!!modePending}
                       onChange={(e) => setTransition(e.target.value)}
                     />
                   </label>
                 </details>
-                <button
-                  className="primary teaching-main-action"
-                  disabled={
-                    recording
-                      ? !!pending ||
-                        teaching.state === "finishing" ||
-                        !view.hasControl
-                      : !available || !transitionValid
-                  }
-                  onClick={() => submit(recording ? "finish" : "start")}
-                >
-                  {pending?.kind === "start"
-                    ? "开始中…"
-                    : pending?.kind === "finish" ||
-                        teaching?.state === "finishing"
-                      ? "保存中…"
-                      : recording
-                        ? "结束并保存"
-                        : "开始录制"}
-                </button>
               </>
             ) : (
               <>
@@ -852,8 +799,8 @@ export default function TeachingPanel({
                     >
                       <b>{nameOf(item)}</b>
                       <span>
-                        {item.side === "right" ? "右臂" : "左臂"} ·{" "}
-                        {clock(item.duration_ms)} ·{" "}
+                        {item.side === "right" ? "右臂" : "左臂"}，{" "}
+                        {clock(item.duration_ms)}，{" "}
                         {item.sample_count.toLocaleString()} 点
                       </span>
                       <small>
@@ -882,7 +829,7 @@ export default function TeachingPanel({
                     step="any"
                     value={speed}
                     aria-invalid={!optionsValid}
-                    disabled={running || !!pending}
+                    disabled={running || !!replayPending}
                     onChange={(e) => setSpeed(e.target.value)}
                   />
                   <span>×</span>
@@ -903,7 +850,7 @@ export default function TeachingPanel({
                         !Number.isFinite(Number(smoothing)) ||
                         Number(smoothing) < 0
                       }
-                      disabled={running || !!pending}
+                      disabled={running || !!replayPending}
                       onChange={(e) => setSmoothing(e.target.value)}
                     />
                   </label>
@@ -911,11 +858,11 @@ export default function TeachingPanel({
                 <button
                   className="primary teaching-main-action"
                   disabled={
-                    !available || !preview || !optionsValid || !sameSide
+                    !canReplay || !preview || !optionsValid || !sameSide
                   }
                   onClick={() => submit("replay")}
                 >
-                  {pending?.kind === "replay"
+                  {!!replayPending
                     ? "准备回放…"
                     : running
                       ? states[teaching.state]
@@ -940,7 +887,7 @@ export default function TeachingPanel({
               )}
               {page === "paths" && preview && (
                 <small>
-                  接近 {clock(preview.approach_duration_ms)} · 全程{" "}
+                  接近 {clock(preview.approach_duration_ms)}，全程{" "}
                   {clock(preview.duration_ms)}
                 </small>
               )}
@@ -1042,16 +989,18 @@ export default function TeachingPanel({
           >
             {error ||
               previewError ||
-              (pending
-                ? pending.kind === "finish"
+              (recordPending
+                ? recordPending.kind === "finish"
                   ? "保存中…"
-                  : pending.kind === "replay"
-                    ? "准备回放…"
-                    : "开始录制…"
-                : feedback) ||
-              (teaching
-                ? `${states[teaching.state]} · ${clock(teaching.duration_ms)}`
-                : unavailable) ||
+                  : "开始录制…"
+                : "") ||
+              (replayPending ? "准备回放…" : "") ||
+              feedback ||
+              (capture
+                ? `录制 ${clock(capture.duration_ms)}，${capture.sample_count.toLocaleString()} 点`
+                : "") ||
+              (teaching ? states[teaching.state] : "") ||
+              unavailable ||
               (preview
                 ? `实际倍速 ${preview.effective_speed_scale.toFixed(2)}×`
                 : "")}
@@ -1059,6 +1008,25 @@ export default function TeachingPanel({
           {running && (
             <progress aria-label="回放进度" max="1" value={teaching.progress} />
           )}
+          <button
+            className="primary teaching-record-action"
+            aria-busy={!!recordPending || capture?.state === "finishing"}
+            disabled={
+              !!recordPending ||
+              capture?.state === "finishing" ||
+              (recording ? !view.online || !view.hasControl : !canRecord)
+            }
+            onClick={() => submit(recording ? "finish" : "start")}
+          >
+            {recordPending?.kind === "start"
+              ? "开始中…"
+              : recordPending?.kind === "finish" ||
+                  capture?.state === "finishing"
+                ? "保存中…"
+                : recording
+                  ? "结束并保存"
+                  : "开始录制"}
+          </button>
           <button className="calibration-stop" onClick={stop}>
             停止 <kbd>Esc</kbd>
           </button>
