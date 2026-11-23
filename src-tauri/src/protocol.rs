@@ -843,6 +843,8 @@ struct PublishedSetpoints {
 }
 
 struct Prepared {
+    enable_epoch: u64,
+    hold_scale: [f64; 7],
     calibration: Option<(u64, PlaybackPhase)>,
     values: [Setpoint; 7],
     timing: Option<Timing>,
@@ -854,6 +856,8 @@ struct Prepared {
 impl Prepared {
     fn committed(&self, at: Instant) -> Committed {
         Committed {
+            enable_epoch: self.enable_epoch,
+            hold_scale: self.hold_scale,
             calibration: self.calibration,
             at,
             values: self.values,
@@ -864,6 +868,8 @@ impl Prepared {
 
     fn direct(values: [Setpoint; 7]) -> Self {
         Self {
+            enable_epoch: 0,
+            hold_scale: [1.0; 7],
             calibration: None,
             values,
             timing: None,
@@ -877,6 +883,8 @@ impl Prepared {
 
 #[derive(Clone, Copy)]
 struct Committed {
+    enable_epoch: u64,
+    hold_scale: [f64; 7],
     calibration: Option<(u64, PlaybackPhase)>,
     at: Instant,
     values: [Setpoint; 7],
@@ -905,6 +913,8 @@ pub struct SentReference {
 impl Committed {
     fn direct(at: Instant, values: [Setpoint; 7]) -> Self {
         Self {
+            enable_epoch: 0,
+            hold_scale: [1.0; 7],
             calibration: None,
             at,
             values,
@@ -1003,8 +1013,37 @@ impl PublishedSetpoints {
             gravity,
             reference.effort_limits,
         )?;
+        // Blend from the last successful servo write in either direction.
+        // At the nominal rate half-to-full gain takes 100 ms. A delayed write
+        // advances by at most one normal step; a first enable starts at its target.
+        // A fallback repeats the last successful command, including its session.
+        let enable_epoch = match (rejection, committed) {
+            (Some(_), Some(last)) => last.enable_epoch,
+            _ => reference.enable_epoch,
+        };
+        let last_servo = committed.filter(|c| previous.is_some() && c.enable_epoch == enable_epoch);
+        let mut hold_scale = last_servo
+            .map_or([crate::tuning::hold_stiffness_scale(0.0); 7], |last| {
+                last.hold_scale
+            });
+        let max_change = last_servo.map_or(1.0, |last| {
+            5.0 * at
+                .saturating_duration_since(last.at)
+                .min(WRITE_PERIOD)
+                .as_secs_f64()
+        });
         for (i, value) in values.iter_mut().enumerate() {
             if value.mode == DriveMode::Servo {
+                // A rejected sample already contains the previous effective Kp.
+                if rejection.is_none() {
+                    let target = reference.hold_feedback.as_ref().map_or(1.0, |measured| {
+                        measured[i].map_or(hold_scale[i], |position| {
+                            crate::tuning::hold_stiffness_scale(q[i] - position)
+                        })
+                    });
+                    hold_scale[i] += (target - hold_scale[i]).clamp(-max_change, max_change);
+                    value.kp *= hold_scale[i];
+                }
                 value.q = q[i];
                 value.dq = applied.dq_feedforward[i];
                 value.tau = applied.tau[i];
@@ -1012,6 +1051,8 @@ impl PublishedSetpoints {
             }
         }
         Ok(Prepared {
+            enable_epoch,
+            hold_scale,
             calibration: send_phase.map(|phase| {
                 let phase = if rejection.is_none() {
                     phase
@@ -2139,6 +2180,7 @@ mod tests {
             let at = origin + Duration::from_millis(tick * 10);
             let mut reference = Reference::joint(at, target.q, [0.0; 7], [0.0; 7], 1, 0);
             reference.sampling = crate::reference::Sampling::Absolute;
+            reference.hold_feedback = Some(actual.map(Some));
             let published = PublishedSetpoints {
                 values,
                 seq: tick,
@@ -2158,6 +2200,8 @@ mod tests {
             );
             assert_eq!(prepared.values.map(|s| s.tau), gravity);
             assert!(gravity.iter().any(|tau| tau.abs() > 0.1));
+            // J1 never leaves its target; its hold and drag curves compose.
+            assert!((prepared.values[0].kp - 30.0 * target.stiffness).abs() < 1e-10);
             for (i, s) in prepared.values.into_iter().enumerate() {
                 let packet = encode(i as u8, calibration[i].command(s)).unwrap();
                 assert_eq!(packet.len(), COMMAND_LEN);
@@ -2178,9 +2222,152 @@ mod tests {
         assert!(
             held.values
                 .iter()
-                .all(|s| s.mode == DriveMode::Servo && s.kp == 60.0 && s.kd == 10.0)
+                .all(|s| s.mode == DriveMode::Servo && s.kp == 30.0 && s.kd == 10.0)
         );
         assert_ne!(held.values.map(|s| s.q), initial);
+    }
+
+    #[test]
+    fn powered_hold_changes_only_the_position_gain_on_the_wire() {
+        let at = Instant::now();
+        let q = [0.3, 0.7, 1.1, 0.9, -0.4, 0.2, -0.3];
+        let errors = [0.0_f64, 1.0, -1.0, 2.0, -2.0, 6.0, -6.0];
+        for side in ["left", "right"] {
+            let model = crate::kinematics::Kinematics::load(side).unwrap();
+            let gravity = model.gravity(&q).unwrap();
+            let values = std::array::from_fn(|i| Setpoint {
+                mode: DriveMode::Servo,
+                q: q[i],
+                dq: 0.0,
+                tau: gravity[i],
+                kp: 60.0,
+                kd: 10.0,
+            });
+            let mut reference =
+                Reference::joint_for_model(at, q, [0.0; 7], [0.0; 7], 1, 0, Some(&model));
+            reference.sampling = Sampling::Absolute;
+            reference.hold_feedback =
+                Some(std::array::from_fn(|i| Some(q[i] - errors[i].to_radians())));
+            let source = PublishedSetpoints {
+                values,
+                seq: 0,
+                reference: Some(reference),
+            };
+            let prepared = source.prepare(at, None).unwrap();
+            let calibration = calibrations(side).unwrap();
+            for (i, expected) in [30.0, 40.0, 40.0, 45.0, 45.0, 52.5, 52.5]
+                .into_iter()
+                .enumerate()
+            {
+                let mut desired = values[i];
+                desired.kp = expected;
+                assert_eq!(
+                    encode(i as u8, calibration[i].command(prepared.values[i])).unwrap(),
+                    encode(i as u8, calibration[i].command(desired)).unwrap(),
+                    "{side} J{}",
+                    i + 1
+                );
+            }
+            // A late J7 keeps its own gain while fresh J6 feedback returns to the anchor.
+            let mut next = source.clone();
+            let positions = next
+                .reference
+                .as_mut()
+                .unwrap()
+                .hold_feedback
+                .as_mut()
+                .unwrap();
+            positions[5] = Some(q[5]);
+            positions[6] = None;
+            let next = next
+                .prepare(at + WRITE_PERIOD, Some(prepared.committed(at)))
+                .unwrap();
+            assert!(next.values[5].kp < prepared.values[5].kp);
+            assert_eq!(next.values[6].kp, prepared.values[6].kp);
+        }
+    }
+
+    #[test]
+    fn hold_gain_follows_the_sent_target_and_blends_only_from_successful_writes() {
+        let start = Instant::now();
+        let mut reference = Reference::joint(start, [0.0; 7], [0.0; 7], [0.0; 7], 1, 0);
+        reference.hold_feedback = Some([Some(0.0); 7]);
+        let mut source = PublishedSetpoints {
+            values: [Setpoint {
+                mode: DriveMode::Servo,
+                q: 0.0,
+                dq: 0.0,
+                tau: 1.0,
+                kp: 60.0,
+                kd: 10.0,
+            }; 7],
+            seq: 0,
+            reference: Some(reference),
+        };
+        let first = source.prepare(start, None).unwrap();
+        assert_eq!(first.values[0].kp, 30.0);
+        let mut last = first.committed(start);
+        let nominal = WRITE_PERIOD;
+        // An integrated hold keeps the last wire position even if control q differs.
+        let at = start + nominal;
+        source.reference.as_mut().unwrap().q = [1.0; 7];
+        let held = source.prepare(at, Some(last)).unwrap();
+        assert_eq!((held.values[0].q, held.values[0].kp), (0.0, 30.0));
+        last = held.committed(at);
+        source.reference.as_mut().unwrap().hold_feedback = None;
+        let mut at = at + Duration::from_millis(300);
+        source.reference.as_mut().unwrap().at = at;
+        let resumed = source.prepare(at, Some(last)).unwrap();
+        assert!((resumed.values[0].kp - 33.0).abs() < 1e-10);
+        assert_eq!(
+            source.prepare(at, Some(last)).unwrap().values[0].kp,
+            resumed.values[0].kp
+        );
+        last = resumed.committed(at);
+        for _ in 0..9 {
+            at += nominal;
+            source.reference.as_mut().unwrap().at = at;
+            last = source.prepare(at, Some(last)).unwrap().committed(at);
+        }
+        assert_eq!(last.values[0].kp, 60.0);
+        // The receiver can observe a fresh enable before TX sees a disabled batch.
+        // A stale retry must not consume that new session's first valid hold.
+        let mut reenabled = source.clone();
+        let new_ref = reenabled.reference.as_mut().unwrap();
+        new_ref.enable_epoch += 1;
+        new_ref.sampling = Sampling::Absolute;
+        new_ref.hold_feedback = Some(new_ref.q.map(Some));
+        let late_at = at + Duration::from_millis(100);
+        let retry = reenabled.prepare(late_at, Some(last)).unwrap();
+        assert_eq!(retry.rejection, Some(SampleStatus::Stale));
+        assert_eq!(retry.enable_epoch, last.enable_epoch);
+        reenabled.reference.as_mut().unwrap().at = late_at + nominal;
+        let fresh = reenabled
+            .prepare(late_at + nominal, Some(retry.committed(late_at)))
+            .unwrap();
+        assert_eq!(fresh.values[0].kp, 30.0);
+        assert_eq!(fresh.values[0].q, 1.0);
+        source.reference.as_mut().unwrap().hold_feedback = Some([Some(0.0); 7]);
+        at += nominal;
+        source.reference.as_mut().unwrap().at = at;
+        let settling = source.prepare(at, Some(last)).unwrap();
+        assert!((settling.values[0].kp - 57.0).abs() < 1e-10);
+        last = settling.committed(at);
+        for _ in 0..2 {
+            at += Duration::from_millis(100);
+            let stale = source.prepare(at, Some(last)).unwrap();
+            assert_eq!(stale.rejection, Some(SampleStatus::Stale));
+            assert_eq!(stale.values[0].kp, last.values[0].kp);
+            last = stale.committed(at);
+        }
+        let disabled = Committed::direct(at, stopped_setpoints());
+        at += nominal;
+        source.reference.as_mut().unwrap().q = [0.0; 7];
+        source.reference.as_mut().unwrap().at = at;
+        assert_eq!(
+            source.prepare(at, Some(disabled)).unwrap().values[0].kp,
+            30.0
+        );
     }
 
     #[test]

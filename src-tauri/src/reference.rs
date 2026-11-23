@@ -26,6 +26,11 @@ pub struct Reference {
     pub epoch: u64,
     pub valid_until: Option<Instant>,
     pub stopping: bool,
+    /// Measured joint positions for a powered hold. The writer compares them
+    /// with its sampled target, which can differ from the control tick's q.
+    pub hold_feedback: Option<[Option<f64>; 7]>,
+    /// The reference epoch at the most recent enable, stable across actions.
+    pub enable_epoch: u64,
     pub joint_velocity: [f64; 7],
     pub effort_limits: [f64; 7],
     pub joint_goal: Option<[f64; 7]>,
@@ -112,6 +117,8 @@ impl Reference {
             epoch,
             valid_until: None,
             stopping: false,
+            hold_feedback: None,
+            enable_epoch: 0,
             joint_velocity: [JOINT_SPEED; 7],
             // A connection loads its model before enabling the bus. A reference
             // without a model has no feedforward torque budget.

@@ -701,6 +701,7 @@ struct Core {
     model: Option<Arc<Kinematics>>,
     reference_epoch: Arc<AtomicU64>,
     reference_version: u64,
+    enable_epoch: u64,
     servo_tuning: ServoTuning,
     motion_tuning: MotionTuning,
     servo_tuning_revision: u64,
@@ -768,6 +769,7 @@ impl Core {
             model: loaded.ok().map(Arc::new),
             reference_epoch: Arc::new(AtomicU64::new(0)),
             reference_version: 0,
+            enable_epoch: 0,
             servo_tuning: ServoTuning::default(),
             motion_tuning: MotionTuning::default(),
             servo_tuning_revision: 1,
@@ -1355,6 +1357,7 @@ impl Core {
                 self.stopping = false;
                 self.phase = Phase::Enabling;
                 self.bump_generation();
+                self.enable_epoch = self.reference_version;
             }
             Operation::Disable { allow_release } => {
                 self.require_release(allow_release)?;
@@ -3509,6 +3512,14 @@ impl Core {
         reference.joint_velocity = self.joint_speeds();
         reference.servo_tuning = self.servo_tuning;
         reference.tuning_revision = self.servo_tuning_revision;
+        reference.enable_epoch = self.enable_epoch;
+        if matches!(self.phase, Phase::Enabling | Phase::Ready | Phase::Teaching) {
+            reference.hold_feedback = Some(self.feedback.each_ref().map(|observation| {
+                let o = observation.as_ref()?;
+                let age = self.control_at.saturating_duration_since(o.at).as_millis();
+                (age <= FEEDBACK_MS as u128 && o.value.q.is_finite()).then_some(o.value.q)
+            }));
+        }
         reference.sampling = if let Some(replay) = &self.replay {
             Sampling::Playback {
                 program: replay.program.clone(),
@@ -5147,6 +5158,54 @@ mod tests {
     }
 
     #[test]
+    fn hold_feedback_resumes_after_the_last_jog_braking_tick() {
+        let start = Instant::now();
+        let (mut core, _dir, sent) = calibration_fixture(start);
+        let published = core.bus.as_ref().unwrap().test_transmit_sink();
+        let loaded = core.reference.map(|q| q - 0.002);
+        let tick = |core: &mut Core, n| {
+            let at = start + CONTROL_PERIOD * n;
+            teaching_tick(core, &sent, at, loaded);
+            core.poll(at);
+            published().unwrap().hold_feedback
+        };
+        calibration_request(
+            &mut core,
+            "jog",
+            Operation::JogStart {
+                space: Space::Joint,
+                axis: 0,
+                direction: 1,
+                speed: 0.08,
+                frame: Frame::Base,
+                ttl_ms: 1000,
+                input_seq: 1,
+            },
+            start,
+        );
+        for n in 1..=20 {
+            assert_eq!(tick(&mut core, n), None);
+        }
+        assert_eq!(core.phase, Phase::Moving);
+        assert!(core.velocity[0] > 0.0);
+        let stop_at = start + CONTROL_PERIOD * 20;
+        calibration_request(&mut core, "stop", Operation::Stop, stop_at);
+        assert_eq!(tick(&mut core, 21), None);
+        assert_eq!(core.phase, Phase::Stopping);
+        for n in 22..=200 {
+            let feedback = tick(&mut core, n);
+            if core.phase == Phase::Ready {
+                assert!(core.at_rest());
+                assert_eq!(feedback, Some(loaded.map(Some)));
+                return;
+            }
+            assert_eq!(core.phase, Phase::Stopping);
+            assert_eq!(feedback, None);
+        }
+        panic!("jog did not return to powered hold");
+    }
+
+    #[test]
     fn teaching_mode_switch_keeps_servo_gravity_and_holds_the_new_position() {
         let origin = Instant::now();
         let (mut core, _directory, sent) = calibration_fixture(origin);
@@ -5172,6 +5231,8 @@ mod tests {
             origin,
         )
         .unwrap();
+        let mut guidance = Guidance::new(initial, 0.4);
+        guidance.set_drag(true, initial, 0.0);
         let mut last_kp = SERVO_KP;
         let mut last_q = initial;
         for tick in 1..=100 {
@@ -5183,6 +5244,12 @@ mod tests {
                 origin + Duration::from_millis(tick * 10),
                 actual,
             );
+            assert_eq!(
+                core.outgoing_reference().hold_feedback,
+                Some(actual.map(Some))
+            );
+            let kp = SERVO_KP * guidance.sample(tick as f64 / 100.0, actual).stiffness;
+            assert!(values.iter().all(|s| (s.kp - kp).abs() < 1e-10));
             assert!(
                 values
                     .iter()
@@ -5211,13 +5278,22 @@ mod tests {
             release_at,
         )
         .unwrap();
+        guidance.set_drag(false, released, 1.0);
+        // The arm can deflect under load while returning to the latched release pose.
+        let loaded = released.map(|q| q + 0.002);
         for tick in 101..=150 {
             let values = teaching_tick(
                 &mut core,
                 &sent,
                 origin + Duration::from_millis(tick * 10),
-                released,
+                loaded,
             );
+            assert_eq!(
+                core.outgoing_reference().hold_feedback,
+                Some(loaded.map(Some))
+            );
+            let kp = SERVO_KP * guidance.sample(tick as f64 / 100.0, loaded).stiffness;
+            assert!(values.iter().all(|s| (s.kp - kp).abs() < 1e-10));
             assert!(core.enabled);
             assert!(values.iter().all(|s| s.mode == DriveMode::Servo));
             assert!(values[0].kp >= last_kp - 1e-10);
@@ -6172,6 +6248,7 @@ mod tests {
         );
         assert!(recorded.points.len() >= 40);
         let outgoing = core.outgoing_reference();
+        assert_eq!(outgoing.hold_feedback, None);
         let expected = core.replay.as_ref().unwrap().program.sample(0.607);
         let sampled = outgoing
             .sample(at + Duration::from_millis(7), None)
@@ -7559,8 +7636,13 @@ mod tests {
             assert!(core.error.is_none());
             assert!((core.reference[1] - center[1]).abs() <= 0.1);
             if core.calibration.is_none() {
+                assert_eq!(
+                    core.outgoing_reference().hold_feedback,
+                    Some(core.measured(now).unwrap().map(Some))
+                );
                 break;
             }
+            assert_eq!(core.outgoing_reference().hold_feedback, None);
         }
         let report = core.snapshot(origin).calibration.unwrap().report.unwrap();
         assert_eq!(report.outcome, "unchanged");
@@ -9698,6 +9780,7 @@ mod tests {
             start,
         );
         let queue = core.bus.as_mut().unwrap().test_feedback_queue();
+        let published = core.bus.as_ref().unwrap().test_transmit_sink();
         let b = std::array::from_fn(|i| a.q[i] + 0.01 * (i + 1) as f64);
         let rx = start + Duration::from_millis(10);
         for (i, q) in b.into_iter().enumerate() {
@@ -9708,10 +9791,74 @@ mod tests {
         }
         let now = rx + Duration::from_millis(1);
         calibration_request(&mut core, "enable", Operation::Enable, now);
+        // Feedback can advance between the Enable command and its first publication.
+        let mut measured = b;
+        measured[4] += 0.003;
+        let mut value = core.feedback[4].as_ref().unwrap().value.clone();
+        value.q = measured[4];
+        queue(value, now);
         core.advance(now, 0.011);
         assert!(core.enable_request.is_some() && !core.enabled);
-        let first = write(core.outgoing_reference(), core.desired_setpoints(), now);
+        core.poll(now);
+        let reference = published().unwrap();
+        assert_eq!(reference.hold_feedback, Some(measured.map(Some)));
+        let session = reference.enable_epoch;
+        let first = write(reference, core.desired_setpoints(), now);
         assert_eq!((first.q, first.dq), (b, [0.0; 7]));
+
+        // Six drives acknowledge under load while J7's pre-enable frame expires.
+        let late = core.enable_request.as_ref().unwrap().1 + Duration::from_millis(FEEDBACK_MS + 1);
+        let mut loaded = measured;
+        loaded[0] = b[0] - 6.0_f64.to_radians();
+        for (axis, q) in loaded[..6].iter().copied().enumerate() {
+            let mut value = core.feedback[axis].as_ref().unwrap().value.clone();
+            value.mode = 1;
+            value.q = q;
+            queue(value, late);
+        }
+        core.advance(late, late.duration_since(now).as_secs_f64());
+        core.poll(late);
+        assert_eq!(core.phase, Phase::Enabling);
+        let waiting = published().unwrap();
+        let mut partial = loaded.map(Some);
+        partial[6] = None;
+        assert_eq!(waiting.q, b);
+        assert_eq!(waiting.hold_feedback, Some(partial));
+        assert_eq!(waiting.enable_epoch, session);
+
+        let ack = late + CONTROL_PERIOD;
+        let mut last = core.feedback[6].as_ref().unwrap().value.clone();
+        last.mode = 1;
+        queue(last, ack);
+        core.advance(ack, CONTROL_PERIOD.as_secs_f64());
+        core.poll(ack);
+        assert_eq!(core.phase, Phase::Ready);
+        let held = published().unwrap();
+        assert_eq!(held.q, b);
+        assert_eq!(held.hold_feedback, Some(loaded.map(Some)));
+        assert_eq!(held.enable_epoch, session);
+
+        calibration_request(&mut core, "stop", Operation::Stop, ack);
+        core.advance(ack + CONTROL_PERIOD, CONTROL_PERIOD.as_secs_f64());
+        core.poll(ack + CONTROL_PERIOD);
+        let stopped = published().unwrap();
+        assert_ne!(stopped.epoch, held.epoch);
+        assert_eq!(stopped.enable_epoch, session);
+
+        let next = ack + CONTROL_PERIOD * 2;
+        calibration_request(
+            &mut core,
+            "disable-again",
+            Operation::Disable {
+                allow_release: true,
+            },
+            next,
+        );
+        calibration_request(&mut core, "enable-again", Operation::Enable, next);
+        core.advance(next, CONTROL_PERIOD.as_secs_f64());
+        core.poll(next);
+        assert_eq!(core.phase, Phase::Enabling);
+        assert_ne!(published().unwrap().enable_epoch, session);
     }
 
     #[test]

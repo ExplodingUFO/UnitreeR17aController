@@ -289,7 +289,7 @@ J1 正向连续点动，速度 0.1 rad/s：
 
 停止权限、租约与 generation 校验、原请求的 cancelled 结果保持原有语义。正常停止按 jerk 限制减速，可能需要更长时间；`action:null` 后仍须等待 `stopping` 结束。停止求解惩罚关节速度本身，使冗余方向的速度也减至零，连续性由导数硬约束维持。笛卡尔路径无法满足制动约束时，写入 `control/stop_path` 警告并转为受限关节制动。故障、失能和关闭继续优先处理。
 
-离散参考的导数限制不保证实际 TX 节拍或机械臂物理运动的 jerk。伺服基线仍为 `kp=60`、`kd=10` 和 URDF 重力前馈；本轮可显式配置逐轴阻尼、速度前馈权重及平滑摩擦，总附加前馈按实际协议编码。
+离散参考的导数限制不保证实际 TX 节拍或机械臂物理运动的 jerk。运动跟踪的目标位置增益为 60，默认阻尼为 10，重力前馈来自 URDF。普通位置保持从使能时的实测位置开始。设某轴发送目标与实测位置的偏差绝对值为 `e`（度），该轴的保持增益目标为 `60 × (1 − 0.5 / (1 + e / 2))`。这是软件初值，两个方向使用同一条连续曲线。每次使能的首个有效目标直接采用本次保持增益。等待使能确认期间，各轴按自己的新鲜反馈调节刚度，缺少反馈的轴沿用上次发送的系数。拖动示教的过渡系数乘在该增益上。运动、校准、重放及停止减速时恢复跟踪增益。模式衔接和保持增益变化均从上个成功发送批次逐步过渡，10 ms 周期内系数最多变化 0.05。短时录制的 `transmit.kp` 记录七轴实际发送的增益，重力前馈与逐轴阻尼独立计算。
 
 ### 5.8 发送时间对齐
 
@@ -1161,7 +1161,7 @@ Tauri 仅向主窗口提供三个命令：
 
 导出 `PortInfo {name,label,kind}`、`enumerate_ports() -> Vec<PortInfo>`。
 
-导出 `DriveMode::{Disabled,Servo,ClearFault}`、`Setpoint {mode,q,dq,tau,kp,kd}`，数值均为标定后的 URDF 关节量。`Feedback {id,q,dq,tau,temperature,winding_temperature,voltage,error,warning,mode,timeout}`。伺服模式默认 `kp=60`、`kd=10`；`tau` 为重力与可选平滑摩擦合成后的总附加前馈，按实际协议编码；`dq` 为加权后的速度前馈，`kd` 按当前配置逐轴设置。
+导出 `DriveMode::{Disabled,Servo,ClearFault}`、`Setpoint {mode,q,dq,tau,kp,kd}`，数值均为标定后的 URDF 关节量。`Feedback {id,q,dq,tau,temperature,winding_temperature,voltage,error,warning,mode,timeout}`。`kp` 按当前保持或跟踪状态生成，`kd` 按当前配置逐轴设置。`tau` 为按模型上限约束的重力与可选摩擦前馈之和。`dq` 为加权后的速度前馈。
 
 `BusHandle::open_recorded(port,side,baud,timeout,journal,reference_epoch)` 创建串口会话；`publish(values,seq,reference)` 发布最新七轴参考及其来源时间、导数和动作约束。`drain()->(Vec<(Feedback,Instant)>,Option<BusError>)` 读取带时间戳反馈，以及 I/O 错误或带 generation/epoch 的参考拒绝。`disable()` 和 `write_blocking()` 提交优先停机/清错写入；`stats()->BusStats` 读取通信与批次时间统计。原始 `send` / `send_with_sequence` 只用于协议测试。
 

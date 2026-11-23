@@ -96,6 +96,14 @@ impl Default for JointTuning {
     }
 }
 
+/// Fraction of the tracking Kp used at rest. Half gain at the anchor, and
+/// halfway back to full gain at two degrees. These are initial software
+/// settings. The restoring torque grows continuously on either side of zero.
+pub(crate) fn hold_stiffness_scale(error_rad: f64) -> f64 {
+    const HALF_RECOVERY_RAD: f64 = 2.0_f64.to_radians();
+    1.0 - 0.5 / (1.0 + error_rad.abs() / HALF_RECOVERY_RAD)
+}
+
 impl ServoTuning {
     pub fn validate(&self) -> Result<(), String> {
         for (index, joint) in self.joints.iter().enumerate() {
