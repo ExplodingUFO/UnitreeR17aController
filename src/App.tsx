@@ -739,7 +739,7 @@ export default function App() {
                       key={i}
                       title={
                         fresh
-                          ? `温度 ${fmt(j?.temperature, 1)} °C，电压 ${fmt(j?.voltage, 1)} V，故障码 ${j?.error ?? "—"}`
+                          ? `驱动 ${fmt(j?.temperature, 0)} °C，绕组 ${fmt(j?.winding_temperature, 0)} °C，电压 ${fmt(j?.voltage, 1)} V${j?.error_reason ? `，${j.error_reason}（${j.error}）` : ""}`
                           : feedbackStatus
                       }
                     >

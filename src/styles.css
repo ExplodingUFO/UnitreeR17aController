@@ -3042,7 +3042,8 @@ summary:focus-visible {
   color: var(--color-focus);
   stroke: var(--color-focus);
 }
-.calibration-chart [data-series="command"] {
+.calibration-chart [data-series="command"],
+.calibration-chart [data-series="feedforward_effort"] {
   color: var(--color-warning);
   stroke: var(--color-warning);
 }
@@ -3124,6 +3125,56 @@ summary:focus-visible {
   font-size: 11px;
   text-align: center;
   padding: 24px;
+}
+.calibration-diagnostic {
+  margin-top: 8px;
+}
+.calibration-diagnostic header,
+.calibration-diagnostic-plot figcaption {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 12px;
+  flex-wrap: wrap;
+  font-size: 11px;
+}
+.calibration-diagnostic header {
+  margin-bottom: 6px;
+}
+.calibration-diagnostic header strong {
+  color: var(--color-muted);
+  font-weight: 500;
+}
+.calibration-diagnostic select {
+  width: auto;
+  height: 26px;
+}
+.calibration-diagnostic-lane {
+  padding-top: 4px;
+  border-top: 1px solid var(--color-rule);
+}
+.calibration-diagnostic-lane svg {
+  height: 51px;
+}
+.calibration-diagnostic-lane:last-child svg {
+  height: 70px;
+}
+.calibration-diagnostic .calibration-chart-legend {
+  align-items: baseline;
+  font-variant-numeric: tabular-nums;
+}
+.calibration-chart [data-series="effort"],
+.calibration-chart [data-series="driver_temperature"] {
+  color: var(--color-focus);
+  stroke: var(--color-focus);
+}
+.calibration-chart [data-series="winding_temperature"] {
+  color: var(--color-warning);
+  stroke: var(--color-warning);
+}
+.calibration-fault-marker {
+  stroke: var(--color-danger);
+  stroke-width: 2;
 }
 .calibration-friction-fit {
   margin-top: 10px;

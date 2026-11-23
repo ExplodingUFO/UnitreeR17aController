@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="zh-CN">
+  <meta charset="utf-8" />
+  <link rel="icon" href="data:," />
+  <title>校准报告选择回归测试</title>
+  <output id="result"></output>
+  <div id="panel"></div>
+  <script type="module">
+    import { act, createElement } from "react";
+    import { createRoot } from "react-dom/client";
+    import { api, emptySnapshot } from "../src/api.ts";
+    import CalibrationPanel from "../src/CalibrationPanel.tsx";
+
+    // Open via Vite. Mount the real panel with two synthetic runs and a memory-only API.
+    globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+    const root = createRoot(document.querySelector("#panel"));
+    const originalMessage = "J6 故障码 512";
+    const reportA = {
+      id: "report-A",
+      request_id: "A",
+      created_at_ms: 1000,
+      settings: { axis: 0 },
+      baseline: emptySnapshot.servo_tuning,
+      recommended: null,
+      center_reference: Array(7).fill(0),
+      center_measured: Array(7).fill(0),
+      outcome: "cancelled",
+      message: "已停止",
+      trials: [],
+      choices: [],
+      curves: [],
+      fault: {
+        axis: 5,
+        code: 512,
+        message: "J6 电机绕组过热（故障码 512）",
+        t_ms: 900,
+        driver_temperature: 50,
+        winding_temperature: 80,
+        position: 1,
+        command: null,
+        effort: 2,
+        voltage: 24,
+      },
+    };
+    const downloads = [];
+    api.listCalibrations = async () => [reportA];
+    api.readCalibration = async (id) => {
+      check(id === reportA.id, "详情请求对应 A");
+      return reportA;
+    };
+    api.downloadCalibration = async (id) => {
+      downloads.push(id);
+      return new Blob([JSON.stringify(reportA)]);
+    };
+    // Capture the filename and Blob without opening a download dialog.
+    let filename, downloaded;
+    URL.createObjectURL = (blob) => {
+      downloaded = blob;
+      return "about:blank";
+    };
+    HTMLAnchorElement.prototype.click = function () {
+      filename = this.download;
+    };
+
+    function check(condition, message) {
+      if (!condition) throw new Error(message);
+    }
+    async function show(calibration) {
+      const view = {
+        online: true,
+        hasControl: false,
+        snapshot: {
+          ...emptySnapshot,
+          phase: "ready",
+          calibration,
+        },
+      };
+      await act(async () =>
+        root.render(
+          createElement(CalibrationPanel, {
+            open: true,
+            view,
+            onStop() {},
+            onClose() {},
+          }),
+        ),
+      );
+    }
+    function button(text) {
+      return [...document.querySelectorAll("button")].find(
+        (b) => b.textContent.trim() === text,
+      );
+    }
+    async function click(text) {
+      const target = button(text);
+      check(target && !target.disabled, "缺少可用按钮 " + text);
+      await act(async () => target.click());
+    }
+    function checkA() {
+      check(
+        document.querySelector('[aria-label="J6 故障分析"]') &&
+          document
+            .querySelector(".calibration-diagnostic header")
+            .textContent.includes(reportA.fault.message),
+        "显示 A 的故障图",
+      );
+    }
+    async function run() {
+      await show({
+        id: "A",
+        request_id: "A",
+        state: "cancelled",
+        stage: "done",
+        report: reportA,
+      });
+      checkA();
+      await click("结果");
+      await show({
+        id: "B",
+        request_id: "B",
+        state: "running",
+        stage: "baseline",
+        axis: 6,
+        report: null,
+        live: {
+          axis: 6,
+          trial: 0,
+          t_ms: 123,
+          reference: Array(7).fill(0),
+          command: null,
+          command_at_ms: null,
+          feedback: Array(7).fill(1),
+          feedback_age_ms: Array(7).fill(2),
+        },
+      });
+      for (const entry of ["查看故障分析", "曲线"]) {
+        await click("进度");
+        await click("查看实时曲线");
+        check(
+          document.querySelector(
+            '.calibration-chart[data-live-count="1"] svg[aria-label^="J7 "]',
+          ),
+          "显示 B 的实时轨迹",
+        );
+        check(!button("下载完整 JSON"), "实时视图没有 A 的下载入口");
+        await click("结果");
+        await click(entry);
+        checkA();
+        const before = downloads.length;
+        await click("下载完整 JSON");
+        check(
+          downloads.length === before + 1 &&
+            downloads.at(-1) === reportA.id &&
+            filename === "calibration-report-A.json",
+          "曲线和下载均来自 A",
+        );
+      }
+      await click("历史");
+      const file = new File(
+        [JSON.stringify({ ...reportA, message: originalMessage, fault: null })],
+        "old.json",
+      );
+      const transfer = new DataTransfer();
+      transfer.items.add(file);
+      const input = document.querySelector("input[type=file]");
+      input.files = transfer.files;
+      const contents = file.text();
+      file.text = () => contents;
+      await act(async () => {
+        input.dispatchEvent(new Event("change", { bubbles: true }));
+        await contents;
+      });
+      check(
+        document.querySelector(".calibration-report-message")?.textContent ===
+          reportA.fault.message,
+        "导入 JSON 显示 SQLite 格式的故障说明",
+      );
+      const before = downloads.length;
+      await click("下载完整 JSON");
+      check(
+        before === downloads.length &&
+          (await downloaded.text()) === (await file.text()),
+        "本地同 ID 报告下载原文件",
+      );
+    }
+
+    try {
+      await run();
+      document.querySelector("#result").value = "PASS";
+    } catch (error) {
+      document.querySelector("#result").value = "FAIL " + error.message;
+      throw error;
+    }
+  </script>
+</html>

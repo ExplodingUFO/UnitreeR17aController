@@ -148,8 +148,10 @@ pub struct Feedback {
     pub q: f64,
     pub dq: f64,
     pub tau: f64,
-    /// Driver temperature, signed degrees Celsius (not winding temperature).
+    /// Driver temperature, signed degrees Celsius (byte 3).
     pub temperature: f64,
+    /// Winding temperature, unsigned degrees Celsius (byte 4).
+    pub winding_temperature: f64,
     pub voltage: f64,
     pub error: u32,
     pub warning: u8,
@@ -157,6 +159,37 @@ pub struct Feedback {
     pub mode: u8,
     /// Device-reported watchdog state, separate from host transaction timeouts.
     pub timeout: bool,
+}
+
+/// Decode the IM6014 MError bitmask (SDK MotorProtocol.cpp, lines 421–466).
+pub fn motor_fault_description(code: u32) -> String {
+    static FAULTS: OnceLock<BTreeMap<u32, &'static str>> = OnceLock::new();
+    if code == 0 {
+        return "正常".into();
+    }
+    let mut unknown = code;
+    let mut descriptions = Vec::new();
+    let faults = FAULTS.get_or_init(|| {
+        serde_json::from_str(include_str!("../../resources/motor-faults.json"))
+            .expect("invalid embedded motor fault descriptions")
+    });
+    for (&mask, &description) in faults {
+        if code == mask {
+            return description.into();
+        }
+        if code & mask != 0 {
+            descriptions.push(description);
+            unknown &= !mask;
+        }
+    }
+    let known = descriptions.join("、");
+    if known.is_empty() {
+        format!("未知故障位 0x{code:08X}")
+    } else if unknown == 0 {
+        format!("{known}（0x{code:08X}）")
+    } else {
+        format!("{known}、未知故障位 0x{unknown:08X}（0x{code:08X}）")
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
@@ -405,6 +438,7 @@ fn decode(frame: &[u8]) -> Option<Feedback> {
         dq,
         tau,
         temperature: (frame[3] as i8) as f64,
+        winding_temperature: f64::from(frame[4]),
         voltage: frame[5] as f64 / 2.0,
         error: u32::from_le_bytes(frame[14..18].try_into().ok()?),
         warning: (u16::from_le_bytes(frame[18..20].try_into().ok()?) >> 13) as u8,
@@ -705,8 +739,40 @@ impl Bus {
     }
 }
 
+#[derive(Debug)]
+pub struct ReceivedFeedback {
+    pub value: Feedback,
+    pub at: Instant,
+    /// This joint's position (rad) and feedforward effort (Nm) from the last
+    /// published successful servo write when the fault frame was received.
+    pub fault_command: Option<(f64, f64)>,
+}
+
+impl ReceivedFeedback {
+    fn capture(
+        value: Feedback,
+        sent: &watch::Receiver<Option<SentReference>>,
+        now: impl FnOnce() -> Instant,
+    ) -> Self {
+        let axis = usize::from(value.id);
+        let receipt = (value.error != 0 && axis < 7).then(|| sent.borrow());
+        // Timestamp while the fault frame's receipt is pinned against replacement.
+        let at = now();
+        let fault_command = receipt
+            .as_deref()
+            .and_then(Option::as_ref)
+            .filter(|s| s.completed_at <= at)
+            .map(|s| (s.q[axis], s.feedforward_effort[axis]));
+        Self {
+            value,
+            at,
+            fault_command,
+        }
+    }
+}
+
 enum BusEvent {
-    Feedback(Feedback, Instant),
+    Feedback(ReceivedFeedback),
     Error(String),
     ReferenceRejected {
         generation: u64,
@@ -830,6 +896,8 @@ pub struct SentReference {
     pub calibration_phase: Option<PlaybackPhase>,
     pub q: [f64; 7],
     pub dq: [f64; 7],
+    /// Feedforward torque of this successful write in joint Nm, before wire quantization.
+    pub feedforward_effort: [f64; 7],
     /// A stale/invalid source retained the last successful position with zero
     /// trajectory velocity; the original program's acceleration no longer applies.
     pub fallback_hold: bool,
@@ -861,6 +929,7 @@ impl Committed {
             calibration_phase: self.calibration.map(|(_, phase)| phase),
             q: previous.q,
             dq: previous.dq,
+            feedforward_effort: self.values.map(|s| s.tau),
             fallback_hold: rejection.is_some(),
         })
     }
@@ -929,7 +998,11 @@ impl PublishedSetpoints {
         };
         // Actuator feedforward is separate from the velocity used to integrate
         // positions. A zero feedforward weight must not stop the trajectory.
-        let applied = reference.servo_tuning.apply(dq, gravity)?;
+        let (applied, delivered_gravity) = reference.servo_tuning.apply_with_effort_limits(
+            dq,
+            gravity,
+            reference.effort_limits,
+        )?;
         for (i, value) in values.iter_mut().enumerate() {
             if value.mode == DriveMode::Servo {
                 value.q = q[i];
@@ -960,7 +1033,7 @@ impl PublishedSetpoints {
             tuning: Some(ServoSample {
                 revision: reference.tuning_revision,
                 dq_feedforward: applied.dq_feedforward,
-                tau_gravity: gravity,
+                tau_gravity: delivered_gravity,
                 friction_requested: applied.friction_requested,
                 friction_applied: applied.friction_applied,
                 clamped: applied.clamped,
@@ -1297,6 +1370,7 @@ impl BusHandle {
             .map_err(|error| format!("spawn serial I/O thread: {error}"))?;
         let reader_stop = stop.clone();
         let reader_failure = failure.clone();
+        let reader_sent = sent.clone();
         let reader = match thread::Builder::new()
             .name("arm-serial-rx".into())
             .spawn(move || {
@@ -1307,16 +1381,19 @@ impl BusHandle {
                     match reader.read_available() {
                         Ok(frames) => {
                             for frame in frames {
-                                let at = Instant::now();
+                                let received =
+                                    ReceivedFeedback::capture(frame, &reader_sent, Instant::now);
                                 if let Some(journal) = journal.as_ref() {
+                                    let frame = &received.value;
                                     journal.sample(
-                                        at,
+                                        received.at,
                                         TraceData::Feedback {
                                             joint: frame.id,
                                             q: frame.q,
                                             dq: frame.dq,
                                             tau: frame.tau,
                                             temperature: frame.temperature,
+                                            winding_temperature: Some(frame.winding_temperature),
                                             voltage: frame.voltage,
                                             error: frame.error,
                                             mode: frame.mode,
@@ -1324,7 +1401,7 @@ impl BusHandle {
                                         },
                                     );
                                 }
-                                let _ = event_tx.send(BusEvent::Feedback(frame, at));
+                                let _ = event_tx.send(BusEvent::Feedback(received));
                             }
                         }
                         Err(error) => {
@@ -1465,14 +1542,30 @@ impl BusHandle {
     pub(crate) fn test_feedback_queue(&mut self) -> impl Fn(Feedback, Instant) + use<> {
         let (tx, rx) = unbounded();
         self.events = rx;
-        move |frame, at| tx.send(BusEvent::Feedback(frame, at)).unwrap()
+        let sent = self.sent.clone();
+        move |frame, at| {
+            let received = ReceivedFeedback::capture(frame, &sent, || at);
+            tx.send(BusEvent::Feedback(received)).unwrap();
+        }
     }
 
     #[cfg(test)]
-    pub(crate) fn test_failed_bus(message: &str) -> Self {
+    pub(crate) fn test_failed_bus(
+        message: &str,
+        frames: impl IntoIterator<Item = (Feedback, Instant)>,
+    ) -> Self {
         let (mut bus, _) = Self::test_idle_bus();
         let (events, receiver) = unbounded();
         bus.failure.set(message.into()).unwrap();
+        for (frame, at) in frames {
+            events
+                .send(BusEvent::Feedback(ReceivedFeedback {
+                    value: frame,
+                    at,
+                    fault_command: None,
+                }))
+                .unwrap();
+        }
         events.send(BusEvent::Error(message.into())).unwrap();
         bus.events = receiver;
         bus
@@ -1483,12 +1576,12 @@ impl BusHandle {
         tests::clear_response_bus()
     }
 
-    pub fn drain(&self) -> (Vec<(Feedback, Instant)>, Option<BusError>) {
+    pub fn drain(&self) -> (Vec<ReceivedFeedback>, Option<BusError>) {
         let mut feedback = Vec::new();
         let mut error = None;
         for event in self.events.try_iter() {
             match event {
-                BusEvent::Feedback(value, at) => feedback.push((value, at)),
+                BusEvent::Feedback(received) => feedback.push(received),
                 BusEvent::Error(message) => error = Some(BusError::Io(self.io_error(message))),
                 BusEvent::ReferenceRejected {
                     generation,
@@ -2330,6 +2423,8 @@ mod tests {
             let bytes = unhex(expected["packet"].as_str().unwrap());
             let f = decode(&bytes).unwrap();
             assert_eq!(f.id as u64, expected["id"].as_u64().unwrap());
+            // The official golden packet generator sets byte 4 to 101 °C.
+            assert_eq!(f.winding_temperature, 101.0);
             for (key, actual) in [
                 ("q", f.q),
                 ("dq", f.dq),
@@ -2350,6 +2445,22 @@ mod tests {
                 assert!(decode(&damaged).is_none(), "corruption offset {i}");
             }
         }
+    }
+
+    #[test]
+    fn motor_fault_description_decodes_single_combined_and_unknown_bits() {
+        assert_eq!(motor_fault_description(0), "正常");
+        assert_eq!(motor_fault_description(512), "电机绕组过热");
+        assert_eq!(motor_fault_description(8), "供电电压短时过低");
+        assert_eq!(
+            motor_fault_description(512 | 8),
+            "供电电压短时过低、电机绕组过热（0x00000208）"
+        );
+        assert_eq!(motor_fault_description(0x80), "未知故障位 0x00000080");
+        assert_eq!(
+            motor_fault_description(0x8000_0200),
+            "电机绕组过热、未知故障位 0x80000000（0x80000200）"
+        );
     }
 
     #[test]
@@ -2411,6 +2522,7 @@ mod tests {
                     dq: motor.dq,
                     tau: motor.tau,
                     temperature: 20.,
+                    winding_temperature: 47.,
                     voltage: 48.,
                     error: 0,
                     warning: 0,
@@ -2792,6 +2904,7 @@ mod tests {
             let base = unhex(g["feedback"][0]["packet"].as_str().unwrap());
             let duplicate = feedback_for_id(&base, 2);
             let mut changed = duplicate.clone();
+            changed[4] = 0xff;
             changed[10..14].copy_from_slice(&12345i32.to_le_bytes());
             let crc = crc32(&changed[2..22]);
             changed[22..26].copy_from_slice(&crc.to_le_bytes());
@@ -2865,6 +2978,8 @@ mod tests {
                 feedback.extend(received);
                 feedback.len() == frames.len()
             });
+            assert_eq!(feedback[2].value.temperature, -23.0);
+            assert_eq!(feedback[2].value.winding_temperature, 255.0);
             let clear = [Setpoint {
                 mode: DriveMode::ClearFault,
                 q: 5.0,
@@ -2982,6 +3097,7 @@ mod tests {
                     dq,
                     tau,
                     temperature,
+                    winding_temperature,
                     voltage,
                     error,
                     mode,
@@ -2990,15 +3106,17 @@ mod tests {
                 else {
                     unreachable!()
                 };
-                let ((event, at), frame) = remaining_feedback
+                let (event, frame) = remaining_feedback
                     .by_ref()
-                    .find(|((event, at), _)| {
-                        joint == event.id
-                            && trace_number_matches(q, event.q)
-                            && source_time_matches(sample.at_us, *at, before, after)
+                    .find(|(event, _)| {
+                        joint == event.value.id
+                            && trace_number_matches(q, event.value.q)
+                            && source_time_matches(sample.at_us, event.at, before, after)
                     })
                     .expect("captured feedback is not an ordered subsequence of decoded frames");
-                let expected = calibration[event.id as usize].feedback(decode(frame).unwrap());
+                let expected =
+                    calibration[event.value.id as usize].feedback(decode(frame).unwrap());
+                assert_eq!(winding_temperature, Some(f64::from(frame[4])));
                 assert_eq!(
                     (joint, error, mode, timeout),
                     (expected.id, expected.error, expected.mode, expected.timeout)
@@ -3013,8 +3131,8 @@ mod tests {
                         expected.voltage,
                     ],
                 );
-                assert_eq!(event.q, expected.q);
-                assert_source_time(sample.at_us, *at, before, after);
+                assert_eq!(event.value.q, expected.q);
+                assert_source_time(sample.at_us, event.at, before, after);
             }
         }
     }
@@ -3323,16 +3441,56 @@ mod tests {
             received.extend(events);
         }
         assert!(received.len() >= 7);
-        for (id, (value, at)) in received.iter().enumerate() {
-            if id == 7 {
-                break;
-            }
-            assert_eq!(value.id as usize, id);
-            assert!(at.elapsed() < Duration::from_secs(1));
+        for (id, event) in received.iter().take(7).enumerate() {
+            assert_eq!(event.value.id as usize, id);
+            assert!(event.at.elapsed() < Duration::from_secs(1));
+            assert!(event.fault_command.is_none());
         }
         assert!(wire.lock().unwrap().written.len() >= 7 * COMMAND_LEN);
         handle.disable().unwrap();
         assert!(wire.lock().unwrap().written.len() >= 14 * COMMAND_LEN);
+    }
+
+    #[test]
+    fn serial_reader_keeps_the_faults_own_joint_command_until_drain() {
+        let (bus, wire) = fake_bus(Wire {
+            write_chunk: COMMAND_LEN,
+            ..Wire::default()
+        });
+        let handle = BusHandle::start(bus).unwrap();
+        let values = std::array::from_fn(|i| Setpoint {
+            mode: DriveMode::Servo,
+            q: 0.05 * i as f64,
+            tau: 0.2 * i as f64,
+            ..stop()
+        });
+        let reference = Reference::joint(
+            Instant::now(),
+            values.map(|s| s.q),
+            [0.0; 7],
+            [0.0; 7],
+            1,
+            0,
+        );
+        handle.publish(values, 1, reference).unwrap();
+        wait_for_protocol(|| handle.latest_reference().is_some());
+
+        let fault = unhex(golden()["feedback"][4]["packet"].as_str().unwrap());
+        let mut healthy = fault.clone();
+        healthy[14..18].fill(0);
+        let crc = crc32(&healthy[2..22]);
+        healthy[22..26].copy_from_slice(&crc.to_le_bytes());
+        wire.lock().unwrap().active.extend([fault, healthy]);
+        wait_for_protocol(|| handle.stats().received == 2);
+        handle.disable().unwrap();
+        assert!(handle.latest_reference().is_none());
+
+        let (frames, error) = handle.drain();
+        assert!(error.is_none());
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].value.id, 5);
+        assert_eq!(frames[0].fault_command, Some((values[5].q, values[5].tau)));
+        assert!(frames[1].fault_command.is_none());
     }
 
     #[test]
@@ -3783,14 +3941,30 @@ mod tests {
 
     #[test]
     fn sender_torque_uses_the_friction_parameter_and_final_encoder() {
-        for sign in [-1.0, 1.0] {
-            let (bus, wire) = fake_bus(Wire {
+        for (side, sign) in [
+            ("right", -1.0),
+            ("right", 1.0),
+            ("left", -1.0),
+            ("left", 1.0),
+        ] {
+            let model = crate::kinematics::Kinematics::load(side).unwrap();
+            let effort_limits = model.effort_limits();
+            let calibration = calibrations(side).unwrap();
+            let (mut bus, wire) = fake_bus(Wire {
                 write_chunk: COMMAND_LEN,
                 ..Wire::default()
             });
+            bus.calibration = calibration;
             let handle = BusHandle::start(bus).unwrap();
-            let mut reference =
-                Reference::joint(Instant::now(), [0.0; 7], [sign * 0.4; 7], [0.0; 7], 1, 0);
+            let mut reference = Reference::joint_for_model(
+                Instant::now(),
+                [0.0; 7],
+                [sign * 0.4; 7],
+                [0.0; 7],
+                1,
+                0,
+                Some(&model),
+            );
             reference.servo_tuning.friction_enabled = true;
             for joint in &mut reference.servo_tuning.joints {
                 joint.coulomb = 30.0;
@@ -3825,17 +3999,15 @@ mod tests {
                 .copied()
                 .collect();
             assert_eq!(packets.len(), 7);
-            let calibration = calibrations("right").unwrap();
             for (i, packet) in packets.into_iter().enumerate() {
+                let tau = sign * 32.0_f64.min(effort_limits[i]);
                 let expected = encode(
                     i as u8,
-                    calibration[i].command(Setpoint {
-                        tau: sign * 32.0,
-                        ..values[i]
-                    }),
+                    calibration[i].command(Setpoint { tau, ..values[i] }),
                 )
                 .unwrap();
-                assert_eq!(packet[4..6], expected[4..6]);
+                assert_eq!(packet[2..8], expected[2..8]);
+                assert_eq!(packet[12..16], expected[12..16]);
             }
             assert!(handle.drain().1.is_none());
             handle.disable().unwrap();
@@ -3845,7 +4017,6 @@ mod tests {
             ..Wire::default()
         });
         let handle = BusHandle::start(bus).unwrap();
-        let reference = Reference::joint(Instant::now(), [0.0; 7], [0.0; 7], [0.0; 7], 1, 0);
         let values = [Setpoint {
             mode: DriveMode::Servo,
             q: 0.0,
@@ -3854,7 +4025,8 @@ mod tests {
             kp: 60.0,
             kd: 10.0,
         }; 7];
-        handle.publish(values, 1, reference).unwrap();
+        // A direct packet has no model reference and must still fail encoder preflight.
+        handle.send_with_sequence(values, 1).unwrap();
         wait_for_protocol(|| handle.join.as_ref().unwrap().is_finished());
         let error = handle.disable().unwrap_err();
         assert!(error.contains("SDK range"), "{error}");
@@ -3868,6 +4040,193 @@ mod tests {
                 .iter()
                 .all(|p| p[2] & 0x70 == 0)
         );
+    }
+
+    #[test]
+    fn calibration_trial_saturates_each_encoded_axis_and_finishes_with_gravity_only() {
+        use crate::{calibration_path::Playback, kinematics::Kinematics, teaching::Approach};
+        let started = Instant::now();
+        let origin = [0.3, 0.7, 1.1, 0.9, -0.4, 0.2, -0.3];
+        for (side, xml) in [
+            (
+                "left",
+                include_str!("../../resources/models/left/robot.urdf"),
+            ),
+            (
+                "right",
+                include_str!("../../resources/models/right/robot.urdf"),
+            ),
+        ] {
+            let model = Kinematics::load(side).unwrap();
+            let calibration = calibrations(side).unwrap();
+            let urdf = urdf_rs::read_from_string(xml).unwrap();
+            for direction in [-1.0, 1.0] {
+                let target = origin.map(|q| q + direction * 0.1);
+                let limits = crate::trajectory::MotionTuning::default();
+                let program = Arc::new(Playback {
+                    approach: Approach::for_motion(origin, target, model.speed_limits(), limits)
+                        .unwrap(),
+                    leg: None,
+                });
+                let mut committed = None;
+                for moving in [true, false] {
+                    let t = if moving {
+                        program.duration() / 2.0
+                    } else {
+                        program.duration() + 0.01
+                    };
+                    let at = started + Duration::from_secs_f64(t);
+                    let phase = PlaybackPhase::Original(started);
+                    let sample = phase.sample(&program, at);
+                    let gravity = model.gravity(&sample.q).unwrap();
+                    let mut reference = Reference::joint_for_model(
+                        at,
+                        sample.q,
+                        sample.dq,
+                        sample.ddq,
+                        1,
+                        0,
+                        Some(&model),
+                    );
+                    reference.sampling = Sampling::Calibration {
+                        program: program.clone(),
+                        phase,
+                        limits,
+                        feedback_at: Some(at),
+                    };
+                    reference.servo_tuning.friction_enabled = true;
+                    for joint in &mut reference.servo_tuning.joints {
+                        joint.stribeck.enabled = true;
+                        joint.stribeck.positive.viscous = f64::MAX;
+                        joint.stribeck.negative.viscous = f64::MAX;
+                        joint.max_friction = f64::MAX;
+                    }
+                    reference.servo_tuning.validate().unwrap();
+                    let values = std::array::from_fn(|i| Setpoint {
+                        mode: DriveMode::Servo,
+                        q: sample.q[i],
+                        dq: sample.dq[i],
+                        tau: gravity[i],
+                        kp: 60.0,
+                        kd: reference.servo_tuning.joints[i].kd,
+                    });
+                    let source = PublishedSetpoints {
+                        values,
+                        seq: 1,
+                        reference: Some(reference),
+                    };
+                    let prepared = source.prepare(at, committed).unwrap();
+                    assert_eq!(prepared.rejection, None);
+                    assert_eq!(prepared.motion_velocity, sample.dq);
+                    let trace = prepared.tuning.unwrap();
+                    assert_eq!(trace.tau_gravity, gravity);
+                    for (i, value) in prepared.values.iter().enumerate() {
+                        let name = format!("J{}", i + 1);
+                        let effort = urdf
+                            .joints
+                            .iter()
+                            .find(|j| j.name == name)
+                            .unwrap()
+                            .limit
+                            .effort;
+                        let tau = if moving {
+                            direction * effort
+                        } else {
+                            gravity[i]
+                        };
+                        assert_eq!(value.tau, tau, "{side} {name}");
+                        assert_eq!(trace.clamped[i], moving);
+                        assert_eq!(trace.friction_applied[i], tau - gravity[i]);
+                        if moving {
+                            assert!(trace.friction_requested[i] * direction > effort);
+                        } else {
+                            assert_eq!(trace.friction_requested[i], 0.0);
+                        }
+                        let packet = encode(i as u8, calibration[i].command(*value)).unwrap();
+                        let expected = Setpoint { tau, ..values[i] };
+                        assert_eq!(
+                            packet,
+                            encode(i as u8, calibration[i].command(expected)).unwrap()
+                        );
+                        let raw = i16::from_le_bytes(packet[4..6].try_into().unwrap());
+                        let wire =
+                            calibration[i].feedback_motion(decode_motion(i as u8, raw, 0, 0))[2];
+                        assert!(wire.abs() <= effort, "{side} {name} {wire} > {effort}");
+                        assert!((wire - tau).abs() <= ratio(i as u8) / 2560.0 / 2.0);
+                    }
+                    committed = Some(prepared.committed(at));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gravity_clipping_and_opposing_friction_are_distinct_in_fresh_and_fallback_trace() {
+        let at = Instant::now();
+        let model = crate::kinematics::Kinematics::load("left").unwrap();
+        let efforts = model.effort_limits();
+        for sign in [-1.0, 1.0] {
+            // The raw gravity alone is two Nm beyond each joint's budget.
+            let values = efforts.map(|limit| Setpoint {
+                mode: DriveMode::Servo,
+                q: 0.0,
+                dq: 0.0,
+                tau: sign * (limit + 2.0),
+                kp: 60.0,
+                kd: 10.0,
+            });
+            for (enabled, speed, applied_delta, clipped) in [
+                (false, 0.5, 0.0, true),
+                (true, 0.0, 0.0, true),
+                (true, 0.125, 0.0, true),
+                (true, 0.25, 0.0, false),
+                (true, 0.5, -2.0, false),
+            ] {
+                let mut reference = Reference::joint_for_model(
+                    at,
+                    [0.0; 7],
+                    [-sign * speed; 7],
+                    [0.0; 7],
+                    1,
+                    0,
+                    Some(&model),
+                );
+                reference.servo_tuning.friction_enabled = enabled;
+                for joint in &mut reference.servo_tuning.joints {
+                    joint.viscous = 8.0;
+                    joint.max_friction = 8.0;
+                }
+                let source = PublishedSetpoints {
+                    values,
+                    seq: 1,
+                    reference: Some(reference),
+                };
+                let prepared = source.prepare(at, None).unwrap();
+                let trace = prepared.tuning.unwrap();
+                assert_eq!(prepared.rejection, None);
+                assert_eq!(trace.tau_gravity, efforts.map(|e| sign * e));
+                assert_eq!(
+                    trace.friction_requested,
+                    [if enabled { -sign * speed * 8.0 } else { 0.0 }; 7]
+                );
+                assert_eq!(trace.friction_applied, [sign * applied_delta; 7]);
+                assert_eq!(trace.clamped, [clipped; 7]);
+                assert_eq!(
+                    prepared.values.map(|s| s.tau),
+                    efforts.map(|e| sign * (e + applied_delta))
+                );
+
+                let stale = at + crate::reference::MAX_REFERENCE_AGE + Duration::from_millis(1);
+                let held = source.prepare(stale, Some(prepared.committed(at))).unwrap();
+                assert_eq!(held.rejection, Some(SampleStatus::Stale));
+                assert_eq!(held.values.map(|s| s.tau), trace.tau_gravity);
+                let held_trace = held.tuning.unwrap();
+                assert_eq!(held_trace.friction_requested, [0.0; 7]);
+                assert_eq!(held_trace.friction_applied, [0.0; 7]);
+                assert_eq!(held_trace.tau_gravity, trace.tau_gravity);
+                assert_eq!(held_trace.clamped, [true; 7]);
+            }
+        }
     }
 
     #[test]

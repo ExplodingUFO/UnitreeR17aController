@@ -91,6 +91,9 @@ pub enum TraceData {
         dq: f64,
         tau: f64,
         temperature: f64,
+        /// Older feedback samples recorded only the driver temperature.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        winding_temperature: Option<f64>,
         voltage: f64,
         error: u32,
         mode: u8,
@@ -842,11 +845,15 @@ fn finite(data: &TraceData) -> bool {
             dq,
             tau,
             temperature,
+            winding_temperature,
             voltage,
             ..
-        } => [q, dq, tau, temperature, voltage]
-            .iter()
-            .all(|x| x.is_finite()),
+        } => {
+            [q, dq, tau, temperature, voltage]
+                .iter()
+                .all(|x| x.is_finite())
+                && winding_temperature.is_none_or(f64::is_finite)
+        }
     }
 }
 
@@ -1090,6 +1097,7 @@ mod tests {
             dq: -0.3,
             tau: 4.0,
             temperature: 33.0,
+            winding_temperature: Some(46.0),
             voltage: 48.0,
             error: 7,
             mode: 1,
@@ -1235,6 +1243,25 @@ mod tests {
     }
 
     #[test]
+    fn legacy_feedback_trace_preserves_driver_temperature_and_absent_winding_temperature() {
+        let legacy = serde_json::json!({
+            "at_us": 17, "source": "feedback", "joint": 0,
+            "q": 0.1, "dq": 0.2, "tau": 0.3, "temperature": -23.0,
+            "voltage": 48.5, "error": 0, "mode": 1, "timeout": false
+        });
+        let sample: TraceSample = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(matches!(
+            sample.data,
+            TraceData::Feedback {
+                temperature: -23.0,
+                winding_temperature: None,
+                ..
+            }
+        ));
+        assert_eq!(serde_json::to_value(sample).unwrap(), legacy);
+    }
+
+    #[test]
     fn tuning_capture_finite_check_covers_configuration_and_transmit_arrays() {
         let mut ctrl = control(5);
         if let TraceData::Control { servo_tuning, .. } = &mut ctrl {
@@ -1365,6 +1392,8 @@ mod tests {
             json["samples"][1]["mode"],
             serde_json::json!([1, 1, 1, 1, 1, 1, 1])
         );
+        assert_eq!(json["samples"][3]["temperature"], 33.0);
+        assert_eq!(json["samples"][3]["winding_temperature"], 46.0);
         assert_eq!(json["samples"][3]["error"], 7);
         assert!(json["samples"][3]["timeout"].as_bool().unwrap());
         assert!(recorder.trace_stop().unwrap().is_none());

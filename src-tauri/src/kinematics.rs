@@ -191,6 +191,7 @@ struct Joint {
     #[cfg_attr(not(test), allow(dead_code))]
     upper: f64,
     velocity: f64,
+    effort: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -288,9 +289,12 @@ impl Kinematics {
                     let l = &joint.limit;
                     if !norm.is_finite()
                         || norm < 1e-12
-                        || ![l.lower, l.upper, l.velocity].iter().all(|v| v.is_finite())
+                        || ![l.lower, l.upper, l.velocity, l.effort]
+                            .iter()
+                            .all(|v| v.is_finite())
                         || l.lower >= l.upper
                         || l.velocity <= 0.0
+                        || l.effort <= 0.0
                     {
                         return Err(format!("invalid axis or limits for {}", joint.name));
                     }
@@ -311,6 +315,7 @@ impl Kinematics {
                         lower: l.lower,
                         upper: l.upper,
                         velocity: l.velocity,
+                        effort: l.effort,
                     });
                     pending = Isometry3::identity();
                 }
@@ -335,6 +340,11 @@ impl Kinematics {
     /// URDF joint velocity ratings, independent of editable motion preferences.
     pub fn speed_limits(&self) -> [f64; 7] {
         std::array::from_fn(|i| self.joints[i].velocity)
+    }
+
+    /// URDF joint effort ratings in Nm, in serial joint order.
+    pub fn effort_limits(&self) -> [f64; 7] {
+        std::array::from_fn(|i| self.joints[i].effort)
     }
 
     /// Conservative base-centred geometric bound including fixed links and TCP.
@@ -1818,6 +1828,8 @@ mod tests {
             xml.replace("xyz=\"0 0 1\"", "xyz=\"0 0 0\""),
             xml.replace("lower=\"-4\"", "lower=\"5\""),
             xml.replace("velocity=\"1\"", "velocity=\"NaN\""),
+            xml.replace("effort=\"1\"", "effort=\"NaN\""),
+            xml.replace("effort=\"1\"", "effort=\"0\""),
             xml.replace("xyz=\"1 0 0\"", "xyz=\"NaN 0 0\""),
             xml.replace("type=\"revolute\"", "type=\"prismatic\""),
             xml.replace("<axis", "<mimic joint=\"J1\"/><axis"),

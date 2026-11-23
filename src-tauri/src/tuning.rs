@@ -76,7 +76,7 @@ pub struct Applied {
     pub dq_feedforward: [f64; 7],
     /// Friction after the configured max_friction limit.
     pub friction_requested: [f64; 7],
-    /// Delivered torque minus the supplied gravity torque.
+    /// Change in delivered feedforward relative to sending gravity alone.
     pub friction_applied: [f64; 7],
     pub tau: [f64; 7],
     pub clamped: [bool; 7],
@@ -150,10 +150,22 @@ impl ServoTuning {
         Ok(())
     }
 
-    /// Compute from the sampled motion velocity, without changing the motion plan.
-    /// The friction switch does not disable the independent velocity FF weight.
-    /// Configuration is validated when it is accepted, not on every send.
+    #[cfg(test)]
     pub fn apply(&self, dq: [f64; 7], gravity: [f64; 7]) -> Result<Applied, String> {
+        // Exercise the compensation formula independently of the arm model.
+        self.apply_with_effort_limits(dq, gravity, [f64::INFINITY; 7])
+            .map(|(applied, _)| applied)
+    }
+
+    /// Apply the active model's effort ratings to the combined torque feedforward.
+    /// The friction switch does not disable the independent velocity FF weight.
+    /// Also return the gravity-only command for the same joint budgets.
+    pub fn apply_with_effort_limits(
+        &self,
+        dq: [f64; 7],
+        gravity: [f64; 7],
+        effort_limits: [f64; 7],
+    ) -> Result<(Applied, [f64; 7]), String> {
         for index in 0..7 {
             // Motion speeds are already bounded by the active profile and
             // model before this stateless feedforward calculation.
@@ -172,6 +184,7 @@ impl ServoTuning {
             tau: gravity,
             clamped: [false; 7],
         };
+        let mut delivered_gravity = gravity;
         for index in 0..7 {
             let joint = self.joints[index];
             let velocity = dq[index];
@@ -181,37 +194,39 @@ impl ServoTuning {
             if !result.dq_feedforward[index].is_finite() {
                 return Err(format!("J{} 速度前馈非有限", index + 1));
             }
-            if !self.friction_enabled || velocity == 0.0 {
-                continue;
-            }
-
-            let raw = if joint.stribeck.enabled {
-                let curve = if velocity > 0.0 {
-                    joint.stribeck.positive
+            if self.friction_enabled && velocity != 0.0 {
+                let raw = if joint.stribeck.enabled {
+                    let curve = if velocity > 0.0 {
+                        joint.stribeck.positive
+                    } else {
+                        joint.stribeck.negative
+                    };
+                    curve.evaluate(velocity, joint.velocity_scale)
                 } else {
-                    joint.stribeck.negative
+                    joint.coulomb * (velocity / joint.velocity_scale).tanh()
+                        + joint.viscous * velocity
                 };
-                curve.evaluate(velocity, joint.velocity_scale)
-            } else {
-                joint.coulomb * (velocity / joint.velocity_scale).tanh() + joint.viscous * velocity
-            };
-            let requested = raw.clamp(-joint.max_friction, joint.max_friction);
-            result.clamped[index] = raw < -joint.max_friction || raw > joint.max_friction;
-            // Preserve gravity's bits (including -0.0) and canonical +0.0 friction.
-            if requested == 0.0 {
-                continue;
+                let requested = raw.clamp(-joint.max_friction, joint.max_friction);
+                result.clamped[index] = requested != raw;
+                // Preserve gravity's bits (including -0.0) and canonical +0.0 friction.
+                if requested != 0.0 {
+                    result.friction_requested[index] = requested;
+                    result.tau[index] += requested;
+                }
             }
 
-            let tau = gravity[index] + requested;
-            let friction = tau - gravity[index];
+            let limit = effort_limits[index];
+            delivered_gravity[index] = gravity[index].clamp(-limit, limit);
+            let tau = result.tau[index].clamp(-limit, limit);
+            result.clamped[index] |= tau != result.tau[index];
+            let friction = tau - delivered_gravity[index];
             if !tau.is_finite() || !friction.is_finite() {
                 return Err(format!("J{} 力矩前馈非有限", index + 1));
             }
-            result.friction_requested[index] = requested;
             result.friction_applied[index] = friction;
             result.tau[index] = tau;
         }
-        Ok(result)
+        Ok((result, delivered_gravity))
     }
 }
 

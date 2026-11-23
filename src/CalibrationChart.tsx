@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import FaultTimeline from "./FaultTimeline";
 import {
   createStribeckTuning,
   sameStribeckTuning,
@@ -12,11 +13,12 @@ import {
 } from "./api";
 
 const DEG = 180 / Math.PI;
-type Metric = "position" | "velocity" | "error" | "friction";
+type Metric = "position" | "velocity" | "error" | "friction" | "fault";
 const metrics: [Metric, string][] = [
   ["position", "位置"],
   ["velocity", "速度"],
   ["error", "误差"],
+  ["fault", "故障分析"],
 ];
 const series = [
   { key: "reference", label: "控制参考 reference" },
@@ -358,13 +360,16 @@ export default function CalibrationChart({
   live?: Live;
 }) {
   const [axis, setAxis] = useState(
-    live?.axis ??
+    report?.fault?.axis ??
+      live?.axis ??
       report?.settings.axis ??
       report?.trials.find((trial) => trial.axis != null)?.axis ??
       report?.identification?.[0]?.axis ??
       0,
   );
-  const [metric, setMetric] = useState<Metric>("position");
+  const [metric, setMetric] = useState<Metric>(
+    report?.fault ? "fault" : "position",
+  );
   const hasIdentification = !!report?.identification?.length;
   const hasCartesian = !!report?.trials.some(
     (trial) =>
@@ -407,6 +412,7 @@ export default function CalibrationChart({
     alternatives.at(-1);
   const points = report?.curves ?? live?.points;
   const plots = useMemo<Plot[]>(() => {
+    if (metric === "fault") return [];
     if (!report || mode === "full")
       return [
         {
@@ -435,6 +441,7 @@ export default function CalibrationChart({
     report,
     live?.axis,
     live?.space,
+    metric,
     mode,
     scope,
     points,
@@ -500,10 +507,10 @@ export default function CalibrationChart({
   return (
     <div
       className="calibration-chart"
-      data-mode={report ? mode : "full"}
+      data-mode={metric === "fault" ? "fault" : report ? mode : "full"}
       data-live-count={live?.points.length}
     >
-      {hasCartesian && metric !== "friction" && (
+      {hasCartesian && metric !== "friction" && metric !== "fault" && (
         <div className="calibration-space-tabs" aria-label="曲线动作类型">
           {(
             [
@@ -563,7 +570,7 @@ export default function CalibrationChart({
             </button>
           ))}
         </div>
-        {metric !== "friction" && (
+        {metric !== "friction" && metric !== "fault" && (
           <select
             className="calibration-chart-mode"
             aria-label="曲线范围"
@@ -582,7 +589,9 @@ export default function CalibrationChart({
           </select>
         )}
       </div>
-      {metric === "friction" && report ? (
+      {metric === "fault" ? (
+        <FaultTimeline points={points} fault={report?.fault} axis={axis} />
+      ) : metric === "friction" && report ? (
         <FrictionFitChart
           fit={report.identification?.find((fit) => fit.axis === axis)}
           axis={axis}
@@ -792,7 +801,7 @@ export default function CalibrationChart({
                         {focused ? (
                           <>
                             <span>
-                              t {focused.t_ms} ms · 测试{" "}
+                              采样 {focused.t_ms} ms · 测试{" "}
                               {focused.space === "cartesian"
                                 ? `末端 ${"XYZ"[focused.axis]}`
                                 : `J${focused.axis + 1}`}
@@ -804,7 +813,7 @@ export default function CalibrationChart({
                               </span>
                             ))}
                             <span>
-                              发送 {focused.command_at_ms ?? "—"} ms · 反馈{" "}
+                              发送 {focused.command_at_ms ?? "—"} ms · 反馈年龄{" "}
                               {focused.feedback_age_ms[axis]} ms
                             </span>
                           </>
@@ -832,6 +841,7 @@ export default function CalibrationChart({
               : scope === "cartesian"
                 ? "末端动作包含七轴的耦合响应；时间为测试原始时间。"
                 : "全程包含其他关节测试时的本轴响应；时间为测试原始时间。"}
+            横轴按取样时刻对照。
             {metric === "velocity"
               ? "未单独记录参考速度。"
               : metric === "error"

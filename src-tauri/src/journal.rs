@@ -5,10 +5,11 @@
 pub use crate::trace::{TraceData, TraceRecording, TraceSummary};
 use crate::{
     calibration::Report,
+    protocol::motor_fault_description,
     teaching::{Capture, Summary as TeachingSummary, Trajectory},
     trace::Recorder,
 };
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, functions::FunctionFlags, params};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
@@ -470,9 +471,7 @@ impl Journal {
             .map_err(|e| e.to_string())?;
         rows.map(|row| {
             let payload = row.map_err(|e| e.to_string())?;
-            serde_json::from_str::<Report>(&payload)
-                .map(|report| report.summary())
-                .map_err(|e| format!("read calibration: {e}"))
+            read_calibration(&payload).map(|report| report.summary())
         })
         .collect()
     }
@@ -514,8 +513,7 @@ impl Journal {
         tx.commit().map_err(|e| e.to_string())?;
         payload
             .map(|payload| {
-                let mut report: Report =
-                    serde_json::from_str(&payload).map_err(|e| format!("read calibration: {e}"))?;
+                let mut report = read_calibration(&payload)?;
                 if let Some(curves) = curves {
                     report.curves = serde_json::from_str(&curves)
                         .map_err(|e| format!("read calibration curves: {e}"))?;
@@ -620,6 +618,17 @@ impl Journal {
         )
         .map_err(|e| format!("open journal reader: {e}"))?;
         conn.busy_timeout(BUSY).map_err(|e| e.to_string())?;
+        conn.create_scalar_function(
+            "legacy_motor_fault_display",
+            1,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let mut message = ctx.get(0)?;
+                describe_legacy_motor_fault(&mut message);
+                Ok(message)
+            },
+        )
+        .map_err(|e| e.to_string())?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         // The first SELECT establishes the same SQLite snapshot for MAX/COUNT/items.
         let max_id: i64 = tx
@@ -630,7 +639,8 @@ impl Journal {
         let filter = "?1 > 0 AND id <= ?1 AND (?2 = ''
             OR instr(lower(level),?2) > 0 OR instr(lower(source),?2) > 0
             OR instr(lower(code),?2) > 0 OR instr(lower(message),?2) > 0
-            OR instr(lower(request_id),?2) > 0)
+            OR instr(lower(request_id),?2) > 0
+            OR (message GLOB 'J? 故障码 *' AND instr(lower(legacy_motor_fault_display(message)),?2) > 0))
             AND (?3 IS NULL OR level = ?3)
             AND (?4 IS NULL OR source = ?4)
             AND (?5 IS NULL OR code = ?5)
@@ -744,15 +754,40 @@ impl Journal {
 }
 
 fn log_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LogRecord> {
+    let mut message = row.get(5)?;
+    describe_legacy_motor_fault(&mut message);
     Ok(LogRecord {
         id: row.get(0)?,
         ts_ms: row.get(1)?,
         level: row.get(2)?,
         source: row.get(3)?,
         code: row.get(4)?,
-        message: row.get(5)?,
+        message,
         request_id: row.get(6)?,
     })
+}
+
+fn read_calibration(payload: &str) -> Result<Report, String> {
+    let mut report: Report =
+        serde_json::from_str(payload).map_err(|e| format!("read calibration: {e}"))?;
+    describe_legacy_motor_fault(&mut report.message);
+    Ok(report)
+}
+
+fn describe_legacy_motor_fault(message: &mut String) {
+    // The old writer emitted J1..J7 and a nonzero u32 in canonical decimal.
+    let Some((joint, raw_code)) = message.split_once(" 故障码 ") else {
+        return;
+    };
+    if matches!(joint.as_bytes(), [b'J', b'1'..=b'7'])
+        && matches!(raw_code.as_bytes(), [b'1'..=b'9', ..])
+        && let Ok(code) = raw_code.parse::<u32>()
+    {
+        *message = format!(
+            "{joint} {}（故障码 {raw_code}）",
+            motor_fault_description(code)
+        );
+    }
 }
 
 fn capped(value: &str, max: usize) -> String {
@@ -1796,6 +1831,9 @@ mod tests {
                     feedback_age_ms: [2; 7],
                     command_at_ms: Some(i as u32 * 20),
                     effort: None,
+                    feedforward_effort: None,
+                    driver_temperature: None,
+                    winding_temperature: None,
                 })
                 .collect(),
         );
@@ -1963,6 +2001,52 @@ mod tests {
     }
 
     #[test]
+    fn calibration_temperatures_and_motor_fault_survive_async_write_and_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.sqlite3");
+        let journal = Journal::start(path.clone()).unwrap();
+        let mut report = calibration_with_curves("overheat", 1234, 2);
+        let driver = [32.0, 33.5, 37.0, 29.5, 34.0, 42.5, 35.0];
+        let winding = [39.5, 35.0, 44.5, 36.0, 41.0, 86.5, 40.0];
+        let feedforward = [-0.25, 0.0, 0.125, 0.75, -0.5, 1.625, -0.125];
+        let points = Arc::make_mut(&mut report.curves);
+        points[1].driver_temperature = Some(driver);
+        points[1].winding_temperature = Some(winding);
+        points[1].feedforward_effort = Some(feedforward);
+        report.outcome = "failed".into();
+        report.improvement = None;
+        report.recommended = None;
+        report.message = "J6 电机绕组过热（故障码 512）".into();
+        let fault = serde_json::json!({
+            "axis": 5, "code": 512, "message": report.message, "t_ms": 23,
+            "driver_temperature": 43.0, "winding_temperature": 87.0,
+            "position": -0.125, "command": -0.121, "effort": 1.875,
+            "feedforward_effort": 1.5, "voltage": 23.75
+        });
+        report.fault = Some(serde_json::from_value(fault.clone()).unwrap());
+        wait_for(|| journal.record_calibration(&report));
+        assert!(journal.shutdown(Duration::from_secs(2)));
+        drop(journal);
+
+        let reopened = Journal::start(path).unwrap();
+        wait_for(|| reopened.stats().healthy);
+        let detail = reopened.calibration(&report.id).unwrap().unwrap();
+        let history = reopened.calibrations(1).unwrap();
+        for stored in [&detail, &history[0]] {
+            assert_eq!(stored.message, report.message);
+            assert_eq!(serde_json::to_value(&stored.fault).unwrap(), fault);
+        }
+        assert!(history[0].curves.is_empty());
+        assert_eq!(detail.curves.len(), 2);
+        assert_eq!(detail.curves[0].driver_temperature, None);
+        assert_eq!(detail.curves[0].winding_temperature, None);
+        assert_eq!(detail.curves[1].driver_temperature, Some(driver));
+        assert_eq!(detail.curves[1].winding_temperature, Some(winding));
+        assert_eq!(detail.curves[1].feedforward_effort, Some(feedforward));
+        assert!(reopened.shutdown(Duration::from_secs(2)));
+    }
+
+    #[test]
     fn calibration_history_retains_newest_orders_ties_and_upserts_literal_ids() {
         let dir = tempdir().unwrap();
         let journal = Journal::start(dir.path().join("events.sqlite3")).unwrap();
@@ -2077,6 +2161,114 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM calibrations", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn legacy_motor_fault_displays_in_logs_and_reports_without_rewriting_history() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.sqlite3");
+        let conn = open_writer(&path).unwrap();
+        let old_message = "J6 故障码 512";
+        conn.execute(
+            "INSERT INTO events(ts_ms,level,source,code,message)
+             VALUES(1234,'error','device','device_error',?1)",
+            [old_message],
+        )
+        .unwrap();
+        let mut metadata = serde_json::to_value(calibration_report("legacy", 1234)).unwrap();
+        metadata["outcome"] = "failed".into();
+        metadata["message"] = old_message.into();
+        metadata["sample_count"] = 1.into();
+        metadata.as_object_mut().unwrap().remove("fault");
+        let metadata = metadata.to_string();
+        let curves = r#"[{"t_ms":20,"trial":0,"axis":5,"reference":[0,0,0,0,0,0,0],
+            "feedback":[0,0,0,0,0,-0.125,0],"velocity":[0,0,0,0,0,0,0],
+            "feedback_velocity":[0,0,0,0,0,0,0],"feedback_age_ms":[1,1,1,1,1,1,1]}]"#;
+        conn.execute(
+            "INSERT INTO calibrations VALUES('legacy',1234,?1)",
+            [&metadata],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_curves VALUES('legacy',?1)",
+            [curves],
+        )
+        .unwrap();
+
+        let journal = Journal::start(path).unwrap();
+        wait_for(|| journal.stats().healthy);
+        let expected = "J6 电机绕组过热（故障码 512）";
+        let recent = journal.recent(1).unwrap();
+        let page = journal
+            .page(LogPageQuery {
+                search: old_message.into(),
+                ..LogPageQuery::default()
+            })
+            .unwrap();
+        for record in [&recent[0], &page.items[0]] {
+            assert_eq!(record.message, expected);
+            assert_eq!(record.code, "device_error");
+        }
+        let history = journal.calibrations(1).unwrap();
+        let detail = journal.calibration("legacy").unwrap().unwrap();
+        for report in [&history[0], &detail] {
+            assert_eq!(report.message, expected);
+            assert_eq!(report.sample_count, 1);
+            assert!(report.fault.is_none());
+        }
+        assert!(history[0].curves.is_empty());
+        assert_eq!(detail.curves.len(), 1);
+        assert_eq!(detail.curves[0].feedback[5], -0.125);
+        assert_eq!(detail.curves[0].feedforward_effort, None);
+        assert_eq!(detail.curves[0].driver_temperature, None);
+        assert_eq!(detail.curves[0].winding_temperature, None);
+        assert!(journal.shutdown(Duration::from_secs(2)));
+        let stored: (String, String, String) = conn
+            .query_row(
+                "SELECT events.message,c.payloadJSON,p.payloadJSON FROM events
+                 CROSS JOIN calibrations c JOIN calibration_curves p ON p.id=c.id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            (old_message.to_owned(), metadata, curves.to_owned())
+        );
+    }
+
+    #[test]
+    fn legacy_motor_fault_requires_the_exact_old_format() {
+        for original in [
+            "J6 故障码 512 附加说明",
+            "故障记录：J6 故障码 512",
+            "J6 故障码 512\n",
+            "J6  故障码 512",
+            "J6 故障码  512",
+            "J6 故障码 +512",
+            "J6 故障码 0512",
+            "J6 故障码 0",
+            "J6 故障码 4294967296",
+            "J0 故障码 512",
+            "J8 故障码 512",
+            "J06 故障码 512",
+            "J6 已记录的说明（故障码 512）",
+        ] {
+            let mut message = original.to_owned();
+            describe_legacy_motor_fault(&mut message);
+            assert_eq!(message, original);
+        }
+        for (joint, code) in [(1, 1), (7, u32::MAX)] {
+            let mut message = format!("J{joint} 故障码 {code}");
+            describe_legacy_motor_fault(&mut message);
+            assert_eq!(
+                message,
+                format!(
+                    "J{joint} {}（故障码 {code}）",
+                    motor_fault_description(code)
+                )
+            );
+        }
     }
 
     #[test]
@@ -2545,6 +2737,51 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&fixed).unwrap()).unwrap();
         assert_eq!(ids(&roundtrip), ids(&fixed));
         assert!(journal.shutdown(Duration::from_secs(8)));
+    }
+
+    #[test]
+    fn page_search_matches_legacy_fault_display_and_original_text() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("events.sqlite3");
+        let original = "J6 故障码 512";
+        let displayed = "J6 电机绕组过热（故障码 512）";
+        let conn = open_writer(&path).unwrap();
+        for message in [original, "J6 故障码 0512", displayed] {
+            conn.execute(
+                "INSERT INTO events(ts_ms,level,source,code,message)
+                 VALUES(1,'error','device','device_error',?1)",
+                [message],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let journal = Journal::start(path.clone()).unwrap();
+        for (search, page, total, expected_id) in [
+            ("绕组过热", 1, 2, 3),
+            ("绕组过热", 2, 2, 1),
+            ("j6 电机绕组过热（故障码 512）", 2, 2, 1),
+            (original, 1, 1, 1),
+        ] {
+            let result = journal
+                .page(LogPageQuery {
+                    search: search.into(),
+                    page,
+                    page_size: 1,
+                    ..LogPageQuery::default()
+                })
+                .unwrap();
+            assert_eq!(result.total, total, "{search}");
+            assert_eq!((result.page, result.total_pages), (page, total as u32));
+            assert_eq!(result.items.len(), 1);
+            assert_eq!(result.items[0].id, expected_id);
+            assert_eq!(result.items[0].message, displayed);
+        }
+        assert!(journal.shutdown(Duration::from_secs(2)));
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let stored: String = conn
+            .query_row("SELECT message FROM events WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, original);
     }
 
     #[test]

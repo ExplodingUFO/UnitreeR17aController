@@ -18,6 +18,7 @@
 | `resources/models/{left,right}/robot.urdf` 与 `meshes/` | 来自 SDK 的 `urdf/URDF_R1-7A.tar.gz`；STL 保持原始二进制，URDF 仅归一化 mesh 文件路径。版本、路径和 SHA-256 见 [manifest.json](resources/models/manifest.json)。 |
 | `resources/calibration/joint_calib_{left,right}.txt` | SDK `config/` 中的官方示例标定文件，保留原始内容；不是对用户本体的标定结果。 |
 | `src-tauri/src/protocol.rs` | Rust 协议实现参考官方电机报文、CRC、缩放与标定约定。 |
+| `resources/motor-faults.json` | 故障位与含义来自官方 SDK 的 `MotorProtocol.cpp`，中文说明供日志与界面共用。 |
 | `resources/calibration/protocol-golden.json` 与生成器 | 使用上述 SDK 固定版本的原始 `MotorProtocol.cpp` 离线生成协议对照；SDK 原始实现不作为本项目运行时依赖。复现方式见 [说明](resources/calibration/README.md)。 |
 
 ## 软件依赖

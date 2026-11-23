@@ -11,7 +11,10 @@ use crate::{
         self, CartesianPath, CartesianPlanning, Frame, HoldPose, Kinematics, LocalTarget,
         MotionLimits, Pose, SmoothingState, StepInput,
     },
-    protocol::{BusError, BusHandle, DriveMode, Feedback, SentReference, Setpoint},
+    protocol::{
+        BusError, BusHandle, DriveMode, Feedback, ReceivedFeedback, SentReference, Setpoint,
+        motor_fault_description,
+    },
     reference::{CartesianGuard, MAX_REFERENCE_AGE, Reference, Sampling},
     teaching::{
         self, Capture as TeachingCapture, Guidance, PlaybackOptions, Program as TeachingProgram,
@@ -24,6 +27,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashSet, VecDeque},
+    fmt::Write as _,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -85,8 +89,10 @@ pub struct JointSnapshot {
     pub tau: Option<f64>,
     pub age_ms: Option<u64>,
     pub temperature: Option<f64>,
+    pub winding_temperature: Option<f64>,
     pub voltage: Option<f64>,
     pub error: Option<u32>,
+    pub error_reason: Option<String>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct CommandResult {
@@ -741,6 +747,7 @@ struct Core {
     clear_request: Option<(String, Instant)>,
     enable_request: Option<(String, Instant)>,
     diag_at: Instant,
+    temperature_log_at: Instant,
     diag_cycles: u64,
     diag_dt_sum: f64,
     diag_dt_max: f64,
@@ -806,6 +813,7 @@ impl Core {
             clear_request: None,
             enable_request: None,
             diag_at: Instant::now(),
+            temperature_log_at: Instant::now(),
             diag_cycles: 0,
             diag_dt_sum: 0.0,
             diag_dt_max: 0.0,
@@ -1021,9 +1029,14 @@ impl Core {
     }
     fn fault(&mut self, code: &str, message: impl Into<String>) {
         let message = message.into();
+        if self.set_fault(code, &message) {
+            self.journal.log("error", "device", code, &message, None);
+        }
+    }
+    fn set_fault(&mut self, code: &str, message: &str) -> bool {
         self.clear_pending = [false; 7];
         if let Some((id, _)) = self.clear_request.take() {
-            self.record(&id, "failed", code, &message);
+            self.record(&id, "failed", code, message);
         }
         let changed = self
             .error
@@ -1036,7 +1049,7 @@ impl Core {
             || self.teaching_mode.is_some()
             || self.replay.is_some()
         {
-            self.end_motion("failed", code, &message);
+            self.end_motion("failed", code, message);
         } else if changed {
             self.bump_generation();
         }
@@ -1044,13 +1057,11 @@ impl Core {
         self.finish_teaching_disabled();
         self.reset_derivatives();
         self.stopping = false;
-        self.error = Some(ApiError::new(code, message.clone()));
+        self.error = Some(ApiError::new(code, message));
         self.restore_calibration_disabled();
         self.phase = Phase::Fault;
-        if changed {
-            self.journal.log("error", "device", code, &message, None);
-            self.dirty = true;
-        }
+        self.dirty |= changed;
+        changed
     }
     fn measured(&self, now: Instant) -> Result<[f64; 7], ApiError> {
         let mut q = [0.0; 7];
@@ -2034,6 +2045,7 @@ impl Core {
                 outcome: "unchanged".into(),
                 improvement: None,
                 message: "测试完成，参数保持原样".into(),
+                fault: None,
             },
             queue,
             legs: Vec::new(),
@@ -2460,10 +2472,16 @@ impl Core {
                             .as_millis()
                             .min(u32::MAX as u128) as u32
                     }),
+                    feedforward_effort: latest.map(|s| s.feedforward_effort),
                     effort: Some(std::array::from_fn(|i| {
                         self.feedback[i].as_ref().unwrap().value.tau
                     })),
-
+                    driver_temperature: Some(std::array::from_fn(|i| {
+                        self.feedback[i].as_ref().unwrap().value.temperature
+                    })),
+                    winding_temperature: Some(std::array::from_fn(|i| {
+                        self.feedback[i].as_ref().unwrap().value.winding_temperature
+                    })),
                     space: run.report.trials[run.trial.min(run.report.trials.len() - 1)]
                         .space
                         .clone(),
@@ -3479,13 +3497,14 @@ impl Core {
         }
     }
     fn outgoing_reference(&self) -> Reference {
-        let mut reference = Reference::joint(
+        let mut reference = Reference::joint_for_model(
             self.control_at,
             self.reference,
             self.velocity,
             self.acceleration,
             self.generation,
             self.reference_version,
+            self.model.as_deref(),
         );
         reference.joint_velocity = self.joint_speeds();
         reference.servo_tuning = self.servo_tuning;
@@ -3727,12 +3746,20 @@ impl Core {
     fn drain_feedback(&mut self, enabling: bool) {
         let Some(bus) = &self.bus else { return };
         let (frames, error) = bus.drain();
+        // Preserve received drive faults, including the last frame before a port failure.
+        let mut calibration_request = None;
+        for frame in frames {
+            if frame.value.error != 0 && calibration_request.is_none() {
+                calibration_request = self
+                    .calibration
+                    .as_ref()
+                    .map(|r| r.report.request_id.clone());
+            }
+            self.handle_feedback(frame, enabling, calibration_request.as_deref());
+        }
         if let Some(BusError::Io(message)) = error {
             self.fault("communication_error", message);
             return;
-        }
-        for (value, at) in frames {
-            self.handle_feedback(value, at, enabling);
         }
         if let Some(BusError::Reference {
             generation,
@@ -3831,6 +3858,30 @@ impl Core {
         );
     }
     fn diagnose(&mut self, now: Instant, dt_ms: f64, work_ms: f64) {
+        if now.saturating_duration_since(self.temperature_log_at) >= Duration::from_secs(1) {
+            let mut readings = String::new();
+            for (axis, sample) in self.feedback.iter().enumerate() {
+                if let Some(o) = sample.as_ref().filter(|o| o.at > self.temperature_log_at) {
+                    let _ = write!(
+                        readings,
+                        "  J{} {}/{}",
+                        axis + 1,
+                        o.value.temperature,
+                        o.value.winding_temperature
+                    );
+                }
+            }
+            if !readings.is_empty() {
+                self.journal.log(
+                    "info",
+                    "device",
+                    "joint_temperatures",
+                    &format!("驱动/绕组温度（°C）{readings}"),
+                    None,
+                );
+            }
+            self.temperature_log_at = now;
+        }
         if !self.enabled && self.motion.is_none() {
             if let Some(bus) = &self.bus {
                 bus.take_transmit_stats();
@@ -3891,11 +3942,14 @@ impl Core {
             .as_ref()
             .map(|bus| bus.take_transmit_stats())
             .unwrap_or_default();
-        let gravity = self
-            .model
+        let feedforward = self
+            .bus
             .as_ref()
-            .and_then(|model| model.gravity(&self.reference).ok())
-            .unwrap_or([0.0; 7]);
+            .and_then(BusHandle::latest_reference)
+            .map_or_else(
+                || "—".into(),
+                |s| format!("{:.3}", s.feedforward_effort[joint]),
+            );
         let motion = self
             .motion
             .as_ref()
@@ -3920,7 +3974,7 @@ impl Core {
             })
             .unwrap_or_else(|| "-".into());
         let message = format!(
-            "周期 {:.2}/{:.2} ms，控制线程 {:.2}/{:.2} ms，action={motion}，反馈年龄 {age_ms} ms，J{} 参考误差 {:.3} rad，qref={:.3} q={:.3} dq={:.3} tau={:.2}，comm={}/{}/{}，tx批次={} 间隔均/小/大={:.2}/{:.2}/{:.2} ms 写入最大={:.2} ms，dqcmd={:.4} tauff={:.3} voltage={:.2}",
+            "周期 {:.2}/{:.2} ms，控制线程 {:.2}/{:.2} ms，action={motion}，反馈年龄 {age_ms} ms，J{} 参考误差 {:.3} rad，qref={:.3} q={:.3} dq={:.3} tau={:.2}，comm={}/{}/{}，tx批次={} 间隔均/小/大={:.2}/{:.2}/{:.2} ms 写入最大={:.2} ms，dqref={:.4} tauff={feedforward} voltage={:.2}",
             self.diag_dt_sum / cycles,
             self.diag_dt_max,
             self.diag_work_sum / cycles,
@@ -3940,7 +3994,6 @@ impl Core {
             transmit.interval_max_ms,
             transmit.write_max_ms,
             self.velocity[joint],
-            gravity[joint],
             voltage,
         );
         self.journal.log("info", "control", "cycle", &message, None);
@@ -3953,9 +4006,22 @@ impl Core {
     }
     #[cfg(test)]
     fn accept_feedback(&mut self, value: Feedback, at: Instant) {
-        self.handle_feedback(value, at, false);
+        self.handle_feedback(
+            ReceivedFeedback {
+                value,
+                at,
+                fault_command: None,
+            },
+            false,
+            None,
+        );
     }
-    fn handle_feedback(&mut self, value: Feedback, at: Instant, enabling: bool) {
+    fn handle_feedback(&mut self, frame: ReceivedFeedback, enabling: bool, request: Option<&str>) {
+        let ReceivedFeedback {
+            value,
+            at,
+            fault_command,
+        } = frame;
         let id = value.id as usize;
         if id >= 7 {
             return;
@@ -3964,16 +4030,92 @@ impl Core {
         let timeout = value.timeout;
         let mode = value.mode;
         let report_fault = self.error.is_none() || self.clear_request.is_some();
+        let new_error = error != 0
+            && self.feedback[id]
+                .as_ref()
+                .is_none_or(|o| o.value.error != error);
         self.feedback[id] = Some(Observation { value, at });
-        if !report_fault {
+        let trips_drive = report_fault && self.clear_request.is_none();
+        if error != 0 && (new_error || trips_drive) {
+            self.motor_fault(id, at, trips_drive, fault_command, request);
+        }
+        if !report_fault || (error != 0 && trips_drive) {
             return;
         }
-        if error != 0 && self.clear_request.is_none() {
-            self.fault("device_error", format!("J{} 故障码 {}", id + 1, error));
-        } else if timeout && (enabling || self.enabled || self.enable_request.is_some()) {
+        if timeout && (enabling || self.enabled || self.enable_request.is_some()) {
             self.fault("device_timeout", format!("J{} 设备通信超时", id + 1));
         } else if mode != 1 && self.enabled {
             self.fault("device_disabled", format!("J{} 已退出使能", id + 1));
+        }
+    }
+    fn motor_fault(
+        &mut self,
+        axis: usize,
+        at: Instant,
+        trip: bool,
+        sent: Option<(f64, f64)>,
+        request: Option<&str>,
+    ) {
+        let value = &self.feedback[axis].as_ref().unwrap().value;
+        let code = value.error;
+        let message = format!(
+            "J{} {}（故障码 {}）",
+            axis + 1,
+            motor_fault_description(code),
+            code
+        );
+        let mut detail = format!(
+            "{message}。驱动温度 {} °C，绕组温度 {} °C，反馈扭矩 {:.3} Nm，实测位置 {:.2}°，电压 {:.2} V，原始故障位 0x{code:08X}",
+            value.temperature,
+            value.winding_temperature,
+            value.tau,
+            value.q.to_degrees(),
+            value.voltage
+        );
+        let _ = write!(
+            detail,
+            "，实测速度 {:.2}°/s，设备模式 {}，警告位 0x{:02X}，通信超时{}",
+            value.dq.to_degrees(),
+            value.mode,
+            value.warning,
+            if value.timeout { "是" } else { "否" }
+        );
+        if let Some((q, ff)) = sent {
+            let _ = write!(
+                detail,
+                "，最近指令位置 {:.2}°，前馈扭矩 {:.3} Nm",
+                q.to_degrees(),
+                ff
+            );
+        }
+        let run = self.calibration.as_mut();
+        let request = request.or_else(|| run.as_ref().map(|r| r.report.request_id.as_str()));
+        self.journal
+            .log("error", "device", "device_error", &detail, request);
+        if trip {
+            if let Some(run) = run {
+                // A stop request may already be decelerating this calibration.
+                run.report.outcome = "failed".into();
+                run.report.message.clone_from(&message);
+                run.report.recommended = None;
+                run.report.fault = Some(calibration::MotorFault {
+                    axis,
+                    code,
+                    message: message.clone(),
+                    t_ms: at
+                        .saturating_duration_since(run.started)
+                        .as_millis()
+                        .min(u32::MAX as u128) as u32,
+                    driver_temperature: value.temperature,
+                    winding_temperature: value.winding_temperature,
+                    position: value.q,
+                    command: sent.map(|(q, _)| q),
+                    feedforward_effort: sent.map(|(_, ff)| ff),
+                    effort: value.tau,
+                    voltage: value.voltage,
+                });
+            }
+            self.set_fault("device_error", &message);
         }
     }
     fn settle_transitions(&mut self, now: Instant) {
@@ -4014,9 +4156,28 @@ impl Core {
                 self.record(&id, "completed", "cleared", "故障已清除");
             } else if now.saturating_duration_since(*started) > Duration::from_secs(1) {
                 let id = id.clone();
+                let faults: Vec<_> = self
+                    .feedback
+                    .iter()
+                    .flatten()
+                    .filter(|o| o.at > *started && o.value.error != 0)
+                    .map(|o| {
+                        format!(
+                            "J{} {}（{}）",
+                            o.value.id + 1,
+                            motor_fault_description(o.value.error),
+                            o.value.error
+                        )
+                    })
+                    .collect();
+                let message = if faults.is_empty() {
+                    "未收到七轴清错确认".to_string()
+                } else {
+                    format!("故障仍在：{}", faults.join("、"))
+                };
                 self.clear_request = None;
-                self.record(&id, "failed", "clear_failed", "故障未清除");
-                self.fault("device_error", "故障未清除");
+                self.record(&id, "failed", "clear_failed", &message);
+                self.fault("device_error", message);
             }
         }
     }
@@ -4042,8 +4203,12 @@ impl Core {
                     tau: value.map(|o| o.value.tau),
                     age_ms: value.map(|o| now.saturating_duration_since(o.at).as_millis() as u64),
                     temperature: value.map(|o| o.value.temperature),
+                    winding_temperature: value.map(|o| o.value.winding_temperature),
                     voltage: value.map(|o| o.value.voltage),
                     error: value.map(|o| o.value.error),
+                    error_reason: value
+                        .filter(|o| o.value.error != 0)
+                        .map(|o| motor_fault_description(o.value.error)),
                 }
             })
             .collect();
@@ -4390,6 +4555,7 @@ mod tests {
             q: held,
             dq: [0.0; 7],
             calibration_phase: None,
+            feedforward_effort: [0.0; 7],
             fallback_hold: false,
         }));
         let mut config = ServoTuning::default();
@@ -4683,6 +4849,7 @@ mod tests {
             q,
             dq: [0.0; 7],
             calibration_phase: None,
+            feedforward_effort: [0.0; 7],
             fallback_hold: false,
         }));
         let mut previous = Some(Previous {
@@ -4750,6 +4917,7 @@ mod tests {
                             q: sample.q,
                             dq: sample.dq,
                             calibration_phase: None,
+                            feedforward_effort: [0.0; 7],
                             fallback_hold: false,
                         }));
                     }
@@ -4926,6 +5094,7 @@ mod tests {
                     dq: 0.0,
                     tau: 0.0,
                     temperature: 25.0,
+                    winding_temperature: 31.0,
                     voltage: 24.0,
                     error: 0,
                     warning: 0,
@@ -4971,6 +5140,7 @@ mod tests {
             q: sample.q,
             dq: sample.dq,
             calibration_phase: None,
+            feedforward_effort: [0.0; 7],
             fallback_hold: false,
         }));
         core.desired_setpoints()
@@ -5904,6 +6074,7 @@ mod tests {
             q: sample.q,
             dq: [0.0; 7],
             calibration_phase: None,
+            feedforward_effort: [0.0; 7],
             fallback_hold: true,
         }));
         core.end_motion("cancelled", "stopped", "停止");
@@ -6016,6 +6187,7 @@ mod tests {
             q: sampled.q,
             dq: sampled.dq,
             calibration_phase: None,
+            feedforward_effort: [0.0; 7],
             fallback_hold: false,
         }));
         core.end_motion("cancelled", "stopped", "停止");
@@ -6199,7 +6371,7 @@ mod tests {
         let now = Instant::now();
         let (mut core, _directory) = observed_core(now);
         let message = "serial write: device disconnected";
-        core.bus = Some(BusHandle::test_failed_bus(message));
+        core.bus = Some(BusHandle::test_failed_bus(message, []));
         core.clear_request = Some(("clear".into(), now));
         core.clear_pending = [true; 7];
         core.poll(now);
@@ -6314,6 +6486,7 @@ mod tests {
             q: core.reference,
             dq: core.velocity,
             calibration_phase: None,
+            feedforward_effort: [0.0; 7],
             fallback_hold: false,
         }));
         (core, directory, sent)
@@ -6765,6 +6938,176 @@ mod tests {
     }
 
     #[test]
+    fn motor_fault_during_calibration_deceleration_supersedes_the_stop_request() {
+        let (mut core, _dir, _) = moving_feedback_fixture(Instant::now());
+        let at = core.control_at + Duration::from_millis(1);
+        core.stop_command("stopped", "停止", at);
+        assert!(core.calibration.as_ref().unwrap().cancelled);
+        let mut frame = core.feedback[5].as_ref().unwrap().value.clone();
+        frame.error = 512;
+        core.accept_feedback(frame, at + Duration::from_millis(2));
+        let report = core.last_calibration_report.as_ref().unwrap();
+        assert_eq!(report.outcome, "failed");
+        assert_eq!(report.fault.as_ref().unwrap().code, 512);
+        assert!(report.message.contains("绕组过热"));
+        assert!(!core.enabled);
+    }
+
+    #[test]
+    fn fault_frame_before_serial_disconnect_survives_in_calibration_report() {
+        let (mut core, _dir, _) = moving_feedback_fixture(Instant::now());
+        let rx = core.control_at + Duration::from_millis(3);
+        let mut frame = core.feedback[6].as_ref().unwrap().value.clone();
+        frame.error = 512;
+        frame.winding_temperature = 109.0;
+        core.bus = Some(BusHandle::test_failed_bus("port closed", [(frame, rx)]));
+        core.advance(rx + Duration::from_millis(1), 0.01);
+        let report = core.last_calibration_report.as_ref().unwrap();
+        let fault = report.fault.as_ref().unwrap();
+        assert_eq!(
+            (fault.axis, fault.code, fault.winding_temperature),
+            (6, 512, 109.0)
+        );
+        assert!(report.message.contains("绕组过热"));
+        assert_eq!(core.error.as_ref().unwrap().code, "communication_error");
+        assert!(!core.enabled);
+    }
+
+    #[test]
+    fn temperature_history_includes_disabled_joints_only_after_new_feedback() {
+        let (mut core, _dir) = core();
+        let t = core.temperature_log_at;
+        let at = |ms| t + Duration::from_millis(ms);
+        for axis in 0..7 {
+            core.accept_feedback(
+                Feedback {
+                    id: axis,
+                    q: 0.0,
+                    dq: 0.0,
+                    tau: 0.0,
+                    temperature: (35 + axis) as f64,
+                    winding_temperature: (42 + axis) as f64,
+                    voltage: 24.0,
+                    error: 0,
+                    warning: 0,
+                    mode: 0,
+                    timeout: false,
+                },
+                at(990),
+            );
+        }
+        core.diagnose(at(1000), 10.0, 0.1);
+        core.diagnose(at(2000), 10.0, 0.1);
+        let mut next = core.feedback[5].as_ref().unwrap().value.clone();
+        next.winding_temperature = 46.0;
+        core.accept_feedback(next, at(2990));
+        core.diagnose(at(3000), 10.0, 0.1);
+        assert!(core.journal.shutdown(Duration::from_secs(3)));
+        let records = core.journal.recent(10).unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|r| r.code == "joint_temperatures"));
+        for i in 0..7 {
+            assert!(
+                records[1]
+                    .message
+                    .contains(&format!("J{} {}/{}", i + 1, 35 + i, 42 + i))
+            );
+        }
+        assert!(records[0].message.ends_with("J6 40/46"));
+        assert!(!records[0].message.contains("J7"));
+    }
+
+    #[test]
+    fn calibration_preserves_seven_thermal_channels_and_the_first_fault_between_samples() {
+        let start = Instant::now();
+        let (mut core, _dir, sent) = moving_feedback_fixture(start);
+        let at = core.control_at + Duration::from_millis(30);
+        let driver = std::array::from_fn(|i| 32.0 + i as f64);
+        let winding = std::array::from_fn(|i| 47.0 + i as f64);
+        let effort = std::array::from_fn(|i| 0.125 * i as f64);
+        for i in 0..7 {
+            let mut frame = core.feedback[i].as_ref().unwrap().value.clone();
+            frame.temperature = driver[i];
+            frame.winding_temperature = winding[i];
+            frame.tau = effort[i];
+            core.accept_feedback(frame, at);
+        }
+        core.advance(at, 0.03);
+        // The sender writes another batch between two control ticks.
+        let mut prior = core.bus.as_ref().unwrap().latest_reference().unwrap();
+        prior.completed_at = at + Duration::from_millis(1);
+        prior.q[5] += 0.01;
+        prior.feedforward_effort[5] = 0.42;
+        sent.send_replace(Some(prior));
+
+        let queue = core.bus.as_mut().unwrap().test_feedback_queue();
+        let mut j6 = core.feedback[5].as_ref().unwrap().value.clone();
+        let mut j7 = core.feedback[6].as_ref().unwrap().value.clone();
+        j6.error = 512;
+        j6.winding_temperature = 108.0;
+        j6.tau = -2.125;
+        j7.error = 512;
+        let trip_at = at + Duration::from_millis(3);
+        queue(j6.clone(), trip_at);
+        queue(j6.clone(), at + Duration::from_millis(4));
+        queue(j7, at + Duration::from_millis(5));
+        let mut cleared = j6.clone();
+        cleared.error = 0;
+        cleared.winding_temperature = 107.0;
+        queue(cleared, at + Duration::from_millis(6));
+        let mut later = prior;
+        later.completed_at = at + Duration::from_millis(9);
+        later.q[5] += 0.02;
+        later.feedforward_effort[5] = -0.75;
+        sent.send_replace(Some(later));
+        core.advance(at + Duration::from_millis(10), 0.01);
+
+        let report = core.last_calibration_report.as_ref().unwrap();
+        let last = report.curves.last().unwrap();
+        assert_eq!(last.driver_temperature, Some(driver));
+        assert_eq!(last.winding_temperature, Some(winding));
+        assert_eq!(last.effort, Some(effort));
+        let fault = report.fault.as_ref().unwrap();
+        assert_eq!(
+            (report.outcome.as_str(), fault.axis, fault.code),
+            ("failed", 5, 512)
+        );
+        assert_eq!(fault.t_ms, trip_at.duration_since(start).as_millis() as u32);
+        assert!(last.t_ms < fault.t_ms);
+        assert_eq!(fault.driver_temperature, driver[5]);
+        assert_eq!(fault.winding_temperature, 108.0);
+        assert_eq!(fault.effort, -2.125);
+        assert_eq!(fault.position, j6.q);
+        assert_eq!(fault.command, Some(prior.q[5]));
+        assert_eq!(fault.feedforward_effort, Some(0.42));
+        assert!(report.message.contains("绕组过热"));
+        assert!(!core.enabled && core.motion.is_none());
+        let snapshot = core.snapshot(at + Duration::from_millis(10));
+        assert_eq!(snapshot.joints[5].winding_temperature, Some(107.0));
+        assert_eq!(
+            snapshot.joints[6].error_reason.as_deref(),
+            Some(motor_fault_description(512).as_str())
+        );
+        assert!(core.journal.shutdown(Duration::from_secs(3)));
+        let entries = core.journal.recent(50).unwrap();
+        let devices: Vec<_> = entries
+            .iter()
+            .filter(|r| r.source == "device" && r.code == "device_error")
+            .collect();
+        assert_eq!(devices.len(), 2);
+        assert!(devices[0].message.contains("J7"));
+        assert!(devices[1].message.contains("绕组温度 108 °C"));
+        assert!(devices[1].message.contains("0x00000200"));
+        assert_eq!(
+            devices
+                .iter()
+                .map(|r| r.request_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some(report.request_id.as_str()); 2]
+        );
+    }
+
+    #[test]
     fn planned_stop_before_feedback_wait_uses_the_final_write_and_the_stop_clock() {
         // Request and handoff ages are measured from the oldest of seven real replies.
         for (stop_ms, tick_ms, handoff_ms, in_flight, refresh_rx, expect_hold) in [
@@ -6872,7 +7215,7 @@ mod tests {
         );
         assert!(core.calibration.is_some());
         let message = "serial transaction deadline expired; wrote 0/20 command bytes";
-        core.bus = Some(BusHandle::test_failed_bus(message));
+        core.bus = Some(BusHandle::test_failed_bus(message, []));
         core.poll(now);
         assert_eq!(core.error.as_ref().unwrap().message, message);
         assert_eq!(
@@ -6910,6 +7253,7 @@ mod tests {
                 q: core.reference,
                 dq: [0.0; 7],
                 calibration_phase: None,
+                feedforward_effort: [0.0; 7],
                 fallback_hold: false,
             }));
         }
@@ -6961,6 +7305,7 @@ mod tests {
                 q: core.reference,
                 dq: [0.0; 7],
                 calibration_phase: None,
+                feedforward_effort: [0.0; 7],
                 fallback_hold: false,
             }));
             let old_velocity_gate = core
@@ -7009,6 +7354,7 @@ mod tests {
                 q: core.reference,
                 dq: [0.0; 7],
                 calibration_phase: None,
+                feedforward_effort: [0.0; 7],
                 fallback_hold: false,
             }));
         }
@@ -7052,6 +7398,7 @@ mod tests {
                 q: core.reference,
                 dq: core.velocity,
                 calibration_phase: None,
+                feedforward_effort: [0.0; 7],
                 fallback_hold: false,
             }));
             core.advance(now, 0.01);
@@ -7077,6 +7424,7 @@ mod tests {
             q: [value; 7],
             dq: [0.0; 7],
             calibration_phase: None,
+            feedforward_effort: [0.0; 7],
             fallback_hold: false,
         };
         let sent = VecDeque::from([make(90, 93, 1.0), make(100, 103, 2.0)]);
@@ -7183,6 +7531,7 @@ mod tests {
             q: wire_q,
             dq: wire_dq,
             calibration_phase,
+            feedforward_effort: [0.0; 7],
             fallback_hold: false,
         }));
         let dt = now.saturating_duration_since(core.control_at).as_secs_f64();
@@ -7610,6 +7959,7 @@ mod tests {
             q: anchor,
             dq: [0.0; 7],
             calibration_phase: None,
+            feedforward_effort: [0.0; 7],
             fallback_hold: false,
         }));
         calibration_request(
@@ -9850,7 +10200,7 @@ mod tests {
         let instant = |ms: u64| origin + Duration::from_millis(ms);
 
         // Only q/dq/tau and inferred receive times below come from the report.
-        // mode=1, error/warning=0, timeout=false, 24 V and 25 C are simulated:
+        // mode=1, error/warning=0, timeout=false, voltage and both temperatures are simulated:
         // this report contains none of those drive-state fields or hardware ACKs.
         // floor(t_ms)-floor(age_ms) locates a receive time to approximately1 ms;
         // duplicate reconstructed receive timestamps are not extra real frames.
@@ -9860,6 +10210,7 @@ mod tests {
             dq: point.feedback_velocity[joint],
             tau: point.effort.expect("recorded torque is required")[joint],
             temperature: 25.0,
+            winding_temperature: 31.0,
             voltage: 24.0,
             error: 0,
             warning: 0,

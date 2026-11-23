@@ -445,10 +445,16 @@ J1 正向连续点动，速度 0.1 rad/s：
 ```text
 raw = [Fc + (Fs - Fc) * exp(-(abs(v) / Vs)^2)] * tanh(v / velocity_scale) + B * v
 requested = clamp(raw, -max_friction, max_friction)
-tau_ff = tau_gravity + requested
+C(x) = clamp(x, -effort_limit, effort_limit)
+tau_gravity = C(G)
+tau_ff = C(G + requested)
+friction_applied = tau_ff - tau_gravity
+clamped = (requested != raw) or (tau_ff != G + requested)
 ```
 
-该轴 Stribeck 关闭或省略时，保留原公式 `raw=Fc*tanh(v/velocity_scale)+B*v`，Fc/B 使用原六字段中的 `coulomb/viscous`。全局摩擦关闭或 `v=0` 时摩擦项严格为零；两种模型共用该轴原有 `max_friction` 限幅。速度前馈独立为 `dq_feedforward=velocity_ff*v`，只作用于最终报文速度字段；`Reference.dq`、位置积分、TCP/目标复核、停止与收纳时序保持原值。纯 Rust 无状态计算只改变附加前馈，输出继续按实际协议编码。
+`G` 为该轴限幅前的模型重力扭矩，`effort_limit` 为当前臂 URDF 的关节 effort 上限（Nm）。发送样本的 `tuning.tau_gravity` 记录单独施加重力时的限幅值。例：上限 10 Nm、`G=12`、`raw=requested=-3` 时，`tau_gravity=10`、`tau_ff=9`、`friction_applied=-1` Nm，`clamped=false`。合计前馈触限时动作继续，沿用常规保持策略。
+
+该轴 Stribeck 关闭或省略时，保留原公式 `raw=Fc*tanh(v/velocity_scale)+B*v`，Fc/B 使用原六字段中的 `coulomb/viscous`。全局摩擦关闭或 `v=0` 时取 `raw=requested=0`；两种模型共用该轴原有 `max_friction` 限幅。速度前馈独立为 `dq_feedforward=velocity_ff*v`，只作用于最终报文速度字段；`Reference.dq`、位置积分、TCP/目标复核、停止与收纳时序保持原值。纯 Rust 无状态计算只改变附加前馈，输出继续按实际协议编码。
 
 候选方案和证据见[补偿方案调查](research/motion-compensation-repositories-2026-11-21.md)。
 
@@ -552,6 +558,8 @@ Kp、Kd 和速度前馈权重在整个校准中保持起始值，不进行 PID �
 
 候选按相对基线的速度误差 0.6、位置误差 0.4 综合比较，没有固定改善百分比门槛。末端程序用末端复测的七轴综合指标给出结论。`choices[]` 保存所选候选索引及单项相对变化；`recommended` 为完整 ServoTuning 或 null，`improvement` 为综合指标变化，不能替代各轴位置和速度对比。
 
+校准因电机故障帧终止时，`report.fault` 保留触发故障的单轴反馈，即使该帧落在两个曲线采样点之间。`axis` 为 J1..J7 的 0..6 索引，`code` 为原始非零故障位（u32），`message` 为中文说明，`t_ms` 为主机收到该帧时距校准开始的毫秒数。帧内的 `driver_temperature`、`winding_temperature` 分别为驱动和绕组温度（°C），`position` 为实测位置（rad），`effort` 为实际反馈扭矩（Nm），`voltage` 为电压（V）。`command` 为收帧时该轴最近成功发送的目标位置（rad），无对应记录时为 null。可选的 `feedforward_effort` 为同一成功批次中该轴的合计前馈扭矩（Nm），无对应批次或旧报告可缺省或为 null。无对应故障帧时省略 `fault`。读取历史报告时，缺省或 null 均表示未记录。
+
 `report.identification` 为可选数组，旧报告省略时按 `[]` 读取。每项包含：
 
 | 字段                    | 含义与单位                                                  |
@@ -575,11 +583,14 @@ Kp、Kd 和速度前馈权重在整个校准中保持起始值，不进行 PID �
 | `feedback`                 | 缓存实测位置，rad                                     |
 | `velocity`                 | 成功发送的未缩放轨迹速度，rad/s；无记录时使用控制参考 |
 | `feedback_velocity`        | 原始回传速度，rad/s                                   |
-| `effort`                   | 可选七轴原始反馈扭矩，Nm；省略或 null 表示未记录      |
+| `effort`                   | 可选七轴实际反馈扭矩，Nm                              |
+| `feedforward_effort`       | 与 `command` 同一成功发送批次的七轴合计前馈扭矩，Nm，可缺省或为 null |
+| `driver_temperature`       | 可选七轴驱动温度，°C                                  |
+| `winding_temperature`      | 可选七轴绕组温度，°C                                  |
 | `feedback_age_ms`          | 各轴反馈年龄，ms                                      |
 | `command_at_ms`            | 该批发送完成的相对时间，ms；无记录时 null             |
 
-时间为主机观测，发送和反馈各自保留时效。旧报告缺失 effort 时按 null 读取，只有统计时展示指标，不生成时间曲线。辨识所用重力在后台按实际反馈关节位置和 URDF 计算。抽样前保留每条反馈的原始邻帧时间和速度，后台据此计算加速度与时间权重，避免把抽样间隔误作反馈间隔。
+曲线点与故障记录的 `feedforward_effort` 都取发送端限幅后、编码前的扭矩指令（Nm）。驱动器另行叠加位置与速度 PD 得到总输出，电流另以 A 计。每轴的 `effort`、两类温度与实测位置取自该轴同一反馈帧，各帧距采样点的年龄见 `feedback_age_ms`。旧报告可独立省略任一可选数组，缺省或 null 均表示未记录。只有统计时展示指标，不生成时间曲线。辨识所用重力在后台按实际反馈关节位置和 URDF 计算。抽样前保留每条反馈的原始邻帧时间和速度，后台据此计算加速度与时间权重，避免把抽样间隔误作反馈间隔。
 
 **应用**：用最新 generation 提交 `kind:"calibrate_apply", calibration_id:"..."`。只应用当前连接最近完成且含推荐的报告；手工改过伺服配置或已应用的结果不重复覆盖。沿用普通参数应用的连接、控制权和空闲要求。结果界面列出逐轴正负方向拟合、参数原值/推荐值及同轨迹前后表现，单轴 Stribeck 开关可在伺服参数中显式切换。
 
@@ -822,8 +833,11 @@ Kp、Kd 和速度前馈权重在整个校准中保持起始值，不进行 PID �
 | `dq`                      | number 或 null，rad/s  | 速度                     |
 | `tau`                     | number 或 null，Nm     | 估算扭矩                 |
 | `age_ms`                  | u64 或 null，ms        | 这条反馈距快照生成的时间 |
-| `temperature` / `voltage` | number 或 null，°C / V | 温度 / 电压              |
-| `error`                   | u32 或 null            | 设备错误值               |
+| `temperature`             | number 或 null，°C     | 驱动温度                 |
+| `winding_temperature`     | number 或 null，°C     | 绕组温度                 |
+| `voltage`                 | number 或 null，V      | 电压                     |
+| `error`                   | u32 或 null            | 原始设备故障位           |
+| `error_reason`            | string 或 null         | 当前非零故障位的中文说明，无反馈或故障位为 0 时为 null |
 
 从未收到的反馈为 `null`。反馈过期后，关节数值保留最后一次测量，`age_ms` 继续增长。控制使用的七轴反馈需全部存在、单轴年龄不超过 200 ms，不再附加七轴接收跨度门槛。仅检查 `feedback_age_ms` 不能证明七轴已经齐全。
 
@@ -982,7 +996,7 @@ Authorization: Bearer <token>
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `control`  | `seq`、`generation`（u64），`enabled/stopping`（boolean），`motion`（0..5），`axis`（整数或 null）；`servo_tuning`（完整配置或 null，可缺省）、`servo_tuning_revision`（u64，可缺省）；`q_ref/dq_ref/ddq_ref/jerk_ref/tau_ff` 为七个数值；`q/dq/tau/voltage` 为七个数值或 null；`age_us` 为七个 u64 或 null。缺失反馈的对应元素为 null，已有旧反馈保留数值与年龄。 |
 | `transmit` | `seq`（u64），`timing`（对象或 null，可缺省）、`tuning`（ServoSample 或 null，可缺省），`mode` 为七个实际编码的命令模式（0 disabled、1 servo、6 clear）；对齐后位置/未缩放轨迹速度 `q_ref/dq_ref`、最终总附加前馈 `tau_ff`、编码后反标定为关节 SI 的 `q_wire/dq_wire/tau_wire`、`kp/kd` 均为七个数值，`write_us`（u64）为主机成功写入整个七轴批次的耗时。          |
-| `feedback` | `joint`（0..6），`q/dq/tau/temperature/voltage`（number），`error`（u32）、`mode`（u8）、`timeout`（boolean）。                                                                                                                                                                                                                                                    |
+| `feedback` | `joint`（0..6），`q/dq/tau/voltage`（number），`temperature` 为驱动温度，`winding_temperature` 为同帧绕组温度（°C），旧样本缺省或为 null 表示未记录，`error`（u32）、`mode`（u8）、`timeout`（boolean）。 |
 
 `control.motion`：0 无当前动作、1 关节连续、2 关节步长、3 笛卡尔连续、4 笛卡尔步长、5 收纳返回。`axis` 在无动作或收纳返回时为 null，关节为 0..6，笛卡尔为 0..5；减速阶段可能为 `motion:0,stopping:true`。
 
@@ -996,12 +1010,12 @@ Authorization: Bearer <token>
 | -------------------- | --------------------------------------------------------------------------- |
 | `revision`           | u64，当前发送使用的配置版本                                                 |
 | `dq_feedforward`     | 七轴加权后的编码前速度前馈，rad/s；速度编码误差的参照                       |
-| `tau_gravity`        | 七轴重力前馈，Nm                                                            |
+| `tau_gravity`        | 七轴单独施加重力时的限幅值 `C(G)`，Nm                                                            |
 | `friction_requested` | 七轴经自身 `max_friction` 限幅后的摩擦请求，Nm                              |
 | `friction_applied`   | 总前馈限幅后的摩擦增量 `tau_ff-tau_gravity`，Nm，仍为编码前值               |
-| `clamped`            | 七个 boolean；摩擦自身或合计前馈任一发生截断即为 true，恰好等于边界不算截断 |
+| `clamped`            | 七个 boolean；摩擦项或实际合计 `G + requested` 被截断时为 true，恰在边界时该项未被截断 |
 
-`transmit.dq_ref` 仍记录未缩放的轨迹速度，`tau_ff` 是重力与摩擦合成、限幅后的最终总附加前馈，`dq_wire` 是实际编码值。计算速度编码误差必须优先比较 `tuning.dq_feedforward` 与 `dq_wire`，仅在 `tuning` 缺省或 null 时回退到 `dq_ref`；权重为零导致的速度差不属于编码误差。位置与扭矩仍分别比较 `q_ref/q_wire`、`tau_ff/tau_wire`。限幅标记描述软件命令，不代表测得的电机总扭矩或物理补偿效果。
+`transmit.dq_ref` 仍记录未缩放的轨迹速度，`tau_ff` 是按 5.9 计算的 `C(G + requested)`，`dq_wire` 是实际编码值。计算速度编码误差必须优先比较 `tuning.dq_feedforward` 与 `dq_wire`，仅在 `tuning` 缺省或 null 时回退到 `dq_ref`；权重为零导致的速度差不属于编码误差。位置与扭矩仍分别比较 `q_ref/q_wire`、`tau_ff/tau_wire`。限幅标记描述软件命令，不代表测得的电机总扭矩或物理补偿效果。
 
 发送样本的 `timing` 为 `{"status":"aligned","age_us":100}` 这样的对象或 null。对象包含 `status` 和 `age_us`；后者为 u64 微秒或 null，无法计算非负源年龄时为 null。未执行发送端取样的直接写入、disabled/clear 批次为 `timing:null`。该字段以 `#[serde(default)]` 读取，旧 JSON 缺省时按 null 处理，接口不要求旧文件补字段。
 
@@ -1147,7 +1161,7 @@ Tauri 仅向主窗口提供三个命令：
 
 导出 `PortInfo {name,label,kind}`、`enumerate_ports() -> Vec<PortInfo>`。
 
-导出 `DriveMode::{Disabled,Servo,ClearFault}`、`Setpoint {mode,q,dq,tau,kp,kd}`，数值均为标定后的 URDF 关节量。`Feedback {id,q,dq,tau,temperature,voltage,error,warning,mode,timeout}`。伺服模式默认 `kp=60`、`kd=10`；`tau` 为重力与可选平滑摩擦合成后的总附加前馈，按实际协议编码；`dq` 为加权后的速度前馈，`kd` 按当前配置逐轴设置。
+导出 `DriveMode::{Disabled,Servo,ClearFault}`、`Setpoint {mode,q,dq,tau,kp,kd}`，数值均为标定后的 URDF 关节量。`Feedback {id,q,dq,tau,temperature,winding_temperature,voltage,error,warning,mode,timeout}`。伺服模式默认 `kp=60`、`kd=10`；`tau` 为重力与可选平滑摩擦合成后的总附加前馈，按实际协议编码；`dq` 为加权后的速度前馈，`kd` 按当前配置逐轴设置。
 
 `BusHandle::open_recorded(port,side,baud,timeout,journal,reference_epoch)` 创建串口会话；`publish(values,seq,reference)` 发布最新七轴参考及其来源时间、导数和动作约束。`drain()->(Vec<(Feedback,Instant)>,Option<BusError>)` 读取带时间戳反馈，以及 I/O 错误或带 generation/epoch 的参考拒绝。`disable()` 和 `write_blocking()` 提交优先停机/清错写入；`stats()->BusStats` 读取通信与批次时间统计。原始 `send` / `send_with_sequence` 只用于协议测试。
 
@@ -1161,7 +1175,7 @@ Tauri 仅向主窗口提供三个命令：
 
 ### tuning.rs
 
-`ServoTuning {friction_enabled,joints:[JointTuning;7]}` 和 `JointTuning {kd,velocity_ff,coulomb,viscous,velocity_scale,max_friction,stribeck}` 具备序列化；六个原字段仍必填；新增 stribeck 缺失时默认关闭。`validate()` 检查有限数与范围，`apply(dq,gravity)` 返回固定七轴的 `dq_feedforward/friction_requested/friction_applied/tau/clamped`，无 I/O 或内部辨识状态。基线、公式和输入限制见 5.9。协议层在 Reference 取样和路径检查后应用前馈；用于后续位置积分和静止交接的成功发送历史保存未缩放轨迹速度。
+`ServoTuning {friction_enabled,joints:[JointTuning;7]}` 和 `JointTuning {kd,velocity_ff,coulomb,viscous,velocity_scale,max_friction,stribeck}` 具备序列化；六个原字段仍必填；新增 stribeck 缺失时默认关闭。`validate()` 检查有限数与范围，`apply_with_effort_limits(dq, gravity, effort_limits)` 返回七轴 `dq_feedforward/friction_requested/friction_applied/tau/clamped` 和单独施加重力时的限幅值，无 I/O 或内部辨识状态。基线、公式和输入限制见 5.9。协议层在 Reference 取样和路径检查后应用前馈；用于后续位置积分和静止交接的成功发送历史保存未缩放轨迹速度。
 
 ### kinematics.rs
 

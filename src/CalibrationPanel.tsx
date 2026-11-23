@@ -82,6 +82,8 @@ const stages: Record<CalibrationStatus["stage"], string> = {
 };
 const terminal = (status: CalibrationStatus) =>
   ["completed", "cancelled", "failed"].includes(status.state);
+const reportPage = (report?: CalibrationReport | null): Page =>
+  report?.fault ? "curves" : "result";
 const degrees = (value: number | null | undefined, digits = 3) =>
   value != null && Number.isFinite(value) ? (value * DEG).toFixed(digits) : "—";
 const percent = (value: number) =>
@@ -287,13 +289,17 @@ function ReportDetails({
                 : "推荐参数待应用。"
             : "各轮测量已保留，可查看每轴的变化与曲线。"}
       </p>
-      {(recordedCount > 0 || !!report.identification?.length) && (
+      {(recordedCount > 0 ||
+        !!report.identification?.length ||
+        report.fault) && (
         <div className="calibration-recorded">
           <span>
             <b>
               {recordedCount > 0
                 ? `${recordedCount.toLocaleString()} 点`
-                : "力矩残差拟合"}
+                : report.fault
+                  ? "故障末帧"
+                  : "力矩残差拟合"}
             </b>
             {lastPoint && (
               <small>已录制 {(lastPoint.t_ms / 1000).toFixed(3)} s</small>
@@ -307,7 +313,11 @@ function ReportDetails({
             )}
           </span>
           <button onClick={onCurves}>
-            {report.identification?.length ? "查看曲线 / 拟合" : "查看曲线"}
+            {report.fault
+              ? "查看故障分析"
+              : report.identification?.length
+                ? "查看曲线 / 拟合"
+                : "查看曲线"}
           </button>
         </div>
       )}
@@ -888,11 +898,14 @@ export default function CalibrationPanel({
       ? [liveReport, ...history]
       : history;
   const local = selection?.local ?? false;
-  const selectedSummary = selection
-    ? local
-      ? localReports.find((item) => item.report.id === selection.id)?.report
-      : shownHistory.find((report) => report.id === selection.id)
-    : liveReport;
+  const showingLiveCurves = page === "curves" && !selection && active;
+  const selectedSummary = showingLiveCurves
+    ? null
+    : selection
+      ? local
+        ? localReports.find((item) => item.report.id === selection.id)?.report
+        : shownHistory.find((report) => report.id === selection.id)
+      : liveReport;
   const report = selectedSummary
     ? local
       ? selectedSummary
@@ -914,6 +927,14 @@ export default function CalibrationPanel({
   function setRun(value: Run | null) {
     runRef.current = value;
     setRunState(value);
+  }
+  function openReport(
+    item: CalibrationReport,
+    local: boolean,
+    destination = reportPage(item),
+  ) {
+    setSelection({ id: item.id, local });
+    setPage(destination);
   }
 
   useEffect(() => {
@@ -1002,8 +1023,11 @@ export default function CalibrationPanel({
         setRun({ ...runRef.current, state: "terminal" });
       if (lastTerminal.current !== completedKey) {
         lastTerminal.current = completedKey;
-        setSelection(null);
-        setPage("result");
+        if (status.report) openReport(status.report, false);
+        else {
+          setSelection(null);
+          setPage("result");
+        }
       }
     }
   }, [status, connection, completedKey, view.online]);
@@ -1024,7 +1048,7 @@ export default function CalibrationPanel({
         state: terminal(status) ? "terminal" : "running",
       });
       setFeedback(null);
-      setPage(terminal(status) ? "result" : "progress");
+      setPage(terminal(status) ? reportPage(status.report) : "progress");
       return;
     }
     if (result && ["rejected", "failed", "cancelled"].includes(result.status)) {
@@ -1480,9 +1504,8 @@ export default function CalibrationPanel({
         { report: imported, blob: file },
         ...before.filter((item) => item.report.id !== imported.id),
       ]);
-      setSelection({ id: imported.id, local: true });
       setFeedback(null);
-      setPage("result");
+      openReport(imported, true);
     } catch (error) {
       setFeedback({
         text: error instanceof Error ? error.message : "报告读取失败",
@@ -1603,7 +1626,13 @@ export default function CalibrationPanel({
               aria-pressed={page === key}
               aria-controls={`calibration-${key}`}
               onClick={() => {
-                setPage(key);
+                if (key === "curves" && page === "result" && report)
+                  openReport(report, local, "curves");
+                else {
+                  if (key === "curves" && page === "progress" && active)
+                    setSelection(null);
+                  setPage(key);
+                }
                 setFeedback(null);
               }}
             >
@@ -2004,12 +2033,18 @@ export default function CalibrationPanel({
                   ? "连接已断开"
                   : "完成后回原位并恢复起始参数，结果与曲线会保留。"}
               </p>
-              <button onClick={() => setPage("curves")}>查看实时曲线</button>
+              <button
+                onClick={() => {
+                  setSelection(null);
+                  setPage("curves");
+                }}
+              >
+                查看实时曲线
+              </button>
               {liveReport && (
                 <button
                   onClick={() => {
-                    setSelection(null);
-                    setPage("result");
+                    openReport(liveReport, false, "result");
                   }}
                 >
                   查看结果
@@ -2017,8 +2052,9 @@ export default function CalibrationPanel({
               )}
             </div>
           )}
-          {page === "curves" && active && status
-            ? open && (
+          {showingLiveCurves
+            ? open &&
+              (status && !terminal(status) ? (
                 <CalibrationChart
                   key={status.id}
                   live={{
@@ -2029,7 +2065,9 @@ export default function CalibrationPanel({
                       livePoints.id === status.id ? livePoints.points : [],
                   }}
                 />
-              )
+              ) : (
+                <p className="calibration-empty">等待实时采样…</p>
+              ))
             : (page === "result" || page === "curves") && (
                 <>
                   {detailError && !local && (
@@ -2056,11 +2094,11 @@ export default function CalibrationPanel({
                           s.servo_tuning,
                           report.baseline,
                         )}
-                        onCurves={() => setPage("curves")}
+                        onCurves={() => openReport(report, local, "curves")}
                       />
                     ) : (
                       <CalibrationChart
-                        key={`${local}:${report.id}`}
+                        key={`${local}:${report.id}:${report.fault?.axis ?? ""}`}
                         report={report}
                       />
                     )
@@ -2103,9 +2141,8 @@ export default function CalibrationPanel({
                       className="calibration-history-item"
                       key={`${isLocal}:${item.id}`}
                       onClick={() => {
-                        setSelection({ id: item.id, local: isLocal });
                         setFeedback(null);
-                        setPage("result");
+                        openReport(item, isLocal);
                       }}
                     >
                       <span>

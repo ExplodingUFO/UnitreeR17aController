@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import motorFaults from "../resources/motor-faults.json" with { type: "json" };
 export const FEEDBACK_MAX_AGE_MS = 200;
 export type Side = "right" | "left";
 export type Space = "joint" | "cartesian";
@@ -22,8 +23,10 @@ export interface Joint {
   tau: number | null;
   age_ms: number | null;
   temperature: number | null;
+  winding_temperature: number | null;
   voltage: number | null;
   error: number | null;
+  error_reason: string | null;
 }
 export interface Pose {
   translation: [number, number, number];
@@ -197,6 +200,22 @@ export interface CalibrationPoint {
   feedback_age_ms: JointPositions;
   command_at_ms: number | null;
   effort?: JointPositions | null;
+  feedforward_effort?: JointPositions | null;
+  driver_temperature?: JointPositions | null;
+  winding_temperature?: JointPositions | null;
+}
+export interface CalibrationFault {
+  axis: number;
+  code: number;
+  message: string;
+  t_ms: number;
+  driver_temperature: number;
+  winding_temperature: number;
+  position: number;
+  command: number | null;
+  effort: number;
+  voltage: number;
+  feedforward_effort?: number | null;
 }
 export interface FitPoint {
   velocity: number;
@@ -245,6 +264,7 @@ export interface CalibrationReport {
   sample_count: number;
   captured_samples?: number;
   curves: CalibrationPoint[];
+  fault?: CalibrationFault | null;
   choices: CalibrationChoice[];
   identification?: Identification[];
   outcome: "improved" | "unchanged" | "insufficient" | "cancelled" | "failed";
@@ -405,6 +425,29 @@ export const isJointPositions = (value: unknown): value is JointPositions =>
   Array.isArray(value) &&
   value.length === 7 &&
   Array.from(value).every((q) => typeof q === "number" && Number.isFinite(q));
+
+// Match the canonical J1–J7/nonzero u32 message emitted by the old writer.
+function legacyFaultMessage(message: string) {
+  const match = /^(J[1-7]) 故障码 ([1-9][0-9]{0,9})$/.exec(message);
+  if (!match) return message;
+  const code = Number(match[2]);
+  if (code > 0xffffffff) return message;
+  const hex = (bits: number) =>
+    "0x" + bits.toString(16).toUpperCase().padStart(8, "0");
+  const parts: string[] = [];
+  let unknown = code;
+  for (const [key, label] of Object.entries(motorFaults)) {
+    const mask = Number(key);
+    if ((code & mask) === 0) continue;
+    parts.push(label);
+    unknown = (unknown & ~mask) >>> 0;
+  }
+  if (unknown) parts.push(`未知故障位 ${hex(unknown)}`);
+  const description =
+    parts.join("、") + (parts.length > 1 ? `（${hex(code)}）` : "");
+  return `${match[1]} ${description}（故障码 ${code}）`;
+}
+
 export function parseCalibrationReport(value: unknown): CalibrationReport {
   if (!value || typeof value !== "object") throw new Error("报告格式无效");
   const report = value as CalibrationReport;
@@ -480,6 +523,26 @@ export function parseCalibrationReport(value: unknown): CalibrationReport {
     throw new Error("请选择有效的校准 JSON 报告");
   const curves = report.curves ?? [];
   const choices = report.choices ?? [];
+  const fault = report.fault;
+  if (
+    fault != null &&
+    (!validAxis(fault.axis) ||
+      !validCount(fault.code) ||
+      typeof fault.message !== "string" ||
+      !Number.isFinite(fault.t_ms) ||
+      fault.t_ms < 0 ||
+      ![
+        fault.position,
+        fault.effort,
+        fault.voltage,
+        fault.driver_temperature,
+        fault.winding_temperature,
+      ].every(Number.isFinite) ||
+      (fault.command !== null && !Number.isFinite(fault.command)) ||
+      (fault.feedforward_effort != null &&
+        !Number.isFinite(fault.feedforward_effort)))
+  )
+    throw new Error("报告中的故障记录无效");
   if (
     !Array.isArray(curves) ||
     !curves.every(
@@ -498,6 +561,12 @@ export function parseCalibrationReport(value: unknown): CalibrationReport {
         ].every(isJointPositions) &&
         (point.command === null || isJointPositions(point.command)) &&
         (point.effort == null || isJointPositions(point.effort)) &&
+        (point.feedforward_effort == null ||
+          isJointPositions(point.feedforward_effort)) &&
+        (point.driver_temperature == null ||
+          isJointPositions(point.driver_temperature)) &&
+        (point.winding_temperature == null ||
+          isJointPositions(point.winding_temperature)) &&
         (point.command_at_ms === null || Number.isFinite(point.command_at_ms)),
     ) ||
     !Array.isArray(choices) ||
@@ -533,6 +602,7 @@ export function parseCalibrationReport(value: unknown): CalibrationReport {
     throw new Error("报告中的摩擦拟合数据无效");
   return {
     ...report,
+    message: legacyFaultMessage(report.message),
     settings: { ...report.settings, axis },
     curves,
     choices,

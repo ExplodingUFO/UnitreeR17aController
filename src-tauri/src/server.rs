@@ -1620,6 +1620,7 @@ mod tests {
     fn calibration_report(sample_count: usize) -> crate::calibration::Report {
         crate::calibration::Report {
             id: "history-api".into(),
+            fault: None,
             request_id: "original-run".into(),
             created_at_ms: 1000,
             side: "right".into(),
@@ -1657,6 +1658,9 @@ mod tests {
                         feedback_age_ms: [2; 7],
                         command_at_ms: (i % 3 != 0).then_some(i as u32 * 20),
                         effort: None,
+                        feedforward_effort: None,
+                        driver_temperature: None,
+                        winding_temperature: None,
                     })
                     .collect(),
             ),
@@ -2638,6 +2642,7 @@ mod tests {
                 dq: 0.2,
                 tau: 0.3,
                 temperature: 30.0,
+                winding_temperature: Some(41.0),
                 voltage: 48.0,
                 error: 0,
                 mode: 1,

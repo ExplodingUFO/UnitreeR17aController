@@ -27,6 +27,7 @@ pub struct Reference {
     pub valid_until: Option<Instant>,
     pub stopping: bool,
     pub joint_velocity: [f64; 7],
+    pub effort_limits: [f64; 7],
     pub joint_goal: Option<[f64; 7]>,
     pub cartesian: Option<CartesianGuard>,
     pub servo_tuning: ServoTuning,
@@ -93,13 +94,14 @@ pub struct Sample {
 }
 
 impl Reference {
-    pub fn joint(
+    pub fn joint_for_model(
         at: Instant,
         q: [f64; 7],
         dq: [f64; 7],
         ddq: [f64; 7],
         generation: u64,
         epoch: u64,
+        model: Option<&Kinematics>,
     ) -> Self {
         Self {
             at,
@@ -111,12 +113,29 @@ impl Reference {
             valid_until: None,
             stopping: false,
             joint_velocity: [JOINT_SPEED; 7],
+            // A connection loads its model before enabling the bus. A reference
+            // without a model has no feedforward torque budget.
+            effort_limits: model.map_or([0.0; 7], Kinematics::effort_limits),
             joint_goal: None,
             cartesian: None,
             servo_tuning: ServoTuning::default(),
             tuning_revision: 0,
             sampling: Sampling::Integrated,
         }
+    }
+
+    #[cfg(test)]
+    pub fn joint(
+        at: Instant,
+        q: [f64; 7],
+        dq: [f64; 7],
+        ddq: [f64; 7],
+        generation: u64,
+        epoch: u64,
+    ) -> Self {
+        static RIGHT: std::sync::OnceLock<Kinematics> = std::sync::OnceLock::new();
+        let model = RIGHT.get_or_init(|| Kinematics::load("right").unwrap());
+        Self::joint_for_model(at, q, dq, ddq, generation, epoch, Some(model))
     }
 
     pub fn timing(&self, at: Instant, status: SampleStatus) -> Timing {

@@ -583,6 +583,12 @@ pub struct Point {
     pub command_at_ms: Option<u32>,
     #[serde(default)]
     pub effort: Option<[f64; 7]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedforward_effort: Option<[f64; 7]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_temperature: Option<[f64; 7]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winding_temperature: Option<[f64; 7]>,
     #[serde(default = "joint_space")]
     pub space: String,
 }
@@ -595,6 +601,22 @@ pub struct Choice {
     pub after_index: Option<usize>,
     pub velocity_change: f64,
     pub tracking_change: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MotorFault {
+    pub axis: usize,
+    pub code: u32,
+    pub message: String,
+    /// Receipt time of the fault frame relative to calibration start.
+    pub t_ms: u32,
+    pub driver_temperature: f64,
+    pub winding_temperature: f64,
+    pub position: f64,
+    pub command: Option<f64>,
+    pub feedforward_effort: Option<f64>,
+    pub effort: f64,
+    pub voltage: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -614,6 +636,8 @@ pub struct Report {
     pub outcome: String,
     pub improvement: Option<f64>,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fault: Option<MotorFault>,
     #[serde(default)]
     pub choices: Vec<Choice>,
     #[serde(default)]
@@ -636,7 +660,7 @@ impl Report {
     }
 
     /// Select real samples without interpolation. Keep each segment's endpoints
-    /// and per-bucket extrema of all joints' position/velocity tracking errors.
+    /// and per-bucket extrema of tracking errors, measured torque and temperatures.
     /// A zero budget returns all retained samples. Already sorted records share
     /// their allocation; reservoir records are sorted only on a worker thread.
     pub fn for_plot(&self, max_points: usize) -> Self {
@@ -652,26 +676,34 @@ impl Report {
         if max_points == 0 || self.curves.len() <= max_points {
             return self.clone();
         }
-        let mut segments = Vec::new();
-        let mut start = 0;
-        for end in 1..=self.curves.len() {
-            if end == self.curves.len()
-                || self.curves[end].trial != self.curves[start].trial
-                || self.curves[end].axis != self.curves[start].axis
-            {
-                segments.push((start, end));
-                start = end;
-            }
-        }
-        let endpoints: usize = segments
-            .iter()
-            .map(|(start, end)| (end - start).min(2))
-            .sum();
-        let mut interiors_left = self.curves.len() - endpoints;
-        let mut extras_left = max_points.saturating_sub(endpoints).min(interiors_left);
-        let mut curves = Vec::with_capacity(endpoints + extras_left);
-        for (start, end) in segments {
-            let interior = (end - start).saturating_sub(2);
+        // The fault view opens on the preceding five seconds. Prefer its real
+        // retained points when the requested plot budget can accommodate them.
+        let before_fault = self.fault.as_ref().map_or(self.curves.len(), |fault| {
+            self.curves
+                .partition_point(|p| p.t_ms < fault.t_ms.saturating_sub(5_000))
+        });
+        let trial_segments =
+            |until| self.curves[..until].chunk_by(|a, b| a.trial == b.trial && a.axis == b.axis);
+        let endpoint_count = |until| {
+            trial_segments(until)
+                .map(|part| part.len().min(2))
+                .sum::<usize>()
+        };
+        let tail_len = self.curves.len() - before_fault;
+        let tail_start = if tail_len + endpoint_count(before_fault) <= max_points {
+            before_fault
+        } else {
+            self.curves.len()
+        };
+        let endpoints = endpoint_count(tail_start);
+        let reserved = self.curves.len() - tail_start;
+        let mut interiors_left = tail_start - endpoints;
+        let mut extras_left = max_points
+            .saturating_sub(endpoints + reserved)
+            .min(interiors_left);
+        let mut curves = Vec::with_capacity(endpoints + extras_left + reserved);
+        for segment in trial_segments(tail_start) {
+            let interior = segment.len().saturating_sub(2);
             let extra = if interiors_left == 0 {
                 0
             } else {
@@ -679,14 +711,15 @@ impl Report {
             };
             interiors_left -= interior;
             extras_left -= extra;
-            curves.push(self.curves[start].clone());
-            for index in plot_indices(&self.curves, start, end, extra) {
-                curves.push(self.curves[index].clone());
+            curves.push(segment[0].clone());
+            for index in plot_indices(segment, extra) {
+                curves.push(segment[index].clone());
             }
-            if end > start + 1 {
-                curves.push(self.curves[end - 1].clone());
+            if segment.len() > 1 {
+                curves.push(segment[segment.len() - 1].clone());
             }
         }
+        curves.extend_from_slice(&self.curves[tail_start..]);
         Self {
             curves: Arc::new(curves),
             ..self.clone()
@@ -694,29 +727,53 @@ impl Report {
     }
 }
 
-fn plot_indices(points: &[Point], start: usize, end: usize, extra: usize) -> Vec<usize> {
+fn plot_indices(points: &[Point], extra: usize) -> Vec<usize> {
     let mut selected = BTreeSet::new();
-    let interior = (end - start).saturating_sub(2);
-    let buckets = extra / 28;
+    let interior = points.len().saturating_sub(2);
+    // Each bucket can contribute two extrema per signal per joint.
+    let available = [
+        true,
+        true,
+        points.iter().any(|p| p.effort.is_some()),
+        points.iter().any(|p| p.feedforward_effort.is_some()),
+        points.iter().any(|p| p.driver_temperature.is_some()),
+        points.iter().any(|p| p.winding_temperature.is_some()),
+    ];
+    let signals: Vec<_> = (0..available.len())
+        .filter(|&i| available[i])
+        .take((extra / (7 * 2)).max(2))
+        .collect();
+    let buckets = extra / (7 * 2 * signals.len());
     for bucket in 0..buckets {
-        let from = start + 1 + bucket * interior / buckets;
-        let to = start + 1 + (bucket + 1) * interior / buckets;
+        let from = 1 + bucket * interior / buckets;
+        let to = 1 + (bucket + 1) * interior / buckets;
         for axis in 0..7 {
-            for velocity in [false, true] {
-                let value = |index: usize| {
-                    let p = &points[index];
-                    if velocity {
-                        p.feedback_velocity[axis] - p.velocity[axis]
-                    } else {
-                        p.feedback[axis] - p.command.as_ref().unwrap_or(&p.reference)[axis]
+            let mut extrema = [None::<(usize, f64, usize, f64)>; 6];
+            for (i, p) in points[from..to].iter().enumerate() {
+                let index = from + i;
+                let values = [
+                    Some(p.feedback[axis] - p.command.as_ref().unwrap_or(&p.reference)[axis]),
+                    Some(p.feedback_velocity[axis] - p.velocity[axis]),
+                    p.effort.as_ref().map(|v| v[axis]),
+                    p.feedforward_effort.as_ref().map(|v| v[axis]),
+                    p.driver_temperature.as_ref().map(|v| v[axis]),
+                    p.winding_temperature.as_ref().map(|v| v[axis]),
+                ];
+                for &signal in &signals {
+                    if let Some(value) = values[signal] {
+                        let (min_i, min, max_i, max) =
+                            extrema[signal].get_or_insert((index, value, index, value));
+                        if value < *min {
+                            (*min_i, *min) = (index, value);
+                        }
+                        if value > *max {
+                            (*max_i, *max) = (index, value);
+                        }
                     }
-                };
-                if let Some(min) = (from..to).min_by(|a, b| value(*a).total_cmp(&value(*b))) {
-                    selected.insert(min);
                 }
-                if let Some(max) = (from..to).max_by(|a, b| value(*a).total_cmp(&value(*b))) {
-                    selected.insert(max);
-                }
+            }
+            for (min, _, max, _) in extrema.into_iter().flatten() {
+                selected.extend([min, max]);
             }
         }
     }
@@ -724,8 +781,8 @@ fn plot_indices(points: &[Point], start: usize, end: usize, extra: usize) -> Vec
         if selected.len() == extra {
             break;
         }
-        let offset = (slot as u128 * (end - start - 1) as u128 / (extra + 1) as u128) as usize;
-        selected.insert(start + offset);
+        let offset = (slot as u128 * (points.len() - 1) as u128 / (extra + 1) as u128) as usize;
+        selected.insert(offset);
     }
     selected.into_iter().collect()
 }
@@ -1449,6 +1506,9 @@ mod tests {
             feedback_age_ms: [(t_ms % 100) as u16; 7],
             command_at_ms: t_ms.checked_sub(4),
             effort: None,
+            feedforward_effort: None,
+            driver_temperature: None,
+            winding_temperature: None,
         }
     }
 
@@ -1475,6 +1535,7 @@ mod tests {
             outcome: "unchanged".into(),
             improvement: None,
             message: "测量完成，当前参数已保持".into(),
+            fault: None,
             choices: vec![Choice {
                 axis: 3,
                 baseline_index: 0,
@@ -1624,13 +1685,62 @@ mod tests {
         points[139].feedback[6] += 0.03;
         points[823].feedback[6] -= 0.02;
         points[1537].feedback_velocity[1] += 0.4;
+        for p in &mut points {
+            p.effort = Some([0.0; 7]);
+            p.driver_temperature = Some([35.0; 7]);
+            p.winding_temperature = Some([50.0; 7]);
+        }
+        points[127].effort.as_mut().unwrap()[5] = -2.0;
+        points[794].winding_temperature.as_mut().unwrap()[5] = 100.0;
+        points[1543].driver_temperature.as_mut().unwrap()[6] = 55.0;
         let plotted = report(points).for_plot(200);
-        for index in [139, 823, 1537] {
+        for index in [139, 823, 1537, 127, 794, 1543] {
             assert!(
                 plotted.curves.iter().any(|p| p.t_ms == index * 20),
                 "passive joint peak {index} disappeared from the plot"
             );
         }
+    }
+
+    #[test]
+    fn legacy_plot_budget_still_preserves_passive_joint_peaks_in_separate_buckets() {
+        let mut points: Vec<_> = (0..101).map(|i| curve_point(i * 20, 0, 0)).collect();
+        points[3].feedback[6] += 0.5;
+        points[60].feedback[6] += 0.4;
+        let plot = report(points).for_plot(58);
+        for ms in [60, 1200] {
+            assert!(plot.curves.iter().any(|p| p.t_ms == ms));
+        }
+    }
+
+    #[test]
+    fn fault_plot_keeps_every_retained_sample_in_the_last_five_seconds() {
+        let mut run = report((0..2000).map(|i| curve_point(i * 20, 0, 5)).collect());
+        run.fault = Some(MotorFault {
+            axis: 5,
+            code: 512,
+            message: "J6 电机绕组过热".into(),
+            t_ms: 40_000,
+            driver_temperature: 48.0,
+            winding_temperature: 105.0,
+            position: 0.1,
+            command: None,
+            feedforward_effort: None,
+            effort: -0.9,
+            voltage: 24.0,
+        });
+        let plotted = run.for_plot(300);
+        assert_eq!(plotted.curves.len(), 300);
+        assert_eq!(plotted.curves[0].t_ms, 0);
+        assert_eq!(
+            plotted.curves[50..]
+                .iter()
+                .map(|p| p.t_ms)
+                .collect::<Vec<_>>(),
+            (35_000..40_000).step_by(20).collect::<Vec<_>>()
+        );
+        assert_eq!(plotted.fault.as_ref().unwrap().t_ms, 40_000);
+        assert_eq!(run.for_plot(20).curves.len(), 20);
     }
 
     #[test]
