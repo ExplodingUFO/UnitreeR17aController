@@ -28,6 +28,7 @@
 | `POST /v1/commands`                     | `CommandRequest`              | `202 {request_id,status:"queued"}` | 提交设备或动作请求       |
 | `GET /v1/events`                        | WebSocket 升级后发送认证首帧  | `101`，随后推送 `StateEvent`       | 订阅完整状态快照         |
 | `GET /v1/logs?limit=50`                 | 可选条数                      | `200 LogRecord[]`                  | 查询 SQLite 中最近的日志 |
+| `GET /v1/logs/filters`                   | 无                            | `200 {levels,sources,codes}`       | 读取历史日志的筛选选项   |
 | `GET /v1/logs/page`                     | 分页、搜索与记录范围          | `200 LogPage`                      | 查询持久化日志历史       |
 | `GET /v1/traces`                        | 可选 `limit`                  | `200 TraceSummary[]`               | 查询最近采样             |
 | `POST /v1/traces`                       | `{duration_ms?:number\|null}` | `200 TraceSummary`                 | 开始短时采样             |
@@ -466,15 +467,18 @@ tau_ff = tau_gravity + requested
 | `amplitude` | null        | 自动计算各方向连续可达行程；指定时为有限正数，单位 m，按实际可达范围截取 |
 | `speed`     | 0.01        | 有限正数，单位 m/s；运动设置与模型决定实际可执行速度                     |
 | `axes`      | [0,1,2]     | 基座 X/Y/Z；重复值合并                                                   |
+| `joint_speeds` | [] | 关节试验速度组，rad/s，空数组采用默认三档 |
 | `motion`    | 1 / 0.6 / 6 | joint_speed / acceleration / jerk，分别为 rad/s、rad/s²、rad/s³          |
 
 预览使用当前指令保持位置和当前 TCP，沿各方向生成正向、反向、回原位片段。保持 TCP 姿态，连续求解关节构型；不足整段时保留可达行程。返回 `program` 与 `points`：
 
 - `program`：side、origin（七轴 rad）、tcp（Link7→TCP）、amplitude、speed、joint_excursion（默认 16°，目标 ±8°）、motion、auto_range、segments、guide。
-- `guide[]`：axis、offset（基座 m）、joints（七轴 rad），为执行提供预览中的连续关节构型参考，随 program 原样提交；旧报告可以缺省。
+- `guide[]`：axis、offset（基座 m）、joints（七轴 rad），保存定时轨迹经过的关节节点，随 program 原样提交；旧报告可以缺省。
 - `ranges[]`：axis、negative、positive，单位 m；表示从当前姿态出发、保持 TCP 方向时，各基座方向的连续可达范围。它不是所有可能关节构型的全局工作空间。
 - `segments[]`：axis（0..2）、offset（相对原始 TCP 的绝对带符号偏移，m）。其他分量仍以原位为准。
 - `points[]`：joints（七轴 rad）、tcp（基座坐标 XYZ，m）、segment、space、axis。space 为 cartesian、joint 或 joint_return；points 同时包含末端路线、冗余自由度回原位和全部关节试验。
+
+生成时已确定每段末端轨迹与各档关节试验的关节位置和时标。笛卡尔点的 `t_s` 从各段起点计秒，`cartesian_duration_s` 是单轮所选 XYZ 方向往返的计划用时。关节试验、参数分析以及第二轮往返另计。`program.preview_id` 指向生成的计划，`joint_targets` 给出 J1–J7 各自的负向、正向目标角，单位 rad。确认后，控制线程和串口发送线程按各自的时钟从同一条曲线取样。若起始保持目标有轻微变化，先从最近发送位置平滑接入起点。
 
 前端使用 points 按阶段显示彩色路线、方向、关键姿态与连杆扫掠，可切换视角和播放。范围盒可单独打开。预览在工作线程计算，不占用控制周期；生成预览不改变参数或使能状态。
 
@@ -505,7 +509,7 @@ tau_ff = tau_gravity + requested
 }
 ```
 
-示例只展示格式；实际使用刚收到的 program，保留其原位、TCP 与可达行程。连接的臂、TCP 或起始保持姿态明显变化时，返回 `stale_preview`，重新生成预览；浮点 JSON 往返误差不会使预览失效。
+启动时原样提交预览返回的 `program`。省略关节速度设置会沿用预览的速度组。如果另给 `settings.speeds`，或使用旧接口的非默认 `settings.speed`，对应的速度组应与预览一致。更换机械臂、修改 TCP、明显改变起始姿态或更改速度组后，需要重新生成预览，原计划返回 `stale_preview`。
 
 程序顺序：
 
@@ -881,8 +885,10 @@ TCP 未设置或控制反馈无效时，`tcp:null`。`action.mode` 为 `continuo
 | ------------ | ---------------- | ---------------------------------------------------------------------------------------- |
 | `page`       | u32，默认 1      | 0 按 1，超过末页时返回末页                                                               |
 | `page_size`  | u32，默认 50     | 限制到 1..500，0 按 1                                                                    |
-| `search`     | string，默认空串 | UTF-8 完整的2 字节；在级别、来源、编号、内容和请求 ID 中搜索字面子串；ASCII 不区分大小写 |
+| `search`     | string，默认空串 | UTF-8 最多 512 字节；在级别、来源、编号、内容和请求 ID 中搜索字面子串；ASCII 不区分大小写 |
 | `through_id` | 可选 i64         | 非负；省略时取当前最大 ID，传入时只查询不大于该 ID 的记录；0 表示空范围                  |
+
+可组合 `level`、`source`、`code` 精确匹配，以及 `from_ms`、`to_ms` 两个含端点的 Unix 毫秒时间。省略任一端即可查询开放区间。所有条件与 `search` 同时生效，计数和翻页使用同一组条件。修改条件后从第一页重新查询。`GET /v1/logs/filters` 返回数据库已有的级别、来源、编号，例如 `{"levels":["info"],"sources":["control"],"codes":["acquired"]}`。
 
 ```http
 GET /v1/logs/page?page=2&page_size=50&through_id=123

@@ -293,13 +293,30 @@ struct Limits {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Approach {
+pub(crate) struct Approach {
     origin: [f64; 7],
     target: [f64; 7],
-    duration: f64,
+    pub(crate) duration: f64,
 }
 
 impl Approach {
+    pub(crate) fn for_motion(
+        origin: [f64; 7],
+        target: [f64; 7],
+        velocity: [f64; 7],
+        tuning: MotionTuning,
+    ) -> Result<Self, String> {
+        Self::new(
+            origin,
+            target,
+            Limits {
+                velocity,
+                acceleration: tuning.acceleration,
+                jerk: tuning.jerk,
+            },
+        )
+    }
+
     fn new(origin: [f64; 7], target: [f64; 7], limits: Limits) -> Result<Self, String> {
         let mut duration: f64 = 0.0;
         for i in 0..7 {
@@ -324,7 +341,7 @@ impl Approach {
         })
     }
 
-    fn sample(&self, t: f64) -> Sample {
+    pub(crate) fn sample(&self, t: f64) -> Sample {
         if t <= 0.0 {
             return Sample::hold(self.origin);
         }

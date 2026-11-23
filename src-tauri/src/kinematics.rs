@@ -582,7 +582,6 @@ impl Kinematics {
         Ok(torque)
     }
 
-    #[cfg(test)]
     pub fn jacobian(&self, q: &[f64; 7], tcp: &TcpTransform) -> Result<SMatrix<f64, 6, 7>, String> {
         self.evaluate(q, tcp).map(|(_, jacobian)| jacobian)
     }
@@ -1999,6 +1998,58 @@ mod tests {
                         if let Ok(c) = official.step(i.clone()) {
                             check_bounds(&official, &i, &c);
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coherent_endpoint_hold_is_valid_but_outside_send_resynchronization_is_infeasible() {
+        // The captured calibration's last wire command had J7=1.62388955,
+        // while its model upper endpoint was 1.571. This is a real position
+        // mismatch, not a floating-point gap at the bound.
+        let captured_excess = 1.6238895549672372 - 1.571;
+        for side in ["right", "left"] {
+            let model = Kinematics::load(side).unwrap();
+            let origin = interior();
+            let (lower, upper) = model.position_limits();
+            for axis in 0..7 {
+                for sign in [-1.0, 1.0] {
+                    for dt in [0.002, 0.01, 0.04] {
+                        let mut q = origin;
+                        q[axis] = if sign > 0.0 { upper[axis] } else { lower[axis] };
+                        let sample = StepInput {
+                            dt,
+                            limits: MotionLimits {
+                                joint_velocity: [1.0; 7],
+                                joint_acceleration: [0.6; 7],
+                                ..limits()
+                            },
+                            smoothing: Some(SmoothingState {
+                                hold: None,
+                                acceleration: [0.0; 7],
+                                jerk: [6.0; 7],
+                                path: None,
+                                stopping: true,
+                            }),
+                            planning: Some(CartesianPlanning {
+                                origin,
+                                guide: None,
+                            }),
+                            ..input(q, velocity([0.0; 6], Frame::Base))
+                        };
+                        let hold = model.step(sample.clone()).unwrap();
+                        assert_eq!(hold.q, q);
+                        assert_eq!(hold.dq, [0.0; 7]);
+                        let mut outside = sample;
+                        outside.reference[axis] += sign * captured_excess;
+                        outside.measured = outside.reference;
+                        let error = model.step(outside).unwrap_err();
+                        assert_eq!(
+                            error,
+                            "joint position and derivative envelopes are infeasible"
+                        );
                     }
                 }
             }

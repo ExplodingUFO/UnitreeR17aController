@@ -7,6 +7,7 @@ use crate::{
         self, Choice, Collector, Leg, Point, Report as CalibrationReport,
         Settings as CalibrationSettings, Status as CalibrationStatus, Trial,
     },
+    calibration_path::{Playback, PlaybackPhase},
     journal::{Journal, JournalStats, TraceData},
     kinematics::{
         self, CartesianPath, CartesianPlanning, Frame, HoldPose, Kinematics, LocalTarget,
@@ -539,6 +540,8 @@ impl MotionMode {
     }
 }
 struct Motion {
+    calibration_phase: Option<PlaybackPhase>,
+    planned: Option<Arc<crate::calibration_path::Playback>>,
     calibration: bool,
     finishing: Option<HoldPose>,
     request_id: String,
@@ -604,10 +607,11 @@ struct CalibrationPlan {
 #[derive(Clone)]
 enum CalibrationLeg {
     Joint(Leg),
-    Cartesian {
+    Planned {
+        space: Space,
         axis: usize,
-        offset: f64,
         speed: f64,
+        leg: Arc<crate::calibration_spline::TimedLeg>,
     },
 }
 struct CalibrationRun {
@@ -632,7 +636,7 @@ struct CalibrationRun {
 }
 impl CalibrationRun {
     fn axis(&self) -> usize {
-        if let Some(CalibrationLeg::Cartesian { axis, .. }) = self.legs.get(self.leg) {
+        if let Some(CalibrationLeg::Planned { axis, .. }) = self.legs.get(self.leg) {
             *axis
         } else {
             self.queue[self.trial.min(self.queue.len() - 1)].axis
@@ -642,31 +646,42 @@ impl CalibrationRun {
         self.queue[self.trial.min(self.queue.len() - 1)].cartesian
     }
     fn make_legs(&self) -> Vec<CalibrationLeg> {
+        let settings = &self.report.settings;
+        let axis = self.queue[self.trial].axis;
+        let Some(program) = &settings.cartesian else {
+            return calibration::legs(settings, axis, self.report.center_reference)
+                .into_iter()
+                .map(CalibrationLeg::Joint)
+                .collect();
+        };
         if self.cartesian() {
-            let program = self.report.settings.cartesian.as_ref().unwrap();
             let mut legs: Vec<_> = program
                 .segments
                 .iter()
-                .map(|segment| CalibrationLeg::Cartesian {
+                .zip(&program.timed)
+                .map(|(segment, leg)| CalibrationLeg::Planned {
+                    space: Space::Cartesian,
                     axis: segment.axis,
-                    offset: segment.offset,
                     speed: program.speed,
+                    leg: leg.clone(),
                 })
                 .collect();
             legs.push(CalibrationLeg::Joint(Leg {
                 target: program.origin,
-                speed: self.report.settings.speed,
+                speed: settings.speed,
             }));
             legs
         } else {
-            calibration::legs(
-                &self.report.settings,
-                self.queue[self.trial].axis,
-                self.report.center_reference,
-            )
-            .into_iter()
-            .map(CalibrationLeg::Joint)
-            .collect()
+            program.joint_legs[axis]
+                .iter()
+                .enumerate()
+                .map(|(i, leg)| CalibrationLeg::Planned {
+                    space: Space::Joint,
+                    axis,
+                    speed: program.joint_speeds[i / 3],
+                    leg: leg.clone(),
+                })
+                .collect()
         }
     }
 }
@@ -695,6 +710,7 @@ struct Core {
     control_seq: u64,
     control_at: Instant,
     stop_path: Option<CartesianPath>,
+    pending_calibration_stop: Option<(u64, Arc<Playback>)>,
     tcp: Option<Pose>,
     enabled: bool,
     close_requested: bool,
@@ -760,6 +776,7 @@ impl Core {
             control_seq: 0,
             control_at: Instant::now(),
             stop_path: None,
+            pending_calibration_stop: None,
             tcp: None,
             enabled: false,
             close_requested: false,
@@ -918,19 +935,56 @@ impl Core {
         }
         if let Some(motion) = self.motion.take() {
             self.stop_path = Self::motion_path(&motion);
+            if let Some(program) = motion.planned {
+                self.pending_calibration_stop = Some((self.reference_version, program));
+                self.absolute_hold = false;
+            }
             if !motion.calibration {
                 self.record(&motion.request_id, status, code, message);
             }
         }
         self.bump_generation();
         self.stopping = self.enabled
-            && (self.velocity.iter().any(|v| v.abs() > 1e-12)
+            && (!self.settle_calibration_stop()
+                || self.velocity.iter().any(|v| v.abs() > 1e-12)
                 || self.acceleration.iter().any(|a| a.abs() > 1e-12));
         if !self.stopping {
             self.stop_path = None;
         }
         self.phase();
         self.dirty = true;
+    }
+    fn settle_calibration_stop(&mut self) -> bool {
+        let Some((epoch, program)) = &self.pending_calibration_stop else {
+            return true;
+        };
+        use std::task::Poll;
+        let Poll::Ready(sent) = self
+            .bus
+            .as_ref()
+            .map_or(Poll::Ready(None), BusHandle::settled_reference)
+        else {
+            return false;
+        };
+        if let Some(sent) = sent {
+            let phase = sent.calibration_phase.filter(|_| sent.epoch == *epoch);
+            if phase.is_none_or(|p| p.progress(sent.at) < program.approach.duration) {
+                self.stop_path = None;
+            }
+            self.reference = sent.q;
+            self.velocity = sent.dq;
+            self.acceleration = phase
+                .filter(|_| !sent.fallback_hold)
+                .map_or([0.0; 7], |p| p.sample(program, sent.at).ddq);
+        } else {
+            // Before the first servo receipt the plan starts at the held anchor.
+            self.stop_path = None;
+            self.reference = program.sample(0.0).q;
+            self.velocity = [0.0; 7];
+            self.acceleration = [0.0; 7];
+        }
+        self.pending_calibration_stop = None;
+        true
     }
     fn fault(&mut self, code: &str, message: impl Into<String>) {
         let message = message.into();
@@ -1848,6 +1902,20 @@ impl Core {
                     "姿态或 TCP 已变化，请更新轨迹预览",
                 ));
             }
+            if program.timed.len() != program.segments.len()
+                || program.joint_legs.iter().any(Vec::is_empty)
+            {
+                return Err(ApiError::new("stale_preview", "请重新生成校准轨迹预览"));
+            }
+            let requested_speeds = !settings.speeds.is_empty()
+                || settings.speed != CalibrationSettings::default().speed;
+            if requested_speeds && calibration::speeds(&settings) != program.joint_speeds {
+                return Err(ApiError::new(
+                    "stale_preview",
+                    "关节速度已变化，请重新生成预览",
+                ));
+            }
+            settings.speeds = program.joint_speeds.clone();
             settings.excursion = program.joint_excursion;
             settings.axis = None;
         }
@@ -1888,22 +1956,6 @@ impl Core {
                 },
             );
         }
-        let legs = if let Some(program) = &settings.cartesian {
-            program
-                .segments
-                .iter()
-                .map(|s| CalibrationLeg::Cartesian {
-                    axis: s.axis,
-                    offset: s.offset,
-                    speed: program.speed,
-                })
-                .collect()
-        } else {
-            calibration::legs(&settings, first, anchor)
-                .into_iter()
-                .map(CalibrationLeg::Joint)
-                .collect()
-        };
         let trial_count = if queue.iter().any(|trial| trial.cartesian) {
             axes.len() * 2 + 2
         } else {
@@ -1946,7 +1998,7 @@ impl Core {
                 message: "测试完成，参数保持原样".into(),
             },
             queue,
-            legs,
+            legs: Vec::new(),
             trial: 0,
             leg: 0,
             step: CalibrationStep::Configure,
@@ -2480,60 +2532,23 @@ impl Core {
                 let id = format!("cal:{}:{}:{}", run.report.id, run.trial, run.leg);
                 let started = match leg {
                     CalibrationLeg::Joint(leg) => {
-                        self.begin_return(&id, leg.target, leg.speed, false, now)
+                        self.begin_calibration_leg(&id, leg.target, leg.speed, None, now)
                     }
-                    CalibrationLeg::Cartesian {
+                    CalibrationLeg::Planned {
+                        space,
                         axis,
-                        offset,
                         speed,
-                    } => {
-                        let program = run.report.settings.cartesian.as_ref().unwrap();
-                        let model = self.model.as_ref().unwrap();
-                        let origin = model.fk(&program.origin, &program.tcp).unwrap();
-                        let current = model.fk(&self.reference, &program.tcp).unwrap();
-                        let distance =
-                            origin.translation[axis] + offset - current.translation[axis];
-                        self.begin(
-                            &id,
-                            Space::Cartesian,
-                            axis,
-                            if distance >= 0.0 { 1 } else { -1 },
-                            speed,
-                            Frame::Base,
-                            true,
-                            distance.abs(),
-                            None,
-                            0,
-                            now,
-                        )
-                        .and_then(|()| {
-                            let mut delta = [0.0; 6];
-                            delta[axis] = offset;
-                            let goal = kinematics::offset_pose(&origin, delta, Frame::Base)
-                                .map_err(|e| ApiError::new("kinematics", e))?;
-                            let motion = self.motion.as_ref().unwrap();
-                            let distance = goal.translation[axis]
-                                - motion.initial_pose.unwrap().translation[axis];
-                            let duration = self.cartesian_step_duration(
-                                motion.initial,
-                                &program.tcp,
-                                &goal,
-                                distance.abs(),
-                                speed,
-                            )?;
-                            let motion = self.motion.as_mut().unwrap();
-                            motion.path_origin = Some(origin);
-                            motion.target_pose = Some(goal);
-                            motion.direction = if distance >= 0.0 { 1.0 } else { -1.0 };
-                            motion.amount = distance.abs();
-                            motion.duration = duration;
-                            Ok(())
-                        })
-                    }
+                        leg,
+                    } => self.begin_calibration_leg(
+                        &id,
+                        leg.sample(0.0).q,
+                        speed,
+                        Some((space, axis, leg)),
+                        now,
+                    ),
                 };
                 match started {
                     Ok(()) => {
-                        self.motion.as_mut().unwrap().calibration = true;
                         run.step = CalibrationStep::Moving;
                     }
                     Err(e) if e.code == "motion_busy" => {}
@@ -2672,6 +2687,75 @@ impl Core {
             measured
         })
     }
+    fn begin_calibration_leg(
+        &mut self,
+        id: &str,
+        first: [f64; 7],
+        speed: f64,
+        leg: Option<(Space, usize, Arc<crate::calibration_spline::TimedLeg>)>,
+        now: Instant,
+    ) -> Result<(), ApiError> {
+        let anchor = self.motion_anchor(now)?;
+        let mut speeds = self.joint_speeds();
+        let (space, axis, path) = match leg {
+            Some((space, axis, path)) => (space, axis, Some(path)),
+            None => {
+                speeds = speeds.map(|v| v.min(speed));
+                (Space::Joint, 0, None)
+            }
+        };
+        let approach = teaching::Approach::for_motion(anchor, first, speeds, self.motion_tuning)
+            .map_err(|e| ApiError::new("invalid_calibration", e))?;
+        let plan = Arc::new(crate::calibration_path::Playback {
+            approach,
+            leg: path,
+        });
+        let duration = plan.duration();
+        let target = plan.sample(duration).q;
+        let (initial_pose, path_origin, target_pose) = if space == Space::Cartesian {
+            let model = self.model.as_ref().unwrap();
+            let tcp = self.tcp.as_ref().unwrap();
+            let pose = |q| model.fk(q, tcp).map_err(|e| ApiError::new("kinematics", e));
+            (
+                Some(pose(&anchor)?),
+                Some(pose(&first)?),
+                Some(pose(&target)?),
+            )
+        } else {
+            (None, None, None)
+        };
+        let distance = initial_pose
+            .zip(target_pose)
+            .map_or(0.0, |(a, b)| b.translation[axis] - a.translation[axis]);
+        self.reference = anchor;
+        self.reset_derivatives();
+        self.absolute_hold = false;
+        self.motion = Some(Motion {
+            calibration_phase: None,
+            planned: Some(plan),
+            calibration: true,
+            finishing: None,
+            request_id: id.into(),
+            space,
+            axis,
+            direction: distance.signum(),
+            speed,
+            frame: Frame::Base,
+            mode: MotionMode::Step,
+            amount: distance.abs(),
+            started: now,
+            duration,
+            initial: anchor,
+            target,
+            initial_pose,
+            path_origin,
+            target_pose,
+            deadline: None,
+            input_seq: 0,
+        });
+        self.phase = Phase::Moving;
+        Ok(())
+    }
     fn begin_return(
         &mut self,
         id: &str,
@@ -2708,6 +2792,8 @@ impl Core {
         self.reset_derivatives();
         self.absolute_hold = false;
         self.motion = Some(Motion {
+            calibration_phase: None,
+            planned: None,
             calibration: false,
             finishing: None,
             request_id: id.into(),
@@ -2812,6 +2898,8 @@ impl Core {
             0.0
         };
         self.motion = Some(Motion {
+            calibration_phase: None,
+            planned: None,
             calibration: false,
             finishing: None,
             request_id: id.into(),
@@ -2876,6 +2964,7 @@ impl Core {
     }
     fn reset_derivatives(&mut self) {
         self.invalidate_reference();
+        self.pending_calibration_stop = None;
         self.velocity = [0.0; 7];
         self.acceleration = [0.0; 7];
         self.jerk = [0.0; 7];
@@ -3092,6 +3181,9 @@ impl Core {
             self.end_motion("cancelled", "input_expired", "连续输入已过期");
         }
         if self.stopping {
+            if !self.settle_calibration_stop() {
+                return;
+            }
             if let Err(e) = self.decelerate(measured, dt) {
                 self.fault(&e.code, e.message);
                 return;
@@ -3125,6 +3217,38 @@ impl Core {
             return;
         };
         let elapsed = now.saturating_duration_since(motion.started).as_secs_f64();
+        if let Some(plan) = &motion.planned {
+            let sent = self
+                .bus
+                .as_ref()
+                .and_then(BusHandle::latest_reference)
+                .filter(|s| s.epoch == self.reference_version);
+            let clock = sent
+                .and_then(|s| s.calibration_phase)
+                .unwrap_or(PlaybackPhase::Original(motion.started));
+            let sample = clock.sample(plan, now);
+            self.jerk = std::array::from_fn(|i| (sample.ddq[i] - self.acceleration[i]) / dt);
+            self.reference = sample.q;
+            self.velocity = sample.dq;
+            self.acceleration = sample.ddq;
+            // A stale hold may still be in flight as our clock reaches the end.
+            // Hand off only after the writer actually sent the endpoint.
+            if sent.is_some_and(|s| {
+                !s.fallback_hold
+                    && s.calibration_phase.is_some()
+                    && clock.progress(s.at.min(now)) >= motion.duration
+            }) {
+                self.motion = None;
+                self.absolute_hold = true;
+                self.reset_derivatives();
+                self.bump_generation();
+                self.phase();
+            } else {
+                self.motion.as_mut().unwrap().calibration_phase = Some(clock);
+            }
+            self.dirty = true;
+            return;
+        }
         let mode = motion.mode;
         let t = if mode.timed() {
             (elapsed / motion.duration).clamp(0.0, 1.0)
@@ -3307,6 +3431,18 @@ impl Core {
                 program: replay.program.clone(),
                 started: replay.started,
             }
+        } else if let Some((motion, program)) = self
+            .motion
+            .as_ref()
+            .and_then(|m| m.planned.as_ref().map(|p| (m, p)))
+        {
+            Sampling::Calibration {
+                program: program.clone(),
+                phase: motion
+                    .calibration_phase
+                    .unwrap_or(PlaybackPhase::Original(motion.started)),
+                limits: self.motion_tuning,
+            }
         } else if self.absolute_hold {
             Sampling::Absolute
         } else {
@@ -3478,7 +3614,11 @@ impl Core {
             }
             value
         });
-        let send_result = bus.publish(heartbeat, self.control_seq, self.outgoing_reference());
+        let send_result = if self.pending_calibration_stop.is_some() && self.enabled {
+            Ok(())
+        } else {
+            bus.publish(heartbeat, self.control_seq, self.outgoing_reference())
+        };
         let (values, read_error) = bus.drain();
         let stats = bus.stats();
         if let Err(e) = clear_result {
@@ -4079,6 +4219,7 @@ mod tests {
             epoch: core.reference_version,
             q: held,
             dq: [0.0; 7],
+            calibration_phase: None,
             fallback_hold: false,
         }));
         let mut config = ServoTuning::default();
@@ -4371,6 +4512,7 @@ mod tests {
             epoch: core.reference_version,
             q,
             dq: [0.0; 7],
+            calibration_phase: None,
             fallback_hold: false,
         }));
         let mut previous = Some(Previous {
@@ -4437,6 +4579,7 @@ mod tests {
                             epoch: source.epoch,
                             q: sample.q,
                             dq: sample.dq,
+                            calibration_phase: None,
                             fallback_hold: false,
                         }));
                     }
@@ -4657,6 +4800,7 @@ mod tests {
             epoch: core.reference_version,
             q: sample.q,
             dq: sample.dq,
+            calibration_phase: None,
             fallback_hold: false,
         }));
         core.desired_setpoints()
@@ -5589,6 +5733,7 @@ mod tests {
             epoch: core.reference_version,
             q: sample.q,
             dq: [0.0; 7],
+            calibration_phase: None,
             fallback_hold: true,
         }));
         core.end_motion("cancelled", "stopped", "停止");
@@ -5700,6 +5845,7 @@ mod tests {
             epoch: core.reference_version,
             q: sampled.q,
             dq: sampled.dq,
+            calibration_phase: None,
             fallback_hold: false,
         }));
         core.end_motion("cancelled", "stopped", "停止");
@@ -5997,11 +6143,212 @@ mod tests {
             epoch: core.reference_version,
             q: core.reference,
             dq: core.velocity,
+            calibration_phase: None,
             fallback_hold: false,
         }));
         (core, directory, sent)
     }
-    fn calibration_request(core: &mut Core, id: &str, operation: Operation, now: Instant) {
+    #[test]
+    fn planned_stop_waits_for_the_in_flight_hold_before_publishing_its_first_frame() {
+        let start = Instant::now() - Duration::from_millis(500);
+        let (mut core, _dir, _sent) = calibration_fixture(start);
+        let mut target = core.reference;
+        target[0] += 0.2;
+        core.begin_calibration_leg("in-flight", target, 0.2, None, start)
+            .unwrap();
+        let (bus, in_flight, release) =
+            crate::protocol::paused_hold_bus(core.reference_epoch.clone());
+        let published = bus.test_transmit_sink();
+        core.bus = Some(bus);
+        let tick = |core: &mut Core| {
+            let at = Instant::now();
+            follow_reference(core, at);
+            core.advance_motion(at, 0.01);
+            core.poll(at);
+        };
+        let receipt = |core: &Core, predicate: fn(SentReference) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                if let std::task::Poll::Ready(Some(sent)) =
+                    core.bus.as_ref().unwrap().settled_reference()
+                    && predicate(sent)
+                {
+                    break sent;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "writer did not commit the expected batch"
+                );
+                std::thread::yield_now();
+            }
+        };
+        tick(&mut core);
+        // The fake port accepts J0 of the stale hold, then blocks before J1.
+        in_flight.recv_timeout(Duration::from_secs(3)).unwrap();
+        let moving = core.bus.as_ref().unwrap().latest_reference().unwrap();
+        assert!(moving.dq[0] > 0.0 && !moving.fallback_hold);
+        core.apply("stop", Operation::Stop, Instant::now(), Instant::now())
+            .unwrap();
+        tick(&mut core);
+        assert!(core.stopping);
+        assert_eq!(published().unwrap().epoch, moving.epoch);
+
+        release.send(()).unwrap();
+        let held = receipt(&core, |s| s.fallback_hold);
+        assert_eq!((held.q, held.dq), (moving.q, [0.0; 7]));
+        tick(&mut core);
+        assert!(!core.stopping && core.enabled && core.error.is_none());
+        let first = receipt(&core, |s| !s.fallback_hold);
+        assert_eq!(first.epoch, core.reference_version);
+        assert_eq!(
+            (first.q, first.dq, core.acceleration),
+            (held.q, [0.0; 7], [0.0; 7])
+        );
+    }
+
+    #[test]
+    fn calibration_sender_recovers_on_the_approved_leg_after_repeated_holds() {
+        for stop_during_recovery in [false, true] {
+            exercise_calibration_recovery(stop_during_recovery);
+        }
+    }
+
+    fn exercise_calibration_recovery(stop_during_recovery: bool) {
+        let start = Instant::now();
+        let (mut core, _dir, sent) = calibration_fixture(start);
+        core.lease.as_mut().unwrap().expires = start + Duration::from_secs(120);
+        let initial = core.reference;
+        let mut middle = initial;
+        middle[0] += 0.05;
+        let mut target = middle;
+        target[0] += 0.02;
+        target[1] += 0.03;
+        let leg = crate::calibration_spline::TimedLeg::fit(
+            &[(0.0, initial), (0.01, middle), (0.02, target)],
+            0.03,
+            core.motion_tuning,
+            core.joint_speeds(),
+        )
+        .unwrap();
+        let duration = leg.duration();
+        core.begin_calibration_leg(
+            "resume",
+            initial,
+            0.03,
+            Some((Space::Joint, 0, Arc::new(leg))),
+            start,
+        )
+        .unwrap();
+        let mut write = BusHandle::test_servo_writer();
+        let tick = |core: &mut Core, at| {
+            follow_reference(core, at);
+            core.advance_motion(at, 0.01);
+        };
+        let mut now = start + Duration::from_secs_f64(duration * 0.25);
+        tick(&mut core, now);
+        let mut source = core.outgoing_reference();
+        // The serial sample is later than the last control sample.
+        now += Duration::from_millis(8);
+        let mut moving = write(source.clone(), core.desired_setpoints(), now);
+        assert!(moving.dq[0] > 0.0);
+        sent.send_replace(Some(moving));
+        let mut previous_ack: Option<Reference> = None;
+        for _ in 0..2 {
+            now += Duration::from_millis(80);
+            let held = write(source.clone(), core.desired_setpoints(), now);
+            assert!(held.fallback_hold);
+            assert_eq!((held.q, held.dq), (moving.q, [0.0; 7]));
+            // Fresh publication races the writer's hold receipt.
+            now += Duration::from_millis(10);
+            tick(&mut core, now);
+            let late = write(core.outgoing_reference(), core.desired_setpoints(), now);
+            assert!(
+                late.fallback_hold,
+                "a fresh timestamp alone released the hold"
+            );
+            assert_eq!(late.q, held.q);
+            sent.send_replace(Some(late));
+            if let Some(mut ack) = previous_ack.take() {
+                now += Duration::from_millis(10);
+                ack.at = now;
+                assert!(write(ack, core.desired_setpoints(), now).fallback_hold);
+            }
+
+            // Wait beyond the original endpoint and delay the first authorized send.
+            now += Duration::from_secs_f64(duration + 0.1);
+            tick(&mut core, now);
+            assert!(core.motion.is_some());
+            assert_eq!(
+                (core.reference, core.velocity, core.acceleration),
+                (held.q, [0.0; 7], [0.0; 7])
+            );
+            source = core.outgoing_reference();
+            previous_ack = Some(source.clone());
+            now += Duration::from_millis(30);
+            moving = write(source.clone(), core.desired_setpoints(), now);
+            assert!(!moving.fallback_hold);
+            assert_eq!((moving.q, moving.dq), (held.q, [0.0; 7]));
+            sent.send_replace(Some(moving));
+            for _ in 0..30 {
+                now += Duration::from_millis(10);
+                let previous_a = core.acceleration;
+                tick(&mut core, now);
+                source = core.outgoing_reference();
+                let previous = moving;
+                moving = write(source.clone(), core.desired_setpoints(), now);
+                assert!(!moving.fallback_hold);
+                assert_eq!((core.reference, core.velocity), (moving.q, moving.dq));
+                for (i, old_acceleration) in previous_a.into_iter().enumerate() {
+                    let limits = core.motion_tuning;
+                    assert!(core.acceleration[i].abs() <= limits.acceleration);
+                    assert!((core.acceleration[i] - old_acceleration).abs() <= limits.jerk * 0.01);
+                    let trapezoid = (moving.dq[i] + previous.dq[i]) * 0.005;
+                    assert!(
+                        (moving.q[i] - previous.q[i] - trapezoid).abs()
+                            <= limits.jerk * 0.01_f64.powi(3) / 12.0 + 1e-14
+                    );
+                }
+                sent.send_replace(Some(moving));
+            }
+            assert!(moving.q[0] > held.q[0] && moving.dq[0] > 0.0);
+        }
+        if stop_during_recovery {
+            now += Duration::from_millis(7);
+            moving = write(source, core.desired_setpoints(), now);
+            let phase = moving.calibration_phase.unwrap();
+            let plan = core.motion.as_ref().unwrap().planned.as_ref().unwrap();
+            let expected = phase.sample(plan, now);
+            assert_ne!(expected.ddq, core.acceleration);
+            sent.send_replace(Some(moving));
+            core.end_motion("cancelled", "stopped", "停止");
+            assert!(core.stopping && core.motion.is_none());
+            assert_eq!(
+                (core.reference, core.velocity, core.acceleration),
+                (moving.q, moving.dq, expected.ddq)
+            );
+            return;
+        }
+        while core.motion.is_some() {
+            assert!(now < start + Duration::from_secs(100));
+            now += Duration::from_millis(10);
+            tick(&mut core, now);
+            moving = write(core.outgoing_reference(), core.desired_setpoints(), now);
+            sent.send_replace(Some(moving));
+        }
+        assert_eq!(
+            (moving.q, moving.dq, core.acceleration),
+            (target, [0.0; 7], [0.0; 7])
+        );
+    }
+    fn calibration_request(core: &mut Core, id: &str, mut operation: Operation, now: Instant) {
+        if let Operation::CalibrateStart { settings } = &mut operation
+            && let Some(program) = &mut settings.cartesian
+            && program.timed.is_empty()
+        {
+            Arc::make_mut(program)
+                .prepare(core.model.as_ref().unwrap())
+                .unwrap();
+        }
         let lease = core.lease.as_ref().unwrap();
         let request = CommandRequest {
             request_id: id.into(),
@@ -6103,6 +6450,7 @@ mod tests {
                 epoch: core.reference_version,
                 q: core.reference,
                 dq: [0.0; 7],
+                calibration_phase: None,
                 fallback_hold: false,
             }));
         }
@@ -6153,6 +6501,7 @@ mod tests {
                 epoch: core.reference_version,
                 q: core.reference,
                 dq: [0.0; 7],
+                calibration_phase: None,
                 fallback_hold: false,
             }));
             let old_velocity_gate = core
@@ -6200,6 +6549,7 @@ mod tests {
                 epoch: core.reference_version,
                 q: core.reference,
                 dq: [0.0; 7],
+                calibration_phase: None,
                 fallback_hold: false,
             }));
         }
@@ -6242,6 +6592,7 @@ mod tests {
                 epoch: core.reference_version,
                 q: core.reference,
                 dq: core.velocity,
+                calibration_phase: None,
                 fallback_hold: false,
             }));
             core.advance(now, 0.01);
@@ -6266,6 +6617,7 @@ mod tests {
             epoch: 1,
             q: [value; 7],
             dq: [0.0; 7],
+            calibration_phase: None,
             fallback_hold: false,
         };
         let sent = VecDeque::from([make(90, 93, 1.0), make(100, 103, 2.0)]);
@@ -6323,6 +6675,21 @@ mod tests {
             let vs = if v >= 0.0 { 0.025 } else { 0.035 };
             (fc + (fs - fc) * (-(v / vs).powi(2)).exp()) * (v / 0.02).tanh() + 0.2 * v
         }
+        let source = core.outgoing_reference();
+        let (wire_q, wire_dq, calibration_phase) =
+            if let Sampling::Calibration { program, phase, .. } = &source.sampling {
+                let previous = sent.borrow().map(|p| crate::reference::Previous {
+                    at: p.at,
+                    q: p.q,
+                    dq: p.dq,
+                });
+                let wire = source.sample(now, previous).unwrap();
+                let expected = phase.sample(program, now);
+                assert_eq!((wire.q, wire.dq), (expected.q, expected.dq));
+                (wire.q, wire.dq, Some(*phase))
+            } else {
+                (core.reference, core.velocity, None)
+            };
         let compensation = core.servo_tuning.apply(core.velocity, [0.0; 7]).unwrap();
         let measured: [f64; 7] = std::array::from_fn(|i| {
             let residual = if jitter {
@@ -6330,7 +6697,7 @@ mod tests {
             } else {
                 0.0
             };
-            core.reference[i]
+            wire_q[i]
                 - residual / SERVO_KP
                     * (1.0
                         + 0.3 * (now.saturating_duration_since(origin).as_secs_f64() * 19.0).sin())
@@ -6352,13 +6719,15 @@ mod tests {
         sent.send_replace(Some(SentReference {
             at: now,
             completed_at: now,
-            generation: core.generation,
-            epoch: core.reference_version,
-            q: core.reference,
-            dq: core.velocity,
+            generation: source.generation,
+            epoch: source.epoch,
+            q: wire_q,
+            dq: wire_dq,
+            calibration_phase,
             fallback_hold: false,
         }));
-        core.advance(now, 0.01);
+        let dt = now.saturating_duration_since(core.control_at).as_secs_f64();
+        core.advance(now, if dt == 0.0 { 0.01 } else { dt });
     }
     #[test]
     fn calibration_completes_smooth_baseline_without_applying_compensation() {
@@ -6682,6 +7051,62 @@ mod tests {
     }
 
     #[test]
+    fn november_23_capture_executes_full_xyz_before_and_after() {
+        // Start of the 981-sample run that stopped on the first positive X leg.
+        run_previewed_calibration(
+            [
+                1.0588989507340771,
+                0.4330010897186444,
+                0.02301950359586734,
+                0.6914591879254376,
+                1.5165053704519271,
+                -0.06798913184098254,
+                1.0028188649979972,
+            ],
+            Pose::identity(),
+        );
+    }
+
+    #[test]
+    fn approved_joint_speeds_respect_an_explicit_legacy_speed() {
+        let now = Instant::now();
+        let (mut core, _directory, _sent) = calibration_fixture(now);
+        let joint_speeds = vec![0.01, 0.02];
+        let program = crate::calibration_path::preview(
+            core.model.as_ref().unwrap(),
+            &core.side,
+            core.reference,
+            core.tcp.unwrap(),
+            crate::calibration_path::PreviewRequest {
+                amplitude: Some(0.01),
+                axes: vec![0],
+                joint_speeds: joint_speeds.clone(),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .program;
+        let mut settings = CalibrationSettings {
+            cartesian: Some(Arc::new(program)),
+            speed: 0.2_f64.to_radians(),
+            ..Default::default()
+        };
+        let error = core
+            .begin_calibration("explicit-speed", settings.clone(), now)
+            .unwrap_err();
+        assert_eq!(error.code, "stale_preview");
+        assert!(core.calibration.is_none() && core.motion.is_none());
+
+        settings.speed = CalibrationSettings::default().speed;
+        core.begin_calibration("use-approved-speeds", settings, now)
+            .unwrap();
+        assert_eq!(
+            core.calibration.as_ref().unwrap().report.settings.speeds,
+            joint_speeds
+        );
+    }
+
+    #[test]
     fn calibration_distance_and_target_use_the_same_sent_anchor() {
         let origin = Instant::now();
         let (mut core, _directory, sent) = calibration_fixture(origin);
@@ -6701,7 +7126,7 @@ mod tests {
                 model.continuation_bounds(&q).unwrap(),
             )
             .unwrap();
-        let mut preview = crate::calibration_path::preview(
+        let preview = crate::calibration_path::preview(
             &model,
             "right",
             q,
@@ -6713,7 +7138,6 @@ mod tests {
             },
         )
         .unwrap();
-        preview.program.guide.clear();
         for (i, position) in anchor.into_iter().enumerate() {
             let mut feedback = core.feedback[i].as_ref().unwrap().value.clone();
             feedback.q = position;
@@ -6726,6 +7150,7 @@ mod tests {
             epoch: core.reference_version,
             q: anchor,
             dq: [0.0; 7],
+            calibration_phase: None,
             fallback_hold: false,
         }));
         calibration_request(
@@ -6751,8 +7176,15 @@ mod tests {
             "trajectory end {end}, target {:?}",
             motion.target_pose
         );
+        let mut write = BusHandle::test_servo_writer();
         for tick in 3..5000 {
             let now = origin + Duration::from_millis(tick * 10);
+            core.lease.as_mut().unwrap().expires = now + Duration::from_millis(LEASE_MS);
+            sent.send_replace(Some(write(
+                core.outgoing_reference(),
+                core.desired_setpoints(),
+                now,
+            )));
             follow_reference(&mut core, now);
             core.advance_motion(now, 0.01);
             if core.motion.is_none() {
@@ -6795,8 +7227,17 @@ mod tests {
         assert!(core.calibration.is_some(), "{:?}", core.results.front());
         let mut low = [[0.0_f64; 3]; 2];
         let mut high = low;
-        for tick in 1..250_000 {
-            let now = origin + Duration::from_millis(tick * 10);
+        // Allow both Cartesian passes and a second visit to each joint trial.
+        // Include control ticks for starting legs, endpoint receipts and trial transitions.
+        let ticks_per_pass: u64 = program
+            .timed
+            .iter()
+            .chain(program.joint_legs.iter().flatten())
+            .map(|leg| (leg.duration() / CONTROL_PERIOD.as_secs_f64()).ceil() as u64 + 4)
+            .sum();
+        for tick in 1..=2 * ticks_per_pass + 128 {
+            let now = origin
+                + Duration::from_micros(tick * 10_000 + [0, 2_100, 3_000, 900][tick as usize % 4]);
             calibration_tick(&mut core, &sent, now, origin, false);
             assert!(core.error.is_none(), "{:?}", core.error);
             for axis in 0..7 {
@@ -7163,12 +7604,21 @@ mod tests {
     fn stopping_a_cartesian_measurement_retains_seven_axis_metrics_and_curves() {
         let origin = Instant::now();
         let (mut core, _dir, sent) = calibration_fixture(origin);
-        let program = serde_json::from_value(serde_json::json!({
-            "side":core.side,"origin":core.reference,"tcp":core.tcp,
-            "amplitude":0.15,"speed":0.04,
-            "segments":[{"axis":2,"offset":0.15},{"axis":2,"offset":0}]
-        }))
-        .unwrap();
+        let program = crate::calibration_path::preview(
+            core.model.as_ref().unwrap(),
+            &core.side,
+            core.reference,
+            core.tcp.unwrap(),
+            crate::calibration_path::PreviewRequest {
+                amplitude: Some(0.15),
+                speed: 0.04,
+                axes: vec![2],
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .program
+        .into();
         calibration_request(
             &mut core,
             "partial-cartesian",

@@ -1154,6 +1154,48 @@
               "maximum": 9223372036854775807
             },
             "example": 101
+          },
+          {
+            "name": "level",
+            "in": "query",
+            "description": "精确匹配，与其他条件同时生效。",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "source",
+            "in": "query",
+            "description": "精确匹配，与其他条件同时生效。",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "code",
+            "in": "query",
+            "description": "精确匹配，与其他条件同时生效。",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "from_ms",
+            "in": "query",
+            "description": "Unix 时间毫秒，含端点。",
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "to_ms",
+            "in": "query",
+            "description": "Unix 时间毫秒，含端点。",
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -2512,7 +2554,7 @@
         },
         "responses": {
           "200": {
-            "description": "几何预览。",
+            "description": "定时运动预览。",
             "content": {
               "application/json": {
                 "schema": {
@@ -3096,6 +3138,61 @@
           },
           "503": {
             "$ref": "#/components/responses/TeachingUnavailable"
+          }
+        }
+      }
+    },
+    "/v1/logs/filters": {
+      "get": {
+        "operationId": "getLogFilters",
+        "tags": [
+          "日志"
+        ],
+        "summary": "获取历史日志中已有的筛选值",
+        "responses": {
+          "200": {
+            "description": "当前数据库中的级别、来源、编号。",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "levels",
+                    "sources",
+                    "codes"
+                  ],
+                  "properties": {
+                    "levels": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "sources": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "codes": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenOrigin"
+          },
+          "503": {
+            "$ref": "#/components/responses/JournalUnavailable"
           }
         }
       }
@@ -9591,6 +9688,14 @@
           },
           "motion": {
             "$ref": "#/components/schemas/MotionTuning"
+          },
+          "joint_speeds": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "description": "关节试验速度，rad/s，空数组使用默认速度组。"
           }
         },
         "required": [],
@@ -9686,6 +9791,32 @@
             },
             "default": [],
             "description": "执行时沿预览的连续关节分支跟随；旧程序可省略。"
+          },
+          "preview_id": {
+            "type": "string",
+            "description": "服务生成的不可变预览标识。确认时原样提交。"
+          },
+          "joint_targets": {
+            "type": "array",
+            "minItems": 7,
+            "maxItems": 7,
+            "items": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {
+                "type": "number"
+              }
+            },
+            "description": "每轴的负向、正向试验目标角，rad。"
+          },
+          "joint_speeds": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "description": "预览已采用的关节试验速度，rad/s。"
           }
         },
         "required": [
@@ -9804,6 +9935,11 @@
             "minimum": 0,
             "maximum": 6,
             "description": "末端点为XYZ索引，关节点为J1..J7索引。"
+          },
+          "t_s": {
+            "type": "number",
+            "minimum": 0,
+            "description": "当前笛卡尔段内的时间，s。"
           }
         },
         "required": [
@@ -9813,7 +9949,7 @@
           "space",
           "axis"
         ],
-        "description": "几何预览点，包含末端路径、关节试验和回原位。点序不代表控制时序。"
+        "description": "预览姿态。笛卡尔段按计划时间采样。"
       },
       "CalibrationPreview": {
         "type": "object",
@@ -9833,13 +9969,18 @@
               "$ref": "#/components/schemas/CalibrationAxisRange"
             },
             "default": []
+          },
+          "cartesian_duration_s": {
+            "type": "number",
+            "minimum": 0,
+            "description": "所选笛卡尔往返轨迹单轮时长，s。"
           }
         },
         "required": [
           "program",
           "points"
         ],
-        "description": "整个测试的几何预览。显示分阶段TCP路线、关键姿态及连杆扫掠；不触发运动。",
+        "description": "末端定时轨迹、关节试验姿态及空间范围。",
         "examples": [
           {
             "program": {

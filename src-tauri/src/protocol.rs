@@ -3,8 +3,9 @@
 //! One owner, seven-joint command batches. No action retries or cached feedback.
 
 use crate::{
+    calibration_path::PlaybackPhase,
     journal::{Journal, TraceData},
-    reference::{Previous, Reference, SampleStatus, Timing},
+    reference::{Previous, Reference, SampleStatus, Sampling, Timing},
     trace::ServoSample,
 };
 use crossbeam_channel::{Receiver as EventReceiver, Sender, bounded, unbounded};
@@ -776,6 +777,7 @@ struct PublishedSetpoints {
 }
 
 struct Prepared {
+    calibration: Option<(u64, PlaybackPhase)>,
     values: [Setpoint; 7],
     timing: Option<Timing>,
     rejection: Option<SampleStatus>,
@@ -784,8 +786,19 @@ struct Prepared {
     tuning: Option<ServoSample>,
 }
 impl Prepared {
+    fn committed(&self, at: Instant) -> Committed {
+        Committed {
+            calibration: self.calibration,
+            at,
+            values: self.values,
+            motion_velocity: self.motion_velocity,
+            gravity: self.gravity,
+        }
+    }
+
     fn direct(values: [Setpoint; 7]) -> Self {
         Self {
+            calibration: None,
             values,
             timing: None,
             rejection: None,
@@ -798,13 +811,14 @@ impl Prepared {
 
 #[derive(Clone, Copy)]
 struct Committed {
+    calibration: Option<(u64, PlaybackPhase)>,
     at: Instant,
     values: [Setpoint; 7],
     motion_velocity: [f64; 7],
     gravity: [f64; 7],
 }
 
-/// Latest successfully written servo batch, for idle action handoff only.
+/// Latest successfully written servo batch and its calibration clock, if active.
 #[derive(Clone, Copy, Debug)]
 pub struct SentReference {
     pub at: Instant,
@@ -812,8 +826,8 @@ pub struct SentReference {
     pub completed_at: Instant,
     #[cfg(test)]
     pub generation: u64,
-    #[cfg(test)]
     pub epoch: u64,
+    pub calibration_phase: Option<PlaybackPhase>,
     pub q: [f64; 7],
     pub dq: [f64; 7],
     /// A stale/invalid source retained the last successful position with zero
@@ -823,12 +837,34 @@ pub struct SentReference {
 impl Committed {
     fn direct(at: Instant, values: [Setpoint; 7]) -> Self {
         Self {
+            calibration: None,
             at,
             values,
             motion_velocity: values.map(|s| s.dq),
             gravity: values.map(|s| s.tau),
         }
     }
+    fn sent(
+        &self,
+        source: &PublishedSetpoints,
+        completed_at: Instant,
+        rejection: Option<SampleStatus>,
+    ) -> Option<SentReference> {
+        let reference = source.reference.as_ref()?;
+        let previous = self.servo()?;
+        Some(SentReference {
+            at: self.at,
+            completed_at,
+            #[cfg(test)]
+            generation: reference.generation,
+            epoch: reference.epoch,
+            calibration_phase: self.calibration.map(|(_, phase)| phase),
+            q: previous.q,
+            dq: previous.dq,
+            fallback_hold: rejection.is_some(),
+        })
+    }
+
     fn servo(&self) -> Option<Previous> {
         self.values
             .iter()
@@ -857,7 +893,17 @@ impl PublishedSetpoints {
             return Ok(Prepared::direct(self.values));
         };
         let previous = committed.and_then(|c| c.servo());
-        let sample = reference.sample(at, previous);
+        let last_phase = committed.and_then(|c| {
+            let (epoch, phase) = c.calibration?;
+            (epoch == reference.epoch).then_some((phase, c.at))
+        });
+        let send_phase = match reference.sampling {
+            Sampling::Calibration { phase, limits, .. } => {
+                Some(last_phase.map_or(phase, |(last, _)| last.for_send(phase, at, limits)))
+            }
+            _ => None,
+        };
+        let sample = reference.sample_with_phase(at, previous, send_phase);
         let (mut values, q, dq, gravity, timing, rejection) = match sample {
             Ok(sample) => (
                 self.values,
@@ -893,6 +939,19 @@ impl PublishedSetpoints {
             }
         }
         Ok(Prepared {
+            calibration: send_phase.map(|phase| {
+                let phase = if rejection.is_none() {
+                    phase
+                } else if let Some((held @ PlaybackPhase::Held { .. }, _)) = last_phase {
+                    held
+                } else {
+                    PlaybackPhase::Held {
+                        since: at,
+                        offset: last_phase.map_or(0.0, |(last, sent)| last.progress(sent)),
+                    }
+                };
+                (reference.epoch, phase)
+            }),
             values,
             motion_velocity: dq,
             gravity,
@@ -989,6 +1048,7 @@ fn sample_transmit(
 pub struct BusHandle {
     setpoints: watch::Sender<PublishedSetpoints>,
     sent: watch::Receiver<Option<SentReference>>,
+    reference_write: Arc<Mutex<()>>,
     command: Sender<BusCommand>,
     events: EventReceiver<BusEvent>,
     stats: Arc<Mutex<BusStats>>,
@@ -1045,6 +1105,8 @@ impl BusHandle {
             reference: None,
         });
         let (sent_tx, sent) = watch::channel(None);
+        let reference_write = Arc::new(Mutex::new(()));
+        let writer_gate = reference_write.clone();
         let (command_tx, command_rx) = bounded::<BusCommand>(1);
         let (event_tx, event_rx) = unbounded();
         let writer_events = event_tx.clone();
@@ -1163,6 +1225,9 @@ impl BusHandle {
                             };
                             // A stop or priority command can arrive while FK is evaluated.
                             // Once writing begins, each packet has a bounded progress deadline.
+                            // A controller that invalidated the epoch can acquire this gate
+                            // only before our final check or after our receipt is visible.
+                            let writing = writer_gate.lock().unwrap();
                             let valid = last.is_current(&reference_epoch, Instant::now());
                             if valid && command_rx.is_empty() {
                                 if let Err(error) = bus.write_all_recorded(
@@ -1185,30 +1250,14 @@ impl BusHandle {
                                     let _ = writer_events.send(BusEvent::Error(error));
                                     break;
                                 }
-                                committed = Some(Committed {
-                                    at: started,
-                                    values: prepared.values,
-                                    gravity: prepared.gravity,
-                                    motion_velocity: prepared.motion_velocity,
-                                });
-                                let sent_reference = last
-                                    .reference
-                                    .as_ref()
-                                    .filter(|_| {
-                                        prepared.values.iter().all(|s| s.mode == DriveMode::Servo)
-                                    })
-                                    .map(|_source| SentReference {
-                                        at: started,
-                                        completed_at: Instant::now(),
-                                        #[cfg(test)]
-                                        generation: _source.generation,
-                                        #[cfg(test)]
-                                        epoch: _source.epoch,
-                                        q: prepared.values.map(|s| s.q),
-                                        dq: prepared.motion_velocity,
-                                        fallback_hold: prepared.rejection.is_some(),
-                                    });
-                                sent_tx.send_replace(sent_reference);
+                                let written = prepared.committed(started);
+                                sent_tx.send_replace(written.sent(
+                                    &last,
+                                    Instant::now(),
+                                    prepared.rejection,
+                                ));
+                                drop(writing);
+                                committed = Some(written);
                                 if let Some(reason) = prepared.rejection
                                     && let Some(source) = &last.reference
                                 {
@@ -1300,6 +1349,7 @@ impl BusHandle {
         Ok(Self {
             setpoints: setpoint_tx,
             sent,
+            reference_write,
             command: command_tx,
             events: event_rx,
             stats: handle_stats,
@@ -1348,9 +1398,35 @@ impl BusHandle {
         *self.sent.borrow()
     }
 
+    /// Call after invalidating the source epoch, before publishing its successor.
+    pub fn settled_reference(&self) -> std::task::Poll<Option<SentReference>> {
+        match self.reference_write.try_lock() {
+            Err(std::sync::TryLockError::WouldBlock) => std::task::Poll::Pending,
+            _ => std::task::Poll::Ready(self.latest_reference()),
+        }
+    }
+
     #[cfg(test)]
-    pub(crate) fn test_transmit_sink(&self) -> impl Send + use<> {
-        self.setpoints.subscribe()
+    pub(crate) fn test_transmit_sink(&self) -> impl Fn() -> Option<Reference> + use<> {
+        let published = self.setpoints.subscribe();
+        move || published.borrow().reference.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_servo_writer()
+    -> impl FnMut(Reference, [Setpoint; 7], Instant) -> SentReference {
+        let mut committed = None;
+        move |reference, values, at| {
+            let source = PublishedSetpoints {
+                values,
+                seq: 0,
+                reference: Some(reference),
+            };
+            let prepared = source.prepare(at, committed).unwrap();
+            let written = prepared.committed(at);
+            committed = Some(written);
+            written.sent(&source, at, prepared.rejection).unwrap()
+        }
     }
 
     #[cfg(test)]
@@ -1367,6 +1443,7 @@ impl BusHandle {
             Self {
                 setpoints,
                 sent,
+                reference_write: Arc::default(),
                 command,
                 events,
                 stats: Arc::new(Mutex::new(BusStats::default())),
@@ -1479,6 +1556,9 @@ fn transient(e: &io::Error) -> bool {
 }
 
 #[cfg(test)]
+pub(crate) use tests::paused_hold_bus;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1569,12 +1649,7 @@ mod tests {
             first.values.map(|s| s.kd),
             [3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
         );
-        let committed = Committed {
-            at,
-            values: first.values,
-            motion_velocity: first.motion_velocity,
-            gravity: first.gravity,
-        };
+        let committed = first.committed(at);
         let next = published
             .prepare(now + Duration::from_millis(30), Some(committed))
             .unwrap();
@@ -1791,18 +1866,8 @@ mod tests {
                             peak_friction = friction
                                 .into_iter()
                                 .fold(peak_friction, |peak, f| peak.max(f.abs()));
-                            baseline = Some(Committed {
-                                at,
-                                values: normal.values,
-                                motion_velocity: normal.motion_velocity,
-                                gravity: normal.gravity,
-                            });
-                            tuned = Some(Committed {
-                                at,
-                                values: actual.values,
-                                motion_velocity: actual.motion_velocity,
-                                gravity: actual.gravity,
-                            });
+                            baseline = Some(normal.committed(at));
+                            tuned = Some(actual.committed(at));
                         }
                         assert!(peak_friction > 0.01);
                         let held = tuned.unwrap();
@@ -1992,12 +2057,7 @@ mod tests {
                 let packet = encode(i as u8, calibration[i].command(s)).unwrap();
                 assert_eq!(packet.len(), COMMAND_LEN);
             }
-            committed = Some(Committed {
-                at,
-                values: prepared.values,
-                motion_velocity: prepared.motion_velocity,
-                gravity,
-            });
+            committed = Some(prepared.committed(at));
             last = Some(published);
         }
         let committed = committed.unwrap();
@@ -2051,15 +2111,7 @@ mod tests {
         let mut fresh = published.clone();
         fresh.reference.as_mut().unwrap().at = at;
         let resumed = fresh
-            .prepare(
-                at + WRITE_PERIOD,
-                Some(Committed {
-                    at,
-                    values: held.values,
-                    motion_velocity: [0.0; 7],
-                    gravity: held.gravity,
-                }),
-            )
+            .prepare(at + WRITE_PERIOD, Some(held.committed(at)))
             .unwrap();
         assert!(resumed.rejection.is_none());
         assert!(resumed.values[0].q > held.values[0].q);
@@ -2430,6 +2482,7 @@ mod tests {
         read_error: Option<io::ErrorKind>,
         late_read: bool,
         pause_after_servo_packet: Option<(u8, Duration)>,
+        hold_write: Option<(Sender<()>, EventReceiver<()>)>,
         fail_once_for_mode: Option<(u8, io::ErrorKind)>,
     }
 
@@ -2496,7 +2549,18 @@ mod tests {
             if pause.is_some() {
                 w.pause_after_servo_packet = None;
             }
+            let hold = if n == COMMAND_LEN && buf[2] == 0x90 && buf[6..8] == [0, 0] {
+                w.hold_write.take()
+            } else {
+                None
+            };
             drop(w);
+            if let Some((entered, release)) = hold {
+                entered.send(()).unwrap();
+                release
+                    .recv_timeout(Duration::from_secs(3))
+                    .map_err(io::Error::other)?;
+            }
             // The complete packet was accepted before this scheduling gap.
             // This must not consume the next packet's I/O progress deadline.
             if let Some(pause) = pause {
@@ -2633,6 +2697,24 @@ mod tests {
             ..Wire::default()
         });
         BusHandle::start(bus).unwrap()
+    }
+
+    pub(crate) fn paused_hold_bus(
+        epoch: Arc<AtomicU64>,
+    ) -> (BusHandle, EventReceiver<()>, Sender<()>) {
+        let (entered, in_flight) = bounded(1);
+        let (release, wait) = bounded(1);
+        let (mut bus, _) = fake_bus(Wire {
+            write_chunk: COMMAND_LEN,
+            hold_write: Some((entered, wait)),
+            ..Wire::default()
+        });
+        bus.budget = TEST_IO_BUDGET;
+        (
+            BusHandle::start_with_epoch(bus, None, epoch).unwrap(),
+            in_flight,
+            release,
+        )
     }
 
     fn wait_for_protocol(mut ready: impl FnMut() -> bool) {

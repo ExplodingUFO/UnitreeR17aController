@@ -1,6 +1,6 @@
 use crate::{
     arm::{ApiError, ArmHandle, CommandRequest, ControlRequest, Operation, Snapshot},
-    journal::{Journal, LogPage, LogPageQuery, LogRecord, TraceSummary},
+    journal::{Journal, LogFilters, LogPage, LogPageQuery, LogRecord, TraceSummary},
     protocol,
     teaching::{self, PlaybackOptions, Program, Trajectory},
 };
@@ -45,6 +45,8 @@ struct ApiState {
     journal: Journal,
     token: Arc<String>,
     sockets: Arc<Semaphore>,
+    calibration_preview:
+        Arc<std::sync::Mutex<Option<Arc<crate::calibration_path::CartesianProgram>>>>,
 }
 
 pub struct ServerHandle {
@@ -98,6 +100,7 @@ pub(crate) async fn launch_at(
         journal: journal.clone(),
         token: Arc::new(token),
         sockets: Arc::new(Semaphore::new(16)),
+        calibration_preview: Default::default(),
     };
     let cors = CorsLayer::new()
         .allow_origin(
@@ -118,6 +121,7 @@ pub(crate) async fn launch_at(
         .route("/v1/commands", post(command))
         .route("/v1/logs", get(logs))
         .route("/v1/logs/page", get(log_page))
+        .route("/v1/logs/filters", get(log_filters))
         .route("/v1/calibrations", get(calibrations))
         .route("/v1/calibrations/preview", post(calibration_preview))
         .route("/v1/calibrations/{id}", get(calibration))
@@ -226,6 +230,34 @@ async fn control(
 ) -> Result<Json<crate::arm::ControlReply>, ApiError> {
     state.arm.control(request).await.map(Json)
 }
+/// Resolve the immutable preview on a worker. A different preview replacing the
+/// cache changes preparation cost only, never the time law of a submitted path.
+fn confirmed_calibration(
+    mut submitted: Arc<crate::calibration_path::CartesianProgram>,
+    cached: Option<Arc<crate::calibration_path::CartesianProgram>>,
+    joint_speeds: Vec<f64>,
+) -> Result<Arc<crate::calibration_path::CartesianProgram>, ApiError> {
+    if let Some(id) = &submitted.preview_id {
+        if *id != submitted.content_id() {
+            return Err(ApiError::new(
+                "stale_preview",
+                "行程或参数已变化，请重新生成预览",
+            ));
+        }
+        if let Some(confirmed) = cached.filter(|p| p.preview_id.as_ref() == Some(id)) {
+            return Ok(confirmed);
+        }
+    } else {
+        Arc::make_mut(&mut submitted).joint_speeds = joint_speeds;
+    }
+    let model = crate::kinematics::Kinematics::load(&submitted.side)
+        .map_err(|e| ApiError::new("preview_failed", e))?;
+    Arc::make_mut(&mut submitted)
+        .prepare(&model)
+        .map_err(|e| ApiError::new("preview_failed", e))?;
+    Ok(submitted)
+}
+
 async fn command(
     State(state): State<ApiState>,
     Json(mut request): Json<CommandRequest>,
@@ -249,6 +281,21 @@ async fn command(
         request.operation = Operation::TeachingPrepared {
             program: Arc::new(program),
         };
+    }
+    if let Operation::CalibrateStart { settings } = &mut request.operation
+        && settings.cartesian.is_some()
+        && state.arm.snapshot().port.is_some()
+    {
+        let cached = state.calibration_preview.lock().unwrap().clone();
+        let joint_speeds = crate::calibration::speeds(settings);
+        let submitted = settings.cartesian.take().unwrap();
+        settings.cartesian = Some(
+            tokio::task::spawn_blocking(move || {
+                confirmed_calibration(submitted, cached, joint_speeds)
+            })
+            .await
+            .map_err(|_| ApiError::new("preview_failed", "轨迹准备未完成"))??,
+        );
     }
     let request_id = request.request_id.clone();
     state.arm.command(request)?;
@@ -289,6 +336,14 @@ async fn log_page(
                 ApiError::new("journal_unavailable", "日志暂不可读")
             }
         })
+}
+
+async fn log_filters(State(state): State<ApiState>) -> Result<Json<LogFilters>, ApiError> {
+    tokio::task::spawn_blocking(move || state.journal.log_filters())
+        .await
+        .map_err(|_| ApiError::new("journal_unavailable", "日志筛选项读取失败"))?
+        .map(Json)
+        .map_err(|_| ApiError::new("journal_unavailable", "日志筛选项暂不可读"))
 }
 
 #[derive(Default, Deserialize)]
@@ -352,7 +407,9 @@ async fn calibration_preview(
             tcp,
             request,
         )?;
-        serde_json::to_vec(&preview).map_err(|e| e.to_string())
+        let bytes = serde_json::to_vec(&preview).map_err(|e| e.to_string())?;
+        *state.calibration_preview.lock().unwrap() = Some(Arc::new(preview.program));
+        Ok::<_, String>(bytes)
     })
     .await
     .map_err(|_| ApiError::new("preview_failed", "轨迹预览未完成"))?
@@ -826,6 +883,42 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn confirmed_calibration_reuses_approved_timing_even_after_cache_replacement() {
+        let model = crate::kinematics::Kinematics::load("right").unwrap();
+        let preview = crate::calibration_path::preview(
+            &model,
+            "right",
+            [0.3, 0.7, 1.1, 0.9, -0.4, 0.2, -0.3],
+            crate::kinematics::Pose::identity(),
+            crate::calibration_path::PreviewRequest {
+                amplitude: Some(0.05),
+                joint_speeds: vec![0.03, 0.06],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let original = Arc::new(preview.program);
+        let submitted: Arc<crate::calibration_path::CartesianProgram> =
+            serde_json::from_slice(&serde_json::to_vec(&original).unwrap()).unwrap();
+        let cached =
+            confirmed_calibration(submitted.clone(), Some(original.clone()), vec![]).unwrap();
+        assert!(Arc::ptr_eq(&original, &cached));
+        let restored = confirmed_calibration(submitted.clone(), None, vec![]).unwrap();
+        assert_eq!(original.timed, restored.timed);
+        assert_eq!(original.joint_legs, restored.joint_legs);
+        let mut changed = submitted;
+        Arc::make_mut(&mut changed).speed *= 0.5;
+        for cache in [None, Some(original)] {
+            assert_eq!(
+                confirmed_calibration(changed.clone(), cache, vec![])
+                    .unwrap_err()
+                    .code,
+                "stale_preview"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1898,6 +1991,133 @@ mod tests {
 
     use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn log_filters_http_uses_persisted_history_and_combines_exact_time_and_search() {
+        fn page_url(base: &str, query: &[(&str, &str)]) -> reqwest::Url {
+            let mut url = reqwest::Url::parse(&format!("{base}/v1/logs/page")).unwrap();
+            url.query_pairs_mut().extend_pairs(query.iter().copied());
+            url
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("events.db");
+        let journal = Journal::start(path.clone()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !journal.stats().healthy {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        for i in 0..8 {
+            conn.execute("INSERT INTO events(ts_ms,level,source,code,message) VALUES(?1,'info','log-filter-fixture','move','needle')", [1000 + i]).unwrap();
+        }
+        conn.execute("INSERT INTO events(ts_ms,level,source,code,message) VALUES(1002,'warn','old-session','50%_界','different')", []).unwrap();
+        drop(conn);
+        assert!(journal.shutdown(Duration::from_secs(2)));
+        drop(journal);
+        let journal = Journal::start(path.clone()).unwrap();
+        let arm = ArmHandle::spawn(journal.clone()).unwrap();
+        let server = launch_at(
+            arm.clone(),
+            journal.clone(),
+            "log-filter-key".into(),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await
+        .unwrap();
+        let base = server.base_url();
+        let client = reqwest::Client::new();
+        let filters = client
+            .get(format!("{base}/v1/logs/filters"))
+            .bearer_auth("log-filter-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(filters.status(), StatusCode::OK);
+        let filters: LogFilters = filters.json().await.unwrap();
+        assert!(filters.levels.contains(&"warn".to_string()));
+        assert!(filters.sources.contains(&"old-session".to_string()));
+        assert!(filters.codes.contains(&"50%_界".to_string()));
+        let query = [
+            ("level", "info"),
+            ("source", "log-filter-fixture"),
+            ("code", "move"),
+            ("search", "NEEDLE"),
+            ("from_ms", "1001"),
+            ("to_ms", "1003"),
+            ("page_size", "2"),
+        ];
+        let response = client
+            .get(page_url(&base, &query))
+            .bearer_auth("log-filter-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let first: LogPage = response.json().await.unwrap();
+        assert_eq!(
+            (first.total, first.total_pages, first.items.len()),
+            (3, 2, 2)
+        );
+        assert_eq!(
+            first.items.iter().map(|r| r.ts_ms).collect::<Vec<_>>(),
+            [1003, 1002]
+        );
+        let through = first.through_id.to_string();
+        let mut next = query.to_vec();
+        next.extend([("page", "2"), ("through_id", &through)]);
+        let second: LogPage = client
+            .get(page_url(&base, &next))
+            .bearer_auth("log-filter-key")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!((second.total, second.items[0].ts_ms), (3, 1001));
+        let response = client
+            .get(page_url(&base, &[("from_ms", "1003"), ("to_ms", "1001")]))
+            .bearer_auth("log-filter-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["code"],
+            "invalid_log_query"
+        );
+        // An exclusive database writer does not pause the control actor or read
+        // endpoints. WAL readers keep seeing the last committed history.
+        let lock = rusqlite::Connection::open(&path).unwrap();
+        lock.execute_batch("BEGIN EXCLUSIVE; UPDATE events SET message='uncommitted' WHERE id=1;")
+            .unwrap();
+        let before = arm.snapshot().seq;
+        for _ in 0..3 {
+            let (filters, state) = tokio::join!(
+                client
+                    .get(format!("{base}/v1/logs/filters"))
+                    .bearer_auth("log-filter-key")
+                    .send(),
+                client
+                    .get(format!("{base}/v1/state"))
+                    .bearer_auth("log-filter-key")
+                    .send()
+            );
+            assert_eq!(filters.unwrap().status(), StatusCode::OK);
+            assert_eq!(state.unwrap().status(), StatusCode::OK);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(arm.snapshot().seq > before);
+        assert!(arm.snapshot().owner.is_none());
+        assert!(arm.snapshot().action.is_none());
+        lock.execute_batch("ROLLBACK").unwrap();
+        assert!(arm.shutdown(Duration::from_millis(500)));
+        server.shutdown().await;
+        assert!(journal.shutdown(Duration::from_secs(2)));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn log_page_http_auth_query_snapshot_and_legacy_reads_do_not_issue_commands() {
         fn page_url(base: &str, query: &[(&str, &str)]) -> reqwest::Url {
@@ -1965,7 +2185,12 @@ mod tests {
         let base = server.base_url();
         let client = reqwest::Client::new();
         let before = serde_json::to_value(arm.snapshot()).unwrap();
-        for path in ["/v1/logs", "/v1/logs/page", "/v1/logs/page?through_id=-1"] {
+        for path in [
+            "/v1/logs",
+            "/v1/logs/page",
+            "/v1/logs/filters",
+            "/v1/logs/page?through_id=-1",
+        ] {
             for auth in [None, Some("wrong-key")] {
                 let mut request = client.get(format!("{base}{path}"));
                 if let Some(auth) = auth {
@@ -2000,6 +2225,8 @@ mod tests {
             ("through_id", "-1".to_owned()),
             ("through_id", "bad".to_owned()),
             ("through_id", "9223372036854775808".to_owned()),
+            ("from_ms", "bad".to_owned()),
+            ("to_ms", "9223372036854775808".to_owned()),
             ("search", "x".repeat(513)),
             ("search", "界".repeat(171)),
         ] {

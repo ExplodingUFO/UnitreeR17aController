@@ -1,6 +1,7 @@
 mod arm;
 mod calibration;
 mod calibration_path;
+mod calibration_spline;
 mod friction;
 mod journal;
 mod kinematics;

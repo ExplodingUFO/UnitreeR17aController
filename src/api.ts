@@ -82,10 +82,14 @@ export interface CalibrationSettings {
 export interface CalibrationPreviewRequest {
   amplitude?: number | null;
   speed: number;
+  joint_speeds: number[];
   axes: number[];
   motion: MotionTuning;
 }
 export interface CartesianProgram {
+  preview_id?: string;
+  joint_targets?: [number, number][];
+  joint_speeds?: number[];
   side: Side;
   origin: JointPositions;
   tcp: Pose;
@@ -98,6 +102,7 @@ export interface CartesianProgram {
   auto_range?: boolean;
 }
 export interface PreviewPoint {
+  t_s?: number;
   joints: JointPositions;
   tcp: [number, number, number];
   segment: number;
@@ -105,6 +110,7 @@ export interface PreviewPoint {
   axis: number;
 }
 export interface CalibrationPreview {
+  cartesian_duration_s?: number;
   program: CartesianProgram;
   points: PreviewPoint[];
   ranges?: { axis: number; negative: number; positive: number }[];
@@ -595,6 +601,16 @@ export interface LogPageQuery {
   page_size: number;
   search: string;
   through_id?: number;
+  level?: string;
+  source?: string;
+  code?: string;
+  from_ms?: number;
+  to_ms?: number;
+}
+export interface LogFilters {
+  levels: string[];
+  sources: string[];
+  codes: string[];
 }
 export interface LogPage {
   items: Log[];
@@ -902,9 +918,22 @@ class DesktopApi {
     });
     if (query.through_id !== undefined)
       params.set("through_id", String(query.through_id));
+    for (const key of [
+      "level",
+      "source",
+      "code",
+      "from_ms",
+      "to_ms",
+    ] as const) {
+      const value = query[key];
+      if (value !== undefined && value !== "") params.set(key, String(value));
+    }
     return this.request<LogPage>(`/v1/logs/page?${params}`, undefined, {
       signal,
     });
+  }
+  async readLogFilters(signal?: AbortSignal) {
+    return this.request<LogFilters>("/v1/logs/filters", undefined, { signal });
   }
   async startTrace(durationMs = 10000, signal?: AbortSignal) {
     return this.request<TraceSummary>(
@@ -971,7 +1000,7 @@ class DesktopApi {
     const preview = await this.request<CalibrationPreview>(
       "/v1/calibrations/preview",
       request,
-      { signal },
+      { signal, timeoutMs: null },
     );
     if (
       !preview?.program ||
@@ -1254,7 +1283,9 @@ class DesktopApi {
           lease_id: this.lease,
           generation,
         },
-        kind.startsWith("teach_") ? { signal, timeoutMs: null } : { signal },
+        kind.startsWith("teach_") || kind === "calibrate_start"
+          ? { signal, timeoutMs: null }
+          : { signal },
       );
     } catch (error) {
       if (

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, type LogPage, type LogPageQuery } from "./api";
+import { api, type LogFilters, type LogPage, type LogPageQuery } from "./api";
 
 const dateFormat = new Intl.DateTimeFormat("zh-CN", {
   year: "numeric",
@@ -21,6 +21,21 @@ export default function LogsPanel({
   active: boolean;
 }) {
   const [search, setSearch] = useState("");
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [choices, setChoices] = useState<LogFilters>({
+    levels: [],
+    sources: [],
+    codes: [],
+  });
+  const [choicesError, setChoicesError] = useState("");
+  const [retry, setRetry] = useState(0);
+  const fromMs = from ? new Date(from).getTime() : undefined;
+  const toMs = to ? new Date(to).getTime() : undefined;
+  const rangeError =
+    fromMs !== undefined && toMs !== undefined && fromMs > toMs
+      ? "开始时间不能晚于结束时间"
+      : "";
   const [query, setQuery] = useState<LogPageQuery>({
     page: 1,
     page_size: 50,
@@ -49,6 +64,26 @@ export default function LogsPanel({
   useEffect(() => {
     if (!online || !active) return;
     const controller = new AbortController();
+    void api
+      .readLogFilters(controller.signal)
+      .then((filters) => {
+        if (!controller.signal.aborted) {
+          setChoices(filters);
+          setChoicesError("");
+        }
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted)
+          setChoicesError(
+            error instanceof Error ? error.message : "筛选项读取失败",
+          );
+      });
+    return () => controller.abort();
+  }, [online, active, retry, data?.through_id]);
+
+  useEffect(() => {
+    if (!online || !active || rangeError) return;
+    const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     setLoading(true);
     setError("");
@@ -76,7 +111,7 @@ export default function LogsPanel({
       controller.abort();
       clearTimeout(timer);
     };
-  }, [online, active, query]);
+  }, [online, active, query, rangeError, retry]);
 
   const go = (page: number) => {
     if (!data || loading) return;
@@ -86,10 +121,40 @@ export default function LogsPanel({
       through_id: page === 1 ? undefined : data.through_id,
     }));
   };
-  const latest = () =>
+  const latest = () => {
     setQuery((current) => ({ ...current, page: 1, through_id: undefined }));
+    setRetry((current) => current + 1);
+  };
+  const filter = (fields: Partial<LogPageQuery>) => {
+    setData(null);
+    setQuery((current) => ({
+      ...current,
+      ...fields,
+      page: 1,
+      through_id: undefined,
+    }));
+  };
+  const time = (field: "from_ms" | "to_ms", value: string) => {
+    if (field === "from_ms") setFrom(value);
+    else setTo(value);
+    filter({ [field]: value ? new Date(value).getTime() : undefined });
+  };
+  const filtered = Boolean(
+    search || query.level || query.source || query.code || from || to,
+  );
+  const clear = () => {
+    setSearch("");
+    setFrom("");
+    setTo("");
+    setData(null);
+    setQuery((current) => ({
+      page: 1,
+      page_size: current.page_size,
+      search: "",
+    }));
+  };
   const pendingSearch = search !== query.search;
-  const busy = loading || pendingSearch;
+  const busy = loading || pendingSearch || Boolean(rangeError);
   const start = data?.total ? (data.page - 1) * data.page_size + 1 : 0;
   const end = data ? Math.min(data.page * data.page_size, data.total) : 0;
 
@@ -107,18 +172,73 @@ export default function LogsPanel({
             onChange={(event) => setSearch(event.target.value)}
           />
         </label>
+        {(
+          [
+            ["level", "级别", choices.levels],
+            ["source", "来源", choices.sources],
+            ["code", "编号", choices.codes],
+          ] as const
+        ).map(([key, label, values]) => (
+          <label className="log-history-filter" key={key}>
+            <span>{label}</span>
+            <select
+              aria-label={`筛选${label}`}
+              value={query[key] ?? ""}
+              onChange={(event) =>
+                filter({ [key]: event.target.value || undefined })
+              }
+            >
+              <option value="">全部</option>
+              {Array.from(
+                new Set([...(query[key] ? [query[key]!] : []), ...values]),
+              )
+                .filter(Boolean)
+                .map((value) => (
+                  <option key={value} value={value}>
+                    {value}
+                  </option>
+                ))}
+            </select>
+          </label>
+        ))}
+        <button
+          type="button"
+          className="log-clear"
+          disabled={!filtered}
+          onClick={clear}
+        >
+          清除
+        </button>
+      </div>
+      <div className="log-history-times">
+        <label className="log-time-filter">
+          <span>开始</span>
+          <input
+            type="datetime-local"
+            step="0.001"
+            value={from}
+            aria-label="开始时间（本地）"
+            onChange={(event) => time("from_ms", event.target.value)}
+          />
+        </label>
+        <span className="log-time-separator">至</span>
+        <label className="log-time-filter">
+          <span>结束</span>
+          <input
+            type="datetime-local"
+            step="0.001"
+            value={to}
+            aria-label="结束时间（本地）"
+            onChange={(event) => time("to_ms", event.target.value)}
+          />
+        </label>
         <label className="log-page-size">
           每页
           <select
             value={query.page_size}
             aria-label="每页日志条数"
             onChange={(event) =>
-              setQuery((current) => ({
-                ...current,
-                page: 1,
-                page_size: Number(event.target.value),
-                through_id: undefined,
-              }))
+              filter({ page_size: Number(event.target.value) })
             }
           >
             {[25, 50, 100].map((size) => (
@@ -126,17 +246,33 @@ export default function LogsPanel({
             ))}
           </select>
         </label>
-        <button type="button" disabled={!online || busy} onClick={latest}>
+        <button
+          type="button"
+          className="log-latest"
+          disabled={!online || busy}
+          onClick={latest}
+        >
           最新
         </button>
       </div>
-      {(!online || error) && (
+      {rangeError && (
         <div className="log-history-error" role="status">
-          <span>{!online ? "服务未连接" : `日志读取失败：${error}`}</span>
+          {rangeError}
+        </div>
+      )}
+      {(!online || error || choicesError) && (
+        <div className="log-history-error" role="status">
+          <span>
+            {!online
+              ? "服务未连接"
+              : error
+                ? `日志读取失败：${error}`
+                : `筛选项读取失败：${choicesError}`}
+          </span>
           {online && (
             <button
               type="button"
-              onClick={() => setQuery((current) => ({ ...current }))}
+              onClick={() => setRetry((current) => current + 1)}
             >
               重试
             </button>
@@ -191,11 +327,13 @@ export default function LogsPanel({
           </table>
         ) : (
           <div className="logs-empty" role="status">
-            {busy
-              ? "正在读取日志…"
-              : query.search
-                ? "没有匹配的日志"
-                : "暂无日志"}
+            {rangeError
+              ? "请调整时间范围"
+              : busy
+                ? "正在读取日志…"
+                : filtered
+                  ? "没有匹配的日志"
+                  : "暂无日志"}
           </div>
         )}
       </div>

@@ -15,11 +15,14 @@ import {
   type View,
   hasJointFeedback,
 } from "./api";
-import RobotScene, {
+import RobotScene, { type PreviewEnvelope } from "./RobotScene";
+import {
+  jointTravel,
   stagePoints,
-  type PreviewEnvelope,
+  stageTimes,
+  sampleStage,
   type PreviewStage,
-} from "./RobotScene";
+} from "./previewTimeline";
 import {
   MotionTuningFields,
   toMotionDraft,
@@ -39,6 +42,15 @@ export interface CalibrationPanelProps {
   onStop: () => void;
 }
 type Page = "settings" | "progress" | "result" | "curves" | "history";
+const previewStages: PreviewStage[] = [
+  "xyz",
+  "cartesian:0",
+  "cartesian:1",
+  "cartesian:2",
+  ...Array.from({ length: 7 }, (_, axis) => `joint:${axis}` as const),
+  "return",
+];
+const browseSeconds = 16;
 type Pending = {
   kind: "start" | "apply" | "restore";
   id: string;
@@ -641,6 +653,9 @@ export default function CalibrationPanel({
     !jointSpeedsText.trim() ||
     (jointSpeeds.length > 0 &&
       jointSpeeds.every((value) => Number.isFinite(value) && value > 0));
+  const jointSpeedsError = jointSpeedsValid
+    ? ""
+    : "关节速度须为正数，以逗号分隔";
   const frictionBudget = frictionBudgetText.trim()
     ? Number(frictionBudgetText)
     : null;
@@ -674,7 +689,12 @@ export default function CalibrationPanel({
         .join(":")
     : "unset";
   const previewContext = `${connection}:${tcpGeometry}`;
-  const previewSettings = JSON.stringify({ amplitude, speed, motion });
+  const previewSettings = JSON.stringify({
+    amplitude,
+    speed,
+    motion,
+    jointSpeeds: jointSpeedsValid ? jointSpeeds : null,
+  });
   const previewContextRef = useRef(previewContext);
   previewContextRef.current = previewContext;
   const [generated, setGenerated] = useState<{
@@ -687,6 +707,14 @@ export default function CalibrationPanel({
     generated.settings === previewSettings
       ? generated.data
       : null;
+  const plannedSpeeds = preview?.program.joint_speeds;
+  const speedLabel = plannedSpeeds?.length
+    ? plannedSpeeds
+        .map((value) => Number((value * DEG).toPrecision(6)))
+        .join(" / ")
+    : speedEntries.length && jointSpeedsValid
+      ? speedEntries.join(" / ")
+      : "1 / 2 / 4";
   const [previewBusy, setPreviewBusy] = useState(false);
   const previewRequest = useRef<AbortController | null>(null);
   const [previewProgress, setPreviewProgress] = useState(0.25);
@@ -697,6 +725,50 @@ export default function CalibrationPanel({
     () => (preview ? stagePoints(preview, previewStage) : []),
     [preview, previewStage],
   );
+  const availableStages = useMemo(
+    () =>
+      previewStages.filter(
+        (stage) => preview && stagePoints(preview, stage).length,
+      ),
+    [preview],
+  );
+  const selectedTimes = useMemo(
+    () => stageTimes(selectedPoints),
+    [selectedPoints],
+  );
+  const stageSeconds = selectedTimes?.at(-1);
+  const jointRange = useMemo(() => {
+    const travel = preview && jointTravel(preview.program, selectedPoints);
+    return travel
+      ?.map(
+        (radians) =>
+          (radians * DEG).toLocaleString("zh-CN", {
+            maximumFractionDigits: 2,
+            signDisplay: "exceptZero",
+          }) + "°",
+      )
+      .join(" 至 ");
+  }, [preview, selectedPoints]);
+  const playbackSeconds = stageSeconds ?? browseSeconds;
+  const currentPoint = sampleStage(
+    selectedPoints,
+    selectedTimes,
+    previewProgress,
+  )?.from;
+  const currentStageLabel = !currentPoint
+    ? "无路径"
+    : currentPoint.space === "cartesian"
+      ? `末端 ${"XYZ"[currentPoint.axis]}`
+      : currentPoint.space === "joint_return"
+        ? "回到原位"
+        : `关节 J${currentPoint.axis + 1}`;
+  const roundSeconds = useMemo(() => {
+    if (!preview) return undefined;
+    const seconds = preview.cartesian_duration_s;
+    if (seconds !== undefined && Number.isFinite(seconds) && seconds >= 0)
+      return seconds;
+    return stageTimes(stagePoints(preview, "xyz"))?.at(-1);
+  }, [preview]);
   const tcpExtents = useMemo(() => {
     const points = preview?.points.filter(
       (point) => point.space === "cartesian",
@@ -715,18 +787,7 @@ export default function CalibrationPanel({
       setPreviewStage(stage);
       return;
     }
-    const candidates: PreviewStage[] = [
-      stage,
-      "cartesian:0",
-      "cartesian:1",
-      "cartesian:2",
-      ...Array.from(
-        { length: 7 },
-        (_, axis) => `joint:${axis}` as PreviewStage,
-      ),
-      "return",
-      "xyz",
-    ];
+    const candidates = [stage, ...previewStages.slice(1), "xyz" as const];
     const visibleStage =
       candidates.find((candidate) => {
         const points = stagePoints(data, candidate);
@@ -761,7 +822,14 @@ export default function CalibrationPanel({
         displacement = delta;
       }
     });
-    setPreviewProgress(points.length > 1 ? selected / (points.length - 1) : 0);
+    const times = stageTimes(points);
+    setPreviewProgress(
+      times
+        ? times[selected] / times.at(-1)!
+        : points.length > 1
+          ? selected / (points.length - 1)
+          : 0,
+    );
   }
   const [pending, setPendingState] = useState<Pending | null>(null);
   const pendingRef = useRef<Pending | null>(null);
@@ -858,16 +926,17 @@ export default function CalibrationPanel({
   useEffect(() => {
     if (!previewPlaying || !preview || !open || page !== "settings") return;
     let frame = 0;
-    const start = performance.now() - previewProgress * 16000;
+    const duration = playbackSeconds * 1000;
+    const start = performance.now() - previewProgress * duration;
     const animate = (time: number) => {
-      const progress = Math.min(1, (time - start) / 16000);
+      const progress = Math.min(1, Math.max(0, (time - start) / duration));
       setPreviewProgress(progress);
       if (progress < 1) frame = requestAnimationFrame(animate);
       else setPreviewPlaying(false);
     };
     frame = requestAnimationFrame(animate);
     return () => cancelAnimationFrame(frame);
-  }, [previewPlaying, preview, open, page]);
+  }, [previewPlaying, preview, open, page, playbackSeconds]);
   useEffect(() => {
     const before = previousConnection.current;
     previousConnection.current = { connection, online: view.online };
@@ -947,6 +1016,7 @@ export default function CalibrationPanel({
     if (result && ["rejected", "failed", "cancelled"].includes(result.status)) {
       setPending(null);
       if (request.kind === "start") {
+        if (result.code === "stale_preview") setGenerated(null);
         setRun(
           result.status === "rejected"
             ? null
@@ -1191,7 +1261,7 @@ export default function CalibrationPanel({
     idleReason ||
     (!s.enabled ? "请先使能机械臂" : "") ||
     (busy ? "等待当前请求完成" : "") ||
-    (!jointSpeedsValid ? "关节速度须为正数，以逗号分隔" : "") ||
+    jointSpeedsError ||
     (!frictionBudgetValid ? "补偿幅值须为非负数或留空" : "") ||
     (previewBusy || !preview ? "请先生成并检查运动预览" : "");
   const previewReason =
@@ -1205,7 +1275,7 @@ export default function CalibrationPanel({
             ? "请输入大于 0 的末端速度"
             : !motion
               ? "运动偏好须为正数"
-              : "";
+              : jointSpeedsError;
   // The current report and servo config are sufficient; TCP/pose changes do not invalidate tuning.
   const applyReason =
     local || reportId !== status?.report?.id
@@ -1254,6 +1324,7 @@ export default function CalibrationPanel({
         {
           amplitude: amplitude == null ? null : amplitude / 1000,
           speed: speed / 1000,
+          joint_speeds: jointSpeeds,
           axes: [0, 1, 2],
           motion: motion!,
         },
@@ -1272,11 +1343,19 @@ export default function CalibrationPanel({
       });
       chooseStage("cartesian:0", data);
     } catch (error) {
-      if (!controller.signal.aborted && alive.current)
+      if (!controller.signal.aborted && alive.current) {
+        let reason = error instanceof Error ? error.message : "请重试";
+        const planningFailed =
+          error instanceof ApiError &&
+          (error.code === "preview_failed" ||
+            (!error.code && error.status === 422));
+        if (planningFailed && !/调整|缩短|降低|请先|请重新/.test(reason))
+          reason += "。可在高级设置中缩短单侧行程或降低末端速度后重试";
         setFeedback({
-          text: error instanceof Error ? error.message : "生成预览失败",
+          text: `生成预览失败。${reason}`,
           tone: "error",
         });
+      }
     } finally {
       if (!controller.signal.aborted && alive.current) setPreviewBusy(false);
     }
@@ -1362,6 +1441,7 @@ export default function CalibrationPanel({
         ) {
           setPending(null);
           if (kind === "start") {
+            if (error.code === "stale_preview") setGenerated(null);
             setRun(null);
             setPage("settings");
           }
@@ -1595,9 +1675,10 @@ export default function CalibrationPanel({
                         value={jointSpeedsText}
                         disabled={busy}
                         aria-invalid={!jointSpeedsValid}
-                        onChange={(event) =>
-                          setJointSpeedsText(event.target.value)
-                        }
+                        onChange={(event) => {
+                          setJointSpeedsText(event.target.value);
+                          setFeedback(null);
+                        }}
                       />
                     </label>
                     <label className="calibration-fit-setting">
@@ -1641,14 +1722,11 @@ export default function CalibrationPanel({
                   <li>
                     <b>双向采集 · 拟合与验证</b>
                     <span>
-                      逐轴 ±
+                      单侧最多{" "}
                       {preview
                         ? degrees(preview.program.joint_excursion / 2, 0)
                         : "8"}
-                      ° ·{" "}
-                      {jointSpeedsText.trim() && jointSpeedsValid
-                        ? speedEntries.join(" / ")
-                        : "1 / 2 / 4"}
+                      ° · {speedLabel}
                       °/s
                     </span>
                   </li>
@@ -1695,29 +1773,32 @@ export default function CalibrationPanel({
                 </div>
                 {preview ? (
                   <>
+                    <p
+                      className="calibration-preview-hint"
+                      title="仅计一次 XYZ 往返，不含关节试验、分析和重复执行"
+                    >
+                      XYZ 往返单轮
+                      {roundSeconds === undefined
+                        ? "用时未知"
+                        : `预计 ${roundSeconds.toFixed(1)} 秒`}
+                      {jointRange && currentPoint && (
+                        <>
+                          {" "}
+                          · J{currentPoint.axis + 1} 相对原位 {jointRange}
+                        </>
+                      )}
+                    </p>
                     <nav
                       className="calibration-preview-stages"
                       aria-label="预览阶段"
                     >
-                      {(
-                        [
-                          "xyz",
-                          "cartesian:0",
-                          "cartesian:1",
-                          "cartesian:2",
-                          ...Array.from(
-                            { length: 7 },
-                            (_, axis) => `joint:${axis}`,
-                          ),
-                          "return",
-                        ] as PreviewStage[]
-                      ).map((stage) => {
+                      {previewStages.map((stage) => {
                         const axis = Number(stage.split(":")[1]);
                         return (
                           <button
                             key={stage}
                             aria-pressed={previewStage === stage}
-                            disabled={!stagePoints(preview, stage).length}
+                            disabled={!availableStages.includes(stage)}
                             className={
                               stage.startsWith("cartesian:")
                                 ? `axis-${"xyz"[axis]}`
@@ -1739,43 +1820,46 @@ export default function CalibrationPanel({
                     <div className="calibration-preview-scrub">
                       <button
                         aria-label={previewPlaying ? "暂停预览" : "播放预览"}
+                        title={
+                          stageSeconds === undefined
+                            ? "用 16 秒浏览当前阶段"
+                            : "按当前阶段的计划时间播放"
+                        }
                         onClick={() => {
                           if (previewProgress >= 1) setPreviewProgress(0);
                           setPreviewPlaying(!previewPlaying);
                         }}
                       >
-                        {previewPlaying ? "暂停" : "播放"}
+                        {previewPlaying
+                          ? "暂停"
+                          : stageSeconds === undefined
+                            ? "16 秒浏览"
+                            : "按计划播放"}
                       </button>
                       <input
                         type="range"
                         aria-label="计划姿态进度"
+                        aria-valuetext={
+                          stageSeconds === undefined
+                            ? `${currentStageLabel}，${Math.round(previewProgress * 100)}%`
+                            : `${currentStageLabel}，${(previewProgress * stageSeconds).toFixed(1)} 秒，共 ${stageSeconds.toFixed(1)} 秒`
+                        }
                         min={0}
                         max={1}
-                        step={0.001}
+                        step={stageSeconds === undefined ? 0.001 : "any"}
                         value={previewProgress}
                         onChange={(event) => {
                           setPreviewPlaying(false);
                           setPreviewProgress(Number(event.target.value));
                         }}
                       />
-                      <output>
-                        {(() => {
-                          const point =
-                            selectedPoints[
-                              Math.min(
-                                selectedPoints.length - 1,
-                                Math.floor(
-                                  previewProgress * (selectedPoints.length - 1),
-                                ),
-                              )
-                            ];
-                          if (!point) return "无路径";
-                          return point.space === "cartesian"
-                            ? `末端 ${"XYZ"[point.axis] ?? ""}`
-                            : point.space === "joint_return"
-                              ? "回到原位"
-                              : `关节 J${point.axis + 1}`;
-                        })()}
+                      <output style={{ width: "auto" }} aria-live="off">
+                        {currentStageLabel}
+                        {stageSeconds === undefined
+                          ? previewPlaying
+                            ? " · 16 秒浏览"
+                            : ""
+                          : ` · ${(previewProgress * stageSeconds).toFixed(1)} / ${stageSeconds.toFixed(1)} s`}
                       </output>
                     </div>
                     <div className="calibration-preview-extents">

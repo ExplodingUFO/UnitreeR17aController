@@ -12,50 +12,21 @@ import type {
   Side,
   TeachingPreview,
 } from "./api";
+import {
+  scenePreview,
+  stagePoints,
+  stageTimes,
+  sampleStage,
+  type PreviewStage,
+  type ScenePoint,
+  type ScenePreview,
+} from "./previewTimeline";
+export { stagePoints, type PreviewStage } from "./previewTimeline";
+
 export interface PreviewEnvelope {
   min: number[];
   max: number[];
   size: number[];
-}
-export type PreviewStage =
-  | "xyz"
-  | "return"
-  | `teaching:${"approach" | "path" | "all"}`
-  | `cartesian:${number}`
-  | `joint:${number}`;
-type ScenePoint = PreviewPoint & { t_ms?: number };
-type ScenePreview = { points: ScenePoint[] };
-function scenePreview(preview: ScenePreview | TeachingPreview): ScenePreview {
-  return "trajectory_id" in preview
-    ? {
-        points: preview.points.map((point) => ({
-          ...point,
-          space: `teaching_${point.phase}`,
-          axis: 0,
-          segment: point.phase === "approach" ? 0 : 1,
-        })),
-      }
-    : preview;
-}
-export function stagePoints(
-  preview: ScenePreview | TeachingPreview,
-  stage: PreviewStage,
-) {
-  return scenePreview(preview).points.filter((point) =>
-    stage.startsWith("teaching:")
-      ? stage === "teaching:all"
-        ? point.space.startsWith("teaching_")
-        : point.space === `teaching_${stage.split(":")[1]}`
-      : stage === "xyz"
-        ? point.space === "cartesian"
-        : stage === "return"
-          ? point.space === "joint_return"
-          : stage.startsWith("cartesian:")
-            ? point.space === "cartesian" &&
-              point.axis === Number(stage.split(":")[1])
-            : point.space === "joint" &&
-              point.axis === Number(stage.split(":")[1]),
-  );
 }
 interface Props {
   side: Side;
@@ -190,6 +161,7 @@ export default function RobotScene({
     let builtStage: PreviewStage | undefined;
     let cachedEnvelope: THREE.Box3 | undefined;
     let selected: ScenePoint[] = [];
+    let selectedTimes: number[] | null = null;
     const sharedGeometry = new Set<THREE.BufferGeometry>();
     const lineMaterials: LineMaterial[] = [];
     const endpointLabels: {
@@ -434,6 +406,7 @@ export default function RobotScene({
         selected = state.preview
           ? stagePoints(state.preview, state.previewStage)
           : [];
+        selectedTimes = stageTimes(selected);
         if (state.preview && selected.length) {
           planned = cloneModel(plannedColor, 0.72);
           planned.name = "preview-selected-pose";
@@ -725,38 +698,11 @@ export default function RobotScene({
       if (box) box.visible = state.showBox;
       element.dataset.aabb = String(!!box?.visible);
       if (planned && selected.length && spec) {
-        let at =
-          THREE.MathUtils.clamp(state.previewProgress, 0, 1) *
-          (selected.length - 1);
-        const firstTime = selected[0].t_ms;
-        const lastTime = selected.at(-1)!.t_ms;
-        if (firstTime !== undefined && lastTime !== undefined) {
-          const time = THREE.MathUtils.lerp(
-            firstTime,
-            lastTime,
-            THREE.MathUtils.clamp(state.previewProgress, 0, 1),
-          );
-          let low = 0,
-            high = selected.length - 1;
-          while (low < high) {
-            const middle = Math.ceil((low + high) / 2);
-            if (selected[middle].t_ms! <= time) low = middle;
-            else high = middle - 1;
-          }
-          const next = Math.min(low + 1, selected.length - 1);
-          const span = selected[next].t_ms! - selected[low].t_ms!;
-          at = low + (span > 0 ? (time - selected[low].t_ms!) / span : 0);
-        }
-        const from = selected[Math.floor(at)],
-          to = selected[Math.min(selected.length - 1, Math.floor(at) + 1)];
-        // Stage transitions are discrete; interpolation only belongs to one path.
-        const blend =
-          from.space.startsWith("teaching_") ||
-          (from.space === to.space &&
-            from.axis === to.axis &&
-            from.segment === to.segment)
-            ? at % 1
-            : 0;
+        const { from, to, blend } = sampleStage(
+          selected,
+          selectedTimes,
+          state.previewProgress,
+        )!;
         spec.joint_names.forEach((name, axis) =>
           planned!.setJointValue(
             name,

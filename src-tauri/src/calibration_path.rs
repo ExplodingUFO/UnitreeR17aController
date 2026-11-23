@@ -1,10 +1,12 @@
 //! Offline geometry for the complete calibration programme. Samples are actual
 //! joint configurations and FK TCP positions, not a Cartesian bounding box.
+use crate::calibration_spline::TimedLeg;
 use crate::kinematics::{
     ContinuationBounds, Frame, JointGuide, Kinematics, Pose, offset_pose, pose_error,
 };
 use crate::trajectory::MotionTuning;
 use serde::{Deserialize, Serialize};
+use std::{sync::Arc, time::Instant};
 
 #[cfg(test)]
 const END_TOLERANCE: f64 = 1e-6;
@@ -19,6 +21,7 @@ pub struct PreviewRequest {
     pub amplitude: Option<f64>,
     pub speed: f64,
     pub axes: Vec<usize>,
+    pub joint_speeds: Vec<f64>,
     pub motion: MotionTuning,
 }
 
@@ -28,6 +31,7 @@ impl Default for PreviewRequest {
             amplitude: None,
             speed: 0.01,
             axes: vec![0, 1, 2],
+            joint_speeds: Vec::new(),
             motion: MotionTuning::default(),
         }
     }
@@ -42,6 +46,14 @@ pub struct CartesianSegment {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CartesianProgram {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_id: Option<String>,
+    #[serde(skip)]
+    pub timed: Vec<Arc<TimedLeg>>,
+    #[serde(skip)]
+    pub joint_legs: [Vec<Arc<TimedLeg>>; 7],
+    #[serde(default)]
+    pub joint_speeds: Vec<f64>,
     pub side: String,
     pub origin: [f64; 7],
     /// Flange-to-TCP transform used for both planning and execution.
@@ -51,6 +63,9 @@ pub struct CartesianProgram {
     /// Full joint excursion in radians; each joint visits +/- half of this.
     #[serde(default = "default_joint_excursion")]
     pub joint_excursion: f64,
+    /// Absolute joint targets after clipping the requested excursion to model travel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joint_targets: Option<[[f64; 2]; 7]>,
     #[serde(default)]
     pub motion: MotionTuning,
     #[serde(default)]
@@ -67,7 +82,304 @@ pub struct BranchPoint {
     pub joints: [f64; 7],
 }
 
+/// A short blend from the last transmitted hold joins the already fitted leg.
+/// A joint trial consists solely of this same rest-to-rest move.
+#[derive(Clone, Debug)]
+pub struct Playback {
+    pub approach: crate::teaching::Approach,
+    pub leg: Option<Arc<TimedLeg>>,
+}
+impl Playback {
+    pub fn duration(&self) -> f64 {
+        self.approach.duration + self.leg.as_ref().map_or(0.0, |leg| leg.duration())
+    }
+
+    pub fn sample(&self, t: f64) -> crate::teaching::Sample {
+        match &self.leg {
+            Some(leg) if t >= self.duration() => leg.sample(leg.duration()),
+            Some(leg) if t >= self.approach.duration => leg.sample(t - self.approach.duration),
+            _ => self.approach.sample(t),
+        }
+    }
+}
+
+/// A held phase doubles as the controller's acknowledgement of that particular
+/// pause. Only the writer knows when the first resumed batch actually starts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PlaybackPhase {
+    Original(Instant),
+    Held {
+        since: Instant,
+        offset: f64,
+    },
+    Resuming {
+        started: Instant,
+        offset: f64,
+        k: f64,
+    },
+}
+
+impl PlaybackPhase {
+    pub fn for_send(self, published: Self, at: Instant, limits: MotionTuning) -> Self {
+        if let Self::Held { offset, .. } = self
+            && self == published
+        {
+            // f' <= (1-f)/k, |f''| <= 6(1-f)/k². The two jerk terms
+            // 3q''ff' and q'f'' each get half of the unused jerk allowance.
+            let k = (limits.joint_speed / limits.acceleration)
+                .max(6.0 * (limits.acceleration / limits.jerk))
+                .max(12.0_f64.sqrt() * (limits.joint_speed.sqrt() / limits.jerk.sqrt()));
+            return Self::Resuming {
+                started: at,
+                offset,
+                k,
+            };
+        }
+        self
+    }
+
+    /// Spline time and its first two wall-clock derivatives. For a restart,
+    /// the integral t*x² has derivative smoothstep(x), x=t/(t+k).
+    fn clock(self, at: Instant) -> (f64, f64, f64) {
+        match self {
+            Self::Original(started) => (
+                at.saturating_duration_since(started).as_secs_f64(),
+                1.0,
+                0.0,
+            ),
+            Self::Held { offset, .. } => (offset, 0.0, 0.0),
+            Self::Resuming { started, offset, k } => {
+                let t = at.saturating_duration_since(started).as_secs_f64();
+                let x = t / (t + k);
+                (
+                    offset + t * x * x,
+                    x * x * (3.0 - 2.0 * x),
+                    6.0 * x * (1.0 - x).powi(3) / k,
+                )
+            }
+        }
+    }
+
+    pub fn progress(self, at: Instant) -> f64 {
+        self.clock(at).0
+    }
+
+    pub fn sample(self, plan: &Playback, at: Instant) -> crate::teaching::Sample {
+        let (time, rate, acceleration) = self.clock(at);
+        let mut sample = plan.sample(time);
+        for i in 0..7 {
+            sample.ddq[i] = sample.ddq[i] * rate * rate + sample.dq[i] * acceleration;
+            sample.dq[i] *= rate;
+        }
+        sample
+    }
+}
+
 impl CartesianProgram {
+    /// Bind confirmation to the geometry and tuning even when another client
+    /// has replaced the one-entry cache. JSON clients normalize signed zero.
+    pub fn content_id(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"r17a-calibration-spline-v1");
+        hash.update(self.side.as_bytes());
+        hash.update([self.auto_range as u8]);
+        let mut number = |v: f64| hash.update(if v == 0.0 { 0.0 } else { v }.to_le_bytes());
+        for value in self
+            .origin
+            .into_iter()
+            .chain(self.tcp.translation)
+            .chain(self.tcp.rotation)
+            .chain([
+                self.amplitude,
+                self.speed,
+                self.joint_excursion,
+                self.motion.joint_speed,
+                self.motion.acceleration,
+                self.motion.jerk,
+            ])
+            .chain(self.joint_targets.into_iter().flatten().flatten())
+        {
+            number(value);
+        }
+        number(self.joint_speeds.len() as f64);
+        self.joint_speeds.iter().copied().for_each(&mut number);
+        number(self.segments.len() as f64);
+        for s in &self.segments {
+            number(s.axis as f64);
+            number(s.offset);
+        }
+        for p in &self.guide {
+            number(p.axis as f64);
+            number(p.offset);
+            p.joints.into_iter().for_each(&mut number);
+        }
+        format!("{:x}", hash.finalize())
+    }
+
+    fn fit_cartesian(
+        &self,
+        model: &Kinematics,
+        axis: usize,
+        knots: &[(f64, [f64; 7])],
+    ) -> Result<TimedLeg, String> {
+        let fit = || {
+            let mut leg = TimedLeg::fit(knots, self.speed, self.motion, model.speed_limits())?;
+            leg.limit_tcp_speed(model, &self.tcp, self.speed)?;
+            Ok::<_, String>(leg)
+        };
+        fit().map_err(|e| {
+            format!(
+                "{} 方向的时间规划失败，调整速度或行程后重新预览。{e}",
+                ["X", "Y", "Z"][axis]
+            )
+        })
+    }
+
+    fn plan_joint_trials(
+        &mut self,
+        model: &Kinematics,
+        bounds: ContinuationBounds,
+    ) -> Result<(), String> {
+        self.set_joint_targets(bounds);
+        if self.joint_speeds.is_empty() {
+            self.joint_speeds =
+                crate::calibration::speeds(&crate::calibration::Settings::default());
+        }
+        let mut legs: [Vec<Arc<TimedLeg>>; 7] = Default::default();
+        for (axis, (trials, [low, high])) in
+            legs.iter_mut().zip(self.joint_targets.unwrap()).enumerate()
+        {
+            let mut start = self.origin;
+            for &speed in &self.joint_speeds {
+                for q in [high, low, self.origin[axis]] {
+                    let mut end = self.origin;
+                    end[axis] = q;
+                    let leg = TimedLeg::fit(
+                        &[(start[axis], start), (q, end)],
+                        speed,
+                        self.motion,
+                        model.speed_limits(),
+                    )
+                    .map_err(|_| {
+                        format!(
+                            "J{} 试验速度或时长无法表示，请调整关节速度后重新预览",
+                            axis + 1
+                        )
+                    })?;
+                    trials.push(Arc::new(leg));
+                    start = end;
+                }
+            }
+        }
+        self.joint_legs = legs;
+        Ok(())
+    }
+
+    fn set_joint_targets(&mut self, bounds: ContinuationBounds) {
+        let half = self.joint_excursion * 0.5;
+        self.joint_targets = Some(std::array::from_fn(|i| {
+            [
+                (self.origin[i] - half).max(bounds.lower[i]),
+                (self.origin[i] + half).min(bounds.upper[i]),
+            ]
+        }));
+    }
+
+    /// Legacy or non-cached requests are prepared off the control thread. Follow
+    /// each requested turnaround, including the original branch on its way back.
+    pub fn prepare(&mut self, model: &Kinematics) -> Result<(), String> {
+        self.motion.validate()?;
+        let origin = model.fk(&self.origin, &self.tcp)?;
+        let start = Sample {
+            joints: self.origin,
+            tcp: origin.translation,
+        };
+        let bounds = model.continuation_bounds(&self.origin)?;
+        self.plan_joint_trials(model, bounds)?;
+        // Old API clients may supply just target offsets. Resolve their knots
+        // once before dispatch, so they get the same playback as a new preview.
+        if self.preview_id.is_none()
+            && self.segments.iter().any(|s| {
+                !self
+                    .guide
+                    .iter()
+                    .any(|k| k.axis == s.axis && k.offset == s.offset)
+            })
+        {
+            let mut guide = Vec::new();
+            for segment in &mut self.segments {
+                let axis = segment.axis;
+                if axis >= 3 || !segment.offset.is_finite() {
+                    return Err("末端试验方向或位移无效".into());
+                }
+                let samples = trace(model, self.tcp, origin, start, axis, segment.offset, bounds);
+                let end = samples.last().unwrap().tcp[axis] - start.tcp[axis];
+                if (end - segment.offset).abs() > PATH_TOLERANCE {
+                    return Err(format!(
+                        "{} 方向可达 {:.1} mm，请重新预览行程",
+                        ["X", "Y", "Z"][axis],
+                        end * 1000.0
+                    ));
+                }
+                segment.offset = end;
+                guide.extend(samples.into_iter().map(|sample| BranchPoint {
+                    axis,
+                    offset: sample.tcp[axis] - start.tcp[axis],
+                    joints: sample.joints,
+                }));
+            }
+            guide.sort_by(|a, b| a.axis.cmp(&b.axis).then(a.offset.total_cmp(&b.offset)));
+            guide.dedup_by(|a, b| a.axis == b.axis && a.offset == b.offset);
+            self.guide = guide;
+        }
+
+        for point in &self.guide {
+            if point.axis >= 3 {
+                return Err("预览方向无效".into());
+            }
+            let mut delta = [0.0; 6];
+            delta[point.axis] = point.offset;
+            let goal = offset_pose(&origin, delta, Frame::Base)?;
+            let error = pose_error(&goal, &model.fk(&point.joints, &self.tcp)?);
+            if (0..7)
+                .any(|i| point.joints[i] < bounds.lower[i] || point.joints[i] > bounds.upper[i])
+                || error[..3].iter().any(|v| v.abs() > PATH_TOLERANCE)
+                || error[3..].iter().any(|v| v.abs() > ORIENTATION_TOLERANCE)
+            {
+                return Err("已保存的路径与当前模型不符，请重新生成预览".into());
+            }
+        }
+        let mut previous = 0.0;
+        let mut last_joints = self.origin;
+        let mut timed = Vec::with_capacity(self.segments.len());
+        for segment in &self.segments {
+            let range = segment.offset.min(previous)..=segment.offset.max(previous);
+            let mut knots: Vec<_> = self
+                .guide
+                .iter()
+                .filter(|p| p.axis == segment.axis && range.contains(&p.offset))
+                .map(|p| (p.offset, p.joints))
+                .collect();
+            if previous > segment.offset {
+                knots.reverse();
+            }
+            if knots.first() != Some(&(previous, last_joints))
+                || knots.last().map(|k| k.0) != Some(segment.offset)
+            {
+                return Err("预览节点与试验起止位置不一致，请重新生成预览".into());
+            }
+            if knots.len() == 1 {
+                knots.push(knots[0]);
+            }
+            timed.push(Arc::new(self.fit_cartesian(model, segment.axis, &knots)?));
+            previous = segment.offset;
+            last_joints = knots.last().unwrap().1;
+        }
+        self.timed = timed;
+        Ok(())
+    }
+
     /// Interpolate the preview branch at actual signed TCP progress using the
     /// accepted geometric samples. No IK runs in this lookup.
     pub fn guide_at(&self, axis: usize, offset: f64) -> Option<JointGuide> {
@@ -106,6 +418,8 @@ pub struct PreviewPoint {
     /// Cartesian segment index, then three joint legs per axis after that;
     /// the Cartesian phase's joint return uses segments.len() + 21.
     pub segment: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t_s: Option<f64>,
     pub space: String,
     /// Base XYZ index for Cartesian samples, joint index for joint samples;
     /// ignored (zero) for space="joint_return", which moves all joints.
@@ -118,6 +432,8 @@ pub struct CalibrationPreview {
     pub points: Vec<PreviewPoint>,
     #[serde(default)]
     pub ranges: Vec<AxisRange>,
+    #[serde(default)]
+    pub cartesian_duration_s: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -134,7 +450,7 @@ struct Sample {
     tcp: [f64; 3],
 }
 
-/// Plans geometry only: no feedback, device I/O, control state or timing claims.
+/// Generate geometry and fit its executable, time-parameterized joint path offline.
 /// Each direction is independent, so a blocked outward leg cannot hide another
 /// useful axis or the seven joint trials that are also part of calibration.
 pub fn preview(
@@ -167,17 +483,23 @@ pub fn preview(
         tcp: origin_pose.translation,
     };
     let mut program = CartesianProgram {
+        preview_id: None,
+        timed: Vec::new(),
+        joint_legs: Default::default(),
+        joint_speeds: request.joint_speeds,
         side: side.into(),
         origin,
         tcp,
         amplitude: request.amplitude.unwrap_or(0.0),
         speed: request.speed,
         joint_excursion: default_joint_excursion(),
+        joint_targets: None,
         motion: request.motion,
         auto_range: request.amplitude.is_none(),
         segments: Vec::new(),
         guide: Vec::new(),
     };
+    program.plan_joint_trials(model, bounds)?;
     let mut points = Vec::new();
     let mut ranges = Vec::with_capacity(3);
     // The sphere only bounds the search. Every accepted point is solved from
@@ -253,7 +575,15 @@ pub fn preview(
         }
         if positive.len() > 1 {
             let offset = positive.last().unwrap().tcp[axis] - start.tcp[axis];
-            append_cartesian(&mut program, &mut points, axis, offset, &positive);
+            append_cartesian(
+                &mut program,
+                &mut points,
+                axis,
+                offset,
+                &positive,
+                model,
+                start.tcp[axis],
+            )?;
         }
         if negative.len() > 1 {
             // Reverse the accepted positive branch through the exact starting
@@ -261,7 +591,15 @@ pub fn preview(
             let mut crossing: Vec<_> = positive.iter().rev().copied().collect();
             crossing.extend_from_slice(&negative[1..]);
             let offset = negative.last().unwrap().tcp[axis] - start.tcp[axis];
-            append_cartesian(&mut program, &mut points, axis, offset, &crossing);
+            append_cartesian(
+                &mut program,
+                &mut points,
+                axis,
+                offset,
+                &crossing,
+                model,
+                start.tcp[axis],
+            )?;
         }
         let outward = if negative.len() > 1 {
             &negative
@@ -269,11 +607,21 @@ pub fn preview(
             &positive
         };
         let returning: Vec<_> = outward.iter().rev().copied().collect();
-        append_cartesian(&mut program, &mut points, axis, 0.0, &returning);
+        append_cartesian(
+            &mut program,
+            &mut points,
+            axis,
+            0.0,
+            &returning,
+            model,
+            start.tcp[axis],
+        )?;
     }
     append_joint_return(model, &program, start, &mut points)?;
     append_joint_trials(model, &program, start, &mut points)?;
+    program.preview_id = Some(program.content_id());
     Ok(CalibrationPreview {
+        cartesian_duration_s: program.timed.iter().map(|leg| leg.duration()).sum(),
         program,
         points,
         ranges,
@@ -388,18 +736,28 @@ fn append_cartesian(
     axis: usize,
     offset: f64,
     samples: &[Sample],
-) {
+    model: &Kinematics,
+    axis_origin: f64,
+) -> Result<(), String> {
+    let knots: Vec<_> = samples
+        .iter()
+        .map(|p| (p.tcp[axis] - axis_origin, p.joints))
+        .collect();
+    let leg = program.fit_cartesian(model, axis, &knots)?;
     let segment = program.segments.len();
-    for sample in samples {
+    for (index, sample) in samples.iter().enumerate() {
         points.push(PreviewPoint {
             joints: sample.joints,
             tcp: sample.tcp,
             segment,
+            t_s: Some(leg.knot_time(index)),
             space: "cartesian".into(),
             axis,
         });
     }
     program.segments.push(CartesianSegment { axis, offset });
+    program.timed.push(Arc::new(leg));
+    Ok(())
 }
 
 fn append_joint_return(
@@ -424,6 +782,7 @@ fn append_joint_return(
         points.push(PreviewPoint {
             joints,
             tcp: model.fk(&joints, &program.tcp)?.translation,
+            t_s: None,
             segment: program.segments.len() + 21,
             space: "joint_return".into(),
             axis: 0,
@@ -438,11 +797,20 @@ fn append_joint_trials(
     origin: Sample,
     points: &mut Vec<PreviewPoint>,
 ) -> Result<(), String> {
-    let half = program.joint_excursion / 2.0;
+    let targets = program.joint_targets.unwrap();
     for axis in 0..7 {
         let mut previous = 0.0;
-        for (leg, target) in [half, -half, 0.0].into_iter().enumerate() {
-            let steps = ((target - previous).abs() / JOINT_SAMPLE_STEP).ceil() as usize;
+        for (leg, target) in [
+            targets[axis][1] - origin.joints[axis],
+            targets[axis][0] - origin.joints[axis],
+            0.0,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let steps = ((target - previous).abs() / JOINT_SAMPLE_STEP)
+                .ceil()
+                .max(1.0) as usize;
             for step in 0..=steps {
                 let offset = previous + (target - previous) * step as f64 / steps as f64;
                 let mut joints = origin.joints;
@@ -450,6 +818,7 @@ fn append_joint_trials(
                 points.push(PreviewPoint {
                     joints,
                     tcp: model.fk(&joints, &program.tcp)?.translation,
+                    t_s: None,
                     segment: program.segments.len() + axis * 3 + leg,
                     space: "joint".into(),
                     axis,
@@ -651,6 +1020,22 @@ mod tests {
     }
 
     #[test]
+    fn unrepresentable_joint_trial_is_reported_while_generating_the_preview() {
+        let model = Kinematics::load("right").unwrap();
+        let result = preview(
+            &model,
+            "right",
+            origin(),
+            tool(),
+            PreviewRequest {
+                joint_speeds: vec![1e-310],
+                ..Default::default()
+            },
+        );
+        assert!(result.unwrap_err().contains("关节速度"));
+    }
+
+    #[test]
     fn operating_speed_and_motion_preferences_do_not_change_reach_or_samples() {
         let model = Kinematics::load("right").unwrap();
         let baseline =
@@ -675,7 +1060,11 @@ mod tests {
             .unwrap();
             assert_eq!(result.ranges, baseline.ranges);
             assert_eq!(result.program.segments, baseline.program.segments);
-            assert_eq!(result.points, baseline.points);
+            assert_eq!(result.points.len(), baseline.points.len());
+            for (a, b) in result.points.iter().zip(&baseline.points) {
+                assert_eq!((a.joints, a.tcp), (b.joints, b.tcp));
+            }
+            assert!(result.cartesian_duration_s.is_finite() && result.cartesian_duration_s > 0.0);
             assert_eq!(result.program.speed, speed);
             assert_eq!(result.program.motion, motion);
         }
@@ -899,8 +1288,59 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "reads the local calibration report in R17A_CALIBRATION_REPORT"]
+    fn replay_saved_program_at_recorded_send_times() {
+        let data = std::fs::read(std::env::var("R17A_CALIBRATION_REPORT").unwrap()).unwrap();
+        let report: crate::calibration::Report = serde_json::from_slice(&data).unwrap();
+        let model = Kinematics::load(&report.side).unwrap();
+        let mut program = (*report.settings.cartesian.unwrap()).clone();
+        let bounds = model.continuation_bounds(&program.origin).unwrap();
+        program.prepare(&model).unwrap();
+        let times: Vec<_> = program
+            .timed
+            .iter()
+            .scan(0.0, |elapsed, leg| {
+                *elapsed += leg.duration();
+                Some(*elapsed)
+            })
+            .collect();
+        let mut samples = 0;
+        for p in report.curves.iter() {
+            let Some(ms) = p.command_at_ms else { continue };
+            let elapsed = ms as f64 / 1000.0;
+            let index = times
+                .partition_point(|end| *end <= elapsed)
+                .min(times.len() - 1);
+            let start = if index == 0 { 0.0 } else { times[index - 1] };
+            let sample = program.timed[index].sample(elapsed - start);
+            for axis in 0..7 {
+                assert!((bounds.lower[axis]..=bounds.upper[axis]).contains(&sample.q[axis]));
+                assert!(
+                    sample.dq[axis].abs()
+                        <= program.motion.speed_limits(model.speed_limits())[axis]
+                );
+                assert!(sample.ddq[axis].abs() <= program.motion.acceleration);
+            }
+            samples += 1;
+        }
+        assert!(samples > 0);
+        eprintln!(
+            "{} recorded send times; {} legs; first leg {:.3}s; XYZ loop {:.3}s",
+            samples,
+            program.timed.len(),
+            program.timed[0].duration(),
+            program.timed.iter().map(|l| l.duration()).sum::<f64>()
+        );
+    }
+
+    #[test]
     fn stored_fifty_one_knot_programs_still_deserialize_and_interpolate() {
         let mut program = CartesianProgram {
+            preview_id: None,
+            timed: vec![],
+            joint_legs: Default::default(),
+            joint_speeds: vec![],
+            joint_targets: None,
             side: "right".into(),
             origin: origin(),
             tcp: tool(),

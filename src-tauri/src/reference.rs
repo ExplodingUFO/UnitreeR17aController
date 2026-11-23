@@ -2,9 +2,10 @@
 #[cfg(test)]
 use crate::trajectory::JOINT_ACCELERATION;
 use crate::{
+    calibration_path::PlaybackPhase,
     kinematics::{CartesianPath, Kinematics, Pose, pose_error},
     teaching::Program as TeachingProgram,
-    trajectory::JOINT_SPEED,
+    trajectory::{JOINT_SPEED, MotionTuning},
     tuning::ServoTuning,
 };
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,11 @@ pub enum Sampling {
     #[default]
     Integrated,
     Absolute,
+    Calibration {
+        program: Arc<crate::calibration_path::Playback>,
+        phase: PlaybackPhase,
+        limits: MotionTuning,
+    },
     Playback {
         program: Arc<TeachingProgram>,
         started: Instant,
@@ -118,7 +124,17 @@ impl Reference {
         }
     }
 
+    #[cfg(test)]
     pub fn sample(&self, at: Instant, previous: Option<Previous>) -> Result<Sample, SampleStatus> {
+        self.sample_with_phase(at, previous, None)
+    }
+
+    pub fn sample_with_phase(
+        &self,
+        at: Instant,
+        previous: Option<Previous>,
+        send_phase: Option<PlaybackPhase>,
+    ) -> Result<Sample, SampleStatus> {
         if self.valid_until.is_some_and(|until| at >= until) {
             return Err(SampleStatus::Expired);
         }
@@ -150,6 +166,18 @@ impl Reference {
                 return Ok(Sample {
                     q: self.q,
                     dq: self.dq,
+                    timing: self.timing(at, SampleStatus::Aligned),
+                });
+            }
+            Sampling::Calibration { program, phase, .. } => {
+                let phase = send_phase.unwrap_or(*phase);
+                if matches!(phase, PlaybackPhase::Held { .. }) {
+                    return Err(SampleStatus::Stale);
+                }
+                let sample = phase.sample(program, at);
+                return Ok(Sample {
+                    q: sample.q,
+                    dq: sample.dq,
                     timing: self.timing(at, SampleStatus::Aligned),
                 });
             }

@@ -360,6 +360,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn position_envelopes_remain_viable_with_endpoint_and_period_changes() {
+        for side in ["right", "left"] {
+            let model = crate::kinematics::Kinematics::load(side).unwrap();
+            let (lower, upper) = model.position_limits();
+            for sign in [-1.0_f64, 1.0] {
+                for clearance in [1e-8, 0.0001, 0.001, 0.01, 0.1, 1.0] {
+                    for initial_speed in [0.0, 1e-8, 1.0] {
+                        if initial_speed == 1.0 && clearance < 1.0 {
+                            continue;
+                        }
+                        let mut q = std::array::from_fn(|i| {
+                            if sign > 0.0 {
+                                upper[i] - clearance
+                            } else {
+                                lower[i] + clearance
+                            }
+                        });
+                        let mut v = [sign * initial_speed; 7];
+                        let mut a = [0.0; 7];
+                        for tick in 0..1500 {
+                            let dt = [0.010, 0.0098, 0.0102, 0.040, 0.002, 0.007, 0.003][tick % 7];
+                            let mut window =
+                                derivative_window(v, a, [1.0; 7], [0.6; 7], [6.0; 7], dt).unwrap();
+                            bound_position_window(
+                            &mut window, q, v, [0.6; 7], [6.0; 7], lower, upper, dt,
+                        ).unwrap_or_else(|error| {
+                            panic!("{side} sign={sign} clearance={clearance} initial_speed={initial_speed} tick={tick} dt={dt} q={q:?} v={v:?} a={a:?}: {error}")
+                        });
+                            let next =
+                                std::array::from_fn(|i| sign.clamp(window.low[i], window.high[i]));
+                            let (position, acceleration) = integrate(q, v, next, dt);
+                            for i in 0..7 {
+                                assert!(
+                                    position[i] >= lower[i] - 1e-12
+                                        && position[i] <= upper[i] + 1e-12
+                                );
+                                assert!(next[i].abs() <= 1.0 + 1e-12);
+                                assert!(acceleration[i].abs() <= 0.6 + 1e-9);
+                                assert!((acceleration[i] - a[i]).abs() <= 6.0 * dt + 1e-8);
+                            }
+                            q = position;
+                            v = next;
+                            a = acceleration;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn position_envelopes_brake_before_both_limits_without_breaking_discrete_derivatives() {
         let mut q = [0.0; 7];
         let mut v = [0.0; 7];
