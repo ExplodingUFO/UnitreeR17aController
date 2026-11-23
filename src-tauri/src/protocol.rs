@@ -1407,6 +1407,11 @@ impl BusHandle {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_reference_write(&self) -> Arc<Mutex<()>> {
+        self.reference_write.clone()
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_transmit_sink(&self) -> impl Fn() -> Option<Reference> + use<> {
         let published = self.setpoints.subscribe();
         move || published.borrow().reference.clone()
@@ -1454,6 +1459,13 @@ impl BusHandle {
             },
             sent_tx,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_feedback_queue(&mut self) -> impl Fn(Feedback, Instant) + use<> {
+        let (tx, rx) = unbounded();
+        self.events = rx;
+        move |frame, at| tx.send(BusEvent::Feedback(frame, at)).unwrap()
     }
 
     #[cfg(test)]

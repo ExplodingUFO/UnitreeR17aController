@@ -43,6 +43,8 @@ pub enum Sampling {
         program: Arc<crate::calibration_path::Playback>,
         phase: PlaybackPhase,
         limits: MotionTuning,
+        /// Oldest of the seven real serial receive times. None requests a powered hold.
+        feedback_at: Option<Instant>,
     },
     Playback {
         program: Arc<TeachingProgram>,
@@ -169,9 +171,16 @@ impl Reference {
                     timing: self.timing(at, SampleStatus::Aligned),
                 });
             }
-            Sampling::Calibration { program, phase, .. } => {
+            Sampling::Calibration {
+                program,
+                phase,
+                feedback_at,
+                ..
+            } => {
                 let phase = send_phase.unwrap_or(*phase);
-                if matches!(phase, PlaybackPhase::Held { .. }) {
+                if feedback_at.is_none_or(|rx| at.saturating_duration_since(rx) > MAX_REFERENCE_AGE)
+                    || matches!(phase, PlaybackPhase::Held { .. })
+                {
                     return Err(SampleStatus::Stale);
                 }
                 let sample = phase.sample(program, at);

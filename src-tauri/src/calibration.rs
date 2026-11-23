@@ -135,10 +135,15 @@ impl ObservationRecording {
         self.pending = Some((group, sample));
     }
 
-    pub fn into_samples(mut self) -> Vec<Observation> {
+    /// Keep the final observed sample; a later frame starts its own derivative window.
+    pub fn break_window(&mut self) {
         if let Some((group, sample)) = self.pending.take() {
             self.samples.push(group, sample);
         }
+    }
+
+    pub fn into_samples(mut self) -> Vec<Observation> {
+        self.break_window();
         self.samples.into_samples()
     }
 }
@@ -482,7 +487,7 @@ impl Collector {
         metrics_valid(&metrics).then_some(metrics)
     }
 
-    fn break_window(&mut self) {
+    pub fn break_window(&mut self) {
         self.window = None;
         self.last_at_us = None;
     }
@@ -973,6 +978,34 @@ mod tests {
         for direction in [&result[0].positive, &result[0].negative] {
             assert!(direction.as_ref().unwrap().rmse < 0.02);
         }
+    }
+
+    #[test]
+    fn friction_and_metrics_exclude_the_interval_without_feedback() {
+        let mut recording = ObservationRecording::new(32, 1);
+        let mut metrics = Collector::new(0, [0.0; 7]);
+        for (start_us, velocity) in [(0, 0.02), (700_000, -0.02)] {
+            recording.break_window();
+            metrics.break_window();
+            for i in 0..=5 {
+                let at_us = start_us + i * 20_000;
+                let mut q = [0.0; 7];
+                q[0] = velocity * (i as f64 * 0.02);
+                recording.push((0, 0), Observation::new(0, at_us, q, velocity, 0.0));
+                metrics.observe(at_us, q, q, true);
+            }
+        }
+        let measured = recording.into_samples();
+        assert_eq!(measured.len(), 12);
+        for sample in measured {
+            let (acceleration, weight) = sample.acceleration_and_weight().unwrap();
+            assert_eq!(
+                acceleration, 0.0,
+                "velocity from the other side of a feedback gap"
+            );
+            assert!(weight <= 0.04);
+        }
+        assert_eq!(metrics.finish().unwrap().valid_ms, 200);
     }
 
     #[test]

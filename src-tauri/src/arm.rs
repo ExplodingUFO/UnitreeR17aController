@@ -1,6 +1,4 @@
 #[cfg(test)]
-use crate::reference::MAX_REFERENCE_AGE;
-#[cfg(test)]
 use crate::trajectory::{JOINT_ACCELERATION, JOINT_JERK, JOINT_SPEED};
 use crate::{
     calibration::{
@@ -14,7 +12,7 @@ use crate::{
         MotionLimits, Pose, SmoothingState, StepInput,
     },
     protocol::{BusError, BusHandle, DriveMode, Feedback, SentReference, Setpoint},
-    reference::{CartesianGuard, Reference, Sampling},
+    reference::{CartesianGuard, MAX_REFERENCE_AGE, Reference, Sampling},
     teaching::{
         self, Capture as TeachingCapture, Guidance, PlaybackOptions, Program as TeachingProgram,
         Recorder as TeachingRecorder, Summary as TeachingSummary,
@@ -625,6 +623,7 @@ struct CalibrationRun {
     collectors: [Collector; 7],
     started: Instant,
     observed: Option<Instant>,
+    feedback_wait: Option<Instant>,
     sent: VecDeque<SentReference>,
     identification: Option<Receiver<Vec<crate::friction::Identification>>>,
     observations: calibration::ObservationRecording,
@@ -871,6 +870,15 @@ impl Core {
         };
     }
     fn end_motion(&mut self, status: &str, code: &str, message: &str) {
+        self.end_motion_at(status, code, message, self.control_at.max(Instant::now()));
+    }
+    fn stop_command(&mut self, code: &str, message: &str, now: Instant) {
+        if self.motion.as_ref().is_some_and(|m| m.planned.is_some()) {
+            self.drain_feedback(false);
+        }
+        self.end_motion_at("cancelled", code, message, now.max(Instant::now()));
+    }
+    fn end_motion_at(&mut self, status: &str, code: &str, message: &str, now: Instant) {
         let close_recording = matches!(
             code,
             "lease_expired" | "released" | "disconnected" | "closing"
@@ -945,7 +953,7 @@ impl Core {
         }
         self.bump_generation();
         self.stopping = self.enabled
-            && (!self.settle_calibration_stop()
+            && (!self.settle_calibration_stop(now)
                 || self.velocity.iter().any(|v| v.abs() > 1e-12)
                 || self.acceleration.iter().any(|a| a.abs() > 1e-12));
         if !self.stopping {
@@ -954,16 +962,34 @@ impl Core {
         self.phase();
         self.dirty = true;
     }
-    fn settle_calibration_stop(&mut self) -> bool {
+    fn settle_calibration_stop(&mut self, now: Instant) -> bool {
+        use std::task::Poll;
         let Some((epoch, program)) = &self.pending_calibration_stop else {
             return true;
         };
-        use std::task::Poll;
-        let Poll::Ready(sent) = self
+        let receipt = self
             .bus
             .as_ref()
-            .map_or(Poll::Ready(None), BusHandle::settled_reference)
-        else {
+            .map_or(Poll::Ready(None), BusHandle::settled_reference);
+        // A seven-packet write can finish after this control tick started.
+        let checked_at = now.max(Instant::now());
+        let checked_at = match receipt {
+            Poll::Ready(Some(sent)) => checked_at.max(sent.completed_at),
+            _ => checked_at,
+        };
+        // Latch at the request and on each pending handoff. New RX while a
+        // write finishes must not restart braking from a stale velocity.
+        if self
+            .oldest_feedback()
+            .is_none_or(|rx| checked_at.saturating_duration_since(rx) > MAX_REFERENCE_AGE)
+            || self
+                .calibration
+                .as_ref()
+                .is_some_and(|run| run.feedback_wait.is_some())
+        {
+            self.absolute_hold = true;
+        }
+        let Poll::Ready(sent) = receipt else {
             return false;
         };
         if let Some(sent) = sent {
@@ -976,6 +1002,13 @@ impl Core {
             self.acceleration = phase
                 .filter(|_| !sent.fallback_hold)
                 .map_or([0.0; 7], |p| p.sample(program, sent.at).ddq);
+            if self.absolute_hold {
+                // Stop may precede the first hold receipt. Pin the final in-flight
+                // position without integrating its old velocity into a new batch.
+                self.stop_path = None;
+                self.velocity = [0.0; 7];
+                self.acceleration = [0.0; 7];
+            }
         } else {
             // Before the first servo receipt the plan starts at the held anchor.
             self.stop_path = None;
@@ -1233,7 +1266,7 @@ impl Core {
             return Err(ApiError::new("calibration_busy", "校准正在进行"));
         }
         match operation {
-            Operation::Stop => self.end_motion("cancelled", "stopped", "动作已取消"),
+            Operation::Stop => self.stop_command("stopped", "动作已取消", now),
             Operation::Connect { port, side } => {
                 if self.bus.is_some() {
                     return Err(ApiError::new("connected", "请先断开当前连接"));
@@ -1293,15 +1326,20 @@ impl Core {
                 if self.enabled || self.enable_request.is_some() {
                     return Err(ApiError::new("enable_busy", "设备已使能或正在使能"));
                 }
-                if self.feedback.iter().any(|o| {
-                    o.as_ref()
-                        .is_some_and(|o| o.value.error != 0 || o.value.timeout)
-                }) {
+                self.drain_feedback(true);
+                let now = now.max(Instant::now());
+                if self.error.is_some()
+                    || self.feedback.iter().any(|o| {
+                        o.as_ref()
+                            .is_some_and(|o| o.value.error != 0 || o.value.timeout)
+                    })
+                {
                     return Err(ApiError::new("fault", "请先清除设备故障"));
                 }
                 self.reference = self.measured(now)?;
                 self.check_positions(&self.reference)?;
                 self.reset_derivatives();
+                self.absolute_hold = true;
                 self.enable_request = Some((id.into(), now));
                 self.stopping = false;
                 self.phase = Phase::Enabling;
@@ -2005,6 +2043,7 @@ impl Core {
             collectors: std::array::from_fn(|axis| Collector::new(axis, measured)),
             started: now,
             observed: None,
+            feedback_wait: None,
             sent: VecDeque::with_capacity(32),
             identification: None,
             observations: calibration::ObservationRecording::new(
@@ -2363,6 +2402,20 @@ impl Core {
             return;
         }
         let latest = self.bus.as_ref().and_then(|bus| bus.latest_reference());
+        let sent_phase = latest
+            .filter(|s| s.epoch == self.reference_version)
+            .and_then(|s| s.calibration_phase);
+        let waiting_for_motion_feedback = match sent_phase {
+            Some(PlaybackPhase::Held { .. }) => true,
+            Some(PlaybackPhase::Resuming { started, .. }) => {
+                self.oldest_feedback().is_none_or(|rx| rx < started)
+            }
+            _ => false,
+        };
+        if !run.cancelled && (run.feedback_wait.is_some() || waiting_for_motion_feedback) {
+            self.calibration = Some(run);
+            return;
+        }
         if let Some(sent) = latest
             && run.sent.back().is_none_or(|last| sent.at > last.at)
         {
@@ -2371,7 +2424,8 @@ impl Core {
             }
             run.sent.push_back(sent);
         }
-        if !run.report.trials.is_empty()
+        if run.feedback_wait.is_none()
+            && !run.report.trials.is_empty()
             && !matches!(run.step, CalibrationStep::Identifying)
             && now.saturating_duration_since(run.last_sample) >= Duration::from_millis(20)
             && let Ok(feedback) = self.measured(now)
@@ -3144,6 +3198,7 @@ impl Core {
         })
     }
     fn advance(&mut self, now: Instant, dt: f64) {
+        self.drain_feedback(false);
         self.flush_calibration_report();
         self.flush_teaching_records();
         self.advance_motion(now, dt);
@@ -3161,12 +3216,21 @@ impl Core {
         let measured = match self.measured(now) {
             Ok(q) => q,
             Err(e) => {
-                self.fault(&e.code, e.message);
+                if self.calibration.as_ref().is_some_and(|r| !r.cancelled)
+                    && matches!(e.code.as_str(), "feedback_missing" | "feedback_stale")
+                {
+                    self.fault_stale_calibration(now);
+                } else {
+                    self.fault(&e.code, e.message);
+                }
                 return;
             }
         };
         if dt <= 0.0 || !dt.is_finite() {
             self.fault("control_timeout", "控制周期超时");
+            return;
+        }
+        if self.wait_for_calibration_feedback(now) {
             return;
         }
         if self.teaching_mode.is_some() {
@@ -3181,7 +3245,7 @@ impl Core {
             self.end_motion("cancelled", "input_expired", "连续输入已过期");
         }
         if self.stopping {
-            if !self.settle_calibration_stop() {
+            if !self.settle_calibration_stop(now) {
                 return;
             }
             if let Err(e) = self.decelerate(measured, dt) {
@@ -3438,6 +3502,12 @@ impl Core {
         {
             Sampling::Calibration {
                 program: program.clone(),
+                feedback_at: self.oldest_feedback().filter(|_| {
+                    !self
+                        .calibration
+                        .as_ref()
+                        .is_some_and(|run| run.feedback_wait.is_some())
+                }),
                 phase: motion
                     .calibration_phase
                     .unwrap_or(PlaybackPhase::Original(motion.started)),
@@ -3619,7 +3689,6 @@ impl Core {
         } else {
             bus.publish(heartbeat, self.control_seq, self.outgoing_reference())
         };
-        let (values, read_error) = bus.drain();
         let stats = bus.stats();
         if let Err(e) = clear_result {
             self.fault("communication_error", e);
@@ -3637,19 +3706,10 @@ impl Core {
             crc_errors: stats.crc_errors,
             timeouts: stats.timeouts,
         };
-        for (value, at) in values {
-            self.accept_feedback(value, at);
-        }
-        if let Some(error) = read_error {
-            match error {
-                BusError::Io(message) => self.fault("communication_error", message),
-                BusError::Reference {
-                    generation,
-                    epoch,
-                    held,
-                    reason,
-                } => self.reject_send_reference(generation, epoch, held, reason),
-            }
+        // The blocking ClearFault write can produce replies after this tick's
+        // pre-motion drain. Consume them before checking the clear acknowledgement.
+        if self.clear_request.is_some() {
+            self.drain_feedback(false);
         }
         if self.phase == Phase::Connecting && self.measured(Instant::now()).is_ok() {
             self.phase = Phase::Disabled;
@@ -3663,6 +3723,112 @@ impl Core {
             self.fault("feedback_timeout", "设备反馈超时");
         }
         self.settle_transitions(Instant::now());
+    }
+    fn drain_feedback(&mut self, enabling: bool) {
+        let Some(bus) = &self.bus else { return };
+        let (frames, error) = bus.drain();
+        if let Some(BusError::Io(message)) = error {
+            self.fault("communication_error", message);
+            return;
+        }
+        for (value, at) in frames {
+            self.handle_feedback(value, at, enabling);
+        }
+        if let Some(BusError::Reference {
+            generation,
+            epoch,
+            held,
+            reason,
+        }) = error
+        {
+            self.reject_send_reference(generation, epoch, held, reason);
+        }
+    }
+
+    fn oldest_feedback(&self) -> Option<Instant> {
+        self.feedback
+            .iter()
+            .map(|observation| observation.as_ref().map(|o| o.at))
+            .min()
+            .flatten()
+    }
+
+    fn wait_for_calibration_feedback(&mut self, now: Instant) -> bool {
+        if !self.calibration.as_ref().is_some_and(|run| !run.cancelled) {
+            return false;
+        }
+        // measured() already checked all seven axes against the hard timeout.
+        let oldest = self.oldest_feedback().unwrap();
+        let fresh = now.saturating_duration_since(oldest) <= MAX_REFERENCE_AGE;
+        let sent = self.bus.as_ref().and_then(BusHandle::latest_reference);
+        let current = sent.filter(|s| s.epoch == self.reference_version);
+        let planned = self.motion.as_ref().filter(|m| m.planned.is_some());
+        // The writer may already have held while the controller was descheduled.
+        // Acknowledge that specific pause even if the RX queue is now fresh.
+        let new_hold = planned.and_then(|m| {
+            let phase = current?.calibration_phase?;
+            match phase {
+                PlaybackPhase::Held { since, .. } if m.calibration_phase != Some(phase) => {
+                    Some(since)
+                }
+                _ => None,
+            }
+        });
+        let late_writer = planned.is_some_and(|m| {
+            now.saturating_duration_since(current.map_or(m.started, |s| s.at)) > MAX_REFERENCE_AGE
+        });
+        let run = self.calibration.as_mut().unwrap();
+        if run.feedback_wait.is_none() && (!fresh || new_hold.is_some() || late_writer) {
+            run.feedback_wait = Some(if fresh { new_hold.unwrap_or(now) } else { now });
+            run.observations.break_window();
+            for collector in &mut run.collectors {
+                collector.break_window();
+            }
+        }
+        let Some(since) = run.feedback_wait else {
+            return false;
+        };
+        let held = current.is_some_and(|s| {
+            s.at >= since && matches!(s.calibration_phase, Some(PlaybackPhase::Held { .. }))
+        });
+        if fresh && oldest > since && (planned.is_none() || (held && !late_writer)) {
+            run.feedback_wait = None;
+            run.observed = self.feedback[run.axis()].as_ref().map(|o| o.at);
+            return false;
+        }
+        if let Some(sent) = sent {
+            self.reference = sent.q;
+        }
+        self.velocity = [0.0; 7];
+        self.acceleration = [0.0; 7];
+        true
+    }
+
+    fn fault_stale_calibration(&mut self, at: Instant) {
+        let axes: Vec<_> = self
+            .feedback
+            .iter()
+            .enumerate()
+            .filter_map(|(i, observation)| {
+                let joint = i + 1;
+                match observation {
+                    None => Some(format!("J{joint} 无反馈")),
+                    Some(o) => {
+                        let age = at.saturating_duration_since(o.at).as_millis();
+                        (age > FEEDBACK_MS as u128).then(|| format!("J{joint} {age} ms"))
+                    }
+                }
+            })
+            .collect();
+        let wait = self
+            .calibration
+            .as_ref()
+            .and_then(|r| r.feedback_wait)
+            .map_or(0, |since| at.saturating_duration_since(since).as_millis());
+        self.fault(
+            "feedback_stale",
+            format!("关节反馈过期：{}；已暂缓等待 {wait} ms", axes.join("、")),
+        );
     }
     fn diagnose(&mut self, now: Instant, dt_ms: f64, work_ms: f64) {
         if !self.enabled && self.motion.is_none() {
@@ -3785,7 +3951,11 @@ impl Core {
         self.diag_work_sum = 0.0;
         self.diag_work_max = 0.0;
     }
+    #[cfg(test)]
     fn accept_feedback(&mut self, value: Feedback, at: Instant) {
+        self.handle_feedback(value, at, false);
+    }
+    fn handle_feedback(&mut self, value: Feedback, at: Instant, enabling: bool) {
         let id = value.id as usize;
         if id >= 7 {
             return;
@@ -3800,7 +3970,7 @@ impl Core {
         }
         if error != 0 && self.clear_request.is_none() {
             self.fault("device_error", format!("J{} 故障码 {}", id + 1, error));
-        } else if timeout && (self.enabled || self.enable_request.is_some()) {
+        } else if timeout && (enabling || self.enabled || self.enable_request.is_some()) {
             self.fault("device_timeout", format!("J{} 设备通信超时", id + 1));
         } else if mode != 1 && self.enabled {
             self.fault("device_disabled", format!("J{} 已退出使能", id + 1));
@@ -4029,7 +4199,7 @@ fn run(
                 &format!("停止请求：{reason}"),
                 None,
             );
-            core.end_motion("cancelled", "host_stop", "宿主已取消当前动作");
+            core.stop_command("host_stop", "宿主已取消当前动作", now);
             seen_epoch = epoch;
         }
         if shutdown.load(Ordering::Acquire) || core.close_requested {
@@ -6399,6 +6569,295 @@ mod tests {
         (per_trial + 2) * axes * 3 + 2
     }
 
+    #[test]
+    fn calibration_feedback_gap_holds_until_all_seven_reply_then_restarts_at_rest() {
+        let (mut core, _dir, sent) = moving_feedback_fixture(Instant::now());
+        let last_rx = core.control_at;
+        let at = |ms| last_rx + Duration::from_millis(ms);
+        let mut write = BusHandle::test_servo_writer();
+        core.advance(at(40), 0.04);
+        let source = core.outgoing_reference();
+        let moving = write(source.clone(), core.desired_setpoints(), at(41));
+        assert!(moving.dq.iter().any(|v| v.abs() > 0.0));
+        sent.send_replace(Some(moving));
+        let held = write(source, core.desired_setpoints(), at(51));
+        assert!(
+            held.fallback_hold,
+            "refreshing control time extended the lifetime of old feedback"
+        );
+        assert_eq!((held.q, held.dq), (moving.q, [0.0; 7]));
+        sent.send_replace(Some(held));
+        let count = core.calibration.as_ref().unwrap().points.captured();
+        core.advance(at(60), 0.02);
+        let queue = core.bus.as_mut().unwrap().test_feedback_queue();
+        for axis in 0..6 {
+            queue(core.feedback[axis].as_ref().unwrap().value.clone(), at(160));
+        }
+        core.advance(at(168), 0.108);
+        let pinned = write(core.outgoing_reference(), core.desired_setpoints(), at(169));
+        assert!(pinned.fallback_hold && core.enabled);
+        assert_eq!(
+            (core.reference, core.velocity, pinned.q),
+            (held.q, [0.0; 7], held.q)
+        );
+        assert_eq!(core.calibration.as_ref().unwrap().points.captured(), count);
+        sent.send_replace(Some(pinned));
+        queue(core.feedback[6].as_ref().unwrap().value.clone(), at(175));
+        core.advance(at(180), 0.012);
+        let first = write(core.outgoing_reference(), core.desired_setpoints(), at(181));
+        assert!(!first.fallback_hold && core.error.is_none());
+        assert_eq!((first.q, first.dq), (held.q, [0.0; 7]));
+        sent.send_replace(Some(first));
+        core.advance(at(190), 0.01);
+        assert!(core.velocity.iter().any(|v| v.abs() > 0.0));
+    }
+
+    #[test]
+    fn calibration_feedback_queue_continuous_during_a_late_control_tick() {
+        let origin = Instant::now();
+        let (mut core, _dir, _sent) = calibration_fixture(origin);
+        calibration_request(
+            &mut core,
+            "queue",
+            Operation::CalibrateStart {
+                settings: calibration_settings(),
+            },
+            origin,
+        );
+        let queue = core.bus.as_mut().unwrap().test_feedback_queue();
+        for ms in (30..=240).step_by(30) {
+            for axis in 0..7 {
+                queue(
+                    core.feedback[axis].as_ref().unwrap().value.clone(),
+                    origin + Duration::from_millis(ms),
+                );
+            }
+        }
+        core.advance(origin + Duration::from_millis(245), 0.245);
+        assert!(core.enabled && core.error.is_none());
+        assert!(core.calibration.as_ref().unwrap().feedback_wait.is_none());
+    }
+
+    fn moving_feedback_fixture(
+        origin: Instant,
+    ) -> (
+        Core,
+        tempfile::TempDir,
+        watch::Sender<Option<SentReference>>,
+    ) {
+        let (mut core, dir, sent) = calibration_fixture(origin);
+        calibration_request(
+            &mut core,
+            "feedback",
+            Operation::CalibrateStart {
+                settings: calibration_settings(),
+            },
+            origin,
+        );
+        for i in 0..25 {
+            calibration_tick(
+                &mut core,
+                &sent,
+                origin + Duration::from_millis(i * 10),
+                origin,
+                false,
+            );
+        }
+        (core, dir, sent)
+    }
+
+    #[test]
+    fn calibration_feedback_recovered_gap_is_not_a_current_timeout() {
+        let (mut core, _dir, sent) = moving_feedback_fixture(Instant::now());
+        let last = core.control_at;
+        let at = |ms| last + Duration::from_millis(ms);
+        let mut write = BusHandle::test_servo_writer();
+        let source = core.outgoing_reference();
+        let moving = write(source.clone(), core.desired_setpoints(), at(1));
+        let held = write(source, core.desired_setpoints(), at(60));
+        assert!(held.fallback_hold && moving.dq[1] > 0.0);
+        sent.send_replace(Some(held));
+        let queue = core.bus.as_mut().unwrap().test_feedback_queue();
+        for axis in 0..7 {
+            queue(core.feedback[axis].as_ref().unwrap().value.clone(), at(240));
+        }
+        let windows = core.calibration.as_ref().unwrap().collectors[1]
+            .finish()
+            .unwrap()
+            .valid_ms;
+        core.advance(at(245), 0.245);
+        assert!(core.enabled && core.error.is_none());
+        // A past hold proves a pause, but request a current powered hold receipt
+        // before resuming if the serial writer was also late.
+        let confirmed = write(core.outgoing_reference(), core.desired_setpoints(), at(246));
+        assert!(confirmed.fallback_hold);
+        sent.send_replace(Some(confirmed));
+        core.advance(at(247), 0.002);
+        let first = write(core.outgoing_reference(), core.desired_setpoints(), at(248));
+        assert_eq!((first.q, first.dq), (held.q, [0.0; 7]));
+        assert!(!first.fallback_hold);
+        sent.send_replace(Some(first));
+        for axis in 0..7 {
+            queue(core.feedback[axis].as_ref().unwrap().value.clone(), at(250));
+        }
+        core.advance(at(251), 0.006);
+        assert!(core.velocity[1] > 0.0);
+        assert_eq!(
+            core.calibration.as_ref().unwrap().collectors[1]
+                .finish()
+                .unwrap()
+                .valid_ms,
+            windows
+        );
+    }
+
+    #[test]
+    fn calibration_feedback_timeout_lists_every_axis_still_missing_after_drain() {
+        let (mut core, _dir, _) = moving_feedback_fixture(Instant::now());
+        let last = core.control_at;
+        let at = |ms| last + Duration::from_millis(ms);
+        core.advance(at(60), 0.06);
+        let queue = core.bus.as_mut().unwrap().test_feedback_queue();
+        for axis in 0..5 {
+            queue(core.feedback[axis].as_ref().unwrap().value.clone(), at(240));
+        }
+        core.advance(at(245), 0.185);
+        let e = core.error.as_ref().unwrap();
+        assert_eq!(e.code, "feedback_stale");
+        assert!(
+            e.message.contains("J6 245 ms")
+                && e.message.contains("J7 245 ms")
+                && e.message.contains("185 ms"),
+            "{}",
+            e.message
+        );
+        assert!(!e.message.contains("J1"), "{}", e.message);
+        assert_eq!(
+            core.last_calibration_report.as_ref().unwrap().message,
+            e.message
+        );
+        follow_reference(&mut core, at(250));
+        core.advance(at(250), 0.005);
+        assert!(!core.enabled && core.calibration.is_none());
+    }
+
+    #[test]
+    fn calibration_feedback_device_fault_is_latched_across_new_healthy_frames() {
+        let (mut core, _dir, _) = moving_feedback_fixture(Instant::now());
+        let last = core.control_at;
+        let queue = core.bus.as_mut().unwrap().test_feedback_queue();
+        let mut fault = core.feedback[5].as_ref().unwrap().value.clone();
+        fault.timeout = true;
+        queue(fault, last + Duration::from_millis(240));
+        for axis in 0..7 {
+            queue(
+                core.feedback[axis].as_ref().unwrap().value.clone(),
+                last + Duration::from_millis(241),
+            );
+        }
+        core.advance(last + Duration::from_millis(245), 0.245);
+        assert_eq!(core.error.as_ref().unwrap().code, "device_timeout");
+        assert!(!core.enabled && core.calibration.is_none());
+        assert_eq!(
+            core.last_calibration_report.as_ref().unwrap().outcome,
+            "failed"
+        );
+    }
+
+    #[test]
+    fn planned_stop_before_feedback_wait_uses_the_final_write_and_the_stop_clock() {
+        // Request and handoff ages are measured from the oldest of seven real replies.
+        for (stop_ms, tick_ms, handoff_ms, in_flight, refresh_rx, expect_hold) in [
+            (51, 52, 52, false, false, true),
+            (51, 53, 53, true, true, true),
+            (49, 52, 52, true, false, true),
+            (49, 50, 50, true, false, false),
+            (49, 50, 52, true, false, true),
+        ] {
+            let (mut core, _dir, sent) = moving_feedback_fixture(Instant::now());
+            let last_rx = core.control_at;
+            let at = |ms| last_rx + Duration::from_millis(ms);
+            core.advance(at(40), 0.04);
+            let source = core.outgoing_reference();
+            let mut write = BusHandle::test_servo_writer();
+            let previous = write(source.clone(), core.desired_setpoints(), at(41));
+            sent.send_replace(Some(previous));
+            let gate = core.bus.as_ref().unwrap().test_reference_write();
+            let pending = in_flight.then(|| gate.lock().unwrap());
+            let mut moving = write(source, core.desired_setpoints(), at(48));
+            assert!(moving.dq[1] > 0.0 && moving.q[1] > previous.q[1]);
+            if !in_flight {
+                sent.send_replace(Some(moving));
+            }
+            let queue = core.bus.as_mut().unwrap().test_feedback_queue();
+            for axis in &core.feedback[..6] {
+                queue(axis.as_ref().unwrap().value.clone(), at(48));
+            }
+            calibration_request(&mut core, "stop", Operation::Stop, at(stop_ms));
+            if in_flight {
+                assert!(core.stopping);
+                moving.completed_at = at(handoff_ms);
+                sent.send_replace(Some(moving));
+                drop(pending);
+            }
+            if refresh_rx {
+                follow_reference(&mut core, at(handoff_ms));
+            }
+            core.advance(at(tick_ms), 0.002);
+            let first = write(
+                core.outgoing_reference(),
+                core.desired_setpoints(),
+                at(handoff_ms + 1),
+            );
+            assert!(core.enabled && core.error.is_none() && !first.fallback_hold);
+            if expect_hold {
+                assert_eq!(
+                    (first.q, first.dq, core.acceleration),
+                    (moving.q, [0.0; 7], [0.0; 7]),
+                    "Stop at {stop_ms} ms, handoff at {handoff_ms} ms"
+                );
+            } else {
+                assert!(first.dq[1] > 0.0 && first.q[1] > moving.q[1] && core.stopping);
+            }
+        }
+    }
+
+    #[test]
+    fn calibration_feedback_wait_cannot_resume_after_stop_or_release() {
+        for release in [false, true] {
+            let (mut core, _dir, sent) = moving_feedback_fixture(Instant::now());
+            let moving = sent.borrow().unwrap();
+            assert!(moving.dq[1] > 0.0);
+            let now = core.control_at + Duration::from_millis(60);
+            core.advance(now, 0.06);
+            // The stop races the first zero-speed hold write.
+            assert!(core.calibration.as_ref().unwrap().feedback_wait.is_some());
+            if release {
+                let lease = core.lease.as_ref().unwrap();
+                core.control(
+                    ControlRequest {
+                        action: "release".into(),
+                        client_id: lease.client_id.clone(),
+                        lease_id: Some(lease.secret.clone()),
+                    },
+                    now,
+                )
+                .unwrap();
+            } else {
+                calibration_request(&mut core, "stop", Operation::Stop, now);
+            }
+            let next = now + CONTROL_PERIOD;
+            follow_reference(&mut core, next);
+            core.advance(next, 0.01);
+            let held = core.outgoing_reference().sample(next, None).unwrap();
+            assert_eq!((held.q, held.dq), (moving.q, [0.0; 7]));
+            assert!(core.motion.is_none() && core.calibration.is_none());
+            assert_eq!(
+                core.last_calibration_report.as_ref().unwrap().outcome,
+                "cancelled"
+            );
+        }
+    }
     #[test]
     fn calibration_retains_the_serial_failure_after_the_writer_exits() {
         let now = Instant::now();
@@ -8874,6 +9333,86 @@ mod tests {
         assert_eq!(core.error.as_ref().unwrap().code, "device_disabled");
     }
     #[test]
+    fn enable_first_servo_frame_uses_the_queued_seven_axis_pose() {
+        let start = Instant::now();
+        let (mut core, _dir, _) = calibration_fixture(start);
+        let mut write = BusHandle::test_servo_writer();
+        core.advance(start, 0.01);
+        let a = write(core.outgoing_reference(), core.desired_setpoints(), start);
+        calibration_request(
+            &mut core,
+            "disable",
+            Operation::Disable {
+                allow_release: true,
+            },
+            start,
+        );
+        let queue = core.bus.as_mut().unwrap().test_feedback_queue();
+        let b = std::array::from_fn(|i| a.q[i] + 0.01 * (i + 1) as f64);
+        let rx = start + Duration::from_millis(10);
+        for (i, q) in b.into_iter().enumerate() {
+            let mut value = core.feedback[i].as_ref().unwrap().value.clone();
+            value.mode = 0;
+            value.q = q;
+            queue(value, rx);
+        }
+        let now = rx + Duration::from_millis(1);
+        calibration_request(&mut core, "enable", Operation::Enable, now);
+        core.advance(now, 0.011);
+        assert!(core.enable_request.is_some() && !core.enabled);
+        let first = write(core.outgoing_reference(), core.desired_setpoints(), now);
+        assert_eq!((first.q, first.dq), (b, [0.0; 7]));
+    }
+
+    #[test]
+    fn enable_rejects_a_queued_device_fault_followed_by_healthy_feedback() {
+        for timeout in [false, true] {
+            let start = Instant::now();
+            let (mut core, _dir, _) = calibration_fixture(start);
+            calibration_request(
+                &mut core,
+                "disable",
+                Operation::Disable {
+                    allow_release: true,
+                },
+                start,
+            );
+            let queue = core.bus.as_mut().unwrap().test_feedback_queue();
+            let mut bad = core.feedback[5].as_ref().unwrap().value.clone();
+            bad.error = if timeout { 0 } else { 1 };
+            bad.timeout = timeout;
+            queue(bad, start + Duration::from_millis(1));
+            for axis in &core.feedback {
+                queue(
+                    axis.as_ref().unwrap().value.clone(),
+                    start + Duration::from_millis(2),
+                );
+            }
+            calibration_request(
+                &mut core,
+                "enable",
+                Operation::Enable,
+                start + Duration::from_millis(3),
+            );
+            assert!(core.enable_request.is_none() && !core.enabled);
+            assert_eq!(core.results.front().unwrap().status, "rejected");
+            assert_eq!(
+                core.error.as_ref().unwrap().code,
+                if timeout {
+                    "device_timeout"
+                } else {
+                    "device_error"
+                }
+            );
+            assert!(
+                core.desired_setpoints()
+                    .iter()
+                    .all(|s| s.mode == DriveMode::Disabled)
+            );
+        }
+    }
+
+    #[test]
     fn enable_requires_all_seven_post_request_confirmations() {
         let now = Instant::now();
         let (mut core, _directory) = observed_core(now);
@@ -9273,6 +9812,271 @@ mod tests {
         assert_eq!(
             snapshot.borrow().owner.as_ref().unwrap().client_id,
             "desktop"
+        );
+    }
+
+    #[test]
+    #[ignore = "local hardware report required: set R17A_FEEDBACK_GAP_REPORT; no serial device is opened"]
+    fn local_report_j6_feedback_gap_holds_without_advancing_or_fabricating_feedback() {
+        use std::collections::BTreeSet;
+
+        let path = std::env::var_os("R17A_FEEDBACK_GAP_REPORT")
+            .expect("set R17A_FEEDBACK_GAP_REPORT to the original local calibration JSON");
+        let file = std::fs::File::open(path).expect("open local report read-only");
+        let report: CalibrationReport = serde_json::from_reader(std::io::BufReader::new(file))
+            .expect("parse the original complete calibration report");
+        assert_eq!(report.curves.len(), report.sample_count);
+        assert!(report.captured_samples >= report.sample_count);
+        let last = report.curves.iter().max_by_key(|p| p.t_ms).unwrap();
+        let trial = &report.trials[last.trial];
+        let axis = trial.axis.expect("the final trial is a joint baseline");
+        assert_eq!((axis, trial.phase.as_str()), (5, "baseline"));
+        assert_eq!(last.feedback_age_ms, [168; 7]);
+
+        let mut rows: Vec<_> = report
+            .curves
+            .iter()
+            .filter(|p| p.trial == last.trial)
+            .collect();
+        rows.sort_unstable_by_key(|p| p.t_ms);
+        let moving_end = rows.iter().rposition(|p| p.velocity[axis] < 0.0).unwrap();
+        let moving_start = rows[..=moving_end]
+            .iter()
+            .rposition(|p| p.velocity[axis] >= 0.0)
+            .map_or(0, |index| index + 1);
+        let rows = &rows[moving_start..];
+        let first = rows[0];
+        let origin = Instant::now();
+        let instant = |ms: u64| origin + Duration::from_millis(ms);
+
+        // Only q/dq/tau and inferred receive times below come from the report.
+        // mode=1, error/warning=0, timeout=false, 24 V and 25 C are simulated:
+        // this report contains none of those drive-state fields or hardware ACKs.
+        // floor(t_ms)-floor(age_ms) locates a receive time to approximately1 ms;
+        // duplicate reconstructed receive timestamps are not extra real frames.
+        let feedback = |point: &Point, joint: usize| Feedback {
+            id: joint as u8,
+            q: point.feedback[joint],
+            dq: point.feedback_velocity[joint],
+            tau: point.effort.expect("recorded torque is required")[joint],
+            temperature: 25.0,
+            voltage: 24.0,
+            error: 0,
+            warning: 0,
+            mode: 1,
+            timeout: false,
+        };
+        let receive_ms = |point: &Point, joint: usize| {
+            u64::from(point.t_ms) - u64::from(point.feedback_age_ms[joint])
+        };
+        let (mut core, _directory, sent) = calibration_fixture(instant(first.t_ms.into()));
+        core.model = Some(Arc::new(Kinematics::load(&report.side).unwrap()));
+        core.side = report.side.clone();
+        core.tcp = report.tcp;
+        core.servo_tuning = report.baseline;
+        core.feedback = Default::default();
+        for joint in 0..7 {
+            core.accept_feedback(feedback(first, joint), instant(receive_ms(first, joint)));
+        }
+        core.reference = first
+            .command
+            .expect("first recorded successful send target");
+        core.velocity = first.velocity;
+        core.control_at = instant(first.t_ms.into());
+        core.lease.as_mut().unwrap().expires = instant(u64::from(last.t_ms) + LEASE_MS);
+
+        // Seed the production sender with the available actual target/velocity.
+        // command_at_ms is completion time; packet start/duration was not recorded.
+        let mut write = BusHandle::test_servo_writer();
+        let seed_at = instant(first.command_at_ms.unwrap().into());
+        let mut seed = Reference::joint(
+            seed_at,
+            core.reference,
+            first.velocity,
+            [0.0; 7], // Controller acceleration is absent from this report.
+            core.generation,
+            core.reference_version,
+        );
+        seed.sampling = Sampling::Absolute;
+        seed.servo_tuning = report.baseline;
+        let seeded = write(seed, core.desired_setpoints(), seed_at);
+        assert_eq!(
+            (seeded.q, seeded.dq),
+            (first.command.unwrap(), first.velocity)
+        );
+        sent.send_replace(Some(seeded));
+
+        let mut program = report.settings.cartesian.as_ref().unwrap().as_ref().clone();
+        program.prepare(core.model.as_ref().unwrap()).unwrap();
+        core.motion_tuning = program.motion;
+        // This capture ends in the highest-speed negative J6 leg. Reconstruct
+        // its approved joint program, not an unrecorded original start phase.
+        let leg_index = program.joint_legs[axis].len() - 2;
+        let leg = program.joint_legs[axis][leg_index].clone();
+        let speed = program.joint_speeds[leg_index / 3];
+        let mut settings = report.settings.clone();
+        settings.axis = Some(axis);
+        settings.cartesian = None;
+        core.begin_calibration("local-feedback-gap", settings, instant(first.t_ms.into()))
+            .unwrap();
+        {
+            let run = core.calibration.as_mut().unwrap();
+            run.report.settings = report.settings.clone();
+            run.report.settings.cartesian = Some(Arc::new(program));
+            run.report.trials = report.trials.clone();
+            run.queue = report
+                .trials
+                .iter()
+                .map(|trial| CalibrationPlan {
+                    phase: trial.phase.clone(),
+                    axis: trial.axis.unwrap_or(0),
+                    config: trial.config,
+                    cartesian: trial.space == "cartesian",
+                })
+                .collect();
+            run.trial = last.trial;
+            run.legs = run.make_legs();
+            run.leg = leg_index;
+            run.step = CalibrationStep::Moving;
+            run.started = origin;
+            run.observed = None;
+        }
+        core.begin_calibration_leg(
+            "local-recorded-j6-leg",
+            leg.sample(0.0).q,
+            speed,
+            Some((Space::Joint, axis, leg)),
+            instant(first.t_ms.into()),
+        )
+        .unwrap();
+
+        let mut latest_ms: [u64; 7] = std::array::from_fn(|j| receive_ms(first, j));
+        let mut arrivals = Vec::new();
+        for point in rows.iter().skip(1) {
+            for (joint, latest) in latest_ms.iter_mut().enumerate() {
+                let at = receive_ms(point, joint);
+                if at > *latest {
+                    arrivals.push((at, feedback(point, joint)));
+                    *latest = at;
+                }
+            }
+        }
+        arrivals.sort_by_key(|(ms, frame)| (*ms, frame.id));
+        // The100 Hz control clock is an explicit simulation, not reconstructed
+        // original control ticks. Sender calls use only retained completion times.
+        let controls: BTreeSet<_> = (u64::from(first.t_ms)..=u64::from(last.t_ms))
+            .step_by(CONTROL_PERIOD.as_millis() as usize)
+            .chain([u64::from(last.t_ms)])
+            .collect();
+        let sends: BTreeSet<_> = rows
+            .iter()
+            .filter_map(|p| p.command_at_ms.map(u64::from))
+            .filter(|ms| *ms >= u64::from(first.t_ms))
+            .collect();
+        let ticks: BTreeSet<_> = controls.union(&sends).copied().collect();
+        let mut next_feedback = 0;
+        let mut delivered_ms: [u64; 7] = std::array::from_fn(|j| receive_ms(first, j));
+        let mut previous_control = instant(first.t_ms.into()) - CONTROL_PERIOD;
+        let mut source = core.outgoing_reference();
+        let mut setpoints = core.desired_setpoints();
+        let mut held: Option<(SentReference, f64)> = None;
+        let mut held_reference = None;
+        let mut held_capture_count = None;
+        for ms in ticks {
+            let at = instant(ms);
+            while next_feedback < arrivals.len() && arrivals[next_feedback].0 <= ms {
+                let (received, frame) = &arrivals[next_feedback];
+                core.accept_feedback(frame.clone(), instant(*received));
+                delivered_ms[frame.id as usize] = *received;
+                next_feedback += 1;
+            }
+            if controls.contains(&ms) {
+                core.advance(at, at.duration_since(previous_control).as_secs_f64());
+                previous_control = at;
+                assert!(core.error.is_none() && core.enabled, "{:?}", core.error);
+                let run = core
+                    .calibration
+                    .as_ref()
+                    .expect("the recorded leg remains active");
+                assert_eq!((run.trial, run.leg), (last.trial, leg_index));
+                assert_eq!(
+                    core.motion.as_ref().unwrap().request_id,
+                    "local-recorded-j6-leg"
+                );
+                if delivered_ms
+                    .iter()
+                    .any(|rx| ms - rx > MAX_REFERENCE_AGE.as_millis() as u64)
+                {
+                    assert_eq!(
+                        core.velocity, [0.0; 7],
+                        "old feedback advanced the planned leg"
+                    );
+                    assert_eq!(core.acceleration, [0.0; 7]);
+                    assert_eq!(
+                        core.reference,
+                        *held_reference.get_or_insert(core.reference),
+                        "the held reference jumped without new feedback"
+                    );
+                    let count = *held_capture_count.get_or_insert(run.points.captured());
+                    assert_eq!(
+                        run.points.captured(),
+                        count,
+                        "held values became new measurements"
+                    );
+                }
+                source = core.outgoing_reference();
+                setpoints = core.desired_setpoints();
+            }
+            if sends.contains(&ms) {
+                let receipt = write(source.clone(), setpoints, at);
+                if delivered_ms
+                    .iter()
+                    .any(|rx| ms - rx > MAX_REFERENCE_AGE.as_millis() as u64)
+                {
+                    assert!(
+                        receipt.fallback_hold,
+                        "a fresh control timestamp extended old feedback"
+                    );
+                    assert_eq!(receipt.dq, [0.0; 7]);
+                    let progress = receipt.calibration_phase.unwrap().progress(at);
+                    let (first_hold, first_progress) = *held.get_or_insert((receipt, progress));
+                    assert_eq!((receipt.q, progress), (first_hold.q, first_progress));
+                }
+                sent.send_replace(Some(receipt));
+            }
+        }
+        assert_eq!(next_feedback, arrivals.len());
+        let (held, _) = held.expect("the recorded168 ms feedback gap must enter sender hold");
+        assert_eq!((core.reference, core.velocity), (held.q, [0.0; 7]));
+        for joint in 0..7 {
+            let observed = core.feedback[joint].as_ref().unwrap();
+            assert_eq!(observed.at, instant(receive_ms(last, joint)));
+            assert_eq!(
+                (observed.value.q, observed.value.dq, observed.value.tau),
+                (
+                    last.feedback[joint],
+                    last.feedback_velocity[joint],
+                    last.effort.unwrap()[joint]
+                )
+            );
+            assert_eq!(
+                instant(last.t_ms.into())
+                    .duration_since(observed.at)
+                    .as_millis(),
+                168
+            );
+        }
+
+        let run = core.calibration.as_ref().unwrap();
+        assert_eq!(run.points.captured(), held_capture_count.unwrap());
+        assert_eq!((run.trial, run.leg), (last.trial, leg_index));
+        assert!(core.error.is_none() && core.enabled);
+        eprintln!(
+            "local report: {} retained/{} captured; {} reconstructed per-axis arrivals; held through{} ms age; drive mode/error/voltage and control clock are simulated; no feedback after EOF",
+            report.sample_count,
+            report.captured_samples,
+            arrivals.len(),
+            last.feedback_age_ms[axis]
         );
     }
 }

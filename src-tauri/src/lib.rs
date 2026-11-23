@@ -5,6 +5,7 @@ mod calibration_spline;
 mod friction;
 mod journal;
 mod kinematics;
+mod power;
 mod protocol;
 mod reference;
 #[cfg(test)]
@@ -42,6 +43,18 @@ struct Runtime {
 }
 
 struct RuntimeState(Arc<Runtime>);
+
+fn keep_awake(state: &arm::Snapshot) -> bool {
+    // A dead serial worker retains its port name for fault display. Driver
+    // faults on a live connection still need observation and recovery.
+    let serial_closed = !state.enabled
+        && state.phase == arm::Phase::Fault
+        && state
+            .error
+            .as_ref()
+            .is_some_and(|error| error.code == "communication_error");
+    state.phase != arm::Phase::Closing && (state.port.is_some() || state.enabled) && !serial_closed
+}
 
 #[tauri::command]
 fn session_info(
@@ -197,8 +210,26 @@ pub fn run() {
             })));
             let app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                let mut power = power::IdleSleep::default();
                 loop {
-                    if states.borrow().phase == arm::Phase::Closing {
+                    let (connected, closing) = {
+                        let state = states.borrow_and_update();
+                        (keep_awake(&state), state.phase == arm::Phase::Closing)
+                    };
+                    // This observer is separate from arm-control. Release the
+                    // watch borrow before making short native power calls.
+                    if let Err(error) = power.update(connected)
+                        && let Some(runtime) = app.try_state::<RuntimeState>()
+                    {
+                        runtime.0.journal.log(
+                            "warn",
+                            "app",
+                            "power_assertion_failed",
+                            &error,
+                            None,
+                        );
+                    }
+                    if closing {
                         // An approved close can outlive its IPC timeout. The
                         // committed state must still finish server/log cleanup.
                         shutdown(&app);
@@ -230,4 +261,76 @@ pub fn run() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod power_state_tests {
+    use super::*;
+
+    #[test]
+    fn power_scope_releases_permanent_io_fault_and_preserves_online_faults() {
+        // Start only the offline controller to obtain its real Snapshot shape.
+        // The mock port below is snapshot data; no Connect command is issued.
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal::Journal::start(directory.path().join("events.db")).unwrap();
+        let arm = arm::ArmHandle::spawn(journal.clone()).unwrap();
+        let mut state = arm.snapshot();
+        assert!(arm.shutdown(Duration::from_secs(1)));
+        assert!(!keep_awake(&state));
+
+        state.port = Some("/dev/mock-power-snapshot".into());
+        for phase in [
+            arm::Phase::Connecting,
+            arm::Phase::Disabled,
+            arm::Phase::Ready,
+            arm::Phase::Moving,
+            arm::Phase::Stopping,
+            arm::Phase::Teaching,
+        ] {
+            state.phase = phase;
+            assert!(keep_awake(&state), "connected {phase:?}");
+        }
+        state.phase = arm::Phase::Fault;
+        state.enabled = false;
+        for code in [
+            "device_error",
+            "device_disabled",
+            "device_timeout",
+            "feedback_timeout",
+        ] {
+            state.error = Some(arm::ApiError::new(code, "online drive fault"));
+            assert!(keep_awake(&state), "online fault {code}");
+        }
+        state.error = Some(arm::ApiError::new(
+            "communication_error",
+            "serial I/O thread is closed",
+        ));
+        assert!(state.port.is_some());
+        assert!(!keep_awake(&state), "permanent serial I/O failure");
+        state.enabled = true;
+        assert!(
+            keep_awake(&state),
+            "only the committed disabled fault ends protection"
+        );
+        state.enabled = false;
+        state.phase = arm::Phase::Ready;
+        assert!(
+            keep_awake(&state),
+            "error text alone does not end protection"
+        );
+
+        state.phase = arm::Phase::Closing;
+        assert!(
+            !keep_awake(&state),
+            "exit releases even with a retained port"
+        );
+        state.phase = arm::Phase::Disconnected;
+        state.port = None;
+        state.error = None;
+        assert!(!keep_awake(&state));
+        state.phase = arm::Phase::Connecting;
+        state.port = Some("/dev/mock-power-snapshot".into());
+        assert!(keep_awake(&state), "reconnect restores protection");
+        assert!(journal.shutdown(Duration::from_secs(1)));
+    }
 }

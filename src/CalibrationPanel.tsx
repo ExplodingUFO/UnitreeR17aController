@@ -218,9 +218,19 @@ function ReportDetails({
   const hasCartesian = !!cartesianBefore || !!cartesianAfter;
   const recordedCount = report.sample_count || report.curves?.length || 0;
   const capturedCount = report.captured_samples || recordedCount;
-  const recordedDuration = report.curves?.length
-    ? Math.max(...report.curves.map((point) => point.t_ms)) / 1000
-    : null;
+  const lastPoint = useMemo(
+    () =>
+      report.curves?.reduce<CalibrationPoint | undefined>(
+        (latest, point) =>
+          !latest || point.t_ms > latest.t_ms ? point : latest,
+        undefined,
+      ),
+    [report.curves],
+  );
+  const lastTrial =
+    lastPoint && report.trials.find((trial) => trial.index === lastPoint.trial);
+  const lastStage =
+    lastTrial && stages[lastTrial.phase as CalibrationStatus["stage"]];
   const beforeMetrics = cartesianBefore?.metrics_by_joint;
   const afterMetrics = cartesianAfter?.metrics_by_joint;
   const cartesianAxes = Array.from({ length: 7 }, (_, axis) => axis).filter(
@@ -285,11 +295,15 @@ function ReportDetails({
                 ? `${recordedCount.toLocaleString()} 点`
                 : "力矩残差拟合"}
             </b>
-            {recordedDuration != null && (
-              <small>已录制 {recordedDuration.toFixed(3)} s</small>
+            {lastPoint && (
+              <small>已录制 {(lastPoint.t_ms / 1000).toFixed(3)} s</small>
             )}
-            {!pairedCartesian && hasCartesian && (
-              <small>末端动作 · 已采集部分</small>
+            {lastStage && ["failed", "cancelled"].includes(report.outcome) && (
+              <small>
+                最后采样 ·{" "}
+                {lastTrial.axis != null && `J${lastTrial.axis + 1} · `}
+                {lastStage}
+              </small>
             )}
           </span>
           <button onClick={onCurves}>
