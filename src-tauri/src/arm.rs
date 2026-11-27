@@ -9,13 +9,13 @@ use crate::{
     journal::{Journal, JournalStats, TraceData},
     kinematics::{
         self, CartesianPath, CartesianPlanning, Frame, HoldPose, Kinematics, LocalTarget,
-        MotionLimits, Pose, SmoothingState, StepInput,
+        MotionLimits, Pose, SmoothingState, StepInput, TcpPosePath,
     },
     protocol::{
         BusError, BusHandle, DriveMode, Feedback, ReceivedFeedback, SentReference, Setpoint,
         motor_fault_description,
     },
-    reference::{CartesianGuard, MAX_REFERENCE_AGE, Reference, Sampling},
+    reference::{CartesianGuard, MAX_REFERENCE_AGE, Reference, Sampling, TcpMoveGuard},
     teaching::{
         self, Capture as TeachingCapture, Guidance, PlaybackOptions, Program as TeachingProgram,
         Recorder as TeachingRecorder, Summary as TeachingSummary,
@@ -100,6 +100,10 @@ pub struct CommandResult {
     pub status: String,
     pub code: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured_tcp: Option<Pose>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual_duration_s: Option<f64>,
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct ActionSnapshot {
@@ -270,6 +274,10 @@ pub enum Operation {
         #[serde(default = "base_frame")]
         frame: Frame,
     },
+    MoveTcp {
+        tcp: Pose,
+        duration_s: f64,
+    },
     ReturnToPose {
         joints: [f64; 7],
         speed: f64,
@@ -298,6 +306,7 @@ impl Operation {
             Self::JogStart { .. } => "jog_start",
             Self::JogUpdate { .. } => "jog_update",
             Self::Step { .. } => "step",
+            Self::MoveTcp { .. } => "move_tcp",
             Self::ReturnToPose { .. } => "return_to_pose",
             Self::Stop => "stop",
         }
@@ -350,6 +359,19 @@ pub struct ArmHandle {
 impl ArmHandle {
     pub fn spawn(journal: Journal) -> Result<Self, String> {
         Self::spawn_core(Core::new(journal))
+    }
+    #[cfg(test)]
+    pub(crate) fn spawn_emulated(journal: Journal) -> Result<Self, String> {
+        let mut core = Core::new(journal.clone());
+        core.bus = Some(BusHandle::emulated_board(
+            journal,
+            core.reference_epoch.clone(),
+        )?);
+        core.port = Some("emulated-board".into());
+        core.tcp = Some(Pose::identity());
+        core.connected_at = Some(Instant::now());
+        core.phase = Phase::Connecting;
+        Self::spawn_core(core)
     }
     fn spawn_core(core: Core) -> Result<Self, String> {
         let journal = core.journal.clone();
@@ -529,7 +551,13 @@ struct Observation {
 enum MotionMode {
     Continuous,
     Step,
-    Return { disconnect_after: bool },
+    MoveTcp {
+        path: TcpPosePath,
+        settled_send: Option<Instant>,
+    },
+    Return {
+        disconnect_after: bool,
+    },
 }
 impl MotionMode {
     fn timed(self) -> bool {
@@ -539,6 +567,7 @@ impl MotionMode {
         match self {
             Self::Continuous => "continuous",
             Self::Step => "step",
+            Self::MoveTcp { .. } => "move_tcp",
             Self::Return { .. } => "return",
         }
     }
@@ -839,26 +868,48 @@ impl Core {
         self.servo_tuning_revision += 1;
     }
     fn record(&mut self, id: &str, status: &str, code: &str, message: impl Into<String>) {
-        let result = CommandResult {
+        self.push_result(CommandResult {
             request_id: id.into(),
             status: status.into(),
             code: code.into(),
             message: message.into(),
-        };
+            measured_tcp: None,
+            actual_duration_s: None,
+        });
+    }
+    fn push_result(&mut self, result: CommandResult) {
         self.journal.log(
-            if status == "rejected" || status == "failed" {
+            if matches!(result.status.as_str(), "rejected" | "failed") {
                 "error"
             } else {
                 "info"
             },
             "control",
-            code,
+            &result.code,
             &result.message,
-            Some(id),
+            Some(&result.request_id),
         );
         self.results.push_front(result);
         self.results.truncate(32);
         self.dirty = true;
+    }
+    fn record_tcp_result(
+        &mut self,
+        motion: Motion,
+        status: &str,
+        code: &str,
+        message: &str,
+        now: Instant,
+        measured_tcp: Option<Pose>,
+    ) {
+        self.push_result(CommandResult {
+            request_id: motion.request_id,
+            status: status.into(),
+            code: code.into(),
+            message: message.into(),
+            measured_tcp,
+            actual_duration_s: Some(now.saturating_duration_since(motion.started).as_secs_f64()),
+        });
     }
     fn phase(&mut self) {
         self.phase = if self.error.is_some() && self.bus.is_some() {
@@ -953,12 +1004,20 @@ impl Core {
         }
         if let Some(motion) = self.motion.take() {
             self.stop_path = Self::motion_path(&motion);
-            if let Some(program) = motion.planned {
-                self.pending_calibration_stop = Some((self.reference_version, program));
-                self.absolute_hold = false;
-            }
-            if !motion.calibration {
-                self.record(&motion.request_id, status, code, message);
+            if matches!(motion.mode, MotionMode::MoveTcp { .. }) {
+                let measured_tcp = self
+                    .measured(now)
+                    .ok()
+                    .and_then(|q| self.model.as_ref()?.fk(&q, self.tcp.as_ref()?).ok());
+                self.record_tcp_result(motion, status, code, message, now, measured_tcp);
+            } else {
+                if let Some(program) = motion.planned {
+                    self.pending_calibration_stop = Some((self.reference_version, program));
+                    self.absolute_hold = false;
+                }
+                if !motion.calibration {
+                    self.record(&motion.request_id, status, code, message);
+                }
             }
         }
         self.bump_generation();
@@ -1200,6 +1259,16 @@ impl Core {
             request.operation,
             Operation::TeachStart { .. } | Operation::TeachFinish { .. }
         );
+        if matches!(request.operation, Operation::MoveTcp { .. })
+            && (self.motion.as_ref().is_some_and(|motion| {
+                matches!(motion.mode, MotionMode::MoveTcp { .. }) && motion.request_id == id
+            }) || self.results.iter().any(|result| {
+                result.request_id == id
+                    && (result.code == "move_tcp" || result.actual_duration_s.is_some())
+            }))
+        {
+            return;
+        }
         if !recording_command && request.generation != self.generation {
             self.record(&id, "rejected", "stale_context", "操作上下文已改变");
             return;
@@ -1557,6 +1626,9 @@ impl Core {
                 speed,
                 disconnect_after,
             } => self.begin_return(id, joints, speed, disconnect_after, now)?,
+            Operation::MoveTcp { tcp, duration_s } => {
+                self.begin_move_tcp(id, tcp, duration_s, now)?
+            }
             Operation::JogUpdate {
                 action_id,
                 input_seq,
@@ -2892,6 +2964,73 @@ impl Core {
         self.phase = Phase::Moving;
         Ok(())
     }
+    fn begin_move_tcp(
+        &mut self,
+        id: &str,
+        goal: Pose,
+        duration_s: f64,
+        now: Instant,
+    ) -> Result<(), ApiError> {
+        if !duration_s.is_finite() || duration_s <= 0.0 {
+            return Err(ApiError::new(
+                "invalid_duration",
+                "TCP 运动时长须为有限正数",
+            ));
+        }
+        let anchor = self.motion_anchor(now)?;
+        let tcp = self
+            .tcp
+            .ok_or_else(|| ApiError::new("tcp_missing", "TCP 未配置"))?;
+        let model = self.model.as_ref().unwrap();
+        let start = model
+            .fk(&anchor, &tcp)
+            .map_err(|e| ApiError::new("kinematics", e))?;
+        let path = TcpPosePath::new(start, goal, model.reach_radius(&tcp))
+            .map_err(|e| ApiError::new("invalid_pose", e))?;
+        let (linear_cap, angular_cap) = model
+            .cartesian_speed_limits(&anchor, &tcp, self.joint_speeds())
+            .map_err(|e| ApiError::new("kinematics", e))?;
+        let (linear, angular) = path.distances();
+        // The quintic progress curve's peak rate is 1.875 times its average.
+        let duration = duration_s
+            .max(1.875 * (linear / linear_cap).max(angular / angular_cap))
+            .max(self.cartesian_step_duration(anchor, &tcp, &path.goal, 0.0, 1.0)?);
+        if !duration.is_finite() {
+            return Err(ApiError::new("invalid_duration", "TCP 轨迹时长无效"));
+        }
+        self.reference = anchor;
+        self.reset_derivatives();
+        self.absolute_hold = false;
+        self.motion = Some(Motion {
+            calibration_phase: None,
+            planned: None,
+            calibration: false,
+            finishing: None,
+            request_id: id.into(),
+            space: Space::Cartesian,
+            axis: 0,
+            direction: 0.0,
+            speed: 0.0,
+            frame: Frame::Base,
+            mode: MotionMode::MoveTcp {
+                path,
+                settled_send: None,
+            },
+            amount: 0.0,
+            started: now,
+            duration,
+            initial: anchor,
+            target: anchor,
+            initial_pose: Some(start),
+            path_origin: None,
+            target_pose: Some(path.goal),
+            deadline: None,
+            input_seq: 0,
+        });
+        self.phase = Phase::Moving;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn begin(
         &mut self,
@@ -3046,11 +3185,12 @@ impl Core {
         self.stop_path = None;
     }
     fn motion_path(motion: &Motion) -> Option<CartesianPath> {
-        (motion.space == Space::Cartesian).then(|| CartesianPath {
-            origin: motion.path_origin.or(motion.initial_pose).unwrap(),
-            axis: motion.axis,
-            frame: motion.frame,
-        })
+        (motion.space == Space::Cartesian && !matches!(motion.mode, MotionMode::MoveTcp { .. }))
+            .then(|| CartesianPath {
+                origin: motion.path_origin.or(motion.initial_pose).unwrap(),
+                axis: motion.axis,
+                frame: motion.frame,
+            })
     }
     // Constrain the controller velocity before integrating its reference once.
     // The serial sender may coalesce updates; capture its timing separately.
@@ -3100,6 +3240,7 @@ impl Core {
             model.cartesian_speed_limits(&self.reference, &tcp, joint_velocity)?;
         if let Some(motion) = &self.motion
             && motion.space == Space::Cartesian
+            && !matches!(motion.mode, MotionMode::MoveTcp { .. })
         {
             if motion.axis < 3 {
                 linear_speed = linear_speed.min(motion.speed);
@@ -3114,7 +3255,14 @@ impl Core {
         let task_rate = (linear_speed / length).min(angular_speed);
         linear_speed = task_rate * length;
         angular_speed = task_rate;
-        let planning = if let Some(run) = &self.calibration
+        let planning = if let Some(motion) = &self.motion
+            && matches!(motion.mode, MotionMode::MoveTcp { .. })
+        {
+            Some(CartesianPlanning {
+                origin: motion.initial,
+                guide: None,
+            })
+        } else if let Some(run) = &self.calibration
             && let Some(program) = &run.report.settings.cartesian
         {
             let origin = model.fk(&program.origin, &program.tcp)?;
@@ -3335,6 +3483,12 @@ impl Core {
             return;
         }
         let mode = motion.mode;
+        if matches!(mode, MotionMode::MoveTcp { .. }) {
+            if let Err(error) = self.advance_move_tcp(measured, now, dt) {
+                self.end_motion_at("failed", &error.code, &error.message, now);
+            }
+            return;
+        }
         let t = if mode.timed() {
             (elapsed / motion.duration).clamp(0.0, 1.0)
         } else {
@@ -3499,6 +3653,94 @@ impl Core {
             }
         }
     }
+    fn advance_move_tcp(
+        &mut self,
+        measured: [f64; 7],
+        now: Instant,
+        dt: f64,
+    ) -> Result<(), ApiError> {
+        let motion = self.motion.as_ref().unwrap();
+        let MotionMode::MoveTcp {
+            path,
+            mut settled_send,
+        } = motion.mode
+        else {
+            unreachable!();
+        };
+        let t = (now.saturating_duration_since(motion.started).as_secs_f64() / motion.duration)
+            .clamp(0.0, 1.0);
+        let model = self.model.as_ref().unwrap();
+        let tcp = self.tcp.as_ref().unwrap();
+        let reference_pose = model
+            .fk(&self.reference, tcp)
+            .map_err(|e| ApiError::new("kinematics", e))?;
+        let at_goal = t >= 1.0 && path.at_reference_goal(&reference_pose);
+        if at_goal && self.can_finish_stop(dt) {
+            if !self.at_rest() {
+                return self.decelerate(measured, dt);
+            }
+            if settled_send.is_none() {
+                let Some(sent) = self
+                    .bus
+                    .as_ref()
+                    .and_then(BusHandle::latest_reference)
+                    .filter(|s| s.epoch == self.reference_version && !s.fallback_hold)
+                    .filter(|s| s.dq.iter().all(|v| v.abs() < 1e-12))
+                else {
+                    return Ok(());
+                };
+                if !model
+                    .fk(&sent.q, tcp)
+                    .is_ok_and(|pose| path.at_reference_goal(&pose))
+                {
+                    // Control and send use separate clocks. Correct residual from
+                    // the actual stationary wire position without a setpoint jump.
+                    self.reference = sent.q;
+                    return Ok(());
+                }
+                settled_send = Some(sent.completed_at);
+                self.motion.as_mut().unwrap().mode = MotionMode::MoveTcp { path, settled_send };
+            }
+            if self.oldest_feedback() <= settled_send {
+                return Ok(());
+            }
+            let actual = model
+                .fk(&measured, tcp)
+                .map_err(|e| ApiError::new("kinematics", e))?;
+            if path.at_goal(&actual) {
+                let motion = self.motion.take().unwrap();
+                self.bump_generation();
+                self.phase();
+                self.record_tcp_result(
+                    motion,
+                    "completed",
+                    "tcp_reached",
+                    "TCP 已到达目标",
+                    now,
+                    Some(actual),
+                );
+            }
+            return Ok(());
+        }
+
+        let progress = t * t * t * (10.0 + t * (-15.0 + 6.0 * t));
+        let target = path
+            .pose(progress)
+            .map_err(|e| ApiError::new("kinematics", e))?;
+        let previous = self.reference;
+        // Use the full pose for the arrival controller as well as the traverse.
+        self.commit_cartesian(LocalTarget::Pose(target), None, measured, dt, t >= 1.0)
+            .map_err(|e| ApiError::new("kinematics", e))?;
+        if t >= 1.0 && !at_goal && (0..7).all(|i| (self.reference[i] - previous[i]).abs() <= 1e-12)
+        {
+            return Err(ApiError::new(
+                "tcp_unreachable",
+                "当前构型无法到达 TCP 目标",
+            ));
+        }
+        Ok(())
+    }
+
     fn outgoing_reference(&self) -> Reference {
         let mut reference = Reference::joint_for_model(
             self.control_at,
@@ -3578,6 +3820,16 @@ impl Core {
                 goal: motion.and_then(|m| m.target_pose),
             });
         }
+        if let (Some(model), Some(tcp), Some(motion)) = (&self.model, self.tcp, motion)
+            && let MotionMode::MoveTcp { path, .. } = motion.mode
+        {
+            reference.tcp_move = Some(TcpMoveGuard {
+                model: model.clone(),
+                tcp,
+                path,
+                origin: motion.initial,
+            });
+        }
         reference
     }
     fn reject_send_reference(
@@ -3610,7 +3862,11 @@ impl Core {
             );
             return;
         }
-        self.end_motion("failed", "send_reference", "发送参考无法对齐，动作已停止");
+        if reason == crate::reference::SampleStatus::PathDeviation {
+            self.end_motion("failed", "tcp_path_deviation", "发送参考偏离 TCP 位姿路径");
+        } else {
+            self.end_motion("failed", "send_reference", "发送参考无法对齐，动作已停止");
+        }
         self.reference = held;
         self.reset_derivatives();
         self.stopping = false;
@@ -3671,13 +3927,19 @@ impl Core {
                 stopping: self.stopping,
                 motion: motion.map_or(0, |m| match (m.space, m.mode) {
                     (_, MotionMode::Return { .. }) => 5,
+                    (_, MotionMode::MoveTcp { .. }) => 6,
                     (Space::Joint, MotionMode::Continuous) => 1,
                     (Space::Joint, MotionMode::Step) => 2,
                     (Space::Cartesian, MotionMode::Continuous) => 3,
                     (Space::Cartesian, MotionMode::Step) => 4,
                 }),
                 axis: motion
-                    .filter(|m| !matches!(m.mode, MotionMode::Return { .. }))
+                    .filter(|m| {
+                        !matches!(
+                            m.mode,
+                            MotionMode::Return { .. } | MotionMode::MoveTcp { .. }
+                        )
+                    })
                     .map(|m| m.axis as u8),
                 q_ref: self.reference,
                 dq_ref: self.velocity,
@@ -3965,8 +4227,10 @@ impl Core {
             .motion
             .as_ref()
             .map(|motion| {
-                if matches!(motion.mode, MotionMode::Return { .. }) {
-                    return "return joint".into();
+                match motion.mode {
+                    MotionMode::Return { .. } => return "return joint".into(),
+                    MotionMode::MoveTcp { .. } => return "move_tcp".into(),
+                    _ => {}
                 }
                 format!(
                     "{}{}J{}",
@@ -4271,8 +4535,11 @@ impl Core {
                         request_id: motion.request_id.clone(),
                         space: motion.space,
                         mode: motion.mode.name().into(),
-                        axis: (!matches!(motion.mode, MotionMode::Return { .. }))
-                            .then_some(motion.axis),
+                        axis: (!matches!(
+                            motion.mode,
+                            MotionMode::Return { .. } | MotionMode::MoveTcp { .. }
+                        ))
+                        .then_some(motion.axis),
                         progress: if motion.mode.timed() {
                             (now.saturating_duration_since(motion.started).as_secs_f64()
                                 / motion.duration)

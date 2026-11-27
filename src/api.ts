@@ -411,6 +411,8 @@ export interface Result {
   status: ResultStatus;
   code: string;
   message: string;
+  measured_tcp?: Pose;
+  actual_duration_s?: number;
 }
 export type JointPositions = [
   number,
@@ -615,6 +617,7 @@ export type Action = {
 } & (
   | { space: Space; mode: "continuous" | "step"; axis: number }
   | { space: "joint"; mode: "return"; axis: null }
+  | { space: "cartesian"; mode: "move_tcp"; axis: null }
   | { space: "joint"; mode: "teaching" | "replay"; axis: null }
   | { space: Space; mode: "calibration"; axis: number }
 );
@@ -750,6 +753,7 @@ export type Operation =
   | { kind: "enable" | "clear_fault" | "stop" }
   | ({ kind: "return_to_pose" } & ReturnToPoseArguments)
   | { kind: "configure_tcp"; tcp: Pose }
+  | { kind: "move_tcp"; tcp: Pose; duration_s: number }
   | { kind: "configure_servo"; config: ServoTuning }
   | { kind: "configure_motion"; config: MotionTuning }
   | { kind: "calibrate_start"; settings?: Partial<CalibrationSettings> }

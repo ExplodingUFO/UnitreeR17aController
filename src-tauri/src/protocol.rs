@@ -1375,7 +1375,11 @@ impl BusHandle {
                                 if let Some(reason) = prepared.rejection
                                     && let Some(source) = &last.reference
                                 {
-                                    if rejected.is_none_or(|(epoch, _)| epoch != source.epoch) {
+                                    if rejected.is_none_or(|(epoch, previous)| {
+                                        epoch != source.epoch
+                                            || (reason == SampleStatus::PathDeviation
+                                                && previous != reason)
+                                    }) {
                                         let _ = writer_events.send(BusEvent::ReferenceRejected {
                                             generation: source.generation,
                                             epoch: source.epoch,
@@ -1527,6 +1531,11 @@ impl BusHandle {
     #[cfg(test)]
     pub(crate) fn test_reference_write(&self) -> Arc<Mutex<()>> {
         self.reference_write.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn emulated_board(journal: Journal, epoch: Arc<AtomicU64>) -> Result<Self, String> {
+        tests::emulated_board(journal, epoch)
     }
 
     #[cfg(test)]
@@ -2795,6 +2804,43 @@ mod tests {
         pause_after_servo_packet: Option<(u8, Duration)>,
         hold_write: Option<(Sender<()>, EventReceiver<()>)>,
         fail_once_for_mode: Option<(u8, io::ErrorKind)>,
+        board: Option<EmulatedBoard>,
+    }
+
+    /// A packet-level board emulator. Quantized encoder positions follow
+    /// the received servo command with lag, independent of Core's target.
+    struct EmulatedBoard {
+        encoders: [i32; 7],
+    }
+
+    impl EmulatedBoard {
+        fn reply(&mut self, command: &[u8]) -> Vec<u8> {
+            assert_eq!(command[..2], [0xfe, 0xee]);
+            assert_eq!(
+                u32::from_le_bytes(command[16..20].try_into().unwrap()),
+                crc32(&command[..16])
+            );
+            let id = command[2] & 0x0f;
+            let servo = (command[2] >> 4) & 7 == 1;
+            let encoder = &mut self.encoders[id as usize];
+            let mut advance = 0;
+            if servo {
+                let target = i32::from_le_bytes(command[8..12].try_into().unwrap());
+                let remaining = i64::from(target) - i64::from(*encoder);
+                advance = (remaining / 3).abs().max(1) * remaining.signum();
+                *encoder = (i64::from(*encoder) + advance) as i32;
+            }
+            let velocity = ((advance as f64 / (512.0 * WRITE_PERIOD.as_secs_f64())).round()) as i16;
+            let mut reply = vec![0; FEEDBACK_LEN];
+            reply[..2].copy_from_slice(&[0xfc, 0xee]);
+            reply[2] = id | if servo { 0x10 } else { 0 };
+            reply[3..6].copy_from_slice(&[28, 28, 48]);
+            reply[8..10].copy_from_slice(&velocity.to_le_bytes());
+            reply[10..14].copy_from_slice(&encoder.to_le_bytes());
+            let crc = crc32(&reply[2..22]);
+            reply[22..26].copy_from_slice(&crc.to_le_bytes());
+            reply
+        }
     }
 
     struct FakePort {
@@ -2847,6 +2893,11 @@ mod tests {
             }
             w.written.extend_from_slice(&buf[..n]);
             if w.written.len().is_multiple_of(COMMAND_LEN) {
+                if let Some(board) = &mut w.board {
+                    assert_eq!(n, COMMAND_LEN);
+                    let reply = board.reply(buf);
+                    w.active.push_back(reply);
+                }
                 let staged = std::mem::take(&mut w.after_tx);
                 w.active.extend(staged);
                 if n == COMMAND_LEN && buf[2] == 0x66 {
@@ -2989,6 +3040,33 @@ mod tests {
             },
             wire,
         )
+    }
+
+    pub(super) fn emulated_board(
+        journal: Journal,
+        epoch: Arc<AtomicU64>,
+    ) -> Result<BusHandle, String> {
+        let calibration = calibrations("right")?;
+        let initial = [0.3, 0.7, 1.1, 0.9, -0.4, 0.2, -0.3];
+        let mut encoders = [0; 7];
+        for (i, (encoder, q)) in encoders.iter_mut().zip(initial).enumerate() {
+            let packet = encode(
+                i as u8,
+                calibration[i].command(Setpoint {
+                    mode: DriveMode::Servo,
+                    q,
+                    ..stop()
+                }),
+            )?;
+            *encoder = i32::from_le_bytes(packet[8..12].try_into().unwrap());
+        }
+        let (mut bus, _) = fake_bus(Wire {
+            write_chunk: COMMAND_LEN,
+            board: Some(EmulatedBoard { encoders }),
+            ..Wire::default()
+        });
+        bus.budget = TEST_IO_BUDGET;
+        BusHandle::start_with_epoch(bus, Some(journal), epoch)
     }
 
     pub(super) fn clear_response_bus() -> BusHandle {

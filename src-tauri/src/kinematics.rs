@@ -88,6 +88,81 @@ pub struct CartesianPath {
     pub frame: Frame,
 }
 
+/// A base-frame segment with one progress parameter for translation and rotation.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TcpPosePath {
+    start: Pose,
+    pub goal: Pose,
+    delta: [f64; 6],
+    direction: Twist,
+    reach: f64,
+}
+
+impl TcpPosePath {
+    pub(crate) fn new(start: Pose, goal: Pose, reach: f64) -> Result<Self, String> {
+        let goal = from_isometry(&to_isometry(&goal)?);
+        if !reach.is_finite()
+            || reach <= 0.0
+            || Vector3::from(goal.translation).norm() > reach + 1e-9
+        {
+            return Err("TCP target is outside model reach".into());
+        }
+        let delta = pose_error(&start, &goal);
+        let direction = Self::weighted(delta, reach);
+        Ok(Self {
+            start,
+            goal,
+            delta,
+            direction,
+            reach,
+        })
+    }
+
+    fn weighted(delta: [f64; 6], reach: f64) -> Twist {
+        Twist::from_fn(|i, _| if i < 3 { delta[i] / reach } else { delta[i] })
+    }
+
+    pub(crate) fn distances(self) -> (f64, f64) {
+        let delta = Twist::from(self.delta);
+        (
+            delta.fixed_rows::<3>(0).norm(),
+            delta.fixed_rows::<3>(3).norm(),
+        )
+    }
+
+    pub(crate) fn pose(self, progress: f64) -> Result<Pose, String> {
+        if progress >= 1.0 {
+            return Ok(self.goal);
+        }
+        offset_pose(&self.start, self.delta.map(|v| v * progress), Frame::Base)
+    }
+
+    pub(crate) fn at_goal(self, pose: &Pose) -> bool {
+        Self::within(&self.goal, pose, 1.0)
+    }
+
+    pub(crate) fn at_reference_goal(self, pose: &Pose) -> bool {
+        // Leave room for board response and wire quantization at the endpoint.
+        Self::within(&self.goal, pose, 0.4)
+    }
+
+    fn within(expected: &Pose, actual: &Pose, scale: f64) -> bool {
+        let error = Twist::from(pose_error(expected, actual));
+        error.fixed_rows::<3>(0).norm() <= 0.001 * scale
+            && error.fixed_rows::<3>(3).norm() <= std::f64::consts::PI / 180.0 * scale
+    }
+
+    pub(crate) fn contains(self, candidate: &Pose) -> bool {
+        if self.at_goal(candidate) || Self::within(&self.start, candidate, 1.0) {
+            return true;
+        }
+        let offset = Self::weighted(pose_error(&self.start, candidate), self.reach);
+        let progress = (self.direction.dot(&offset) / self.direction.norm_squared()).clamp(0., 1.);
+        self.pose(progress)
+            .is_ok_and(|expected| Self::within(&expected, candidate, 1.0))
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct HoldPose {
     pub joints: [f64; 7],

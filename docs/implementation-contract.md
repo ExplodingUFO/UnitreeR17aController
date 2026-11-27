@@ -143,6 +143,7 @@
 | `jog_start`        | `space,axis,direction,speed,frame?,ttl_ms?,input_seq`          | 请求被接受且 `action.request_id` 等于本次 `request_id`                                      |
 | `jog_update`       | `action_id,input_seq,ttl_ms?`                                  | 成功更新不产生 `accepted` 记录；按当前动作与后续状态判断                                    |
 | `step`             | `space,axis,direction,amount,speed,frame?`                     | 该请求 `completed/completed`                                                                |
+| `move_tcp`         | `tcp:Pose,duration_s:number`                                  | 该请求 `completed/tcp_reached`，含 `measured_tcp` 和 `actual_duration_s`                        |
 | `return_to_pose`   | `joints:[number;7],speed,disconnect_after?:boolean`            | 该请求 `completed/returned`（继续保持）或 `completed/parked`（已断开）                      |
 | `stop`             | 无                                                             | 原动作收到 `cancelled`、`action:null`，等待 `stopping` 结束                                 |
 
@@ -251,6 +252,12 @@ J1 正向连续点动，速度 0.1 rad/s：
 停止发送更新后，动作在输入过期时取消。主动松开按钮时同时发送 `stop`，缩短等待。过期或已结束的动作不能通过迟到的更新恢复。WebSocket 断开不会直接释放控制权；点动输入有效期与控制权有效期分别计时。
 
 固定步长一次执行一个动作，不将后续点击排成运动队列。`progress` 按时间估计，达到 1 不表示已完成；以 `completed` 结果为准。完成前会同时检查实测值与参考值，并在减速结束后报告结果。
+
+### 5.5.1 基座 TCP 目标
+
+`move_tcp.tcp` 是当前配置工具点在基座坐标系中的绝对目标。平移单位为米，旋转为单位 XYZW 四元数。`duration_s` 是有限正数，表示请求的最短用时。控制器按同一进度插值平移与旋转，并应用现有运动约束。动作需要已使能、完整新鲜反馈和空闲控制器；控制权续期规则与其他动作相同。执行中 `action.mode` 为 `move_tcp`，`space` 为 `cartesian`，`axis` 为 `null`。
+
+请求接受后，按 `request_id` 读取 `results` 中的最新记录。到位时控制器先确认静止参考已发送，再以更新的七轴反馈计算 `measured_tcp`。完成容差为平移 1 mm、旋转 1°。实际用时 `actual_duration_s` 从开始执行计到结果记录。取消或失败同样记录实际用时，并在反馈可用时附带取消或失败时的实测 TCP。发送 `stop` 后按原请求查找 `cancelled`，等到 `phase:"ready"` 后使用最新 `generation` 和实测位姿提交下一目标。TCP 路径约束只检查运动学路径，工作区避障由调用方负责。
 
 ### 5.6 收纳返回与断开
 

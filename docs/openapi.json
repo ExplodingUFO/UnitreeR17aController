@@ -570,6 +570,21 @@
                     "frame": "base"
                   }
                 },
+                "move_tcp": {
+                  "summary": "基座 TCP 目标（位姿仅为格式示例）",
+                  "value": {
+                    "request_id": "req-tcp-move-001",
+                    "client_id": "example-service",
+                    "lease_id": "11111111-1111-4111-8111-111111111111",
+                    "generation": 5,
+                    "kind": "move_tcp",
+                    "tcp": {
+                      "translation": [0.13, -0.1, 0.2],
+                      "rotation": [0, 0, 0, 1]
+                    },
+                    "duration_s": 1.2
+                  }
+                },
                 "stop": {
                   "value": {
                     "request_id": "req-stop-001",
@@ -4396,6 +4411,37 @@
           }
         ]
       },
+      "MoveTcpCommand": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/CommandEnvelope"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "type": "string",
+                "const": "move_tcp"
+              },
+              "tcp": {
+                "$ref": "#/components/schemas/Pose",
+                "description": "当前配置 TCP 在基座坐标系中的绝对目标。平移用 m，旋转用单位 XYZW 四元数。"
+              },
+              "duration_s": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": "请求的最短时长。模型限制或反馈到位确认可延长执行。"
+              }
+            },
+            "required": [
+              "kind",
+              "tcp",
+              "duration_s"
+            ]
+          }
+        ],
+        "description": "执行单次基座 TCP 位姿动作。按 request_id 查找 completed/tcp_reached 及实测位姿。"
+      },
       "StopCommand": {
         "allOf": [
           {
@@ -4458,6 +4504,9 @@
             "$ref": "#/components/schemas/StepCommand"
           },
           {
+            "$ref": "#/components/schemas/MoveTcpCommand"
+          },
+          {
             "$ref": "#/components/schemas/StopCommand"
           },
           {
@@ -4497,6 +4546,7 @@
             "jog_start": "#/components/schemas/JogStartCommand",
             "jog_update": "#/components/schemas/JogUpdateCommand",
             "step": "#/components/schemas/StepCommand",
+            "move_tcp": "#/components/schemas/MoveTcpCommand",
             "stop": "#/components/schemas/StopCommand",
             "return_to_pose": "#/components/schemas/ReturnToPoseCommand",
             "configure_servo": "#/components/schemas/ConfigureServoCommand",
@@ -4824,6 +4874,15 @@
           "message": {
             "type": "string",
             "description": "显示文字。"
+          },
+          "measured_tcp": {
+            "$ref": "#/components/schemas/Pose",
+            "description": "move_tcp 结束时锁存的基座 TCP 实测位姿。反馈不可用时省略。"
+          },
+          "actual_duration_s": {
+            "type": "number",
+            "minimum": 0,
+            "description": "move_tcp 从开始执行至结果记录的秒数。"
           }
         },
         "required": [
@@ -5058,6 +5117,7 @@
               "continuous",
               "step",
               "return",
+              "move_tcp",
               "calibration",
               "replay"
             ]
@@ -5069,7 +5129,7 @@
             ],
             "minimum": 0,
             "maximum": 6,
-            "description": "点动轴索引；收纳返回和轨迹重放涉及七轴，mode=return/replay时为null且space=joint。mode=calibration时为正在测试的关节索引。独立位置录制不创建action。"
+            "description": "点动轴索引；mode=return/replay 时为 null 且 space=joint，mode=move_tcp 时为 null 且 space=cartesian。mode=calibration 时为正在测试的关节索引。独立位置录制不创建 action。"
           },
           "progress": {
             "type": "number",
@@ -5111,9 +5171,20 @@
               }
             },
             "else": {
-              "properties": {
-                "axis": {
-                  "type": "integer"
+              "if": {
+                "properties": {
+                  "mode": { "const": "move_tcp" }
+                }
+              },
+              "then": {
+                "properties": {
+                  "axis": { "type": "null" },
+                  "space": { "const": "cartesian" }
+                }
+              },
+              "else": {
+                "properties": {
+                  "axis": { "type": "integer" }
                 }
               }
             }
@@ -7089,9 +7160,10 @@
               2,
               3,
               4,
-              5
+              5,
+              6
             ],
-            "description": "0 无当前动作；1 关节连续；2 关节步长；3 笛卡尔连续；4 笛卡尔步长；5 收纳返回。减速期间可为 0。"
+            "description": "0 无当前动作；1 关节连续；2 关节步长；3 笛卡尔连续；4 笛卡尔步长；5 收纳返回；6 基座 TCP 目标。减速期间可为 0。"
           },
           "axis": {
             "type": [
@@ -7100,7 +7172,7 @@
             ],
             "minimum": 0,
             "maximum": 6,
-            "description": "关节 0..6；笛卡尔 0..5；无动作或收纳返回时为 null。"
+            "description": "关节 0..6；笛卡尔单轴 0..5；无动作、收纳返回或基座 TCP 目标时为 null。"
           },
           "q_ref": {
             "type": "array",
@@ -7306,9 +7378,10 @@
                   "future",
                   "invalid",
                   "constraint",
+                  "path_deviation",
                   "expired"
                 ],
-                "description": "aligned 已按发送时刻取样速度并连续积分位置，含速度/首次零点封顶；bounded 受目标边界限制或保持；stale 源年龄超过 50 ms；future 取样时刻早于源或不晚于上一成功伺服批次；invalid 数值或参数无效；constraint 为历史记录兼容标记，当前发送层不再重复检查这些运动窗口；expired 输入或租约有效期已到。"
+                "description": "aligned 已按发送时刻取样速度并连续积分位置，含速度/首次零点封顶；bounded 受目标边界限制或保持；stale 源年龄超过 50 ms；future 取样时刻早于源或不晚于上一成功伺服批次；invalid 数值或参数无效；constraint 为历史记录兼容标记；path_deviation 为基座 TCP 目标的采样超出位姿路径；expired 输入或租约有效期已到。"
               },
               "age_us": {
                 "type": [

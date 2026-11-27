@@ -2129,6 +2129,20 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "manual loopback fixture for desktop and integration testing"]
     async fn offline_controller_fixture() {
+        run_offline_fixture(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "manual loopback fixture with packet-level board emulation"]
+    async fn offline_motion_fixture() {
+        run_offline_fixture(true).await;
+    }
+
+    async fn launch_offline_fixture(
+        arm: ArmHandle,
+        journal: Journal,
+        token: String,
+    ) -> ServerHandle {
         async fn offline_command(
             State(state): State<ApiState>,
             Json(request): Json<CommandRequest>,
@@ -2139,22 +2153,345 @@ mod tests {
             command(State(state), Json(request)).await
         }
 
-        let directory = tempfile::tempdir().unwrap();
-        let journal = Journal::start(directory.path().join("events.db")).unwrap();
-        let arm = ArmHandle::spawn(journal.clone()).unwrap();
-        let token = std::env::var("R17A_OFFLINE_TOKEN").expect("set R17A_OFFLINE_TOKEN");
-        assert!(!token.is_empty(), "R17A_OFFLINE_TOKEN must be non-empty");
-        let server = launch_with_commands(
-            arm.clone(),
-            journal.clone(),
+        launch_with_commands(
+            arm,
+            journal,
             token,
             SocketAddr::from(([127, 0, 0, 1], 0)),
             post(offline_command),
         )
         .await
-        .unwrap();
+        .unwrap()
+    }
+
+    async fn run_offline_fixture(emulate: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = Journal::start(directory.path().join("events.db")).unwrap();
+        let arm = if emulate {
+            ArmHandle::spawn_emulated(journal.clone()).unwrap()
+        } else {
+            ArmHandle::spawn(journal.clone()).unwrap()
+        };
+        let token = std::env::var("R17A_OFFLINE_TOKEN").expect("set R17A_OFFLINE_TOKEN");
+        assert!(!token.is_empty(), "R17A_OFFLINE_TOKEN must be non-empty");
+        let server = launch_offline_fixture(arm.clone(), journal.clone(), token).await;
         println!("Offline controller: {}", server.base_url());
         tokio::time::sleep(Duration::from_secs(900)).await;
+        assert!(arm.shutdown(Duration::from_millis(500)));
+        server.shutdown().await;
+        assert!(journal.shutdown(Duration::from_secs(1)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn move_tcp_http_uses_emulated_wire_feedback_for_completion_and_stop() {
+        use crate::kinematics::{Frame, Kinematics, Pose, offset_pose, pose_error};
+        use serde_json::{Value, json};
+
+        async fn wait_state(
+            api: &reqwest::RequestBuilder,
+            ready: impl Fn(&Value) -> bool,
+        ) -> Value {
+            let start = tokio::time::Instant::now();
+            loop {
+                let state: Value = api
+                    .try_clone()
+                    .unwrap()
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if ready(&state) {
+                    return state;
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(8),
+                    "phase={}, action={}, last_result={}",
+                    state["phase"],
+                    state["action"],
+                    state["last_result"]
+                );
+                tokio::time::sleep(Duration::from_millis(8)).await;
+            }
+        }
+
+        fn result_for<'a>(state: &'a Value, id: &str) -> &'a Value {
+            state["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["request_id"] == id)
+                .unwrap_or(&Value::Null)
+        }
+
+        fn finished(state: &Value, id: &str) -> bool {
+            matches!(
+                result_for(state, id)["status"].as_str(),
+                Some("completed" | "cancelled" | "failed" | "rejected")
+            )
+        }
+
+        async fn submit(
+            api: &reqwest::RequestBuilder,
+            lease: &Value,
+            generation: &Value,
+            id: &str,
+            mut operation: Value,
+        ) {
+            operation["request_id"] = json!(id);
+            operation["client_id"] = json!("offline-motion-test");
+            operation["lease_id"] = lease.clone();
+            operation["generation"] = generation.clone();
+            let response = api
+                .try_clone()
+                .unwrap()
+                .json(&operation)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            assert_eq!(
+                response.json::<Value>().await.unwrap(),
+                json!({"request_id":id,"status":"queued"})
+            );
+        }
+
+        async fn terminal(state_api: &reqwest::RequestBuilder, id: &str, code: &str) -> Value {
+            let state = wait_state(state_api, |state| finished(state, id)).await;
+            let result = result_for(&state, id);
+            assert_eq!(result["code"], code, "{result}");
+            state
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let journal = Journal::start(directory.path().join("events.db")).unwrap();
+        let arm = ArmHandle::spawn_emulated(journal.clone()).unwrap();
+        let token = "offline-move-tcp";
+        let server = launch_offline_fixture(arm.clone(), journal.clone(), token.into()).await;
+        let base = server.base_url();
+        let client = reqwest::Client::new();
+        let state_api = client.get(format!("{base}/v1/state")).bearer_auth(token);
+        let command_api = client
+            .post(format!("{base}/v1/commands"))
+            .bearer_auth(token);
+        let control_api = client.post(format!("{base}/v1/control")).bearer_auth(token);
+        let lease: Value = control_api
+            .try_clone()
+            .unwrap()
+            .json(&json!({"action":"acquire","client_id":"offline-motion-test"}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let renew_body = json!({"action":"renew","client_id":"offline-motion-test","lease_id":lease["lease_id"]});
+        let renew = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                control_api
+                    .try_clone()
+                    .unwrap()
+                    .json(&renew_body)
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap();
+            }
+        });
+        let key = &lease["lease_id"];
+        let start = wait_state(&state_api, |s| s["phase"] == "disabled").await;
+        let offset = Pose {
+            translation: [0.063, -0.02, 0.09],
+            rotation: [0.0, 0.0, 0.1_f64.sin(), 0.1_f64.cos()],
+        };
+        submit(
+            &command_api,
+            key,
+            &start["generation"],
+            "offset",
+            json!({"kind":"configure_tcp","tcp":offset}),
+        )
+        .await;
+        let configured = wait_state(&state_api, |s| {
+            result_for(s, "offset")["status"] == "accepted"
+        })
+        .await;
+        submit(
+            &command_api,
+            key,
+            &configured["generation"],
+            "enable",
+            json!({"kind":"enable"}),
+        )
+        .await;
+        let ready = terminal(&state_api, "enable", "enabled").await;
+        let from: Pose = serde_json::from_value(ready["tcp"].clone()).unwrap();
+        submit(
+            &command_api,
+            key,
+            &ready["generation"],
+            "bad-duration",
+            json!({"kind":"move_tcp","tcp":from,"duration_s":0}),
+        )
+        .await;
+        assert_eq!(
+            result_for(
+                &terminal(&state_api, "bad-duration", "invalid_duration").await,
+                "bad-duration"
+            )["status"],
+            "rejected"
+        );
+        let first_goal = offset_pose(
+            &from,
+            [0.008, -0.007, 0.009, 0.036, -0.048, 0.018],
+            Frame::Base,
+        )
+        .unwrap();
+        let first = json!({"kind":"move_tcp","tcp":first_goal,"duration_s":1.2});
+        submit(
+            &command_api,
+            key,
+            &ready["generation"],
+            "first",
+            first.clone(),
+        )
+        .await;
+        let moving = wait_state(&state_api, |s| {
+            s["action"]["request_id"] == "first" || finished(s, "first")
+        })
+        .await;
+        assert_eq!(moving["action"]["mode"], "move_tcp");
+        assert!(moving["action"]["axis"].is_null());
+        // Both phases must use the same latest context, one action at a time.
+        submit(
+            &command_api,
+            key,
+            &moving["generation"],
+            "busy",
+            first.clone(),
+        )
+        .await;
+        assert_eq!(
+            result_for(&terminal(&state_api, "busy", "motion_busy").await, "busy")["status"],
+            "rejected"
+        );
+
+        let done = terminal(&state_api, "first", "tcp_reached").await;
+        let result = result_for(&done, "first").clone();
+        assert_eq!(result["status"], "completed");
+        assert!(result["actual_duration_s"].as_f64().unwrap() >= 1.2);
+        assert_eq!(done["phase"], "ready");
+        assert!(done["action"].is_null());
+        let actual: Pose = serde_json::from_value(result["measured_tcp"].clone()).unwrap();
+        assert_ne!(actual, first_goal);
+        let model = Kinematics::load("right").unwrap();
+        let joints = std::array::from_fn(|i| done["joints"][i]["q"].as_f64().unwrap());
+        let observed = model.fk(&joints, &offset).unwrap();
+        assert!(
+            pose_error(&actual, &observed)
+                .iter()
+                .all(|e| e.abs() < 1e-10)
+        );
+        let error = pose_error(&actual, &first_goal);
+        assert!(error[..3].iter().map(|e| e * e).sum::<f64>().sqrt() <= 0.001);
+        assert!(error[3..].iter().map(|e| e * e).sum::<f64>().sqrt() <= 1_f64.to_radians());
+
+        // A stale retry must leave the original terminal pose readable.
+        submit(&command_api, key, &ready["generation"], "first", first).await;
+        let second_goal = offset_pose(
+            &actual,
+            [-0.009, 0.01, 0.004, -0.04, 0.025, -0.01],
+            Frame::Base,
+        )
+        .unwrap();
+        submit(
+            &command_api,
+            key,
+            &done["generation"],
+            "second",
+            json!({"kind":"move_tcp","tcp":second_goal,"duration_s":0.7}),
+        )
+        .await;
+        let second = terminal(&state_api, "second", "tcp_reached").await;
+        let second_result = result_for(&second, "second");
+        assert_eq!(second_result["status"], "completed");
+        assert!(second_result["actual_duration_s"].as_f64().unwrap() >= 0.7);
+        let second_actual: Pose =
+            serde_json::from_value(second_result["measured_tcp"].clone()).unwrap();
+        assert!(
+            pose_error(&second_actual, &second_goal)[..3]
+                .iter()
+                .map(|e| e * e)
+                .sum::<f64>()
+                .sqrt()
+                <= 0.001
+        );
+        assert_ne!(second_actual, actual);
+
+        let third_goal = offset_pose(
+            &second_actual,
+            [0.009, 0.004, -0.004, 0.04, -0.025, 0.01],
+            Frame::Base,
+        )
+        .unwrap();
+        submit(
+            &command_api,
+            key,
+            &second["generation"],
+            "third",
+            json!({"kind":"move_tcp","tcp":third_goal,"duration_s":2.0}),
+        )
+        .await;
+        let moving = wait_state(&state_api, |s| {
+            finished(s, "third")
+                || (s["action"]["request_id"] == "third"
+                    && s["action"]["progress"].as_f64().unwrap_or_default() > 0.35)
+        })
+        .await;
+        assert_eq!(moving["action"]["request_id"], "third");
+        assert_eq!(result_for(&moving, "first"), &result);
+        submit(
+            &command_api,
+            key,
+            &moving["generation"],
+            "stop",
+            json!({"kind":"stop"}),
+        )
+        .await;
+        let cancelled = terminal(&state_api, "third", "stopped").await;
+        let stopped = result_for(&cancelled, "third");
+        assert_eq!(stopped["status"], "cancelled");
+        assert!(stopped["actual_duration_s"].as_f64().unwrap() < 2.0);
+        let stop_pose: Pose = serde_json::from_value(stopped["measured_tcp"].clone()).unwrap();
+        assert_ne!(stop_pose, second_actual);
+        assert_ne!(stop_pose, third_goal);
+        let after_stop = wait_state(&state_api, |s| s["phase"] == "ready").await;
+        submit(
+            &command_api,
+            key,
+            &after_stop["generation"],
+            "axis",
+            json!({
+                "kind":"step","space":"cartesian","axis":0,"direction":1,"amount":0.004,"speed":0.01
+            }),
+        )
+        .await;
+        let jogged = terminal(&state_api, "axis", "completed").await;
+        assert!(result_for(&jogged, "axis")["measured_tcp"].is_null());
+        assert!(
+            jogged["tcp"]["translation"][0].as_f64().unwrap()
+                > after_stop["tcp"]["translation"][0].as_f64().unwrap() + 0.002
+        );
+        assert_eq!(result_for(&jogged, "first"), &result);
+
+        renew.abort();
         assert!(arm.shutdown(Duration::from_millis(500)));
         server.shutdown().await;
         assert!(journal.shutdown(Duration::from_secs(1)));

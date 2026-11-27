@@ -3,7 +3,7 @@
 use crate::trajectory::JOINT_ACCELERATION;
 use crate::{
     calibration_path::PlaybackPhase,
-    kinematics::{CartesianPath, Kinematics, Pose, pose_error},
+    kinematics::{CartesianPath, Kinematics, Pose, TcpPosePath, pose_error},
     teaching::Program as TeachingProgram,
     trajectory::{JOINT_SPEED, MotionTuning},
     tuning::ServoTuning,
@@ -35,6 +35,7 @@ pub struct Reference {
     pub effort_limits: [f64; 7],
     pub joint_goal: Option<[f64; 7]>,
     pub cartesian: Option<CartesianGuard>,
+    pub(crate) tcp_move: Option<TcpMoveGuard>,
     pub servo_tuning: ServoTuning,
     pub tuning_revision: u64,
     pub sampling: Sampling,
@@ -66,6 +67,33 @@ pub struct CartesianGuard {
     pub goal: Option<Pose>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct TcpMoveGuard {
+    pub model: Arc<Kinematics>,
+    pub tcp: Pose,
+    pub path: TcpPosePath,
+    pub origin: [f64; 7],
+}
+
+impl TcpMoveGuard {
+    fn check(&self, joints: &[f64; 7]) -> Result<(), SampleStatus> {
+        let bounds = self
+            .model
+            .continuation_bounds(&self.origin)
+            .map_err(|_| SampleStatus::Invalid)?;
+        if (0..7).any(|i| joints[i] < bounds.lower[i] - 1e-9 || joints[i] > bounds.upper[i] + 1e-9)
+        {
+            return Err(SampleStatus::PathDeviation);
+        }
+        self.model
+            .fk(joints, &self.tcp)
+            .ok()
+            .filter(|pose| self.path.contains(pose))
+            .map(|_| ())
+            .ok_or(SampleStatus::PathDeviation)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Previous {
     pub at: Instant,
@@ -82,6 +110,7 @@ pub enum SampleStatus {
     Future,
     Invalid,
     Constraint,
+    PathDeviation,
     Expired,
 }
 
@@ -125,6 +154,7 @@ impl Reference {
             effort_limits: model.map_or([0.0; 7], Kinematics::effort_limits),
             joint_goal: None,
             cartesian: None,
+            tcp_move: None,
             servo_tuning: ServoTuning::default(),
             tuning_revision: 0,
             sampling: Sampling::Integrated,
@@ -278,6 +308,9 @@ impl Reference {
             q = previous.map_or(self.q, |p| p.q);
             dq = [0.0; 7];
             bounded = true;
+        }
+        if let Some(guard) = &self.tcp_move {
+            guard.check(&q)?;
         }
         if !q.iter().chain(dq.iter()).all(|x| x.is_finite()) {
             return Err(SampleStatus::Invalid);
@@ -626,4 +659,43 @@ mod tests {
             relative * 100.0
         );
     }
+}
+#[test]
+fn tcp_move_checks_position_and_rotation_at_the_same_progress() {
+    use crate::kinematics::{Frame, offset_pose};
+
+    let model = Arc::new(Kinematics::load("right").unwrap());
+    let tcp = Pose {
+        translation: [0.05, -0.03, 0.09],
+        rotation: [0.0, 0.0, 0.0, 1.0],
+    };
+    let joints = [0.3, 0.7, 1.1, 0.9, -0.4, 0.2, -0.3];
+    let start = model.fk(&joints, &tcp).unwrap();
+    let goal = offset_pose(&start, [0.02, -0.02, 0.01, 0.2, -0.1, 0.1], Frame::Base).unwrap();
+    let path = TcpPosePath::new(start, goal, model.reach_radius(&tcp)).unwrap();
+    for i in 0..=10 {
+        assert!(path.contains(&path.pose(f64::from(i) / 10.0).unwrap()));
+    }
+    // This pose is on the translation line, but has the orientation of a
+    // different point on the path.
+    let independently_rotated = Pose {
+        translation: path.pose(0.5).unwrap().translation,
+        rotation: path.pose(0.8).unwrap().rotation,
+    };
+    assert!(!path.contains(&independently_rotated));
+
+    let now = Instant::now();
+    let mut sample = Reference::joint(now, joints, [0.0; 7], [0.0; 7], 1, 0);
+    sample.tcp_move = Some(TcpMoveGuard {
+        model,
+        tcp,
+        path,
+        origin: joints,
+    });
+    assert!(sample.sample(now, None).is_ok());
+    sample.q[3] += 0.25;
+    assert_eq!(
+        sample.sample(now, None).unwrap_err(),
+        SampleStatus::PathDeviation
+    );
 }
