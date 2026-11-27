@@ -1868,6 +1868,19 @@ summary:focus-visible {
   gap: 4px;
   font-size: 12px;
 }
+.tcp-fields small {
+  color: var(--color-muted);
+}
+.tcp-rotation {
+  margin: 0 16px 16px;
+}
+.tcp-rotation .tcp-fields {
+  padding: 8px 0 0;
+}
+.tcp-error {
+  margin-bottom: 12px;
+  color: var(--color-danger);
+}
 .dialog-actions {
   display: flex;
   justify-content: flex-end;

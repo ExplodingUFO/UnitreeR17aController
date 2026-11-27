@@ -1370,6 +1370,60 @@ class DesktopApi {
       throw error;
     }
   }
+  async configureTcp(tcp: Pose): Promise<Pose> {
+    const { snapshot, connectionEpoch } = this.view;
+    const requestId = crypto.randomUUID();
+    const ack = await this.command(
+      "configure_tcp",
+      { tcp },
+      requestId,
+      snapshot.generation,
+    );
+    if (ack.request_id !== requestId || ack.status !== "queued")
+      throw new Error("TCP 请求响应无效");
+
+    const norm = Math.hypot(...tcp.rotation);
+    let unsubscribe = () => {};
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await new Promise<Pose>((resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("未确认 TCP 生效")), 4000);
+        unsubscribe = this.subscribe((view) => {
+          if (!view.online || view.connectionEpoch !== connectionEpoch) {
+            reject(new Error("连接已变化，TCP 未确认"));
+            return;
+          }
+          const { results, last_result, tcp_configured, tcp_transform } =
+            view.snapshot;
+          const result =
+            results.find((item) => item.request_id === requestId) ??
+            (last_result?.request_id === requestId ? last_result : null);
+          if (!result) return;
+          if (result.status !== "accepted" || result.code !== "configure_tcp") {
+            reject(new Error(result.message || "TCP 未应用"));
+            return;
+          }
+          if (
+            !tcp_configured ||
+            !tcp_transform ||
+            !tcp_transform.translation.every(
+              (v, i) => v === tcp.translation[i],
+            ) ||
+            !tcp_transform.rotation.every(
+              (v, i) => Math.abs(v - tcp.rotation[i] / norm) < 1e-9,
+            )
+          ) {
+            reject(new Error("TCP 配置已变化，无法确认本次应用"));
+            return;
+          }
+          resolve(tcp_transform);
+        });
+      });
+    } finally {
+      clearTimeout(timeout);
+      unsubscribe();
+    }
+  }
   async configureServo(
     config: ServoTuning,
     signal?: AbortSignal,

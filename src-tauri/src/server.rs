@@ -91,6 +91,16 @@ pub(crate) async fn launch_at(
     token: String,
     address: SocketAddr,
 ) -> Result<ServerHandle, String> {
+    launch_with_commands(arm, journal, token, address, post(command)).await
+}
+
+async fn launch_with_commands(
+    arm: ArmHandle,
+    journal: Journal,
+    token: String,
+    address: SocketAddr,
+    commands: axum::routing::MethodRouter<ApiState>,
+) -> Result<ServerHandle, String> {
     let listener = TcpListener::bind(address)
         .await
         .map_err(|e| format!("本机接口启动失败：{e}"))?;
@@ -118,7 +128,7 @@ pub(crate) async fn launch_at(
         .route("/v1/ports", get(ports))
         .route("/v1/state", get(snapshot))
         .route("/v1/control", post(control))
-        .route("/v1/commands", post(command))
+        .route("/v1/commands", commands)
         .route("/v1/logs", get(logs))
         .route("/v1/logs/page", get(log_page))
         .route("/v1/logs/filters", get(log_filters))
@@ -1994,6 +2004,161 @@ mod tests {
     }
 
     use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tcp_configuration_uses_lease_and_publishes_the_correlated_offset_without_motion() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = Journal::start(directory.path().join("events.db")).unwrap();
+        let arm = ArmHandle::spawn(journal.clone()).unwrap();
+        let token = "offline-tcp-api";
+        let server = launch_at(
+            arm.clone(),
+            journal.clone(),
+            token.into(),
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+        )
+        .await
+        .unwrap();
+        let base = server.base_url();
+        let client = reqwest::Client::new();
+        let lease: serde_json::Value = client
+            .post(format!("{base}/v1/control"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"action":"acquire","client_id":"tcp-test"}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let generation = lease["generation"].as_u64().unwrap();
+        let translation = [0.023, -0.045, 0.107];
+        for (id, lease_id, context, rotation, status, code) in [
+            (
+                "wrong-lease",
+                serde_json::json!("wrong"),
+                generation,
+                [0., 0., 3., 4.],
+                "rejected",
+                "not_owner",
+            ),
+            (
+                "invalid-offset",
+                lease["lease_id"].clone(),
+                generation,
+                [0.; 4],
+                "rejected",
+                "invalid_tcp",
+            ),
+            (
+                "valid-offset",
+                lease["lease_id"].clone(),
+                generation,
+                [0., 0., 3., 4.],
+                "accepted",
+                "configure_tcp",
+            ),
+            (
+                "stale-offset",
+                lease["lease_id"].clone(),
+                generation,
+                [0., 0., 0., 1.],
+                "rejected",
+                "stale_context",
+            ),
+        ] {
+            let response = client
+                .post(format!("{base}/v1/commands"))
+                .bearer_auth(token)
+                .json(&serde_json::json!({
+                    "kind": "configure_tcp", "request_id": id, "client_id": "tcp-test",
+                    "lease_id": lease_id, "generation": context,
+                    "tcp": {"translation":translation, "rotation":rotation}
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            assert_eq!(
+                response.json::<serde_json::Value>().await.unwrap(),
+                serde_json::json!({"request_id":id,"status":"queued"})
+            );
+            let state = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let state: serde_json::Value = client
+                        .get(format!("{base}/v1/state"))
+                        .bearer_auth(token)
+                        .send()
+                        .await
+                        .unwrap()
+                        .json()
+                        .await
+                        .unwrap();
+                    if state["last_result"]["request_id"] == id {
+                        break state;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(state["last_result"]["status"], status);
+            assert_eq!(state["last_result"]["code"], code);
+            assert_eq!(state["phase"], "disconnected");
+            assert_eq!(state["enabled"], false);
+            assert!(state["action"].is_null());
+            assert!(state["tcp"].is_null());
+            if matches!(id, "valid-offset" | "stale-offset") {
+                assert_eq!(state["tcp_configured"], true);
+                assert_eq!(
+                    state["tcp_transform"],
+                    serde_json::json!({"translation":translation,"rotation":[0.,0.,0.6,0.8]})
+                );
+            } else {
+                assert_eq!(state["tcp_configured"], false);
+                assert!(state["tcp_transform"].is_null());
+            }
+        }
+        assert!(arm.shutdown(Duration::from_millis(500)));
+        server.shutdown().await;
+        assert!(journal.shutdown(Duration::from_secs(1)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "manual loopback fixture for desktop and integration testing"]
+    async fn offline_controller_fixture() {
+        async fn offline_command(
+            State(state): State<ApiState>,
+            Json(request): Json<CommandRequest>,
+        ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+            if matches!(request.operation, Operation::Connect { .. }) {
+                return Err(ApiError::new("offline_fixture", "离线测试不连接设备"));
+            }
+            command(State(state), Json(request)).await
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let journal = Journal::start(directory.path().join("events.db")).unwrap();
+        let arm = ArmHandle::spawn(journal.clone()).unwrap();
+        let token = std::env::var("R17A_OFFLINE_TOKEN").expect("set R17A_OFFLINE_TOKEN");
+        assert!(!token.is_empty(), "R17A_OFFLINE_TOKEN must be non-empty");
+        let server = launch_with_commands(
+            arm.clone(),
+            journal.clone(),
+            token,
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            post(offline_command),
+        )
+        .await
+        .unwrap();
+        println!("Offline controller: {}", server.base_url());
+        tokio::time::sleep(Duration::from_secs(900)).await;
+        assert!(arm.shutdown(Duration::from_millis(500)));
+        server.shutdown().await;
+        assert!(journal.shutdown(Duration::from_secs(1)));
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn log_filters_http_uses_persisted_history_and_combines_exact_time_and_search() {

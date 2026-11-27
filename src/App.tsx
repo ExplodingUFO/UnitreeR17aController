@@ -15,11 +15,14 @@ import {
   isJointPositions,
   type JointPositions,
   type Phase,
+  type Pose,
   type Side,
   type Space,
   type View,
 } from "./api";
 const DEG = 180 / Math.PI;
+const TCP_STORAGE_KEY = "unitree.tcp.v1";
+const LINK7_TCP: Pose = { translation: [0, 0, 0], rotation: [0, 0, 0, 1] };
 type Page = "control" | "api" | "logs";
 type SafetyIntent = "parking" | "disconnect" | "disable" | "exit";
 const pages: { id: Page; label: string }[] = [
@@ -70,6 +73,26 @@ function quaternion(values: number[]): [number, number, number, number] {
     cr * cp * cy + sr * sp * sy,
   ];
 }
+function readSavedTcp(): Pose | null {
+  try {
+    const pose: Partial<Pose> | null = JSON.parse(
+      localStorage.getItem(TCP_STORAGE_KEY) ?? "null",
+    );
+    if (
+      Array.isArray(pose?.translation) &&
+      pose.translation.length === 3 &&
+      pose.translation.every(Number.isFinite) &&
+      Array.isArray(pose.rotation) &&
+      pose.rotation.length === 4 &&
+      pose.rotation.every(Number.isFinite) &&
+      Math.abs(Math.hypot(...pose.rotation) - 1) < 1e-9
+    )
+      return { translation: pose.translation, rotation: pose.rotation };
+  } catch {
+    // Fall back to the controller's current transform if storage is unusable.
+  }
+  return null;
+}
 export default function App() {
   const layout = usePanelLayout();
   const [page, setPage] = useState<Page>(currentPage);
@@ -87,7 +110,12 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [motionPending, setMotionPending] = useState<string | null>(null);
   const pendingGeneration = useRef(0);
-  const [tcpOpen, setTcpOpen] = useState(false);
+  const [tcpDraft, setTcpDraft] = useState<{
+    pose: Pose;
+    restored: boolean;
+  } | null>(null);
+  const tcpApplying = useRef(false);
+  const [tcpError, setTcpError] = useState("");
   const [servoOpen, setServoOpen] = useState(false);
   const [calibrationOpen, setCalibrationOpen] = useState(false);
   const [teachingOpen, setTeachingOpen] = useState(false);
@@ -333,7 +361,7 @@ export default function App() {
     });
     if (moving) stop();
     cancel("safety_dialog");
-    setTcpOpen(false);
+    setTcpDraft(null);
     setServoOpen(false);
     setCalibrationOpen(false);
     setTeachingOpen(false);
@@ -357,13 +385,13 @@ export default function App() {
       return;
     }
     cancel("servo_dialog");
-    setTcpOpen(false);
+    setTcpDraft(null);
     setInterfaceOpen(false);
     setServoOpen(true);
   };
   const openTeaching = () => {
     cancel("teaching_dialog");
-    setTcpOpen(false);
+    setTcpDraft(null);
     setInterfaceOpen(false);
     setServoOpen(false);
     setCalibrationOpen(false);
@@ -371,7 +399,7 @@ export default function App() {
   };
   const openCalibration = () => {
     cancel("calibration_dialog");
-    setTcpOpen(false);
+    setTcpDraft(null);
     setInterfaceOpen(false);
     setServoOpen(false);
     setCalibrationOpen(true);
@@ -379,7 +407,7 @@ export default function App() {
   const navigate = (next: Page) => {
     cancel("navigation");
     dismissSafety();
-    setTcpOpen(false);
+    setTcpDraft(null);
     setServoOpen(false);
     setCalibrationOpen(false);
     setTeachingOpen(false);
@@ -394,7 +422,7 @@ export default function App() {
         .cancelReturnToPose("navigation")
         .catch((error) => api.fail(error));
       setSafetyIntent(null);
-      setTcpOpen(false);
+      setTcpDraft(null);
       setServoOpen(false);
       setCalibrationOpen(false);
       setTeachingOpen(false);
@@ -466,33 +494,78 @@ export default function App() {
     beginMotion(axis, direction);
   };
   const openTcp = () => {
-    const transform = s.tcp_transform;
+    const saved = !s.tcp_transform || tcpAtLink7 ? readSavedTcp() : null;
+    const pose = saved ?? s.tcp_transform ?? LINK7_TCP;
     setTcpFields(
-      transform
-        ? [
-            ...transform.translation.map((value) => value * 1000),
-            ...rpy(transform.rotation),
-          ].map(String)
-        : ["0", "0", "0", "0", "0", "0"],
+      [
+        ...pose.translation.map((value) => value * 1000),
+        ...rpy(pose.rotation),
+      ].map(String),
     );
-    setTcpOpen(true);
+    setTcpDraft({ pose, restored: saved !== null });
+    setTcpError("");
   };
-  const applyTcp = () =>
+  const applyTcp = () => {
+    if (!tcpDraft || !deviceWritable || s.action || tcpApplying.current) return;
     void run(async () => {
-      const values = tcpFields.map(Number);
-      if (
-        tcpFields.some((v) => v.trim() === "") ||
-        values.some((v) => !Number.isFinite(v))
-      )
-        throw new Error("请输入有效的 TCP 数值");
-      await api.command("configure_tcp", {
-        tcp: {
-          translation: values.slice(0, 3).map((v) => v / 1000),
-          rotation: quaternion(values.slice(3)),
-        },
-      });
-      setTcpOpen(false);
+      tcpApplying.current = true;
+      setTcpError("");
+      try {
+        const values = tcpFields.map(Number);
+        if (
+          tcpFields.some((v) => v.trim() === "") ||
+          values.some((v) => !Number.isFinite(v))
+        )
+          throw new Error("请输入有效的 TCP 数值");
+        const [x, y, z, rx, ry, rz] = values;
+        const angles = [rx, ry, rz];
+        const { translation: originalTranslation, rotation: originalRotation } =
+          tcpDraft.pose;
+        const originalAngles = rpy(originalRotation);
+        const metres = (value: number, axis: number) =>
+          value === originalTranslation[axis] * 1000
+            ? originalTranslation[axis]
+            : value / 1000;
+        const applied = await api.configureTcp({
+          translation: [metres(x, 0), metres(y, 1), metres(z, 2)],
+          rotation: angles.every((angle, i) => angle === originalAngles[i])
+            ? originalRotation
+            : quaternion(angles),
+        });
+        setTcpDraft(null);
+        try {
+          localStorage.setItem(TCP_STORAGE_KEY, JSON.stringify(applied));
+        } catch {
+          api.fail(new Error("TCP 已应用，无法保存到本机。"));
+        }
+      } catch (error) {
+        setTcpError(error instanceof Error ? error.message : String(error));
+      } finally {
+        tcpApplying.current = false;
+      }
     });
+  };
+  const tcpField = (name: string, i: number) => (
+    <label key={name}>
+      <span>
+        {name} <small>{i < 3 ? "mm" : "°"}</small>
+      </span>
+      <input
+        autoFocus={i === 0}
+        type="number"
+        step="0.1"
+        disabled={busy}
+        value={tcpFields[i]}
+        onChange={(e) =>
+          setTcpFields((fields) =>
+            fields.map((field, index) =>
+              index === i ? e.target.value : field,
+            ),
+          )
+        }
+      />
+    </label>
+  );
   const result = s.last_result;
   const resolvedMotionBusy =
     result?.status === "rejected" &&
@@ -1073,7 +1146,7 @@ export default function App() {
             disabled={!view.baseUrl}
             onClick={() => {
               cancel("interface_dialog");
-              setTcpOpen(false);
+              setTcpDraft(null);
               setInterfaceOpen(true);
             }}
           >
@@ -1149,12 +1222,12 @@ export default function App() {
         onFold={() => setTeachingOpen(false)}
         onStop={stop}
       />
-      {tcpOpen && (
+      {tcpDraft && (
         <div
           className="modal-backdrop"
           onKeyDown={(e) => {
-            if (e.key === "Escape") {
-              setTcpOpen(false);
+            if (e.key === "Escape" && !tcpApplying.current) {
+              setTcpDraft(null);
             }
           }}
         >
@@ -1168,47 +1241,52 @@ export default function App() {
               <h2 id="tcp-title">TCP 偏移（相对 Link7）</h2>
               <button
                 aria-label="关闭 TCP 配置"
-                onClick={() => setTcpOpen(false)}
+                disabled={busy}
+                onClick={() => setTcpDraft(null)}
               >
                 ×
               </button>
             </div>
-            <p className="dialog-hint">
-              末端点动默认使用 Link7 法兰，可直接操作。安装工具后在这里填写相对
-              Link7 的 TCP 偏移。
-            </p>
-            <div className="tcp-fields">
-              {["X / mm", "Y / mm", "Z / mm", "Rx / °", "Ry / °", "Rz / °"].map(
-                (name, i) => (
-                  <label key={name}>
-                    {name}
-                    <input
-                      autoFocus={i === 0}
-                      type="number"
-                      step="0.1"
-                      value={tcpFields[i]}
-                      onChange={(e) =>
-                        setTcpFields((fields) =>
-                          fields.map((field, index) =>
-                            index === i ? e.target.value : field,
-                          ),
-                        )
-                      }
-                    />
-                  </label>
-                ),
+            <form
+              noValidate
+              onSubmit={(event) => {
+                event.preventDefault();
+                applyTcp();
+              }}
+            >
+              <p className="dialog-hint">
+                {tcpDraft.restored
+                  ? "已填入上次应用的 TCP。点击应用可恢复该偏移。"
+                  : "默认使用 Link7 法兰。输入工具相对法兰的偏移。"}
+              </p>
+              <div className="tcp-fields">{["X", "Y", "Z"].map(tcpField)}</div>
+              <details className="tcp-rotation">
+                <summary>旋转（Rx、Ry、Rz）</summary>
+                <div className="tcp-fields">
+                  {["Rx", "Ry", "Rz"].map((name, i) => tcpField(name, i + 3))}
+                </div>
+              </details>
+              {tcpError && (
+                <p className="dialog-hint tcp-error" role="alert">
+                  {tcpError}
+                </p>
               )}
-            </div>
-            <div className="dialog-actions">
-              <button onClick={() => setTcpOpen(false)}>取消</button>
-              <button
-                className="primary"
-                disabled={!deviceWritable || !!s.action}
-                onClick={applyTcp}
-              >
-                应用
-              </button>
-            </div>
+              <div className="dialog-actions">
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => setTcpDraft(null)}
+                >
+                  取消
+                </button>
+                <button
+                  className="primary"
+                  disabled={!deviceWritable || !!s.action}
+                >
+                  应用
+                </button>
+              </div>
+            </form>
           </section>
         </div>
       )}
