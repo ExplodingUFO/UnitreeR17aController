@@ -621,6 +621,8 @@ struct TeachingReplay {
     request_id: String,
     started: Instant,
     program: Arc<TeachingProgram>,
+    terminal_sent_at: Option<Instant>,
+    peak_error: (usize, f64),
 }
 
 #[derive(Clone, Copy)]
@@ -1578,6 +1580,8 @@ impl Core {
                     request_id: id.into(),
                     started: now,
                     program,
+                    terminal_sent_at: None,
+                    peak_error: (0, 0.0),
                 });
                 self.bump_generation();
                 self.phase();
@@ -1970,6 +1974,8 @@ impl Core {
             sample_count: run.recorder.sample_count(),
             duration_ms: run.recorder.duration_ms(),
             progress: 0.0,
+            elapsed_ms: None,
+            approach_duration_ms: None,
             trajectory_id: Some(run.id.clone()),
         })
     }
@@ -1994,6 +2000,8 @@ impl Core {
                 } else {
                     (elapsed / run.program.duration()).clamp(0.0, 1.0)
                 },
+                elapsed_ms: Some(elapsed * 1000.0),
+                approach_duration_ms: Some(run.program.approach_duration() * 1000.0),
                 trajectory_id: Some(run.program.trajectory_id().into()),
             }
         })
@@ -3429,21 +3437,8 @@ impl Core {
             }
             return;
         }
-        if let Some(replay) = self.replay.as_ref() {
-            let elapsed = now.saturating_duration_since(replay.started).as_secs_f64();
-            let sample = replay.program.sample(elapsed);
-            self.reference = sample.q;
-            self.velocity = sample.dq;
-            self.acceleration = sample.ddq;
-            if elapsed >= replay.program.duration() {
-                let replay = self.replay.take().unwrap();
-                self.reset_derivatives();
-                self.absolute_hold = true;
-                self.bump_generation();
-                self.record(&replay.request_id, "completed", "replayed", "轨迹重放完成");
-                self.phase();
-            }
-            self.dirty = true;
+        if self.replay.is_some() {
+            self.advance_replay(measured, now);
             return;
         }
         let Some(motion) = self.motion.as_ref() else {
@@ -3653,6 +3648,70 @@ impl Core {
             }
         }
     }
+    fn advance_replay(&mut self, measured: [f64; 7], now: Instant) {
+        let oldest_feedback = self.oldest_feedback();
+        let replay = self.replay.as_mut().unwrap();
+        let elapsed = now.saturating_duration_since(replay.started).as_secs_f64();
+        let duration = replay.program.duration();
+        let sample = replay.program.sample(elapsed);
+        self.reference = sample.q;
+        self.velocity = sample.dq;
+        self.acceleration = sample.ddq;
+        self.dirty = true;
+
+        let bus = self.bus.as_ref().unwrap();
+        let matches_replay = |sent: &crate::protocol::SentReference| {
+            sent.epoch == self.reference_version && sent.at >= replay.started && !sent.fallback_hold
+        };
+        for (axis, feedback) in self.feedback.iter().enumerate() {
+            if let Some(feedback) = feedback
+                && let Some(sent) = bus.reference_at(feedback.at).filter(matches_replay)
+            {
+                let error = (measured[axis] - sent.q[axis]).abs();
+                if error > replay.peak_error.1 {
+                    replay.peak_error = (axis, error);
+                }
+            }
+        }
+        if elapsed < duration {
+            return;
+        }
+        if replay.terminal_sent_at.is_none() {
+            replay.terminal_sent_at = bus
+                .latest_reference()
+                .filter(matches_replay)
+                .filter(|sent| sent.at.duration_since(replay.started).as_secs_f64() >= duration)
+                .map(|sent| sent.completed_at);
+        }
+        if !replay
+            .terminal_sent_at
+            .is_some_and(|sent| oldest_feedback.is_some_and(|at| at > sent))
+        {
+            return;
+        }
+
+        let replay = self.replay.take().unwrap();
+        self.reset_derivatives();
+        self.absolute_hold = true;
+        self.bump_generation();
+        let (axis, peak) = replay.peak_error;
+        if peak > RETURN_POSITION_TOLERANCE {
+            self.record(
+                &replay.request_id,
+                "completed",
+                "replayed_with_deviation",
+                format!(
+                    "回放结束，J{} 跟随偏差最大 {:.2}°",
+                    axis + 1,
+                    peak.to_degrees()
+                ),
+            );
+        } else {
+            self.record(&replay.request_id, "completed", "replayed", "轨迹重放完成");
+        }
+        self.phase();
+    }
+
     fn advance_move_tcp(
         &mut self,
         measured: [f64; 7],
@@ -4825,7 +4884,7 @@ mod tests {
         });
         let tcp = core.tcp;
         let held = core.reference.map(|q| q + 0.0003);
-        sent.send_replace(Some(crate::protocol::SentReference {
+        sent.record(Some(crate::protocol::SentReference {
             at: now,
             completed_at: now,
             generation: core.generation,
@@ -5119,7 +5178,7 @@ mod tests {
         let (bus, sent) = BusHandle::test_idle_bus();
         core.bus = Some(bus);
         assert_eq!(core.motion_anchor(now).unwrap(), q);
-        sent.send_replace(Some(SentReference {
+        sent.record(Some(SentReference {
             at: now,
             completed_at: now,
             generation: core.generation,
@@ -5138,7 +5197,7 @@ mod tests {
         let (mut applied_q, mut applied_dq) = (q, [0.0; 7]);
         let mut next_send = now + Duration::from_millis(2);
         for segment in 0..11 {
-            let held = sent.borrow().unwrap();
+            let held = sent.latest().unwrap();
             let cartesian = segment == 10;
             core.begin(
                 "chain",
@@ -5187,7 +5246,7 @@ mod tests {
                             q: sample.q,
                             dq: sample.dq,
                         });
-                        sent.send_replace(Some(SentReference {
+                        sent.record(Some(SentReference {
                             at: next_send,
                             completed_at: next_send,
                             generation: source.generation,
@@ -5215,7 +5274,7 @@ mod tests {
                 core.advance(now, dt);
                 assert!(core.error.is_none(), "{:?}", core.error);
                 source = core.outgoing_reference();
-                let sent_hold = sent.borrow().is_some_and(|last| {
+                let sent_hold = sent.latest().is_some_and(|last| {
                     last.epoch == core.reference_version && last.dq.iter().all(|v| v.abs() < 1e-12)
                 });
                 if stopped && core.motion.is_none() && core.at_rest() && sent_hold {
@@ -5224,12 +5283,12 @@ mod tests {
             }
             assert!(core.motion.is_none() && core.at_rest(), "segment {segment}");
             assert!(core.enabled && core.port.is_some());
-            assert_eq!(core.motion_anchor(now).unwrap(), sent.borrow().unwrap().q);
+            assert_eq!(core.motion_anchor(now).unwrap(), sent.latest().unwrap().q);
         }
         // A completed write remains the start position after its timestamp ages.
         let later = now + MAX_REFERENCE_AGE + Duration::from_millis(1);
         follow_reference(&mut core, later);
-        assert_eq!(core.motion_anchor(later).unwrap(), sent.borrow().unwrap().q);
+        assert_eq!(core.motion_anchor(later).unwrap(), sent.latest().unwrap().q);
     }
 
     #[test]
@@ -5388,7 +5447,7 @@ mod tests {
 
     fn teaching_tick(
         core: &mut Core,
-        sent: &watch::Sender<Option<SentReference>>,
+        sent: &crate::protocol::SentWrites,
         at: Instant,
         actual: [f64; 7],
     ) -> [Setpoint; 7] {
@@ -5401,16 +5460,13 @@ mod tests {
             core.accept_feedback(value, at);
         }
         core.advance(at, 0.01);
-        let previous = sent
-            .borrow()
-            .as_ref()
-            .map(|value| crate::reference::Previous {
-                at: value.at,
-                q: value.q,
-                dq: value.dq,
-            });
+        let previous = sent.latest().map(|value| crate::reference::Previous {
+            at: value.at,
+            q: value.q,
+            dq: value.dq,
+        });
         let sample = core.outgoing_reference().sample(at, previous).unwrap();
-        sent.send_replace(Some(SentReference {
+        sent.record(Some(SentReference {
             at,
             completed_at: at,
             generation: core.generation,
@@ -6366,7 +6422,10 @@ mod tests {
                 .is_number()
         );
         teaching_tick(&mut core, &sent, origin + Duration::from_millis(10), q);
+        assert!(core.replay.is_some());
+        teaching_tick(&mut core, &sent, origin + Duration::from_millis(20), q);
         assert!(core.replay.is_none() && core.enabled);
+        assert_eq!(core.results.front().unwrap().code, "replayed");
 
         // A sender fallback has zero actual trajectory velocity. Its abandoned
         // playback's nonzero acceleration must not restart movement on Stop.
@@ -6404,12 +6463,14 @@ mod tests {
             request_id: "fallback".into(),
             started: origin,
             program,
+            terminal_sent_at: None,
+            peak_error: (0, 0.0),
         });
         core.reference = sample.q;
         core.velocity = sample.dq;
         core.acceleration = sample.ddq;
         let at = origin + Duration::from_secs_f64(elapsed);
-        sent.send_replace(Some(SentReference {
+        sent.record(Some(SentReference {
             at,
             completed_at: at,
             generation: core.generation,
@@ -6425,6 +6486,85 @@ mod tests {
         assert_eq!(core.acceleration, [0.0; 7]);
         assert!(!core.stopping);
         assert_eq!(core.reference, sample.q);
+    }
+
+    #[test]
+    fn teaching_detects_stalled_motion_even_when_the_last_pose_matches() {
+        let origin = Instant::now();
+        let (mut core, _directory, sent) = calibration_fixture(origin);
+        let initial = core.reference;
+        let trajectory = teaching::Trajectory {
+            summary: TeachingSummary {
+                id: "out-and-back".into(),
+                name: "往返".into(),
+                created_at_ms: 0,
+                side: "right".into(),
+                tcp: core.tcp.unwrap(),
+                duration_ms: 4000,
+                sample_count: 3,
+                outcome: "completed".into(),
+            },
+            points: vec![
+                teaching::Point {
+                    t_ms: 0,
+                    q: initial,
+                },
+                teaching::Point {
+                    t_ms: 2000,
+                    q: std::array::from_fn(|i| initial[i] + if i == 1 { 0.1 } else { 0.0 }),
+                },
+                teaching::Point {
+                    t_ms: 4000,
+                    q: initial,
+                },
+            ],
+        };
+        let program = teaching::plan(
+            &trajectory,
+            initial,
+            core.model.as_ref().unwrap(),
+            core.motion_tuning,
+            PlaybackOptions {
+                smoothing_s: 0.0,
+                ..PlaybackOptions::default()
+            },
+        )
+        .unwrap();
+        let duration = program.duration();
+        core.apply(
+            "replay",
+            Operation::TeachingPrepared {
+                program: Arc::new(program),
+            },
+            origin,
+            origin,
+        )
+        .unwrap();
+        let next_tick = (duration * 100.0).ceil() as u64;
+        core.lease.as_mut().unwrap().expires =
+            origin + Duration::from_secs_f64(duration) + Duration::from_millis(LEASE_MS);
+        for i in 1..=next_tick {
+            // Valid, fresh feedback from an arm that never follows the command.
+            teaching_tick(
+                &mut core,
+                &sent,
+                origin + Duration::from_millis(i * 10),
+                initial,
+            );
+        }
+        assert!(core.replay.is_some());
+        assert_eq!(core.measured(core.control_at).unwrap(), initial);
+        teaching_tick(
+            &mut core,
+            &sent,
+            origin + Duration::from_millis((next_tick + 1) * 10),
+            initial,
+        );
+        assert!(core.replay.is_none() && core.enabled);
+        let result = core.results.front().unwrap();
+        assert_eq!(result.code, "replayed_with_deviation");
+        assert!(result.message.contains("J2"));
+        assert_eq!(core.reference, initial);
     }
 
     #[test]
@@ -6523,7 +6663,7 @@ mod tests {
         assert_eq!(sampled.q, expected.q);
         assert_eq!(sampled.dq, expected.dq);
         assert!(core.velocity.iter().any(|v| v.abs() > 1e-6));
-        sent.send_replace(Some(SentReference {
+        sent.record(Some(SentReference {
             at: at + Duration::from_millis(7),
             completed_at: at + Duration::from_millis(7),
             generation: core.generation,
@@ -6796,13 +6936,7 @@ mod tests {
             "stale_input"
         );
     }
-    fn calibration_fixture(
-        now: Instant,
-    ) -> (
-        Core,
-        tempfile::TempDir,
-        watch::Sender<Option<SentReference>>,
-    ) {
+    fn calibration_fixture(now: Instant) -> (Core, tempfile::TempDir, crate::protocol::SentWrites) {
         let (mut core, directory) = observed_core(now);
         core.enabled = true;
         core.tcp = Some(Pose {
@@ -6822,7 +6956,7 @@ mod tests {
         .unwrap();
         let (bus, sent) = BusHandle::test_idle_bus();
         core.bus = Some(bus);
-        sent.send_replace(Some(SentReference {
+        sent.record(Some(SentReference {
             at: now,
             completed_at: now,
             generation: core.generation,
@@ -6938,7 +7072,7 @@ mod tests {
         now += Duration::from_millis(8);
         let mut moving = write(source.clone(), core.desired_setpoints(), now);
         assert!(moving.dq[0] > 0.0);
-        sent.send_replace(Some(moving));
+        sent.record(Some(moving));
         let mut previous_ack: Option<Reference> = None;
         for _ in 0..2 {
             now += Duration::from_millis(80);
@@ -6954,7 +7088,7 @@ mod tests {
                 "a fresh timestamp alone released the hold"
             );
             assert_eq!(late.q, held.q);
-            sent.send_replace(Some(late));
+            sent.record(Some(late));
             if let Some(mut ack) = previous_ack.take() {
                 now += Duration::from_millis(10);
                 ack.at = now;
@@ -6975,7 +7109,7 @@ mod tests {
             moving = write(source.clone(), core.desired_setpoints(), now);
             assert!(!moving.fallback_hold);
             assert_eq!((moving.q, moving.dq), (held.q, [0.0; 7]));
-            sent.send_replace(Some(moving));
+            sent.record(Some(moving));
             for _ in 0..30 {
                 now += Duration::from_millis(10);
                 let previous_a = core.acceleration;
@@ -6995,7 +7129,7 @@ mod tests {
                             <= limits.jerk * 0.01_f64.powi(3) / 12.0 + 1e-14
                     );
                 }
-                sent.send_replace(Some(moving));
+                sent.record(Some(moving));
             }
             assert!(moving.q[0] > held.q[0] && moving.dq[0] > 0.0);
         }
@@ -7006,7 +7140,7 @@ mod tests {
             let plan = core.motion.as_ref().unwrap().planned.as_ref().unwrap();
             let expected = phase.sample(plan, now);
             assert_ne!(expected.ddq, core.acceleration);
-            sent.send_replace(Some(moving));
+            sent.record(Some(moving));
             core.end_motion("cancelled", "stopped", "停止");
             assert!(core.stopping && core.motion.is_none());
             assert_eq!(
@@ -7020,7 +7154,7 @@ mod tests {
             now += Duration::from_millis(10);
             tick(&mut core, now);
             moving = write(core.outgoing_reference(), core.desired_setpoints(), now);
-            sent.send_replace(Some(moving));
+            sent.record(Some(moving));
         }
         assert_eq!(
             (moving.q, moving.dq, core.acceleration),
@@ -7096,14 +7230,14 @@ mod tests {
         let source = core.outgoing_reference();
         let moving = write(source.clone(), core.desired_setpoints(), at(41));
         assert!(moving.dq.iter().any(|v| v.abs() > 0.0));
-        sent.send_replace(Some(moving));
+        sent.record(Some(moving));
         let held = write(source, core.desired_setpoints(), at(51));
         assert!(
             held.fallback_hold,
             "refreshing control time extended the lifetime of old feedback"
         );
         assert_eq!((held.q, held.dq), (moving.q, [0.0; 7]));
-        sent.send_replace(Some(held));
+        sent.record(Some(held));
         let count = core.calibration.as_ref().unwrap().points.captured();
         core.advance(at(60), 0.02);
         let queue = core.bus.as_mut().unwrap().test_feedback_queue();
@@ -7118,13 +7252,13 @@ mod tests {
             (held.q, [0.0; 7], held.q)
         );
         assert_eq!(core.calibration.as_ref().unwrap().points.captured(), count);
-        sent.send_replace(Some(pinned));
+        sent.record(Some(pinned));
         queue(core.feedback[6].as_ref().unwrap().value.clone(), at(175));
         core.advance(at(180), 0.012);
         let first = write(core.outgoing_reference(), core.desired_setpoints(), at(181));
         assert!(!first.fallback_hold && core.error.is_none());
         assert_eq!((first.q, first.dq), (held.q, [0.0; 7]));
-        sent.send_replace(Some(first));
+        sent.record(Some(first));
         core.advance(at(190), 0.01);
         assert!(core.velocity.iter().any(|v| v.abs() > 0.0));
     }
@@ -7157,11 +7291,7 @@ mod tests {
 
     fn moving_feedback_fixture(
         origin: Instant,
-    ) -> (
-        Core,
-        tempfile::TempDir,
-        watch::Sender<Option<SentReference>>,
-    ) {
+    ) -> (Core, tempfile::TempDir, crate::protocol::SentWrites) {
         let (mut core, dir, sent) = calibration_fixture(origin);
         calibration_request(
             &mut core,
@@ -7193,7 +7323,7 @@ mod tests {
         let moving = write(source.clone(), core.desired_setpoints(), at(1));
         let held = write(source, core.desired_setpoints(), at(60));
         assert!(held.fallback_hold && moving.dq[1] > 0.0);
-        sent.send_replace(Some(held));
+        sent.record(Some(held));
         let queue = core.bus.as_mut().unwrap().test_feedback_queue();
         for axis in 0..7 {
             queue(core.feedback[axis].as_ref().unwrap().value.clone(), at(240));
@@ -7208,12 +7338,12 @@ mod tests {
         // before resuming if the serial writer was also late.
         let confirmed = write(core.outgoing_reference(), core.desired_setpoints(), at(246));
         assert!(confirmed.fallback_hold);
-        sent.send_replace(Some(confirmed));
+        sent.record(Some(confirmed));
         core.advance(at(247), 0.002);
         let first = write(core.outgoing_reference(), core.desired_setpoints(), at(248));
         assert_eq!((first.q, first.dq), (held.q, [0.0; 7]));
         assert!(!first.fallback_hold);
-        sent.send_replace(Some(first));
+        sent.record(Some(first));
         for axis in 0..7 {
             queue(core.feedback[axis].as_ref().unwrap().value.clone(), at(250));
         }
@@ -7382,7 +7512,7 @@ mod tests {
         prior.completed_at = at + Duration::from_millis(1);
         prior.q[5] += 0.01;
         prior.feedforward_effort[5] = 0.42;
-        sent.send_replace(Some(prior));
+        sent.record(Some(prior));
 
         let queue = core.bus.as_mut().unwrap().test_feedback_queue();
         let mut j6 = core.feedback[5].as_ref().unwrap().value.clone();
@@ -7403,7 +7533,7 @@ mod tests {
         later.completed_at = at + Duration::from_millis(9);
         later.q[5] += 0.02;
         later.feedforward_effort[5] = -0.75;
-        sent.send_replace(Some(later));
+        sent.record(Some(later));
         core.advance(at + Duration::from_millis(10), 0.01);
 
         let report = core.last_calibration_report.as_ref().unwrap();
@@ -7468,13 +7598,13 @@ mod tests {
             let source = core.outgoing_reference();
             let mut write = BusHandle::test_servo_writer();
             let previous = write(source.clone(), core.desired_setpoints(), at(41));
-            sent.send_replace(Some(previous));
+            sent.record(Some(previous));
             let gate = core.bus.as_ref().unwrap().test_reference_write();
             let pending = in_flight.then(|| gate.lock().unwrap());
             let mut moving = write(source, core.desired_setpoints(), at(48));
             assert!(moving.dq[1] > 0.0 && moving.q[1] > previous.q[1]);
             if !in_flight {
-                sent.send_replace(Some(moving));
+                sent.record(Some(moving));
             }
             let queue = core.bus.as_mut().unwrap().test_feedback_queue();
             for axis in &core.feedback[..6] {
@@ -7484,7 +7614,7 @@ mod tests {
             if in_flight {
                 assert!(core.stopping);
                 moving.completed_at = at(handoff_ms);
-                sent.send_replace(Some(moving));
+                sent.record(Some(moving));
                 drop(pending);
             }
             if refresh_rx {
@@ -7513,7 +7643,7 @@ mod tests {
     fn calibration_feedback_wait_cannot_resume_after_stop_or_release() {
         for release in [false, true] {
             let (mut core, _dir, sent) = moving_feedback_fixture(Instant::now());
-            let moving = sent.borrow().unwrap();
+            let moving = sent.latest().unwrap();
             assert!(moving.dq[1] > 0.0);
             let now = core.control_at + Duration::from_millis(60);
             core.advance(now, 0.06);
@@ -7589,7 +7719,7 @@ mod tests {
                 value.dq = if i == 5 { 0.0306796166 } else { 0.0 };
                 core.accept_feedback(value, now);
             }
-            sent.send_replace(Some(SentReference {
+            sent.record(Some(SentReference {
                 at: now,
                 completed_at: now,
                 generation: core.generation,
@@ -7641,7 +7771,7 @@ mod tests {
             value.error = sample["error"].as_u64().unwrap() as u32;
             value.timeout = sample["timeout"].as_bool().unwrap();
             core.accept_feedback(value, now);
-            sent.send_replace(Some(SentReference {
+            sent.record(Some(SentReference {
                 at: now,
                 completed_at: now,
                 generation: core.generation,
@@ -7690,7 +7820,7 @@ mod tests {
                 value.dq = 0.0;
                 core.accept_feedback(value, now);
             }
-            sent.send_replace(Some(SentReference {
+            sent.record(Some(SentReference {
                 at: now,
                 completed_at: now,
                 generation: core.generation,
@@ -7734,7 +7864,7 @@ mod tests {
                 value.dq = if i == 5 { 0.0306796166 } else { 0.0 };
                 core.accept_feedback(value, now);
             }
-            sent.send_replace(Some(SentReference {
+            sent.record(Some(SentReference {
                 at: now,
                 completed_at: now,
                 generation: core.generation,
@@ -7794,7 +7924,7 @@ mod tests {
     }
     fn calibration_tick(
         core: &mut Core,
-        sent: &watch::Sender<Option<SentReference>>,
+        sent: &crate::protocol::SentWrites,
         now: Instant,
         origin: Instant,
         jitter: bool,
@@ -7829,7 +7959,7 @@ mod tests {
         let source = core.outgoing_reference();
         let (wire_q, wire_dq, calibration_phase) =
             if let Sampling::Calibration { program, phase, .. } = &source.sampling {
-                let previous = sent.borrow().map(|p| crate::reference::Previous {
+                let previous = sent.latest().map(|p| crate::reference::Previous {
                     at: p.at,
                     q: p.q,
                     dq: p.dq,
@@ -7867,7 +7997,7 @@ mod tests {
             value.tau = gravity[i] + if jitter { friction(value.dq, i) } else { 0.0 };
             core.accept_feedback(value, now);
         }
-        sent.send_replace(Some(SentReference {
+        sent.record(Some(SentReference {
             at: now,
             completed_at: now,
             generation: source.generation,
@@ -8300,7 +8430,7 @@ mod tests {
             feedback.q = position;
             core.accept_feedback(feedback, origin);
         }
-        sent.send_replace(Some(SentReference {
+        sent.record(Some(SentReference {
             at: origin,
             completed_at: origin,
             generation: core.generation,
@@ -8338,7 +8468,7 @@ mod tests {
         for tick in 3..5000 {
             let now = origin + Duration::from_millis(tick * 10);
             core.lease.as_mut().unwrap().expires = now + Duration::from_millis(LEASE_MS);
-            sent.send_replace(Some(write(
+            sent.record(Some(write(
                 core.outgoing_reference(),
                 core.desired_setpoints(),
                 now,
@@ -10669,7 +10799,7 @@ mod tests {
             (seeded.q, seeded.dq),
             (first.command.unwrap(), first.velocity)
         );
-        sent.send_replace(Some(seeded));
+        sent.record(Some(seeded));
 
         let mut program = report.settings.cartesian.as_ref().unwrap().as_ref().clone();
         program.prepare(core.model.as_ref().unwrap()).unwrap();
@@ -10807,7 +10937,7 @@ mod tests {
                     let (first_hold, first_progress) = *held.get_or_insert((receipt, progress));
                     assert_eq!((receipt.q, progress), (first_hold.q, first_progress));
                 }
-                sent.send_replace(Some(receipt));
+                sent.record(Some(receipt));
             }
         }
         assert_eq!(next_feedback, arrivals.len());

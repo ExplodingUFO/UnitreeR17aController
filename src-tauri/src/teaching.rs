@@ -42,6 +42,10 @@ pub struct Status {
     pub sample_count: usize,
     pub duration_ms: u64,
     pub progress: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approach_duration_ms: Option<f64>,
     pub trajectory_id: Option<String>,
 }
 
@@ -596,6 +600,7 @@ pub fn plan(
     }
     let mut positions: Vec<[f64; 7]> = points.into_iter().map(|point| point.q).collect();
     smooth(&times, &mut positions, options.smoothing_s)?;
+    let (times, positions) = playback_knots(times, positions, options.smoothing_s);
     let path = fit(&times, &positions)?;
     let effective_speed_scale = retime(&path, limits, options.speed_scale)?;
     let path_duration = path.duration / effective_speed_scale;
@@ -680,6 +685,40 @@ fn smooth(times: &[f64], q: &mut [[f64; 7]], smoothing_s: f64) -> Result<(), Str
         }
     }
     Ok(())
+}
+
+// The raw capture stays at its original resolution. Fit the filtered playback
+// on the full span of the forward/backward smoothing so encoder intervals cannot dominate
+// the derivatives. A uniform grid avoids a tiny last interval at the endpoint.
+fn playback_knots(
+    times: Vec<f64>,
+    positions: Vec<[f64; 7]>,
+    smoothing_s: f64,
+) -> (Vec<f64>, Vec<[f64; 7]>) {
+    if smoothing_s == 0.0 || times.len() <= 2 {
+        return (times, positions);
+    }
+    let duration = *times.last().unwrap();
+    let intervals = ((0.5 * duration / smoothing_s).floor() as usize).clamp(1, times.len() - 1);
+    let mut knots = Vec::with_capacity(intervals + 1);
+    let mut values = Vec::with_capacity(intervals + 1);
+    knots.push(0.0);
+    values.push(positions[0]);
+    let mut right = 1;
+    for index in 1..intervals {
+        let t = duration * (index as f64 / intervals as f64);
+        while times[right] < t {
+            right += 1;
+        }
+        let u = (t - times[right - 1]) / (times[right] - times[right - 1]);
+        knots.push(t);
+        values.push(std::array::from_fn(|axis| {
+            lerp(positions[right - 1][axis], positions[right][axis], u)
+        }));
+    }
+    knots.push(duration);
+    values.push(*positions.last().unwrap());
+    (knots, values)
 }
 
 fn fit(times: &[f64], q: &[[f64; 7]]) -> Result<Path, String> {
@@ -1115,6 +1154,51 @@ mod tests {
         )
         .unwrap();
         close(stronger.path.sample(0.6, 1.0).q[0], 0.036, 1e-12);
+    }
+
+    #[test]
+    fn dense_hand_recording_does_not_slow_the_whole_path_for_encoder_steps() {
+        let model = Kinematics::load("right").unwrap();
+        let data = recording(
+            (0..=414)
+                .map(|i| {
+                    let u = ((i as f64 - 80.0) / 260.0).clamp(0.0, 1.0);
+                    let intended = 0.05 * ease(u);
+                    let encoder_step = 0.0002;
+                    let quantized = (intended / encoder_step).round() * encoder_step;
+                    let perturbation = if i % 2 == 0 { 0.0005 } else { -0.0005 };
+                    Point {
+                        t_ms: i * 10 + u64::from(i % 7 == 1) * 3,
+                        q: std::array::from_fn(|axis| {
+                            if axis == 1 {
+                                quantized + perturbation
+                            } else {
+                                0.0
+                            }
+                        }),
+                    }
+                })
+                .collect(),
+        );
+        let q = data.points[0].q;
+        let program = plan(
+            &data,
+            q,
+            &model,
+            MotionTuning::default(),
+            PlaybackOptions::default(),
+        )
+        .unwrap();
+        let duration = program.duration();
+        assert!(
+            (4.14..=4.50).contains(&duration),
+            "a 4.14 s recording took {duration:.3} s"
+        );
+        let mid = program.sample(duration * (210.0 / 414.0)).q[1];
+        close(mid, 0.025, 0.003);
+        assert_eq!(program.sample(0.0).q, q);
+        assert_eq!(program.sample(duration).q, data.points.last().unwrap().q);
+        dynamics_ratios(&program);
     }
 
     #[test]

@@ -11614,6 +11614,16 @@
             "maximum": 1,
             "description": "录制为 0；回放为含接近的时间进度，不能代替 completed 结果。"
           },
+          "elapsed_ms": {
+            "type": "number",
+            "minimum": 0,
+            "description": "回放启动后的实际经过时间，包含接近起点。录制时省略。"
+          },
+          "approach_duration_ms": {
+            "type": "number",
+            "minimum": 0,
+            "description": "从执行起点重新计算后的接近段时长。录制时省略。"
+          },
           "trajectory_id": {
             "type": [
               "string",
@@ -11873,7 +11883,7 @@
             ]
           }
         ],
-        "description": "读取、路径平滑、重定时在工作线程先完成再入队；准备失败可在202前返回JSON错误。保留原租约/generation，由控制线程再次复核并从当前有效起点接近首点。正常完成 completed/replayed，保持末点；停止取消剩余段。输出 q/dq/ddq 参考，复用已有发送/补偿流程，不重放原始扭矩。内部 teaching_prepared 无法从客户端 JSON 反序列化。",
+        "description": "读取、路径平滑、重定时在工作线程先完成再入队；准备失败可在202前返回JSON错误。保留原租约/generation，由控制线程再次复核并从当前有效起点接近首点。末点成功发送并收到新反馈后，返回 completed/replayed。跟随偏差超过 0.02 rad 时返回 completed/replayed_with_deviation，并在 message 中提供偏差最大的轴与角度。两种结果均保持末点，停止取消剩余段。输出 q/dq/ddq 参考，复用已有发送/补偿流程，不重放原始扭矩。内部 teaching_prepared 无法从客户端 JSON 反序列化。",
         "examples": [
           {
             "request_id": "req-teach-replay-001",

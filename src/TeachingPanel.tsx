@@ -31,7 +31,7 @@ type Pending = {
   enabled?: boolean;
   waiting: boolean;
 };
-type ReplaySample = { t_ms: number; q: JointPositions };
+type ReplaySample = { jointTimes: (number | null)[]; q: JointPositions };
 const states: Record<TeachingStatus["state"], string> = {
   recording: "录制中",
   finishing: "保存中",
@@ -596,21 +596,32 @@ export default function TeachingPanel({
   useEffect(() => {
     if (
       !running ||
-      !preview ||
+      !replayPreview.current ||
+      teaching.request_id !== requests.replay?.id ||
       teaching.trajectory_id !== replayId.current ||
-      teaching.trajectory_id !== preview.trajectory_id ||
       replaySeq.current === s.seq
     )
       return;
     const q = s.joints.map((joint) => joint.q);
     if (!isJointPositions(q)) return;
     replaySeq.current = s.seq;
-    replaySamples.current.push({
-      t_ms: teaching.progress * preview.duration_ms,
-      q,
+    const planned = replayPreview.current;
+    const plannedApproach = planned.approach_duration_ms;
+    const approach = teaching.approach_duration_ms ?? plannedApproach;
+    const elapsed =
+      teaching.elapsed_ms ?? teaching.progress * teaching.duration_ms;
+    const jointTimes = s.joints.map((joint) => {
+      if (joint.age_ms == null || joint.age_ms > elapsed) return null;
+      const time = elapsed - joint.age_ms;
+      // The sender may rebase the approach when it accepts the command.
+      // Align at the first recorded pose and leave the replay path clock intact.
+      return time < approach
+        ? (time / approach) * plannedApproach
+        : Math.min(planned.duration_ms, plannedApproach + time - approach);
     });
+    replaySamples.current.push({ jointTimes, q });
     setSampleRevision((value) => value + 1);
-  }, [s.seq, running, teaching, preview]);
+  }, [s.seq, running, teaching, requests.replay?.id]);
 
   async function download() {
     if (!selected || downloading) return;
@@ -887,8 +898,11 @@ export default function TeachingPanel({
               )}
               {page === "paths" && preview && (
                 <small>
-                  接近 {clock(preview.approach_duration_ms)}，全程{" "}
-                  {clock(preview.duration_ms)}
+                  接近 {clock(preview.approach_duration_ms)} · 回放{" "}
+                  {clock(preview.duration_ms - preview.approach_duration_ms)}
+                  {preview.effective_speed_scale + 1e-9 <
+                    preview.requested_speed_scale &&
+                    `（实际 ${Number(preview.effective_speed_scale.toPrecision(3))}×）`}
                 </small>
               )}
             </div>
@@ -1056,15 +1070,16 @@ function TeachingChart({
   const chart = useMemo(() => {
     const duration = preview?.duration_ms ?? trajectory?.duration_ms ?? 1;
     const approach = preview?.approach_duration_ms ?? 0;
-    const rawScale = trajectory?.duration_ms
-      ? (duration - approach) / trajectory.duration_ms
-      : 1;
+    const rawStart = trajectory?.points[0]?.t_ms ?? 0;
+    const rawEnd = trajectory?.points.at(-1)?.t_ms ?? rawStart;
+    const rawScale =
+      rawEnd > rawStart ? (duration - approach) / (rawEnd - rawStart) : 1;
     const series = [
       {
         key: "recorded",
         points:
           trajectory?.points.map((p) => [
-            approach + p.t_ms * rawScale,
+            approach + (p.t_ms - rawStart) * rawScale,
             (p.q[axis] * 180) / Math.PI,
           ]) ?? [],
       },
@@ -1078,7 +1093,10 @@ function TeachingChart({
       },
       {
         key: "feedback",
-        points: samples.map((p) => [p.t_ms, (p.q[axis] * 180) / Math.PI]),
+        points: samples.flatMap(({ jointTimes, q }) => {
+          const t = jointTimes[axis];
+          return t == null ? [] : [[t, (q[axis] * 180) / Math.PI]];
+        }),
       },
     ];
     let minimum = Infinity,

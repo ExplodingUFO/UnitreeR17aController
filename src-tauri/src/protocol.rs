@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serialport::{
     ClearBuffer, DataBits, FlowControl, Parity, SerialPort, SerialPortType, StopBits,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::sync::{
     Arc, Mutex, OnceLock,
@@ -749,18 +749,14 @@ pub struct ReceivedFeedback {
 }
 
 impl ReceivedFeedback {
-    fn capture(
-        value: Feedback,
-        sent: &watch::Receiver<Option<SentReference>>,
-        now: impl FnOnce() -> Instant,
-    ) -> Self {
+    fn capture(value: Feedback, sent: &SentWrites, now: impl FnOnce() -> Instant) -> Self {
         let axis = usize::from(value.id);
-        let receipt = (value.error != 0 && axis < 7).then(|| sent.borrow());
+        let receipt = (value.error != 0 && axis < 7).then(|| sent.0.lock().unwrap());
         // Timestamp while the fault frame's receipt is pinned against replacement.
         let at = now();
         let fault_command = receipt
             .as_deref()
-            .and_then(Option::as_ref)
+            .and_then(|writes| writes.back())
             .filter(|s| s.completed_at <= at)
             .map(|s| (s.q[axis], s.feedforward_effort[axis]));
         Self {
@@ -910,6 +906,44 @@ pub struct SentReference {
     /// trajectory velocity; the original program's acceleration no longer applies.
     pub fallback_hold: bool,
 }
+/// Successful writes in completion order, shared by the serial and control threads.
+/// Readers copy only the selected receipt. A disabled/cleared bus starts a new history.
+#[derive(Clone)]
+pub(crate) struct SentWrites(Arc<Mutex<VecDeque<SentReference>>>);
+
+impl SentWrites {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(VecDeque::with_capacity(32))))
+    }
+
+    pub(crate) fn record(&self, receipt: Option<SentReference>) {
+        let mut writes = self.0.lock().unwrap();
+        match receipt {
+            Some(write) => {
+                if writes.len() == writes.capacity() {
+                    writes.pop_front();
+                }
+                writes.push_back(write);
+            }
+            None => writes.clear(),
+        }
+    }
+
+    pub(crate) fn latest(&self) -> Option<SentReference> {
+        self.0.lock().unwrap().back().copied()
+    }
+
+    fn at(&self, at: Instant) -> Option<SentReference> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|s| s.completed_at <= at)
+            .copied()
+    }
+}
+
 impl Committed {
     fn direct(at: Instant, values: [Setpoint; 7]) -> Self {
         Self {
@@ -1161,7 +1195,7 @@ fn sample_transmit(
 /// frame cannot lengthen the command cycle.
 pub struct BusHandle {
     setpoints: watch::Sender<PublishedSetpoints>,
-    sent: watch::Receiver<Option<SentReference>>,
+    sent: SentWrites,
     reference_write: Arc<Mutex<()>>,
     command: Sender<BusCommand>,
     events: EventReceiver<BusEvent>,
@@ -1218,7 +1252,8 @@ impl BusHandle {
             seq: 0,
             reference: None,
         });
-        let (sent_tx, sent) = watch::channel(None);
+        let sent = SentWrites::new();
+        let sent_tx = sent.clone();
         let reference_write = Arc::new(Mutex::new(()));
         let writer_gate = reference_write.clone();
         let (command_tx, command_rx) = bounded::<BusCommand>(1);
@@ -1264,7 +1299,7 @@ impl BusHandle {
                                 if result.is_ok() {
                                     committed = Some(Committed::direct(started, values));
                                 }
-                                sent_tx.send_replace(None);
+                                sent_tx.record(None);
                                 let failed = result.is_err();
                                 let _ = reply.send(result);
                                 if failed {
@@ -1310,7 +1345,7 @@ impl BusHandle {
                                     }
                                     previous_write = Some(started);
                                 }
-                                sent_tx.send_replace(None);
+                                sent_tx.record(None);
                                 let failed = result.is_err();
                                 let _ = reply.send(result);
                                 if failed {
@@ -1332,7 +1367,7 @@ impl BusHandle {
                                 Ok(prepared) => prepared,
                                 Err(error) => {
                                     let _ = writer_failure.set(error.clone());
-                                    sent_tx.send_replace(None);
+                                    sent_tx.record(None);
                                     let _ = writer_events.send(BusEvent::Error(error));
                                     break;
                                 }
@@ -1360,12 +1395,12 @@ impl BusHandle {
                                     }),
                                 ) {
                                     let _ = writer_failure.set(error.clone());
-                                    sent_tx.send_replace(None);
+                                    sent_tx.record(None);
                                     let _ = writer_events.send(BusEvent::Error(error));
                                     break;
                                 }
                                 let written = prepared.committed(started);
-                                sent_tx.send_replace(written.sent(
+                                sent_tx.record(written.sent(
                                     &last,
                                     Instant::now(),
                                     prepared.rejection,
@@ -1516,8 +1551,12 @@ impl BusHandle {
         self.failure.get().cloned().unwrap_or(fallback)
     }
 
+    pub fn reference_at(&self, received_at: Instant) -> Option<SentReference> {
+        self.sent.at(received_at)
+    }
+
     pub fn latest_reference(&self) -> Option<SentReference> {
-        *self.sent.borrow()
+        self.sent.latest()
     }
 
     /// Call after invalidating the source epoch, before publishing its successor.
@@ -1562,7 +1601,7 @@ impl BusHandle {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_idle_bus() -> (Self, watch::Sender<Option<SentReference>>) {
+    pub(crate) fn test_idle_bus() -> (Self, SentWrites) {
         let (setpoints, _) = watch::channel(PublishedSetpoints {
             values: stopped_setpoints(),
             seq: 0,
@@ -1570,7 +1609,8 @@ impl BusHandle {
         });
         let (command, _) = bounded(1);
         let (_, events) = unbounded();
-        let (sent_tx, sent) = watch::channel(None);
+        let sent = SentWrites::new();
+        let sent_tx = sent.clone();
         (
             Self {
                 setpoints,

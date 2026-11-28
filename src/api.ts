@@ -169,6 +169,8 @@ export interface TeachingStatus {
   duration_ms: number;
   progress: number;
   trajectory_id: string | null;
+  elapsed_ms?: number;
+  approach_duration_ms?: number;
 }
 export interface CalibrationMetrics {
   windows: number;
